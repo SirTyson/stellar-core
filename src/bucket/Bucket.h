@@ -9,6 +9,7 @@
 #include "overlay/StellarXDR.h"
 #include "util/NonCopyable.h"
 #include "util/XDRStream.h"
+#include <optional>
 #include <string>
 
 namespace stellar
@@ -30,6 +31,18 @@ class BucketManager;
 class BucketList;
 class Database;
 
+typedef uint64_t ShortLedgerKey;
+class Bucket;
+class BucketIndex
+{
+    std::vector<ShortLedgerKey> mKeys;
+    std::vector<size_t> mPositions;
+
+  public:
+    BucketIndex(std::shared_ptr<Bucket const> b);
+    std::optional<off_t> lookup(LedgerKey const& k) const;
+};
+
 class Bucket : public std::enable_shared_from_this<Bucket>,
                public NonMovableOrCopyable
 {
@@ -38,10 +51,24 @@ class Bucket : public std::enable_shared_from_this<Bucket>,
     Hash const mHash;
     size_t mSize{0};
 
+    // Lazily-constructed and retained members for read path.
+    std::unique_ptr<BucketIndex> mIndex;
+    std::unique_ptr<XDRInputFileStream> mStream;
+
   public:
     // Create an empty bucket. The empty bucket has hash '000000...' and its
     // filename is the empty string.
     Bucket();
+
+    // Returns (lazily-constructed) index.
+    BucketIndex const& getIndex();
+
+    // Returns (lazily-constructed) file stream. Note this might be in some
+    // random position left over from a previous read -- must be seek()'ed
+    // before use.
+    XDRInputFileStream& getStream();
+
+    std::optional<BucketEntry> getBucketEntry(LedgerKey const& k);
 
     // Construct a bucket with a given filename and hash. Asserts that the file
     // exists, but does not check that the hash is the bucket's hash. Caller

@@ -3,6 +3,7 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "ledger/LedgerTxn.h"
+#include "bucket/BucketList.h"
 #include "crypto/Hex.h"
 #include "crypto/KeyUtils.h"
 #include "crypto/SecretKey.h"
@@ -2356,14 +2357,14 @@ LedgerTxn::Impl::EntryIteratorImpl::clone() const
 // Implementation of LedgerTxnRoot ------------------------------------------
 size_t const LedgerTxnRoot::Impl::MIN_BEST_OFFERS_BATCH_SIZE = 5;
 
-LedgerTxnRoot::LedgerTxnRoot(Database& db, size_t entryCacheSize,
-                             size_t prefetchBatchSize
+LedgerTxnRoot::LedgerTxnRoot(Database& db, BucketList& bl,
+                             size_t entryCacheSize, size_t prefetchBatchSize
 #ifdef BEST_OFFER_DEBUGGING
                              ,
                              bool bestOfferDebuggingEnabled
 #endif
                              )
-    : mImpl(std::make_unique<Impl>(db, entryCacheSize, prefetchBatchSize
+    : mImpl(std::make_unique<Impl>(db, bl, entryCacheSize, prefetchBatchSize
 #ifdef BEST_OFFER_DEBUGGING
                                    ,
                                    bestOfferDebuggingEnabled
@@ -2372,7 +2373,7 @@ LedgerTxnRoot::LedgerTxnRoot(Database& db, size_t entryCacheSize,
 {
 }
 
-LedgerTxnRoot::Impl::Impl(Database& db, size_t entryCacheSize,
+LedgerTxnRoot::Impl::Impl(Database& db, BucketList& bl, size_t entryCacheSize,
                           size_t prefetchBatchSize
 #ifdef BEST_OFFER_DEBUGGING
                           ,
@@ -2383,6 +2384,7 @@ LedgerTxnRoot::Impl::Impl(Database& db, size_t entryCacheSize,
           std::min(std::max(prefetchBatchSize, MIN_BEST_OFFERS_BATCH_SIZE),
                    getMaxOffersToCross()))
     , mDatabase(db)
+    , mBucketList(bl)
     , mHeader(std::make_unique<LedgerHeader>())
     , mEntryCache(entryCacheSize)
     , mBulkLoadBatchSize(prefetchBatchSize)
@@ -3381,48 +3383,58 @@ LedgerTxnRoot::Impl::getNewestVersion(InternalLedgerKey const& gkey) const
     }
 
     std::shared_ptr<LedgerEntry const> entry;
-    try
+    auto e = mBucketList.getLedgerEntry(key);
+    if (e.has_value())
     {
-        switch (key.type())
+        releaseAssertOrThrow(LedgerEntryKey(e.value()) == key);
+        entry = std::make_shared<LedgerEntry const>(std::move(e.value()));
+    }
+    else
+    {
+        // Fallback from BL to DB for now. Eventually remove this.
+        try
         {
-        case ACCOUNT:
-            entry = loadAccount(key);
-            break;
-        case DATA:
-            entry = loadData(key);
-            break;
-        case OFFER:
-            entry = loadOffer(key);
-            break;
-        case TRUSTLINE:
-            entry = loadTrustLine(key);
-            break;
-        case CLAIMABLE_BALANCE:
-            entry = loadClaimableBalance(key);
-            break;
-        case LIQUIDITY_POOL:
-            entry = loadLiquidityPool(key);
-            break;
-        default:
-            throw std::runtime_error("Unknown key type");
+            switch (key.type())
+            {
+            case ACCOUNT:
+                entry = loadAccount(key);
+                break;
+            case DATA:
+                entry = loadData(key);
+                break;
+            case OFFER:
+                entry = loadOffer(key);
+                break;
+            case TRUSTLINE:
+                entry = loadTrustLine(key);
+                break;
+            case CLAIMABLE_BALANCE:
+                entry = loadClaimableBalance(key);
+                break;
+            case LIQUIDITY_POOL:
+                entry = loadLiquidityPool(key);
+                break;
+            default:
+                throw std::runtime_error("Unknown key type");
+            }
+        }
+        catch (NonSociRelatedException&)
+        {
+            throw;
+        }
+        catch (std::exception& e)
+        {
+            printErrorAndAbort(
+                "fatal error when loading ledger entry from LedgerTxnRoot: ",
+                e.what());
+        }
+        catch (...)
+        {
+            printErrorAndAbort(
+                "unknown fatal error when loading ledger entry from "
+                "LedgerTxnRoot");
         }
     }
-    catch (NonSociRelatedException&)
-    {
-        throw;
-    }
-    catch (std::exception& e)
-    {
-        printErrorAndAbort(
-            "fatal error when loading ledger entry from LedgerTxnRoot: ",
-            e.what());
-    }
-    catch (...)
-    {
-        printErrorAndAbort("unknown fatal error when loading ledger entry from "
-                           "LedgerTxnRoot");
-    }
-
     putInEntryCache(key, entry, LoadType::IMMEDIATE);
     if (entry)
     {

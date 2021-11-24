@@ -4,6 +4,7 @@
 // under the Apache License, Version 2.0. See the COPYING file at the root
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
+#include "bucket/BucketList.h"
 #include "database/Database.h"
 #include "ledger/LedgerTxn.h"
 #include "util/RandomEvictionCache.h"
@@ -682,6 +683,7 @@ class LedgerTxnRoot::Impl
     size_t const mMaxBestOffersBatchSize;
 
     Database& mDatabase;
+    BucketList& mBucketList;
     std::unique_ptr<LedgerHeader> mHeader;
     mutable EntryCache mEntryCache;
     mutable BestOffers mBestOffers;
@@ -796,7 +798,8 @@ class LedgerTxnRoot::Impl
 
   public:
     // Constructor has the strong exception safety guarantee
-    Impl(Database& db, size_t entryCacheSize, size_t prefetchBatchSize
+    Impl(Database& db, BucketList& bl, size_t entryCacheSize,
+         size_t prefetchBatchSize
 #ifdef BEST_OFFER_DEBUGGING
          ,
          bool bestOfferDebuggingEnabled

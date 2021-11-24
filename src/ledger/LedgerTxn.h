@@ -4,6 +4,7 @@
 // under the Apache License, Version 2.0. See the COPYING file at the root
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
+#include "bucket/BucketList.h"
 #include "ledger/InternalLedgerEntry.h"
 #include "ledger/LedgerTxnEntry.h"
 #include "ledger/LedgerTxnHeader.h"
@@ -801,7 +802,7 @@ class LedgerTxnRoot : public AbstractLedgerTxnParent
     std::unique_ptr<Impl> const mImpl;
 
   public:
-    explicit LedgerTxnRoot(Database& db, size_t entryCacheSize,
+    explicit LedgerTxnRoot(Database& db, BucketList& bl, size_t entryCacheSize,
                            size_t prefetchBatchSize
 #ifdef BEST_OFFER_DEBUGGING
                            ,

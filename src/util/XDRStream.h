@@ -84,6 +84,13 @@ class XDRInputFileStream
         return mIn.tellg();
     }
 
+    void
+    seek(size_t pos)
+    {
+        releaseAssertOrThrow(!mIn.fail());
+        mIn.seekg(pos);
+    }
+
     template <typename T>
     bool
     readOne(T& out)

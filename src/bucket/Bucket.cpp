@@ -8,6 +8,7 @@
 #include "util/asio.h"
 #include "bucket/Bucket.h"
 #include "bucket/BucketApplicator.h"
+#include "bucket/BucketInputIterator.h"
 #include "bucket/BucketList.h"
 #include "bucket/BucketManager.h"
 #include "bucket/BucketOutputIterator.h"
@@ -24,13 +25,203 @@
 #include "util/Logging.h"
 #include "util/TmpDir.h"
 #include "util/XDRStream.h"
+#include "util/types.h"
+#include "xdr/Stellar-ledger.h"
 #include "xdrpp/message.h"
 #include <Tracy.hpp>
+#include <cstdint>
 #include <fmt/format.h>
 #include <future>
+#include <unistd.h>
 
 namespace stellar
 {
+
+template <size_t N>
+static uint64_t
+wordFromBytes(std::array<std::uint8_t, N> const& arr)
+{
+    uint64_t res{0};
+    res |= static_cast<uint64_t>(arr[0]) << 56;
+    res |= static_cast<uint64_t>(arr[1]) << 48;
+    res |= static_cast<uint64_t>(arr[2]) << 40;
+    res |= static_cast<uint64_t>(arr[3]) << 32;
+    res |= static_cast<uint64_t>(arr[4]) << 24;
+    res |= static_cast<uint64_t>(arr[5]) << 16;
+    res |= static_cast<uint64_t>(arr[6]) << 8;
+    res |= static_cast<uint64_t>(arr[7]);
+    return res;
+}
+
+static inline uint8_t
+sixbitOfAlnum(uint8_t uch)
+{
+    if (uch == 0)
+    {
+        return 0;
+    }
+    char ch = static_cast<char>(uch);
+    releaseAssert(std::isalnum(ch));
+    if ('0' <= ch && ch <= '9')
+    {
+        return static_cast<uint8_t>(ch - '0');
+    }
+    else if ('A' <= ch && ch <= 'Z')
+    {
+        return 10 + static_cast<uint8_t>(ch - 'A');
+    }
+    else
+    {
+        releaseAssert('a' <= ch && ch <= 'z');
+        return 36 + static_cast<uint8_t>(ch - 'a');
+    }
+}
+
+template <typename LK>
+static ShortLedgerKey
+getShortLedgerKey(LK const& k)
+{
+    // A ShortLedgerKey has to have the following features:
+    //
+    //   - Preserves non-strict order and strict equality from LedgerKey: a <= b
+    //     => SLK(a) <= SLK(b) and a == b => SLK(a) == SLK(b). Doesn't
+    //     necessarily preserve strict inequality, a < b might not imply SLK(a)
+    //     < SLK(b).
+    //
+    //   - Uses as many bits as it safely can from the most-unique part of each
+    //     existing LedgerEntry (typically its public key).
+    //
+    // The general structure of the mapping is just "take high order bits of
+    // fields in their lexicographical order".
+
+    ShortLedgerKey res{0};
+
+    // Top 3 bits are type (there are only 5 types so this fits).
+    res |= static_cast<uint64_t>(k.type()) << 61;
+
+    // Low 61 bits are from the rest
+    switch (k.type())
+    {
+    case ACCOUNT:
+        // for account the layout is just 61 bits of pubkey.
+        res |= wordFromBytes(k.account().accountID.ed25519()) >> 3;
+        break;
+
+    case TRUSTLINE:
+    {
+        // for trustline the layout is
+        //
+        // 39 bits account pubkey
+        // 2 bits of asset type
+        // 12 bits of asset alphanum + 8 bits issuer
+        // OR
+        // 20 bits poolID
+        auto const& tl = k.trustLine();
+        auto const& a = tl.asset;
+        res |= (wordFromBytes(tl.accountID.ed25519()) >> 3) & ~0x3fffff;
+        res |= (a.type() << 20);
+        switch (a.type())
+        {
+        case ASSET_TYPE_NATIVE:
+            break;
+        case ASSET_TYPE_CREDIT_ALPHANUM4:
+            res |= sixbitOfAlnum(a.alphaNum4().assetCode[0]) << 14;
+            res |= sixbitOfAlnum(a.alphaNum4().assetCode[1]) << 8;
+            res |= a.alphaNum4().issuer.ed25519()[0];
+            break;
+        case ASSET_TYPE_CREDIT_ALPHANUM12:
+            res |= sixbitOfAlnum(a.alphaNum12().assetCode[0]) << 14;
+            res |= sixbitOfAlnum(a.alphaNum12().assetCode[1]) << 8;
+            res |= a.alphaNum12().issuer.ed25519()[0];
+            break;
+        case ASSET_TYPE_POOL_SHARE:
+            res |= wordFromBytes(a.liquidityPoolID()) >> 44;
+            break;
+        }
+    }
+    break;
+    case OFFER:
+        res |= (k.offer().offerID >> 3);
+        break;
+    case DATA:
+        // for data the layout is 45 bits of accountID and
+        // 16 bits of dataName
+        res |= (wordFromBytes(k.data().accountID.ed25519()) >> 3) & ~0xffff;
+        if (k.data().dataName.size() > 0)
+        {
+            res |= (k.data().dataName[0] << 8);
+        }
+        if (k.data().dataName.size() > 1)
+        {
+            res |= k.data().dataName[1];
+        }
+        break;
+    case CLAIMABLE_BALANCE:
+        res |= wordFromBytes(k.claimableBalance().balanceID.v0()) >> 3;
+        break;
+    case LIQUIDITY_POOL:
+        res |= wordFromBytes(k.liquidityPool().liquidityPoolID) >> 3;
+        break;
+    }
+    return res;
+}
+
+static std::optional<ShortLedgerKey>
+getBucketEntryShortLedgerKey(BucketEntry const& be)
+{
+    switch (be.type())
+    {
+    case LIVEENTRY:
+    case INITENTRY:
+        return std::make_optional(
+            getShortLedgerKey<LedgerEntry::_data_t>(be.liveEntry().data));
+    case DEADENTRY:
+        return std::make_optional(getShortLedgerKey<LedgerKey>(be.deadEntry()));
+    case METAENTRY:
+    default:
+        break;
+    }
+    return std::nullopt;
+}
+
+BucketIndex::BucketIndex(std::shared_ptr<Bucket const> b)
+{
+    if (b->getFilename().empty())
+    {
+        return;
+    }
+    XDRInputFileStream in;
+    in.open(b->getFilename());
+    size_t pos = 0;
+    BucketEntry be;
+    while (in && in.readOne(be))
+    {
+        auto bek = getBucketEntryShortLedgerKey(be);
+        if (bek.has_value())
+        {
+            CLOG_TRACE(Bucket, "Indexed {} at {} in {}", bek.value(), pos,
+                       std::filesystem::path(b->getFilename()).filename());
+            mKeys.emplace_back(bek.value());
+            mPositions.emplace_back(pos);
+        }
+        pos = in.pos();
+    }
+    CLOG_INFO(Bucket, "Indexed {} positions in {}", mKeys.size(),
+              std::filesystem::path(b->getFilename()).filename());
+}
+
+std::optional<off_t>
+BucketIndex::lookup(LedgerKey const& k) const
+{
+    ShortLedgerKey slk = getShortLedgerKey(k);
+    auto i = std::lower_bound(mKeys.begin(), mKeys.end(), slk);
+    if (i == mKeys.end() || *i != slk)
+    {
+        return std::nullopt;
+    }
+    auto n = i - mKeys.begin();
+    return std::make_optional(mPositions.at(n));
+}
 
 Bucket::Bucket(std::string const& filename, Hash const& hash)
     : mFilename(filename), mHash(hash)
@@ -46,6 +237,62 @@ Bucket::Bucket(std::string const& filename, Hash const& hash)
 
 Bucket::Bucket()
 {
+}
+
+BucketIndex const&
+Bucket::getIndex()
+{
+    if (!mIndex)
+    {
+        CLOG_INFO(Bucket, "Bucket::getIndex() indexing bucket {}", mFilename);
+        mIndex = std::make_unique<BucketIndex>(shared_from_this());
+    }
+    return *mIndex;
+}
+
+XDRInputFileStream&
+Bucket::getStream()
+{
+    if (!mStream)
+    {
+        mStream = std::make_unique<XDRInputFileStream>();
+        if (!mFilename.empty())
+        {
+            mStream->open(mFilename);
+        }
+    }
+    return *mStream;
+}
+
+std::optional<BucketEntry>
+Bucket::getBucketEntry(LedgerKey const& k)
+{
+    auto sk = getShortLedgerKey<LedgerKey const>(k);
+    auto pos = getIndex().lookup(k);
+    if (pos.has_value())
+    {
+        BucketEntry be;
+        auto& stream = getStream();
+        CLOG_TRACE(Bucket, "Seeking bucket {} to position {} for {:x}",
+                   std::filesystem::path(mFilename).filename(), pos.value(),
+                   sk);
+        stream.seek(pos.value());
+        while (stream && stream.readOne(be) &&
+               getBucketEntryShortLedgerKey(be) == sk)
+        {
+            if (be.type() == LIVEENTRY && LedgerEntryKey(be.liveEntry()) == k)
+            {
+                CLOG_TRACE(Bucket, "Found BE for {:x} in bucket {}", sk,
+                           std::filesystem::path(mFilename).filename());
+                return std::make_optional(be);
+            }
+            if (be.type() == DEADENTRY && be.deadEntry() == k)
+            {
+                return std::nullopt;
+            }
+        }
+    }
+    return std::nullopt;
 }
 
 Hash const&

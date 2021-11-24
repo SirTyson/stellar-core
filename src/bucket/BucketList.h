@@ -6,6 +6,7 @@
 
 #include "bucket/FutureBucket.h"
 #include "overlay/StellarXDR.h"
+#include "util/XDRStream.h"
 #include "xdrpp/message.h"
 #include <future>
 
@@ -401,6 +402,11 @@ class BucketList
     // the concatenation of each level's hash, each of which in turn is the hash
     // of the concatenation of the hashes of the `curr` and `snap` buckets.
     Hash getHash() const;
+
+    // Look up a ledger entry from the BL, dynamically indexing buckets as
+    // needed to resolve the LE. Returns nullopt if the LE is dead /
+    // nonexistent.
+    std::optional<LedgerEntry> getLedgerEntry(LedgerKey const& k) const;
 
     // Restart any merges that might be running on background worker threads,
     // merging buckets between levels. This needs to be called after forcing a

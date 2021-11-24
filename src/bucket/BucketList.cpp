@@ -15,6 +15,7 @@
 #include "util/XDRStream.h"
 #include "util/types.h"
 #include <Tracy.hpp>
+#include <fmt/chrono.h>
 #include <fmt/format.h>
 
 namespace stellar
@@ -367,6 +368,38 @@ BucketList::getHash() const
         hsh.add(lev.getHash());
     }
     return hsh.finish();
+}
+
+std::optional<LedgerEntry>
+BucketList::getLedgerEntry(LedgerKey const& k) const
+{
+    auto start = std::chrono::steady_clock::now();
+    for (auto const& lev : mLevels)
+    {
+        std::array<std::shared_ptr<Bucket>, 2> buckets = {lev.getCurr(),
+                                                          lev.getSnap()};
+        for (auto b : buckets)
+        {
+            auto be = b->getBucketEntry(k);
+            if (be.has_value())
+            {
+                if (be.value().type() == DEADENTRY)
+                {
+                    return std::nullopt;
+                }
+                else
+                {
+                    auto end = std::chrono::steady_clock::now();
+                    CLOG_INFO(
+                        Bucket, "BucketList::getLedgerEntry lookup took {}",
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            end - start));
+                    return std::make_optional(be.value().liveEntry());
+                }
+            }
+        }
+    }
+    return std::nullopt;
 }
 
 // levelShouldSpill is the set of boundaries at which each level should spill,
