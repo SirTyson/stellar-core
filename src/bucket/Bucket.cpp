@@ -302,6 +302,24 @@ Bucket::Bucket(std::string const& filename, Hash const& hash,
         CLOG_INFO(Bucket, "Bucket::Bucket() created, file exists : {}",
                   filename);
         mSize = fs::size(filename);
+        if (!fs::exists(mSortedV2Filename))
+        {
+            CLOG_INFO(
+                Bucket,
+                "Bucket::Bucket() V2 sorted file does not exist, creating",
+                mSortedV2Filename);
+            releaseAssert(false);
+        }
+        else
+        {
+            CLOG_INFO(Bucket, "Bucket::Bucket() V2 sorted file exists : {}",
+                      mSortedV2Filename);
+            CLOG_INFO(Bucket, "mSize: {}", mSize);
+            CLOG_INFO(Bucket, "Sorted Size: {}", fs::size(mSortedV2Filename));
+            // Account for additional space in header
+            // Remove, not a good assert. Just for my own personal dev
+            // releaseAssert(mSize == fs::size(mSortedV2Filename) - 8);
+        }
     }
 }
 
@@ -1029,13 +1047,18 @@ Bucket::merge(BucketManager& bucketManager, uint32_t maxProtocolVersion,
         }
     }
 
+    // Don't want to double count merge events, don't incriment after 2nd loop
+    if (countMergeEvents)
+    {
+        bucketManager.incrMergeCounters(mc);
+    }
+
     BucketMetadata metaV2;
-    MergeCounters mc2;
     metaV2.ledgerVersion = protocolVersion;
     metaV2.ext.v(1);
     metaV2.ext.v1().flags = BucketMetadataFlags::BUCKET_METADATA_NEW_CMP_FLAG;
     BucketOutputIterator outV2(bucketManager.getTmpDir(), keepDeadEntries,
-                               metaV2, mc2, ctx, doFsync);
+                               metaV2, mc, ctx, doFsync);
 
     BucketEntryIdCmpV2 cmp2;
     while (oV2i || nV2i)
@@ -1054,20 +1077,14 @@ Bucket::merge(BucketManager& bucketManager, uint32_t maxProtocolVersion,
             }
         }
 
-        if (!mergeCasesWithDefaultAcceptance(cmp2, mc2, oV2i, nV2i, outV2,
+        if (!mergeCasesWithDefaultAcceptance(cmp2, mc, oV2i, nV2i, outV2,
                                              shadowIterators, protocolVersion,
                                              keepShadowedLifecycleEntries))
         {
-            mergeCasesWithEqualKeys(mc2, oV2i, nV2i, outV2, shadowIterators,
+            mergeCasesWithEqualKeys(mc, oV2i, nV2i, outV2, shadowIterators,
                                     protocolVersion,
                                     keepShadowedLifecycleEntries);
         }
-    }
-
-    // Don't want to double count merge events, don't incriment after 2nd loop
-    if (countMergeEvents)
-    {
-        bucketManager.incrMergeCounters(mc);
     }
 
     MergeKey mk{keepDeadEntries, oldBucket, newBucket, shadows};
