@@ -398,7 +398,6 @@ BucketManagerImpl::adoptFileAsBucket(std::string const& filename,
             std::remove(filename.c_str());
             if (!v2Filename.empty())
             {
-
                 CLOG_DEBUG(Bucket,
                            "Deleting bucket file {} that is redundant with "
                            "existing bucket",
@@ -505,6 +504,7 @@ BucketManagerImpl::getBucketByHash(uint256 const& hash)
         return i->second;
     }
     std::string canonicalName = bucketFilename(hash);
+    std::string v2CanonicalName = canonicalName + Bucket::CMP_V2_FILE_EXT;
     if (fs::exists(canonicalName))
     {
         std::string const v2CanonicalName =
