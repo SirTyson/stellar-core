@@ -127,7 +127,8 @@ class BucketManager : NonMovableOrCopyable
     virtual std::shared_ptr<Bucket>
     adoptFileAsBucket(std::string const& filename, uint256 const& hash,
                       size_t nObjects, size_t nBytes,
-                      MergeKey* mergeKey = nullptr) = 0;
+                      MergeKey* mergeKey = nullptr,
+                      std::string const& v2Filename = {}) = 0;
 
     // Companion method to `adoptFileAsBucket` also called from the
     // `BucketOutputIterator::getBucket` merge-completion path. This method

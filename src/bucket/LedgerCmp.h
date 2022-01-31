@@ -94,7 +94,7 @@ struct LedgerEntryIdCmp
  */
 struct BucketEntryIdCmp
 {
-    bool
+    virtual bool
     operator()(BucketEntry const& a, BucketEntry const& b) const
     {
         BucketEntryType aty = a.type();
@@ -146,4 +146,15 @@ struct BucketEntryIdCmp
         }
     }
 };
+
+struct BucketEntryIdCmpV2 : public BucketEntryIdCmp
+{
+    // TODO: Implement
+    virtual bool
+    operator()(BucketEntry const& a, BucketEntry const& b) const
+    {
+        return BucketEntryIdCmp::operator()(a, b);
+    }
+};
+
 }

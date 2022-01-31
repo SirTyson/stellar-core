@@ -62,6 +62,11 @@ BucketOutputIterator::BucketOutputIterator(std::string const& tmpDir,
         put(bme);
         mPutMeta = true;
     }
+
+    // Check if bucket is sorted using legacy or new sorted order
+    if (meta.ext.v() == 1 && meta.ext.v1().flags & BUCKET_METADATA_NEW_CMP_FLAG) {
+        mCmp = BucketEntryIdCmpV2();
+    }
 }
 
 void
@@ -112,9 +117,39 @@ BucketOutputIterator::put(BucketEntry const& e)
 
 std::shared_ptr<Bucket>
 BucketOutputIterator::getBucket(BucketManager& bucketManager,
-                                MergeKey* mergeKey)
+                                MergeKey* mergeKey,
+                                BucketOutputIterator* v2FileIter)
 {
     ZoneScoped;
+    this->close();
+    if (v2FileIter) {
+        v2FileIter->close();
+    }
+
+    if (mObjectsPut == 0 || mBytesPut == 0)
+    {
+        if (mergeKey)
+        {
+            bucketManager.noteEmptyMergeOutput(*mergeKey);
+        }
+        return std::make_shared<Bucket>();
+    }
+
+    if (v2FileIter)
+    {
+        return bucketManager.adoptFileAsBucket(mFilename, mHasher.finish(),
+                                               mObjectsPut, mBytesPut, mergeKey, v2FileIter->getFilename());
+    }
+    else
+    {
+        return bucketManager.adoptFileAsBucket(mFilename, mHasher.finish(),
+                                               mObjectsPut, mBytesPut, mergeKey);
+    }
+}
+
+void
+BucketOutputIterator::close()
+{
     if (mBuf)
     {
         mOut.writeOne(*mBuf, &mHasher, &mBytesPut);
@@ -129,13 +164,12 @@ BucketOutputIterator::getBucket(BucketManager& bucketManager,
         releaseAssert(mBytesPut == 0);
         CLOG_DEBUG(Bucket, "Deleting empty bucket file {}", mFilename);
         std::remove(mFilename.c_str());
-        if (mergeKey)
-        {
-            bucketManager.noteEmptyMergeOutput(*mergeKey);
-        }
-        return std::make_shared<Bucket>();
     }
-    return bucketManager.adoptFileAsBucket(mFilename, mHasher.finish(),
-                                           mObjectsPut, mBytesPut, mergeKey);
+}
+
+std::string const&
+BucketOutputIterator::getFilename() const
+{
+    return mFilename;
 }
 }

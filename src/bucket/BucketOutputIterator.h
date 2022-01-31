@@ -50,6 +50,11 @@ class BucketOutputIterator
     void put(BucketEntry const& e);
 
     std::shared_ptr<Bucket> getBucket(BucketManager& bucketManager,
-                                      MergeKey* mergeKey = nullptr);
+                                      MergeKey* mergeKey = nullptr,
+                                      BucketOutputIterator* v2FileIter = nullptr);
+
+    std::string const& getFilename() const;
+
+    void close();
 };
 }

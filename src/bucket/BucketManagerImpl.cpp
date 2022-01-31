@@ -362,7 +362,8 @@ BucketManagerImpl::renameBucket(std::string const& src, std::string const& dst)
 std::shared_ptr<Bucket>
 BucketManagerImpl::adoptFileAsBucket(std::string const& filename,
                                      uint256 const& hash, size_t nObjects,
-                                     size_t nBytes, MergeKey* mergeKey)
+                                     size_t nBytes, MergeKey* mergeKey,
+                                     std::string const& v2Filename)
 {
     ZoneScoped;
     releaseAssertOrThrow(mApp.getConfig().MODE_ENABLES_BUCKETLIST);
@@ -395,11 +396,15 @@ BucketManagerImpl::adoptFileAsBucket(std::string const& filename,
         {
             auto timer = LogSlowExecution("Delete redundant bucket");
             std::remove(filename.c_str());
+            if (!b->getSortedV2Filename().empty()) {
+                std::remove(b->getSortedV2Filename().c_str());
+            }
         }
     }
     else
     {
         std::string canonicalName = bucketFilename(hash);
+        std::string v2CanonicalName = canonicalName + Bucket::CMP_V2_FILE_EXT;
         CLOG_DEBUG(Bucket, "Adopting bucket file {} as {}", filename,
                    canonicalName);
         if (!renameBucket(filename, canonicalName))
@@ -416,7 +421,26 @@ BucketManagerImpl::adoptFileAsBucket(std::string const& filename,
             }
         }
 
-        b = std::make_shared<Bucket>(canonicalName, hash);
+        if (!v2Filename.empty())
+        {
+            CLOG_DEBUG(Bucket, "Adopting bucket file {} as {}", v2Filename,
+                       v2CanonicalName);
+            if (!renameBucket(v2Filename, v2CanonicalName))
+            {
+                std::string err("Failed to rename bucket :");
+                err += strerror(errno);
+                // it seems there is a race condition with external systems
+                // retry after sleeping for a second works around the problem
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                if (!renameBucket(v2Filename, v2CanonicalName))
+                {
+                    // if rename fails again, surface the original error
+                    throw std::runtime_error(err);
+                }
+            }
+        }
+
+        b = std::make_shared<Bucket>(canonicalName, hash, v2CanonicalName);
         {
             mSharedBuckets.emplace(hash, b);
             mSharedBucketsSize.set_count(mSharedBuckets.size());
@@ -468,13 +492,16 @@ BucketManagerImpl::getBucketByHash(uint256 const& hash)
         return i->second;
     }
     std::string canonicalName = bucketFilename(hash);
+    std::string v2CanonicalName = canonicalName + Bucket::CMP_V2_FILE_EXT;
     if (fs::exists(canonicalName))
     {
-        CLOG_TRACE(Bucket,
+        CLOG_INFO(Bucket,
                    "BucketManager::getBucketByHash({}) found no bucket, making "
                    "new one",
                    binToHex(hash));
-        auto p = std::make_shared<Bucket>(canonicalName, hash);
+        auto p = fs::exists(v2CanonicalName) ?
+                        std::make_shared<Bucket>(canonicalName, hash, v2CanonicalName) :
+                        std::make_shared<Bucket>(canonicalName, hash);
         mSharedBuckets.emplace(hash, p);
         mSharedBucketsSize.set_count(mSharedBuckets.size());
         return p;
@@ -950,6 +977,7 @@ std::shared_ptr<Bucket>
 BucketManagerImpl::mergeBuckets(HistoryArchiveState const& has)
 {
     std::map<LedgerKey, LedgerEntry> ledgerMap = loadCompleteLedgerState(has);
+    std::set<BucketEntry, BucketEntryIdCmpV2> sortedV2Ledger;
     BucketMetadata meta;
     MergeCounters mc;
     auto& ctx = mApp.getClock().getIOContext();
@@ -961,9 +989,21 @@ BucketManagerImpl::mergeBuckets(HistoryArchiveState const& has)
         BucketEntry be;
         be.type(LIVEENTRY);
         be.liveEntry() = pair.second;
+        sortedV2Ledger.insert(be);
         out.put(be);
     }
-    return out.getBucket(*this);
+
+    BucketMetadata metaV2;
+    metaV2.ledgerVersion = meta.ledgerVersion;
+    metaV2.ext.v(1);
+    metaV2.ext.v1().flags = BucketMetadataFlags::BUCKET_METADATA_NEW_CMP_FLAG;
+    BucketOutputIterator outV2(getTmpDir(), /*keepDeadEntries=*/false, metaV2, mc,
+                               ctx, /*doFsync=*/true);
+    for (auto const& e : sortedV2Ledger)
+    {
+        outV2.put(e);
+    }
+    return out.getBucket(*this, /*mergeKey=*/nullptr, &outV2);
 }
 
 std::shared_ptr<BasicWork>

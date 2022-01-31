@@ -46,7 +46,8 @@ class BucketInputIterator
 
     BucketEntry const& operator*();
 
-    BucketInputIterator(std::shared_ptr<Bucket const> bucket);
+    // If no filename given, creates iterator for bucket file sorted with V1 cmp function
+    BucketInputIterator(std::shared_ptr<Bucket const> bucket, std::string const& filename = {});
 
     ~BucketInputIterator();
 

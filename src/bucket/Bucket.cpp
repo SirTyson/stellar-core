@@ -8,6 +8,7 @@
 #include "util/asio.h"
 #include "bucket/Bucket.h"
 #include "bucket/BucketApplicator.h"
+#include "bucket/BucketInputIterator.h"
 #include "bucket/BucketList.h"
 #include "bucket/BucketManager.h"
 #include "bucket/BucketOutputIterator.h"
@@ -24,23 +25,46 @@
 #include "util/Logging.h"
 #include "util/TmpDir.h"
 #include "util/XDRStream.h"
+#include "util/types.h"
+#include "xdr/Stellar-ledger.h"
 #include "xdrpp/message.h"
 #include <Tracy.hpp>
+#include <cstdint>
 #include <fmt/format.h>
 #include <future>
+#include <unistd.h>
 
 namespace stellar
 {
 
-Bucket::Bucket(std::string const& filename, Hash const& hash)
-    : mFilename(filename), mHash(hash)
+Bucket::Bucket(std::string const& filename, Hash const& hash, std::string const& sortedV2Filename)
+    : mFilename(filename)
+    , mSortedV2Filename(sortedV2Filename.empty() && !filename.empty() ? filename + CMP_V2_FILE_EXT : sortedV2Filename)
+    , mHash(hash)
 {
     releaseAssert(filename.empty() || fs::exists(filename));
     if (!filename.empty())
     {
-        CLOG_TRACE(Bucket, "Bucket::Bucket() created, file exists : {}",
-                   mFilename);
+        CLOG_INFO(Bucket, "Bucket::Bucket() created, file exists : {}",
+                   fs::size(filename));
         mSize = fs::size(filename);
+        if (!fs::exists(mSortedV2Filename))
+        {
+            CLOG_INFO(Bucket, "Bucket::Bucket() V2 sorted file does not exist, creating",
+                       mSortedV2Filename);
+            releaseAssert(false);
+        }
+        else
+        {
+            CLOG_INFO(Bucket, "Bucket::Bucket() V2 sorted file exists : {}",
+                       mSortedV2Filename);
+            CLOG_INFO(Bucket, "mSize: {}", mSize);
+            CLOG_INFO(Bucket, "Sorted Size: {}", fs::size(mSortedV2Filename));
+            // Account for additional space in header
+            // Remove, not a good assert. Just for my own personal dev
+            //releaseAssert(mSize == fs::size(mSortedV2Filename) - 8);
+        }
+
     }
 }
 
@@ -58,6 +82,12 @@ std::string const&
 Bucket::getFilename() const
 {
     return mFilename;
+}
+
+std::string const&
+Bucket::getSortedV2Filename() const
+{
+    return mSortedV2Filename;
 }
 
 size_t
@@ -170,7 +200,23 @@ Bucket::fresh(BucketManager& bucketManager, uint32_t protocolVersion,
     {
         bucketManager.incrMergeCounters(mc);
     }
-    return out.getBucket(bucketManager);
+
+    // Make 2nd file in new sort order
+    BucketMetadata metaV2;
+    metaV2.ledgerVersion = protocolVersion;
+    metaV2.ext.v(1);
+    metaV2.ext.v1().flags = BucketMetadataFlags::BUCKET_METADATA_NEW_CMP_FLAG;
+
+    BucketEntryIdCmpV2 cmp;
+    std::sort(entries.begin(), entries.end(), cmp);
+    BucketOutputIterator outV2Sorted(bucketManager.getTmpDir(), true, metaV2, mc, ctx,
+                                     doFsync);
+    for (auto const& e : entries)
+    {
+        outV2Sorted.put(e);
+    }
+
+    return out.getBucket(bucketManager, /*mergeKey=*/nullptr, &outV2Sorted);
 }
 
 static void
@@ -609,11 +655,14 @@ Bucket::merge(BucketManager& bucketManager, uint32_t maxProtocolVersion,
     releaseAssert(newBucket);
 
     MergeCounters mc;
-    BucketInputIterator oi(oldBucket);
-    BucketInputIterator ni(newBucket);
+    BucketInputIterator oi(oldBucket, oldBucket->getFilename());
+    BucketInputIterator ni(newBucket, newBucket->getFilename());
+    BucketInputIterator oV2i(oldBucket, oldBucket->getSortedV2Filename());
+    BucketInputIterator nV2i(newBucket, newBucket->getSortedV2Filename());
     std::vector<BucketInputIterator> shadowIterators(shadows.begin(),
                                                      shadows.end());
 
+    CLOG_INFO(Bucket, "Garand: About to merge. old bucket: {}, new bucket: {}",oldBucket->getFilename(), newBucket->getFilename());
     uint32_t protocolVersion;
     bool keepShadowedLifecycleEntries;
     calculateMergeProtocolVersion(mc, maxProtocolVersion, oi, ni,
@@ -654,12 +703,49 @@ Bucket::merge(BucketManager& bucketManager, uint32_t maxProtocolVersion,
                                     keepShadowedLifecycleEntries);
         }
     }
+
+    // Don't want to double count merge events, don't incriment after 2nd loop
     if (countMergeEvents)
     {
         bucketManager.incrMergeCounters(mc);
     }
+
+    BucketMetadata metaV2;
+    metaV2.ledgerVersion = protocolVersion;
+    metaV2.ext.v(1);
+    metaV2.ext.v1().flags = BucketMetadataFlags::BUCKET_METADATA_NEW_CMP_FLAG;
+    BucketOutputIterator outV2(bucketManager.getTmpDir(), keepDeadEntries, metaV2,
+                               mc, ctx, doFsync);
+
+    BucketEntryIdCmpV2 cmp2;
+    while (oV2i || nV2i)
+    {
+        // Check if the merge should be stopped every few entries
+        if (++iter >= 1000)
+        {
+            iter = 0;
+            if (bucketManager.isShutdown())
+            {
+                // Stop merging, as BucketManager is now shutdown
+                // This is safe as temp file has not been adopted yet,
+                // so it will be removed with the tmp dir
+                throw std::runtime_error(
+                    "Incomplete bucket merge due to BucketManager shutdown");
+            }
+        }
+
+        if (!mergeCasesWithDefaultAcceptance(cmp2, mc, oV2i, nV2i, outV2,
+                                             shadowIterators, protocolVersion,
+                                             keepShadowedLifecycleEntries))
+        {
+            mergeCasesWithEqualKeys(mc, oV2i, nV2i, outV2, shadowIterators,
+                                    protocolVersion,
+                                    keepShadowedLifecycleEntries);
+        }
+    }
+
     MergeKey mk{keepDeadEntries, oldBucket, newBucket, shadows};
-    return out.getBucket(bucketManager, &mk);
+    return out.getBucket(bucketManager, &mk, &outV2);
 }
 
 uint32_t
