@@ -64,7 +64,8 @@ BucketOutputIterator::BucketOutputIterator(std::string const& tmpDir,
     }
 
     // Check if bucket is sorted using legacy or new sorted order
-    if (meta.ext.v() == 1 && meta.ext.v1().flags & BUCKET_METADATA_NEW_CMP_FLAG) {
+    if (meta.ext.v() == 1 && meta.ext.v1().flags & BUCKET_METADATA_NEW_CMP_FLAG)
+    {
         mCmp = BucketEntryIdCmpV2();
     }
 }
@@ -122,7 +123,8 @@ BucketOutputIterator::getBucket(BucketManager& bucketManager,
 {
     ZoneScoped;
     this->close();
-    if (v2FileIter) {
+    if (v2FileIter)
+    {
         v2FileIter->close();
     }
 
@@ -138,12 +140,13 @@ BucketOutputIterator::getBucket(BucketManager& bucketManager,
     if (v2FileIter)
     {
         return bucketManager.adoptFileAsBucket(mFilename, mHasher.finish(),
-                                               mObjectsPut, mBytesPut, mergeKey, v2FileIter->getFilename());
+                                               mObjectsPut, mBytesPut, mergeKey,
+                                               v2FileIter->getFilename());
     }
     else
     {
-        return bucketManager.adoptFileAsBucket(mFilename, mHasher.finish(),
-                                               mObjectsPut, mBytesPut, mergeKey);
+        return bucketManager.adoptFileAsBucket(
+            mFilename, mHasher.finish(), mObjectsPut, mBytesPut, mergeKey);
     }
 }
 
@@ -171,5 +174,11 @@ std::string const&
 BucketOutputIterator::getFilename() const
 {
     return mFilename;
+}
+
+bool
+BucketOutputIterator::empty() const
+{
+    return mObjectsPut == 0 || mBytesPut == 0;
 }
 }

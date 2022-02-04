@@ -8,7 +8,6 @@
 #include "util/asio.h"
 #include "bucket/Bucket.h"
 #include "bucket/BucketApplicator.h"
-#include "bucket/BucketInputIterator.h"
 #include "bucket/BucketList.h"
 #include "bucket/BucketManager.h"
 #include "bucket/BucketOutputIterator.h"
@@ -25,21 +24,17 @@
 #include "util/Logging.h"
 #include "util/TmpDir.h"
 #include "util/XDRStream.h"
-#include "util/types.h"
-#include "xdr/Stellar-ledger.h"
 #include "xdrpp/message.h"
 #include <Tracy.hpp>
-#include <cstdint>
 #include <fmt/format.h>
 #include <future>
-#include <unistd.h>
 
 namespace stellar
 {
 
 Bucket::Bucket(std::string const& filename, Hash const& hash,
                std::string const& sortedV2Filename)
-    : mFilename(filename), mSortedV2Filename(sortedV2Filename), mHash(hash)
+    : mFilename(filename), mV2Filename(sortedV2Filename), mHash(hash)
 {
     releaseAssert(filename.empty() || fs::exists(filename));
     releaseAssert(sortedV2Filename.empty() || fs::exists(sortedV2Filename));
@@ -68,15 +63,15 @@ Bucket::getFilename() const
 }
 
 std::string const&
-Bucket::getSortedV2Filename() const
+Bucket::getV2Filename() const
 {
-    return mSortedV2Filename;
+    return mV2Filename;
 }
 
 std::string&
-Bucket::getSortedV2Filename()
+Bucket::getV2Filename()
 {
-    return mSortedV2Filename;
+    return mV2Filename;
 }
 
 size_t
@@ -198,14 +193,14 @@ Bucket::fresh(BucketManager& bucketManager, uint32_t protocolVersion,
 
     BucketEntryIdCmpV2 cmp;
     std::sort(entries.begin(), entries.end(), cmp);
-    BucketOutputIterator outV2Sorted(bucketManager.getTmpDir(), true, metaV2,
-                                     mc, ctx, doFsync);
+    BucketOutputIterator outV2(bucketManager.getTmpDir(), true, metaV2, mc, ctx,
+                               doFsync);
     for (auto const& e : entries)
     {
-        outV2Sorted.put(e);
+        outV2.put(e);
     }
 
-    return out.getBucket(bucketManager, /*mergeKey=*/nullptr, &outV2Sorted);
+    return out.getBucket(bucketManager, /*mergeKey=*/nullptr, &outV2);
 }
 
 static void
@@ -646,13 +641,11 @@ Bucket::merge(BucketManager& bucketManager, uint32_t maxProtocolVersion,
     MergeCounters mc;
     BucketInputIterator oi(oldBucket, oldBucket->getFilename());
     BucketInputIterator ni(newBucket, newBucket->getFilename());
-    BucketInputIterator oV2i(oldBucket, oldBucket->getSortedV2Filename());
-    BucketInputIterator nV2i(newBucket, newBucket->getSortedV2Filename());
+    BucketInputIterator oV2i(oldBucket, oldBucket->getV2Filename());
+    BucketInputIterator nV2i(newBucket, newBucket->getV2Filename());
     std::vector<BucketInputIterator> shadowIterators(shadows.begin(),
                                                      shadows.end());
 
-    CLOG_INFO(Bucket, "Garand: About to merge. old bucket: {}, new bucket: {}",
-              oldBucket->getFilename(), newBucket->getFilename());
     uint32_t protocolVersion;
     bool keepShadowedLifecycleEntries;
     calculateMergeProtocolVersion(mc, maxProtocolVersion, oi, ni,
@@ -729,7 +722,6 @@ Bucket::merge(BucketManager& bucketManager, uint32_t maxProtocolVersion,
         }
     }
 
-    // Don't want to double count merge events, don't incriment after 2nd loop
     if (countMergeEvents)
     {
         bucketManager.incrMergeCounters(mc);

@@ -34,10 +34,10 @@ class Bucket : public std::enable_shared_from_this<Bucket>,
                public NonMovableOrCopyable
 {
 
-    std::string const mFilename;   // Backing file sorted using legacy cmp
-                                   // function, used for hashes
-    std::string mSortedV2Filename; // Backing file sorted using V2 cmp
-                                   // function, used for lookup
+    std::string const mFilename; // Backing file sorted using legacy cmp
+                                 // function, used for hashes
+    std::string mV2Filename;     // Backing file sorted using V2 cmp
+                                 // function, used for lookup
     Hash const mHash;
     size_t mSize{0};
 
@@ -56,8 +56,8 @@ class Bucket : public std::enable_shared_from_this<Bucket>,
 
     Hash const& getHash() const;
     std::string const& getFilename() const;
-    std::string const& getSortedV2Filename() const;
-    std::string& getSortedV2Filename();
+    std::string const& getV2Filename() const;
+    std::string& getV2Filename();
     size_t getSize() const;
 
     // Returns true if a BucketEntry that is key-wise identical to the given

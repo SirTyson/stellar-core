@@ -33,8 +33,6 @@ struct HistoryArchiveState;
 
 class BucketManagerImpl : public BucketManager
 {
-    const std::string CMP_V2_FILE_EXT{".v2"};
-
     static std::string const kLockFilename;
 
     Application& mApp;

@@ -87,7 +87,8 @@ BucketInputIterator::getMetadata() const
     return mMetadata;
 }
 
-BucketInputIterator::BucketInputIterator(std::shared_ptr<Bucket const> bucket, std::string const& inFilename)
+BucketInputIterator::BucketInputIterator(std::shared_ptr<Bucket const> bucket,
+                                         std::string const& inFilename)
     : mBucket(bucket), mEntryPtr(nullptr), mSeenMetadata(false)
 {
     // In absence of metadata, we treat every bucket as though it is from ledger
@@ -97,10 +98,11 @@ BucketInputIterator::BucketInputIterator(std::shared_ptr<Bucket const> bucket, s
     // protocol of a pre-protocol-11 bucket, and we have to use as conservative
     // a default as possible to avoid spurious attempted-downgrade errors.
     mMetadata.ledgerVersion = 0;
-    auto filename = inFilename.empty() ? mBucket->getFilename() : inFilename;
+    std::string const& filename =
+        inFilename.empty() ? mBucket->getFilename() : inFilename;
     if (!filename.empty())
     {
-        CLOG_INFO(Bucket, "Garand: BucketInputIterator opening file to read: {}",
+        CLOG_TRACE(Bucket, "BucketInputIterator opening file to read: {}",
                    filename);
         mIn.open(filename);
         loadEntry();
