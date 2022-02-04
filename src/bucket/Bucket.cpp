@@ -48,24 +48,6 @@ Bucket::Bucket(std::string const& filename, Hash const& hash,
         CLOG_INFO(Bucket, "Bucket::Bucket() created, file exists : {}",
                   fs::size(filename));
         mSize = fs::size(filename);
-        if (!fs::exists(mSortedV2Filename))
-        {
-            CLOG_INFO(
-                Bucket,
-                "Bucket::Bucket() V2 sorted file does not exist, creating",
-                mSortedV2Filename);
-            releaseAssert(false);
-        }
-        else
-        {
-            CLOG_INFO(Bucket, "Bucket::Bucket() V2 sorted file exists : {}",
-                      mSortedV2Filename);
-            CLOG_INFO(Bucket, "mSize: {}", mSize);
-            CLOG_INFO(Bucket, "Sorted Size: {}", fs::size(mSortedV2Filename));
-            // Account for additional space in header
-            // Remove, not a good assert. Just for my own personal dev
-            // releaseAssert(mSize == fs::size(mSortedV2Filename) - 8);
-        }
     }
 }
 
@@ -87,6 +69,12 @@ Bucket::getFilename() const
 
 std::string const&
 Bucket::getSortedV2Filename() const
+{
+    return mSortedV2Filename;
+}
+
+std::string&
+Bucket::getSortedV2Filename()
 {
     return mSortedV2Filename;
 }
