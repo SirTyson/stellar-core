@@ -389,14 +389,14 @@ BucketManagerImpl::adoptFileAsBucket(std::string const& filename,
     std::shared_ptr<Bucket> b = getBucketByHash(hash);
     if (b)
     {
-        CLOG_INFO(
+        CLOG_DEBUG(
             Bucket,
             "Deleting bucket file {} that is redundant with existing bucket",
             filename);
         {
             auto timer = LogSlowExecution("Delete redundant bucket");
             std::remove(filename.c_str());
-            if (!b->getSortedV2Filename().empty())
+            if (!b->getV2Filename().empty())
             {
                 CLOG_DEBUG(Bucket,
                            "Deleting bucket file {} that is redundant with "
@@ -413,7 +413,6 @@ BucketManagerImpl::adoptFileAsBucket(std::string const& filename,
                    canonicalName);
         if (!renameBucket(filename, canonicalName))
         {
-            CLOG_INFO(Bucket, "CRAP: Failed while renaming regular bucket.");
             std::string err("Failed to rename bucket :");
             err += strerror(errno);
             // it seems there is a race condition with external systems
@@ -505,7 +504,7 @@ BucketManagerImpl::getBucketByHash(uint256 const& hash)
         return i->second;
     }
     std::string canonicalName = bucketFilename(hash);
-    std::string v2CanonicalName = canonicalName + Bucket::CMP_V2_FILE_EXT;
+    std::string const v2CanonicalName = canonicalName + Bucket::CMP_V2_FILE_EXT;
     if (fs::exists(canonicalName))
     {
         std::string const v2CanonicalName =

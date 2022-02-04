@@ -8,7 +8,6 @@
 #include "util/asio.h"
 #include "bucket/Bucket.h"
 #include "bucket/BucketApplicator.h"
-#include "bucket/BucketInputIterator.h"
 #include "bucket/BucketList.h"
 #include "bucket/BucketManager.h"
 #include "bucket/BucketOutputIterator.h"
@@ -26,13 +25,10 @@
 #include "util/TmpDir.h"
 #include "util/XDRStream.h"
 #include "util/types.h"
-#include "xdr/Stellar-ledger.h"
 #include "xdrpp/message.h"
 #include <Tracy.hpp>
-#include <cstdint>
 #include <fmt/format.h>
 #include <future>
-#include <unistd.h>
 
 namespace stellar
 {
