@@ -389,7 +389,7 @@ BucketManagerImpl::adoptFileAsBucket(std::string const& filename,
     std::shared_ptr<Bucket> b = getBucketByHash(hash);
     if (b)
     {
-        CLOG_DEBUG(
+        CLOG_INFO(
             Bucket,
             "Deleting bucket file {} that is redundant with existing bucket",
             filename);
@@ -413,6 +413,7 @@ BucketManagerImpl::adoptFileAsBucket(std::string const& filename,
                    canonicalName);
         if (!renameBucket(filename, canonicalName))
         {
+            CLOG_INFO(Bucket, "CRAP: Failed while renaming regular bucket.");
             std::string err("Failed to rename bucket :");
             err += strerror(errno);
             // it seems there is a race condition with external systems
@@ -434,6 +435,8 @@ BucketManagerImpl::adoptFileAsBucket(std::string const& filename,
 
             if (!renameBucket(v2Filename, v2CanonicalName))
             {
+                CLOG_INFO(Bucket, "WHACK: Failed to remove v2 bucket: {}",
+                          v2Filename);
                 std::string err("Failed to rename bucket :");
                 err += strerror(errno);
                 // it seems there is a race condition with external systems
@@ -441,6 +444,10 @@ BucketManagerImpl::adoptFileAsBucket(std::string const& filename,
                 std::this_thread::sleep_for(std::chrono::seconds(1));
                 if (!renameBucket(v2Filename, v2CanonicalName))
                 {
+
+                    CLOG_INFO(Bucket,
+                              "G: ERROR: Could not rename file {} as {}",
+                              v2Filename, v2CanonicalName);
                     // if rename fails again, surface the original error
                     throw std::runtime_error(err);
                 }
@@ -1076,6 +1083,7 @@ BucketManagerImpl::mergeBuckets(HistoryArchiveState const& has)
     {
         outV2.put(e);
     }
+    CLOG_INFO(Bucket, "Size of merge: {}", sortedV2Ledger.size());
     return out.getBucket(*this, /*mergeKey=*/nullptr, &outV2);
 }
 

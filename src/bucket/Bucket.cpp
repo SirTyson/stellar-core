@@ -1064,6 +1064,7 @@ Bucket::merge(BucketManager& bucketManager, uint32_t maxProtocolVersion,
         }
     }
 
+    // Don't want to double count merge events, don't incriment after 2nd loop
     if (countMergeEvents)
     {
         bucketManager.incrMergeCounters(mc);
