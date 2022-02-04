@@ -389,15 +389,22 @@ BucketManagerImpl::adoptFileAsBucket(std::string const& filename,
     std::shared_ptr<Bucket> b = getBucketByHash(hash);
     if (b)
     {
-        CLOG_DEBUG(
+        CLOG_INFO(
             Bucket,
             "Deleting bucket file {} that is redundant with existing bucket",
             filename);
         {
             auto timer = LogSlowExecution("Delete redundant bucket");
             std::remove(filename.c_str());
-            if (!b->getSortedV2Filename().empty()) {
-                std::remove(b->getSortedV2Filename().c_str());
+            if (!v2Filename.empty())
+            {
+
+                CLOG_INFO(Bucket,
+                          "YEE: Deleting V2 file {} that is redundant with "
+                          "existing bucket",
+                          v2Filename);
+                // releaseAssert(1 == 2);
+                std::remove(v2Filename.c_str());
             }
         }
     }
@@ -405,10 +412,11 @@ BucketManagerImpl::adoptFileAsBucket(std::string const& filename,
     {
         std::string canonicalName = bucketFilename(hash);
         std::string v2CanonicalName = canonicalName + Bucket::CMP_V2_FILE_EXT;
-        CLOG_DEBUG(Bucket, "Adopting bucket file {} as {}", filename,
-                   canonicalName);
+        CLOG_INFO(Bucket, "Adopting bucket file {} as {}", filename,
+                  canonicalName);
         if (!renameBucket(filename, canonicalName))
         {
+            CLOG_INFO(Bucket, "CRAP: Failed while renaming regular bucket.");
             std::string err("Failed to rename bucket :");
             err += strerror(errno);
             // it seems there is a race condition with external systems
@@ -423,10 +431,12 @@ BucketManagerImpl::adoptFileAsBucket(std::string const& filename,
 
         if (!v2Filename.empty())
         {
-            CLOG_DEBUG(Bucket, "Adopting bucket file {} as {}", v2Filename,
-                       v2CanonicalName);
+            CLOG_INFO(Bucket, "G: Adopting bucket file {} as {}", v2Filename,
+                      v2CanonicalName);
             if (!renameBucket(v2Filename, v2CanonicalName))
             {
+                CLOG_INFO(Bucket, "WHACK: Failed to remove v2 bucket: {}",
+                          v2Filename);
                 std::string err("Failed to rename bucket :");
                 err += strerror(errno);
                 // it seems there is a race condition with external systems
@@ -434,13 +444,19 @@ BucketManagerImpl::adoptFileAsBucket(std::string const& filename,
                 std::this_thread::sleep_for(std::chrono::seconds(1));
                 if (!renameBucket(v2Filename, v2CanonicalName))
                 {
+
+                    CLOG_INFO(Bucket,
+                              "G: ERROR: Could not rename file {} as {}",
+                              v2Filename, v2CanonicalName);
                     // if rename fails again, surface the original error
                     throw std::runtime_error(err);
                 }
             }
         }
 
-        b = std::make_shared<Bucket>(canonicalName, hash, v2CanonicalName);
+        b = std::make_shared<Bucket>(canonicalName, hash,
+                                     v2Filename.empty() ? std::string()
+                                                        : v2CanonicalName);
         {
             mSharedBuckets.emplace(hash, b);
             mSharedBucketsSize.set_count(mSharedBuckets.size());
@@ -496,12 +512,14 @@ BucketManagerImpl::getBucketByHash(uint256 const& hash)
     if (fs::exists(canonicalName))
     {
         CLOG_INFO(Bucket,
-                   "BucketManager::getBucketByHash({}) found no bucket, making "
-                   "new one",
-                   binToHex(hash));
-        auto p = fs::exists(v2CanonicalName) ?
-                        std::make_shared<Bucket>(canonicalName, hash, v2CanonicalName) :
-                        std::make_shared<Bucket>(canonicalName, hash);
+                  "BucketManager::getBucketByHash({}) found no bucket, making "
+                  "new one",
+                  binToHex(hash));
+        auto p =
+            fs::exists(v2CanonicalName)
+                ? std::make_shared<Bucket>(canonicalName, hash, v2CanonicalName)
+                : std::make_shared<Bucket>(canonicalName, hash);
+        releaseAssert(fs::exists(v2CanonicalName));
         mSharedBuckets.emplace(hash, p);
         mSharedBucketsSize.set_count(mSharedBuckets.size());
         return p;
@@ -874,6 +892,58 @@ BucketManagerImpl::assumeState(HistoryArchiveState const& has,
             throw std::runtime_error(
                 "Missing bucket files while assuming saved BucketList state");
         }
+
+        // If bucket file has not been resorted in a new file
+        if (curr->getSortedV2Filename().empty())
+        {
+            std::string v2CanonicalName =
+                curr->getFilename() + Bucket::CMP_V2_FILE_EXT;
+            BucketMetadata meta;
+            meta.ledgerVersion = mApp.getConfig().LEDGER_PROTOCOL_VERSION;
+            meta.ext.v(1);
+            meta.ext.v1().flags =
+                BucketMetadataFlags::BUCKET_METADATA_NEW_CMP_FLAG;
+            MergeCounters mc;
+            BucketOutputIterator out(getTmpDir(),
+                                     BucketList::keepDeadEntries(i), meta, mc,
+                                     mApp.getClock().getIOContext(),
+                                     !mApp.getConfig().DISABLE_XDR_FSYNC);
+            BucketInputIterator in(curr, curr->getFilename());
+            std::set<BucketEntry, BucketEntryIdCmpV2> sortedEntries;
+            while (in)
+            {
+                sortedEntries.insert(*in);
+                ++in;
+            }
+
+            for (auto const& e : sortedEntries)
+            {
+                out.put(e);
+            }
+
+            out.close();
+
+            if (sortedEntries.size() > 0)
+            {
+                if (!renameBucket(out.getFilename(), v2CanonicalName))
+                {
+                    std::string err("Failed to rename bucket :");
+                    err += strerror(errno);
+                    // it seems there is a race condition with external systems
+                    // retry after sleeping for a second works around the
+                    // problem
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                    if (!renameBucket(out.getFilename(), v2CanonicalName))
+                    {
+                        // if rename fails again, surface the original error
+                        throw std::runtime_error(err);
+                    }
+                }
+
+                curr->getSortedV2Filename() = v2CanonicalName;
+            }
+        }
+
         mBucketList->getLevel(i).setCurr(curr);
         mBucketList->getLevel(i).setSnap(snap);
         mBucketList->getLevel(i).setNext(has.currentBuckets.at(i).next);
@@ -997,12 +1067,13 @@ BucketManagerImpl::mergeBuckets(HistoryArchiveState const& has)
     metaV2.ledgerVersion = meta.ledgerVersion;
     metaV2.ext.v(1);
     metaV2.ext.v1().flags = BucketMetadataFlags::BUCKET_METADATA_NEW_CMP_FLAG;
-    BucketOutputIterator outV2(getTmpDir(), /*keepDeadEntries=*/false, metaV2, mc,
-                               ctx, /*doFsync=*/true);
+    BucketOutputIterator outV2(getTmpDir(), /*keepDeadEntries=*/false, metaV2,
+                               mc, ctx, /*doFsync=*/true);
     for (auto const& e : sortedV2Ledger)
     {
         outV2.put(e);
     }
+    CLOG_INFO(Bucket, "Size of merge: {}", sortedV2Ledger.size());
     return out.getBucket(*this, /*mergeKey=*/nullptr, &outV2);
 }
 

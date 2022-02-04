@@ -37,34 +37,17 @@
 namespace stellar
 {
 
-Bucket::Bucket(std::string const& filename, Hash const& hash, std::string const& sortedV2Filename)
-    : mFilename(filename)
-    , mSortedV2Filename(sortedV2Filename.empty() && !filename.empty() ? filename + CMP_V2_FILE_EXT : sortedV2Filename)
-    , mHash(hash)
+Bucket::Bucket(std::string const& filename, Hash const& hash,
+               std::string const& sortedV2Filename)
+    : mFilename(filename), mSortedV2Filename(sortedV2Filename), mHash(hash)
 {
     releaseAssert(filename.empty() || fs::exists(filename));
+    releaseAssert(sortedV2Filename.empty() || fs::exists(sortedV2Filename));
     if (!filename.empty())
     {
         CLOG_INFO(Bucket, "Bucket::Bucket() created, file exists : {}",
-                   fs::size(filename));
+                  fs::size(filename));
         mSize = fs::size(filename);
-        if (!fs::exists(mSortedV2Filename))
-        {
-            CLOG_INFO(Bucket, "Bucket::Bucket() V2 sorted file does not exist, creating",
-                       mSortedV2Filename);
-            releaseAssert(false);
-        }
-        else
-        {
-            CLOG_INFO(Bucket, "Bucket::Bucket() V2 sorted file exists : {}",
-                       mSortedV2Filename);
-            CLOG_INFO(Bucket, "mSize: {}", mSize);
-            CLOG_INFO(Bucket, "Sorted Size: {}", fs::size(mSortedV2Filename));
-            // Account for additional space in header
-            // Remove, not a good assert. Just for my own personal dev
-            //releaseAssert(mSize == fs::size(mSortedV2Filename) - 8);
-        }
-
     }
 }
 
@@ -84,8 +67,8 @@ Bucket::getFilename() const
     return mFilename;
 }
 
-std::string const&
-Bucket::getSortedV2Filename() const
+std::string&
+Bucket::getSortedV2Filename()
 {
     return mSortedV2Filename;
 }
@@ -209,8 +192,8 @@ Bucket::fresh(BucketManager& bucketManager, uint32_t protocolVersion,
 
     BucketEntryIdCmpV2 cmp;
     std::sort(entries.begin(), entries.end(), cmp);
-    BucketOutputIterator outV2Sorted(bucketManager.getTmpDir(), true, metaV2, mc, ctx,
-                                     doFsync);
+    BucketOutputIterator outV2Sorted(bucketManager.getTmpDir(), true, metaV2,
+                                     mc, ctx, doFsync);
     for (auto const& e : entries)
     {
         outV2Sorted.put(e);
@@ -662,7 +645,8 @@ Bucket::merge(BucketManager& bucketManager, uint32_t maxProtocolVersion,
     std::vector<BucketInputIterator> shadowIterators(shadows.begin(),
                                                      shadows.end());
 
-    CLOG_INFO(Bucket, "Garand: About to merge. old bucket: {}, new bucket: {}",oldBucket->getFilename(), newBucket->getFilename());
+    CLOG_INFO(Bucket, "Garand: About to merge. old bucket: {}, new bucket: {}",
+              oldBucket->getFilename(), newBucket->getFilename());
     uint32_t protocolVersion;
     bool keepShadowedLifecycleEntries;
     calculateMergeProtocolVersion(mc, maxProtocolVersion, oi, ni,
@@ -704,18 +688,13 @@ Bucket::merge(BucketManager& bucketManager, uint32_t maxProtocolVersion,
         }
     }
 
-    // Don't want to double count merge events, don't incriment after 2nd loop
-    if (countMergeEvents)
-    {
-        bucketManager.incrMergeCounters(mc);
-    }
-
     BucketMetadata metaV2;
+    MergeCounters mc2;
     metaV2.ledgerVersion = protocolVersion;
     metaV2.ext.v(1);
     metaV2.ext.v1().flags = BucketMetadataFlags::BUCKET_METADATA_NEW_CMP_FLAG;
-    BucketOutputIterator outV2(bucketManager.getTmpDir(), keepDeadEntries, metaV2,
-                               mc, ctx, doFsync);
+    BucketOutputIterator outV2(bucketManager.getTmpDir(), keepDeadEntries,
+                               metaV2, mc2, ctx, doFsync);
 
     BucketEntryIdCmpV2 cmp2;
     while (oV2i || nV2i)
@@ -734,14 +713,20 @@ Bucket::merge(BucketManager& bucketManager, uint32_t maxProtocolVersion,
             }
         }
 
-        if (!mergeCasesWithDefaultAcceptance(cmp2, mc, oV2i, nV2i, outV2,
+        if (!mergeCasesWithDefaultAcceptance(cmp2, mc2, oV2i, nV2i, outV2,
                                              shadowIterators, protocolVersion,
                                              keepShadowedLifecycleEntries))
         {
-            mergeCasesWithEqualKeys(mc, oV2i, nV2i, outV2, shadowIterators,
+            mergeCasesWithEqualKeys(mc2, oV2i, nV2i, outV2, shadowIterators,
                                     protocolVersion,
                                     keepShadowedLifecycleEntries);
         }
+    }
+
+    // Don't want to double count merge events, don't incriment after 2nd loop
+    if (countMergeEvents)
+    {
+        bucketManager.incrMergeCounters(mc);
     }
 
     MergeKey mk{keepDeadEntries, oldBucket, newBucket, shadows};
