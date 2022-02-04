@@ -1073,7 +1073,6 @@ BucketManagerImpl::mergeBuckets(HistoryArchiveState const& has)
     {
         outV2.put(e);
     }
-    CLOG_INFO(Bucket, "Size of merge: {}", sortedV2Ledger.size());
     return out.getBucket(*this, /*mergeKey=*/nullptr, &outV2);
 }
 
