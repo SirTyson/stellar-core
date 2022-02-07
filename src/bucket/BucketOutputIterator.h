@@ -49,7 +49,15 @@ class BucketOutputIterator
 
     void put(BucketEntry const& e);
 
-    std::shared_ptr<Bucket> getBucket(BucketManager& bucketManager,
-                                      MergeKey* mergeKey = nullptr);
+    std::shared_ptr<Bucket>
+    getBucket(BucketManager& bucketManager, MergeKey* mergeKey = nullptr,
+              BucketOutputIterator* v2FileIter = nullptr);
+
+    std::string const& getFilename() const;
+
+    // Returns true if no objects have been written, false otherwise
+    bool empty() const;
+
+    void close();
 };
 }

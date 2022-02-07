@@ -223,14 +223,16 @@ BucketIndex::lookup(LedgerKey const& k) const
     return std::make_optional(mPositions.at(n));
 }
 
-Bucket::Bucket(std::string const& filename, Hash const& hash)
-    : mFilename(filename), mHash(hash)
+Bucket::Bucket(std::string const& filename, Hash const& hash,
+               std::string const& sortedV2Filename)
+    : mFilename(filename), mV2Filename(sortedV2Filename), mHash(hash)
 {
     releaseAssert(filename.empty() || fs::exists(filename));
+    releaseAssert(sortedV2Filename.empty() || fs::exists(sortedV2Filename));
     if (!filename.empty())
     {
-        CLOG_TRACE(Bucket, "Bucket::Bucket() created, file exists : {}",
-                   mFilename);
+        CLOG_INFO(Bucket, "Bucket::Bucket() created, file exists : {}",
+                  fs::size(filename));
         mSize = fs::size(filename);
     }
 }
@@ -305,6 +307,18 @@ std::string const&
 Bucket::getFilename() const
 {
     return mFilename;
+}
+
+std::string const&
+Bucket::getV2Filename() const
+{
+    return mV2Filename;
+}
+
+std::string&
+Bucket::getV2Filename()
+{
+    return mV2Filename;
 }
 
 size_t
@@ -417,7 +431,23 @@ Bucket::fresh(BucketManager& bucketManager, uint32_t protocolVersion,
     {
         bucketManager.incrMergeCounters(mc);
     }
-    return out.getBucket(bucketManager);
+
+    // Make 2nd file in new sort order
+    BucketMetadata metaV2;
+    metaV2.ledgerVersion = protocolVersion;
+    metaV2.ext.v(1);
+    metaV2.ext.v1().flags = BucketMetadataFlags::BUCKET_METADATA_NEW_CMP_FLAG;
+
+    BucketEntryIdCmpV2 cmp;
+    std::sort(entries.begin(), entries.end(), cmp);
+    BucketOutputIterator outV2(bucketManager.getTmpDir(), true, metaV2, mc, ctx,
+                               doFsync);
+    for (auto const& e : entries)
+    {
+        outV2.put(e);
+    }
+
+    return out.getBucket(bucketManager, /*mergeKey=*/nullptr, &outV2);
 }
 
 static void
@@ -856,8 +886,10 @@ Bucket::merge(BucketManager& bucketManager, uint32_t maxProtocolVersion,
     releaseAssert(newBucket);
 
     MergeCounters mc;
-    BucketInputIterator oi(oldBucket);
-    BucketInputIterator ni(newBucket);
+    BucketInputIterator oi(oldBucket, oldBucket->getFilename());
+    BucketInputIterator ni(newBucket, newBucket->getFilename());
+    BucketInputIterator oV2i(oldBucket, oldBucket->getV2Filename());
+    BucketInputIterator nV2i(newBucket, newBucket->getV2Filename());
     std::vector<BucketInputIterator> shadowIterators(shadows.begin(),
                                                      shadows.end());
 
@@ -901,12 +933,49 @@ Bucket::merge(BucketManager& bucketManager, uint32_t maxProtocolVersion,
                                     keepShadowedLifecycleEntries);
         }
     }
+
+    BucketMetadata metaV2;
+    MergeCounters mc2;
+    metaV2.ledgerVersion = protocolVersion;
+    metaV2.ext.v(1);
+    metaV2.ext.v1().flags = BucketMetadataFlags::BUCKET_METADATA_NEW_CMP_FLAG;
+    BucketOutputIterator outV2(bucketManager.getTmpDir(), keepDeadEntries,
+                               metaV2, mc2, ctx, doFsync);
+
+    BucketEntryIdCmpV2 cmp2;
+    while (oV2i || nV2i)
+    {
+        // Check if the merge should be stopped every few entries
+        if (++iter >= 1000)
+        {
+            iter = 0;
+            if (bucketManager.isShutdown())
+            {
+                // Stop merging, as BucketManager is now shutdown
+                // This is safe as temp file has not been adopted yet,
+                // so it will be removed with the tmp dir
+                throw std::runtime_error(
+                    "Incomplete bucket merge due to BucketManager shutdown");
+            }
+        }
+
+        if (!mergeCasesWithDefaultAcceptance(cmp2, mc2, oV2i, nV2i, outV2,
+                                             shadowIterators, protocolVersion,
+                                             keepShadowedLifecycleEntries))
+        {
+            mergeCasesWithEqualKeys(mc2, oV2i, nV2i, outV2, shadowIterators,
+                                    protocolVersion,
+                                    keepShadowedLifecycleEntries);
+        }
+    }
+
     if (countMergeEvents)
     {
         bucketManager.incrMergeCounters(mc);
     }
+
     MergeKey mk{keepDeadEntries, oldBucket, newBucket, shadows};
-    return out.getBucket(bucketManager, &mk);
+    return out.getBucket(bucketManager, &mk, &outV2);
 }
 
 uint32_t

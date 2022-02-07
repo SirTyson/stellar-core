@@ -150,6 +150,25 @@ enum BucketEntryType
     INITENTRY = 2 // At-and-after protocol 11: only created.
 };
 
+enum BucketMetadataFlags
+{
+    // If set, bucket is sorted in "new" format
+    BUCKET_METADATA_NEW_CMP_FLAG = 0x1
+};
+
+struct BucketMetadataExtensionV1
+{
+    union switch (int v)
+    {
+    case 0:
+        void;
+    }
+    ext;
+
+    // May want to make this cmpVersion instead of flags field?
+    uint32 flags; // See BucketMetadataFlags
+};
+
 struct BucketMetadata
 {
     // Indicates the protocol version used to create / merge this bucket.
@@ -160,6 +179,8 @@ struct BucketMetadata
     {
     case 0:
         void;
+    case 1:
+        BucketMetadataExtensionV1 v1;
     }
     ext;
 };
