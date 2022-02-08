@@ -67,7 +67,8 @@ class XDRInputFileStream
 
     operator bool() const
     {
-        return mIn.good();
+        auto ret = mIn.good();
+        return ret;
     }
 
     size_t
@@ -97,7 +98,7 @@ class XDRInputFileStream
     {
         ZoneScoped;
         char szBuf[4];
-        if (!mIn.read(szBuf, 4))
+        if (mIn.tellg() == mSize || !mIn.read(szBuf, 4))
         {
             return false;
         }

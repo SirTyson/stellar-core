@@ -78,8 +78,8 @@ sixbitOfAlnum(uint8_t uch)
 }
 
 template <typename LK>
-static ShortLedgerKey
-getShortLedgerKey(LK const& k)
+static std::optional<ShortLedgerKey>
+getShortLedgerKey(LK const& k, uint32_t protocolVersion)
 {
     // A ShortLedgerKey has to have the following features:
     //
@@ -118,6 +118,11 @@ getShortLedgerKey(LK const& k)
         // 20 bits poolID
         auto const& tl = k.trustLine();
         auto const& a = tl.asset;
+        if (!isAssetValid<TrustLineAsset>(a, protocolVersion))
+        {
+            return std::nullopt;
+        }
+
         res |= (wordFromBytes(tl.accountID.ed25519()) >> 3) & ~0x3fffff;
         res |= (a.type() << 20);
         switch (a.type())
@@ -163,20 +168,20 @@ getShortLedgerKey(LK const& k)
         res |= wordFromBytes(k.liquidityPool().liquidityPoolID) >> 3;
         break;
     }
-    return res;
+    return std::make_optional(res);
 }
 
 static std::optional<ShortLedgerKey>
-getBucketEntryShortLedgerKey(BucketEntry const& be)
+getBucketEntryShortLedgerKey(BucketEntry const& be, uint32_t ledgerVersion)
 {
     switch (be.type())
     {
     case LIVEENTRY:
     case INITENTRY:
-        return std::make_optional(
-            getShortLedgerKey<LedgerEntry::_data_t>(be.liveEntry().data));
+        return getShortLedgerKey<LedgerEntry::_data_t>(be.liveEntry().data,
+                                                       ledgerVersion);
     case DEADENTRY:
-        return std::make_optional(getShortLedgerKey<LedgerKey>(be.deadEntry()));
+        return getShortLedgerKey<LedgerKey>(be.deadEntry(), ledgerVersion);
     case METAENTRY:
     default:
         break;
@@ -186,36 +191,44 @@ getBucketEntryShortLedgerKey(BucketEntry const& be)
 
 BucketIndex::BucketIndex(std::shared_ptr<Bucket const> b)
 {
-    if (b->getFilename().empty())
+    if (b->getV2Filename().empty())
     {
         return;
     }
+
+    mLedgerVersion = Bucket::getBucketVersion(b);
     XDRInputFileStream in;
-    in.open(b->getFilename());
+    in.open(b->getV2Filename());
     size_t pos = 0;
     BucketEntry be;
     while (in && in.readOne(be))
     {
-        auto bek = getBucketEntryShortLedgerKey(be);
+        auto bek = getBucketEntryShortLedgerKey(be, mLedgerVersion);
         if (bek.has_value())
         {
             CLOG_TRACE(Bucket, "Indexed {} at {} in {}", bek.value(), pos,
-                       std::filesystem::path(b->getFilename()).filename());
+                       std::filesystem::path(b->getV2Filename()).filename());
             mKeys.emplace_back(bek.value());
             mPositions.emplace_back(pos);
         }
         pos = in.pos();
     }
+
     CLOG_INFO(Bucket, "Indexed {} positions in {}", mKeys.size(),
-              std::filesystem::path(b->getFilename()).filename());
+              std::filesystem::path(b->getV2Filename()).filename());
 }
 
 std::optional<off_t>
 BucketIndex::lookup(LedgerKey const& k) const
 {
-    ShortLedgerKey slk = getShortLedgerKey(k);
-    auto i = std::lower_bound(mKeys.begin(), mKeys.end(), slk);
-    if (i == mKeys.end() || *i != slk)
+    std::optional<ShortLedgerKey> slk = getShortLedgerKey(k, mLedgerVersion);
+    if (!slk)
+    {
+        return std::nullopt;
+    }
+
+    auto i = std::lower_bound(mKeys.begin(), mKeys.end(), *slk);
+    if (i == mKeys.end() || *i != *slk)
     {
         return std::nullopt;
     }
@@ -246,7 +259,7 @@ Bucket::getIndex()
 {
     if (!mIndex)
     {
-        CLOG_INFO(Bucket, "Bucket::getIndex() indexing bucket {}", mFilename);
+        CLOG_INFO(Bucket, "Bucket::getIndex() indexing bucket {}", mV2Filename);
         mIndex = std::make_unique<BucketIndex>(shared_from_this());
     }
     return *mIndex;
@@ -258,9 +271,9 @@ Bucket::getStream()
     if (!mStream)
     {
         mStream = std::make_unique<XDRInputFileStream>();
-        if (!mFilename.empty())
+        if (!mV2Filename.empty())
         {
-            mStream->open(mFilename);
+            mStream->open(mV2Filename);
         }
     }
     return *mStream;
@@ -269,23 +282,27 @@ Bucket::getStream()
 std::optional<BucketEntry>
 Bucket::getBucketEntry(LedgerKey const& k)
 {
-    auto sk = getShortLedgerKey<LedgerKey const>(k);
+    auto skop = getShortLedgerKey<LedgerKey const>(
+        k, getBucketVersion(shared_from_this()));
     auto pos = getIndex().lookup(k);
     if (pos.has_value())
     {
+        releaseAssert(skop.has_value());
+        auto sk = *skop;
         BucketEntry be;
         auto& stream = getStream();
         CLOG_TRACE(Bucket, "Seeking bucket {} to position {} for {:x}",
-                   std::filesystem::path(mFilename).filename(), pos.value(),
+                   std::filesystem::path(mV2Filename).filename(), pos.value(),
                    sk);
         stream.seek(pos.value());
         while (stream && stream.readOne(be) &&
-               getBucketEntryShortLedgerKey(be) == sk)
+               getBucketEntryShortLedgerKey(
+                   be, getBucketVersion(shared_from_this())) == sk)
         {
             if (be.type() == LIVEENTRY && LedgerEntryKey(be.liveEntry()) == k)
             {
                 CLOG_TRACE(Bucket, "Found BE for {:x} in bucket {}", sk,
-                           std::filesystem::path(mFilename).filename());
+                           std::filesystem::path(mV2Filename).filename());
                 return std::make_optional(be);
             }
             if (be.type() == DEADENTRY && be.deadEntry() == k)
@@ -979,7 +996,7 @@ Bucket::merge(BucketManager& bucketManager, uint32_t maxProtocolVersion,
 }
 
 uint32_t
-Bucket::getBucketVersion(std::shared_ptr<Bucket> const& bucket)
+Bucket::getBucketVersion(std::shared_ptr<Bucket const> bucket)
 {
     releaseAssert(bucket);
     BucketInputIterator it(bucket);

@@ -505,9 +505,10 @@ BucketManagerImpl::getBucketByHash(uint256 const& hash)
         return i->second;
     }
     std::string canonicalName = bucketFilename(hash);
-    std::string const v2CanonicalName = canonicalName + Bucket::CMP_V2_FILE_EXT;
     if (fs::exists(canonicalName))
     {
+        std::string const v2CanonicalName =
+            canonicalName + Bucket::CMP_V2_FILE_EXT;
         CLOG_TRACE(Bucket,
                    "BucketManager::getBucketByHash({}) found no bucket, making "
                    "new one",
@@ -890,7 +891,7 @@ BucketManagerImpl::assumeState(HistoryArchiveState const& has,
         }
 
         // If bucket file has not been resorted in a new file
-        if (curr->getV2Filename().empty())
+        if (curr->getV2Filename().empty() && !curr->getFilename().empty())
         {
             std::string const v2CanonicalName =
                 curr->getFilename() + Bucket::CMP_V2_FILE_EXT;

@@ -37,6 +37,7 @@ class BucketIndex
 {
     std::vector<ShortLedgerKey> mKeys;
     std::vector<size_t> mPositions;
+    uint32_t mLedgerVersion;
 
   public:
     BucketIndex(std::shared_ptr<Bucket const> b);
@@ -143,6 +144,6 @@ class Bucket : public std::enable_shared_from_this<Bucket>,
           bool keepDeadEntries, bool countMergeEvents, asio::io_context& ctx,
           bool doFsync);
 
-    static uint32_t getBucketVersion(std::shared_ptr<Bucket> const& bucket);
+    static uint32_t getBucketVersion(std::shared_ptr<Bucket const> bucket);
 };
 }
