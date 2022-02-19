@@ -155,7 +155,7 @@ struct LedgerEntryCmpV2
             case ACCOUNT:
                 return e.account().accountID;
             case TRUSTLINE:
-                return e.trustline().accountID;
+                return e.trustLine().accountID;
             case OFFER:
                 return e.offer().sellerID;
             case DATA:
@@ -171,19 +171,19 @@ struct LedgerEntryCmpV2
         if (aid < bid)
             return true;
 
-        if (aid > bid)
+        if (bid < aid)
             return false;
 
         // Else if order by type
         if (aty < bty)
             return true;
 
-        if (aty > bty)
+        if (bty < aty)
             return false;
 
         // Else if both entries are assocaited with the same accountID and
         // are the same type
-        switch (aid)
+        switch (aty)
         {
         case ACCOUNT:
             // Entries are identical
@@ -223,7 +223,7 @@ bucketEntryIdCmpInternal(BucketEntry const& a, BucketEntry const& b)
     {
         if (bty == LIVEENTRY || bty == INITENTRY)
         {
-            return LedgerEntryCmp{}(a.liveEntry().data, b.liveEntry().data);
+            return LedgerCmp{}(a.liveEntry().data, b.liveEntry().data);
         }
         else
         {
@@ -232,7 +232,7 @@ bucketEntryIdCmpInternal(BucketEntry const& a, BucketEntry const& b)
                 throw std::runtime_error("Malformed bucket: unexpected "
                                          "non-INIT/LIVE/DEAD entry.");
             }
-            return LedgerEntryCmp{}(a.liveEntry().data, b.deadEntry());
+            return LedgerCmp{}(a.liveEntry().data, b.deadEntry());
         }
     }
     else
@@ -244,7 +244,7 @@ bucketEntryIdCmpInternal(BucketEntry const& a, BucketEntry const& b)
         }
         if (bty == LIVEENTRY || bty == INITENTRY)
         {
-            return LedgerEntryCmp{}(a.deadEntry(), b.liveEntry().data);
+            return LedgerCmp{}(a.deadEntry(), b.liveEntry().data);
         }
         else
         {
@@ -253,7 +253,7 @@ bucketEntryIdCmpInternal(BucketEntry const& a, BucketEntry const& b)
                 throw std::runtime_error("Malformed bucket: unexpected "
                                          "non-INIT/LIVE/DEAD entry.");
             }
-            return LedgerEntryCmp{}(a.deadEntry(), b.deadEntry());
+            return LedgerCmp{}(a.deadEntry(), b.deadEntry());
         }
     }
 }
@@ -280,7 +280,7 @@ struct BucketEntryIdCmp
 struct BucketEntryIdCmpV2 : public BucketEntryIdCmp
 {
     virtual bool
-    operator()(BucketEntry const& a, BucketEntry const& b) const
+    operator()(BucketEntry const& a, BucketEntry const& b) const override
     {
         return bucketEntryIdCmpInternal<LedgerEntryCmpV2>(a, b);
     }

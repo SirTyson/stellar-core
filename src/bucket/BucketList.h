@@ -5,10 +5,12 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "bucket/FutureBucket.h"
+#include "bucket/LedgerCmp.h"
 #include "overlay/StellarXDR.h"
 #include "util/XDRStream.h"
 #include "xdrpp/message.h"
 #include <future>
+#include <map>
 
 namespace stellar
 {
@@ -297,6 +299,9 @@ namespace stellar
 class Application;
 class Bucket;
 
+typedef std::map<LedgerKey, std::optional<LedgerEntry>, LedgerEntryCmpV2>
+    BucketListHotState;
+
 namespace testutil
 {
 class BucketListDepthModifier;
@@ -351,6 +356,12 @@ class BucketList
     static uint32_t mask(uint32_t v, uint32_t m);
     std::vector<BucketLevel> mLevels;
 
+    // Keeps track of ledger entries that have been added to database but not
+    // yet commited to the BucketList. When searching for an entry in the
+    // BucketList, mHotState acts like the bucket at level -1 as is searched
+    // first.
+    BucketListHotState mHotState;
+
   public:
     // Number of bucket levels in the bucketlist. Every bucketlist in the system
     // will have this many levels and it effectively gets wired-in to the
@@ -402,6 +413,10 @@ class BucketList
     // the concatenation of each level's hash, each of which in turn is the hash
     // of the concatenation of the hashes of the `curr` and `snap` buckets.
     Hash getHash() const;
+
+    // Ledger entries in state are inserted into mHotState. If a given entry is
+    // in both state and mHotState, value in state overwrites mHotState.
+    void updateHotState(BucketListHotState const& state);
 
     // Look up a ledger entry from the BL, dynamically indexing buckets as
     // needed to resolve the LE. Returns nullopt if the LE is dead /

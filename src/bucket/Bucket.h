@@ -31,8 +31,59 @@ class BucketManager;
 class BucketList;
 class Database;
 
-typedef uint64_t ShortLedgerKey;
 class Bucket;
+
+// This struct is only for debugging, can be replaced with a typedef later
+// typedef uint64_t ShortLedgerKey;
+struct ShortLedgerKey
+{
+    uint64_t key{0};
+
+    // Gets first 39 bits of accountID from key
+    // We only get the first 39 because that is the lowest common
+    // ammount of accountID bits for all the types
+    static constexpr uint64_t ACCOUNT_ID_MASK = 0x1fffffffffc00000;
+
+    bool
+    operator==(ShortLedgerKey const& b) const
+    {
+        return this->key == b.key;
+    }
+
+    bool
+    operator!=(ShortLedgerKey const& b) const
+    {
+        return !(*this == b);
+    }
+
+    bool operator<(ShortLedgerKey const& b) const;
+
+    bool
+    operator<=(ShortLedgerKey const& b) const
+    {
+        return *this < b || *this == b;
+    }
+
+    bool
+    operator>(ShortLedgerKey const& b) const
+    {
+        return !(*this < b) && *this != b;
+    }
+
+    bool
+    operator>=(ShortLedgerKey const& b) const
+    {
+        return *this > b || *this == b;
+    }
+
+    ShortLedgerKey&
+    operator|=(uint64_t const b)
+    {
+        this->key |= b;
+        return *this;
+    }
+};
+
 class BucketIndex
 {
     std::vector<ShortLedgerKey> mKeys;

@@ -25,7 +25,6 @@ class BucketOutputIterator
   protected:
     std::string mFilename;
     XDROutputFileStream mOut;
-    BucketEntryIdCmp mCmp;
     std::unique_ptr<BucketEntry> mBuf;
     SHA256 mHasher;
     size_t mBytesPut{0};
@@ -34,6 +33,9 @@ class BucketOutputIterator
     BucketMetadata mMeta;
     bool mPutMeta{false};
     MergeCounters& mMergeCounters;
+    bool mV2Sorted;
+
+    bool cmp(BucketEntry const& a, BucketEntry const& b) const;
 
   public:
     // BucketOutputIterators must _always_ be constructed with BucketMetadata,

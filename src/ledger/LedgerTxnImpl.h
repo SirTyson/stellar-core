@@ -57,6 +57,7 @@ class EntryIterator::AbstractImpl
 // reorganizing the relevant parts of soci.
 class BulkLedgerEntryChangeAccumulator
 {
+    BucketListHotState mState;
 
     std::vector<EntryIterator> mAccountsToUpsert;
     std::vector<EntryIterator> mAccountsToDelete;
@@ -72,6 +73,12 @@ class BulkLedgerEntryChangeAccumulator
     std::vector<EntryIterator> mLiquidityPoolToDelete;
 
   public:
+    BucketListHotState const&
+    getState()
+    {
+        return mState;
+    }
+
     std::vector<EntryIterator>&
     getAccountsToUpsert()
     {
@@ -680,6 +687,7 @@ class LedgerTxnRoot::Impl
     static size_t const MIN_BEST_OFFERS_BATCH_SIZE;
     size_t const mMaxBestOffersBatchSize;
 
+    Application& mApp;
     Database& mDatabase;
     BucketList& mBucketList;
     std::unique_ptr<LedgerHeader> mHeader;
@@ -796,7 +804,7 @@ class LedgerTxnRoot::Impl
 
   public:
     // Constructor has the strong exception safety guarantee
-    Impl(Database& db, BucketList& bl, size_t entryCacheSize,
+    Impl(Application& app, Database& db, BucketList& bl, size_t entryCacheSize,
          size_t prefetchBatchSize
 #ifdef BEST_OFFER_DEBUGGING
          ,

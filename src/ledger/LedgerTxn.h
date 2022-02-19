@@ -802,8 +802,8 @@ class LedgerTxnRoot : public AbstractLedgerTxnParent
     std::unique_ptr<Impl> const mImpl;
 
   public:
-    explicit LedgerTxnRoot(Database& db, BucketList& bl, size_t entryCacheSize,
-                           size_t prefetchBatchSize
+    explicit LedgerTxnRoot(Application& app, Database& db, BucketList& bl,
+                           size_t entryCacheSize, size_t prefetchBatchSize
 #ifdef BEST_OFFER_DEBUGGING
                            ,
                            bool bestOfferDebuggingEnabled

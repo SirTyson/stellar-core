@@ -31,6 +31,19 @@ randomBucketName(std::string const& tmpDir)
 }
 }
 
+bool
+BucketOutputIterator::cmp(BucketEntry const& a, BucketEntry const& b) const
+{
+    if (mV2Sorted)
+    {
+        return BucketEntryIdCmpV2{}(a, b);
+    }
+    else
+    {
+        return BucketEntryIdCmp{}(a, b);
+    }
+}
+
 /**
  * Helper class that points to an output tempfile. Absorbs BucketEntries and
  * hashes them while writing to either destination. Produces a Bucket when done.
@@ -46,6 +59,8 @@ BucketOutputIterator::BucketOutputIterator(std::string const& tmpDir,
     , mKeepDeadEntries(keepDeadEntries)
     , mMeta(meta)
     , mMergeCounters(mc)
+    , mV2Sorted(meta.ext.v() == 1 &&
+                meta.ext.v1().flags & BUCKET_METADATA_NEW_CMP_FLAG)
 {
     ZoneScoped;
     CLOG_TRACE(Bucket, "BucketOutputIterator opening file to write: {}",
@@ -61,12 +76,6 @@ BucketOutputIterator::BucketOutputIterator(std::string const& tmpDir,
         bme.metaEntry() = mMeta;
         put(bme);
         mPutMeta = true;
-    }
-
-    // Check if bucket is sorted using legacy or new sorted order
-    if (meta.ext.v() == 1 && meta.ext.v1().flags & BUCKET_METADATA_NEW_CMP_FLAG)
-    {
-        mCmp = BucketEntryIdCmpV2();
     }
 }
 
@@ -93,13 +102,13 @@ BucketOutputIterator::put(BucketEntry const& e)
     // Check to see if there's an existing buffered entry.
     if (mBuf)
     {
-        // mCmp(e, *mBuf) means e < *mBuf; this should never be true since
+        // cmp(e, *mBuf) means e < *mBuf; this should never be true since
         // it would mean that we're getting entries out of order.
-        releaseAssert(!mCmp(e, *mBuf));
+        releaseAssert(!cmp(e, *mBuf));
 
         // Check to see if the new entry should flush (greater identity), or
         // merely replace (same identity), the buffered entry.
-        if (mCmp(*mBuf, e))
+        if (cmp(*mBuf, e))
         {
             ++mMergeCounters.mOutputIteratorActualWrites;
             mOut.writeOne(*mBuf, &mHasher, &mBytesPut);

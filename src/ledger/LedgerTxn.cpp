@@ -13,6 +13,7 @@
 #include "ledger/LedgerTxnHeader.h"
 #include "ledger/LedgerTxnImpl.h"
 #include "ledger/NonSociRelatedException.h"
+#include "main/Application.h"
 #include "transactions/TransactionUtils.h"
 #include "util/GlobalChecks.h"
 #include "util/XDROperators.h"
@@ -21,6 +22,8 @@
 #include "xdrpp/marshal.h"
 #include <Tracy.hpp>
 #include <soci.h>
+
+#include "util/XDRCereal.h"
 
 namespace stellar
 {
@@ -2361,14 +2364,15 @@ LedgerTxn::Impl::EntryIteratorImpl::clone() const
 // Implementation of LedgerTxnRoot ------------------------------------------
 size_t const LedgerTxnRoot::Impl::MIN_BEST_OFFERS_BATCH_SIZE = 5;
 
-LedgerTxnRoot::LedgerTxnRoot(Database& db, BucketList& bl,
+LedgerTxnRoot::LedgerTxnRoot(Application& app, Database& db, BucketList& bl,
                              size_t entryCacheSize, size_t prefetchBatchSize
 #ifdef BEST_OFFER_DEBUGGING
                              ,
                              bool bestOfferDebuggingEnabled
 #endif
                              )
-    : mImpl(std::make_unique<Impl>(db, bl, entryCacheSize, prefetchBatchSize
+    : mImpl(std::make_unique<Impl>(app, db, bl, entryCacheSize,
+                                   prefetchBatchSize
 #ifdef BEST_OFFER_DEBUGGING
                                    ,
                                    bestOfferDebuggingEnabled
@@ -2377,8 +2381,8 @@ LedgerTxnRoot::LedgerTxnRoot(Database& db, BucketList& bl,
 {
 }
 
-LedgerTxnRoot::Impl::Impl(Database& db, BucketList& bl, size_t entryCacheSize,
-                          size_t prefetchBatchSize
+LedgerTxnRoot::Impl::Impl(Application& app, Database& db, BucketList& bl,
+                          size_t entryCacheSize, size_t prefetchBatchSize
 #ifdef BEST_OFFER_DEBUGGING
                           ,
                           bool bestOfferDebuggingEnabled
@@ -2387,6 +2391,7 @@ LedgerTxnRoot::Impl::Impl(Database& db, BucketList& bl, size_t entryCacheSize,
     : mMaxBestOffersBatchSize(
           std::min(std::max(prefetchBatchSize, MIN_BEST_OFFERS_BATCH_SIZE),
                    getMaxOffersToCross()))
+    , mApp(app)
     , mDatabase(db)
     , mBucketList(bl)
     , mHeader(std::make_unique<LedgerHeader>())
@@ -2484,13 +2489,25 @@ accum(EntryIterator const& iter, std::vector<EntryIterator>& upsertBuffer,
 void
 BulkLedgerEntryChangeAccumulator::accumulate(EntryIterator const& iter)
 {
+    auto const& key = iter.key();
+    auto const& entryPtr = iter.entryPtr();
+
     // Right now, only LEDGER_ENTRY are recorded in the SQL database
-    if (iter.key().type() != InternalLedgerEntryType::LEDGER_ENTRY)
+    if (key.type() != InternalLedgerEntryType::LEDGER_ENTRY)
     {
         return;
     }
 
-    switch (iter.key().ledgerKey().type())
+    if (entryPtr.get())
+    {
+        mState[key.ledgerKey()] = iter.entry().ledgerEntry();
+    }
+    else
+    {
+        mState[key.ledgerKey()] = std::nullopt;
+    }
+
+    switch (key.ledgerKey().type())
     {
     case ACCOUNT:
         accum(iter, mAccountsToUpsert, mAccountsToDelete);
@@ -2626,6 +2643,12 @@ LedgerTxnRoot::Impl::commitChild(EntryIterator iter,
                 (bool)iter ? LEDGER_ENTRY_BATCH_COMMIT_SIZE : 0;
             bulkApply(bleca, bufferThreshold, cons);
         }
+
+        if (mApp.getConfig().MODE_ENABLES_BUCKETLIST)
+        {
+            mBucketList.updateHotState(bleca.getState());
+        }
+
         // FIXME: there is no medida historgram for this presently,
         // but maybe we would like one?
         TracyPlot("ledger.entry.commit", counter);
@@ -3387,65 +3410,74 @@ LedgerTxnRoot::Impl::getNewestVersion(InternalLedgerKey const& gkey) const
     }
 
     std::shared_ptr<LedgerEntry const> entry;
+    std::shared_ptr<LedgerEntry const> entryDB;
     auto e = mBucketList.getLedgerEntry(key);
     if (e.has_value())
     {
         releaseAssertOrThrow(LedgerEntryKey(e.value()) == key);
         entry = std::make_shared<LedgerEntry const>(std::move(e.value()));
     }
-    else
+
+    // Fallback from BL to DB for now. Eventually remove this.
+    try
     {
-        // Fallback from BL to DB for now. Eventually remove this.
-        try
+        switch (key.type())
         {
-            switch (key.type())
-            {
-            case ACCOUNT:
-                entry = loadAccount(key);
-                break;
-            case DATA:
-                entry = loadData(key);
-                break;
-            case OFFER:
-                entry = loadOffer(key);
-                break;
-            case TRUSTLINE:
-                entry = loadTrustLine(key);
-                break;
-            case CLAIMABLE_BALANCE:
-                entry = loadClaimableBalance(key);
-                break;
-            case LIQUIDITY_POOL:
-                entry = loadLiquidityPool(key);
-                break;
-            default:
-                throw std::runtime_error("Unknown key type");
-            }
-        }
-        catch (NonSociRelatedException&)
-        {
-            throw;
-        }
-        catch (std::exception& e)
-        {
-            printErrorAndAbort(
-                "fatal error when loading ledger entry from LedgerTxnRoot: ",
-                e.what());
-        }
-        catch (...)
-        {
-            printErrorAndAbort(
-                "unknown fatal error when loading ledger entry from "
-                "LedgerTxnRoot");
+        case ACCOUNT:
+            entryDB = loadAccount(key);
+            break;
+        case DATA:
+            entryDB = loadData(key);
+            break;
+        case OFFER:
+            entryDB = loadOffer(key);
+            break;
+        case TRUSTLINE:
+            entryDB = loadTrustLine(key);
+            break;
+        case CLAIMABLE_BALANCE:
+            entryDB = loadClaimableBalance(key);
+            break;
+        case LIQUIDITY_POOL:
+            entryDB = loadLiquidityPool(key);
+            break;
+        default:
+            throw std::runtime_error("Unknown key type");
         }
     }
-    putInEntryCache(key, entry, LoadType::IMMEDIATE);
+    catch (NonSociRelatedException&)
+    {
+        throw;
+    }
+    catch (std::exception& e)
+    {
+        printErrorAndAbort(
+            "fatal error when loading ledger entry from LedgerTxnRoot: ",
+            e.what());
+    }
+    catch (...)
+    {
+        printErrorAndAbort("unknown fatal error when loading ledger entry from "
+                           "LedgerTxnRoot");
+    }
+
+    putInEntryCache(key, entryDB, LoadType::IMMEDIATE);
     if (entry)
     {
+        releaseAssert(*entry == *entryDB);
         return std::make_shared<InternalLedgerEntry const>(*entry);
     }
     else
     {
+        // This assert should be here, but currently breaks catchup from
+        // historical archive. Until that's fixed, default to returning DB entry
+        // releaseAssert(!entryDB);
+        if (entryDB)
+        {
+            CLOG_INFO(Bucket, "ERROR: Entry was NULL, DB was not: {}",
+                      xdr_to_string(entryDB, "live"));
+            return std::make_shared<InternalLedgerEntry const>(*entryDB);
+        }
         return nullptr;
     }
 }

@@ -94,7 +94,7 @@ getShortLedgerKey(LK const& k, uint32_t protocolVersion)
     // The general structure of the mapping is just "take high order bits of
     // fields in their lexicographical order".
 
-    ShortLedgerKey res{0};
+    ShortLedgerKey res;
 
     // Top 3 bits are type (there are only 5 types so this fits).
     res |= static_cast<uint64_t>(k.type()) << 61;
@@ -146,7 +146,9 @@ getShortLedgerKey(LK const& k, uint32_t protocolVersion)
     }
     break;
     case OFFER:
-        res |= (k.offer().offerID >> 3);
+        // 45 bits of accountID and 16 bits of offerID
+        res |= (wordFromBytes(k.offer().sellerID.ed25519()) >> 3) & ~0xffff;
+        res |= (k.offer().offerID >> 45);
         break;
     case DATA:
         // for data the layout is 45 bits of accountID and
@@ -189,6 +191,46 @@ getBucketEntryShortLedgerKey(BucketEntry const& be, uint32_t ledgerVersion)
     return std::nullopt;
 }
 
+bool
+ShortLedgerKey::operator<(ShortLedgerKey const& b) const
+{
+    LedgerEntryType aty = static_cast<LedgerEntryType>(this->key >> 61);
+    LedgerEntryType bty = static_cast<LedgerEntryType>(b.key >> 61);
+
+    // If at least one account is not associated with an account or
+    // account subentry
+    if (aty >= CLAIMABLE_BALANCE || bty >= CLAIMABLE_BALANCE)
+    {
+        // Order by type if types differ
+        if (aty < bty)
+            return true;
+
+        if (aty > bty)
+            return false;
+
+        // Else if types are the same order strictly
+        return this->key < b.key;
+    }
+
+    uint64_t aID = this->key & ACCOUNT_ID_MASK;
+    uint64_t bID = b.key & ACCOUNT_ID_MASK;
+
+    // If associated accountIDs are different, order by accountID
+    if (aID != bID)
+        return aID < bID;
+
+    // If accountIDs are the same, sort by type
+    if (aty < bty)
+        return true;
+
+    if (aty > bty)
+        return false;
+
+    // If accountID's are the same and entrie's are same type, order by
+    // entire key
+    return this->key < b.key;
+}
+
 BucketIndex::BucketIndex(std::shared_ptr<Bucket const> b)
 {
     if (b->getV2Filename().empty())
@@ -201,13 +243,22 @@ BucketIndex::BucketIndex(std::shared_ptr<Bucket const> b)
     in.open(b->getV2Filename());
     size_t pos = 0;
     BucketEntry be;
+    // std::vector<BucketEntry> bes;
     while (in && in.readOne(be))
     {
         auto bek = getBucketEntryShortLedgerKey(be, mLedgerVersion);
         if (bek.has_value())
         {
-            CLOG_TRACE(Bucket, "Indexed {} at {} in {}", bek.value(), pos,
+            CLOG_TRACE(Bucket, "Indexed {} at {} in {}", bek.value().key, pos,
                        std::filesystem::path(b->getV2Filename()).filename());
+            // Assert ShortLedgerKeys and Buckets are sorted correctly
+            // for (size_t i = 0; i < bes.size(); ++i)
+            // {
+            //     releaseAssert(BucketEntryIdCmpV2{}(bes[i], be));
+            //     releaseAssert(mKeys[i] < bek.value());
+            // }
+
+            // bes.push_back(be);
             mKeys.emplace_back(bek.value());
             mPositions.emplace_back(pos);
         }
@@ -245,7 +296,7 @@ Bucket::Bucket(std::string const& filename, Hash const& hash,
     if (!filename.empty())
     {
         CLOG_INFO(Bucket, "Bucket::Bucket() created, file exists : {}",
-                  fs::size(filename));
+                  filename);
         mSize = fs::size(filename);
     }
 }
@@ -259,7 +310,20 @@ Bucket::getIndex()
 {
     if (!mIndex)
     {
-        CLOG_INFO(Bucket, "Bucket::getIndex() indexing bucket {}", mV2Filename);
+        if (mV2Filename.empty())
+        {
+            CLOG_INFO(Bucket,
+                      "WARN Bucket::getIndex() bucket with empty filename.");
+            // Assert that this bucket is not backed by any file to make sure
+            // that V2 is not missing if V1 sorted file is present
+            releaseAssert(mFilename.empty());
+        }
+        else
+        {
+            CLOG_INFO(Bucket, "Bucket::getIndex() indexing bucket {}",
+                      mV2Filename);
+        }
+
         mIndex = std::make_unique<BucketIndex>(shared_from_this());
     }
     return *mIndex;
@@ -293,7 +357,7 @@ Bucket::getBucketEntry(LedgerKey const& k)
         auto& stream = getStream();
         CLOG_TRACE(Bucket, "Seeking bucket {} to position {} for {:x}",
                    std::filesystem::path(mV2Filename).filename(), pos.value(),
-                   sk);
+                   sk.key);
         stream.seek(pos.value());
         while (stream && stream.readOne(be) &&
                getBucketEntryShortLedgerKey(
@@ -301,7 +365,7 @@ Bucket::getBucketEntry(LedgerKey const& k)
         {
             if (be.type() == LIVEENTRY && LedgerEntryKey(be.liveEntry()) == k)
             {
-                CLOG_TRACE(Bucket, "Found BE for {:x} in bucket {}", sk,
+                CLOG_TRACE(Bucket, "Found BE for {:x} in bucket {}", sk.key,
                            std::filesystem::path(mV2Filename).filename());
                 return std::make_optional(be);
             }
@@ -992,6 +1056,10 @@ Bucket::merge(BucketManager& bucketManager, uint32_t maxProtocolVersion,
     }
 
     MergeKey mk{keepDeadEntries, oldBucket, newBucket, shadows};
+
+    // Clear and invalidate old indexes
+    oldBucket->mIndex = nullptr;
+    newBucket->mIndex = nullptr;
     return out.getBucket(bucketManager, &mk, &outV2);
 }
 

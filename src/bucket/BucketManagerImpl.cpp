@@ -880,21 +880,14 @@ BucketManagerImpl::assumeState(HistoryArchiveState const& has,
 {
     ZoneScoped;
     releaseAssertOrThrow(mApp.getConfig().MODE_ENABLES_BUCKETLIST);
-    for (uint32_t i = 0; i < BucketList::kNumLevels; ++i)
-    {
-        auto curr = getBucketByHash(hexToBin256(has.currentBuckets.at(i).curr));
-        auto snap = getBucketByHash(hexToBin256(has.currentBuckets.at(i).snap));
-        if (!(curr && snap))
-        {
-            throw std::runtime_error(
-                "Missing bucket files while assuming saved BucketList state");
-        }
 
-        // If bucket file has not been resorted in a new file
-        if (curr->getV2Filename().empty() && !curr->getFilename().empty())
+    // Checks if bucket has been resorted with V2 cmp function. If not,
+    // creates a new file in the new sort order and adds it to the bucket
+    auto sortFile = [&](std::shared_ptr<Bucket> b, uint32_t i) {
+        if (b->getV2Filename().empty() && !b->getFilename().empty())
         {
             std::string const v2CanonicalName =
-                curr->getFilename() + Bucket::CMP_V2_FILE_EXT;
+                b->getFilename() + Bucket::CMP_V2_FILE_EXT;
             BucketMetadata meta;
             meta.ledgerVersion = mApp.getConfig().LEDGER_PROTOCOL_VERSION;
             meta.ext.v(1);
@@ -905,7 +898,7 @@ BucketManagerImpl::assumeState(HistoryArchiveState const& has,
                                      BucketList::keepDeadEntries(i), meta, mc,
                                      mApp.getClock().getIOContext(),
                                      !mApp.getConfig().DISABLE_XDR_FSYNC);
-            BucketInputIterator in(curr, curr->getFilename());
+            BucketInputIterator in(b, b->getFilename());
             std::set<BucketEntry, BucketEntryIdCmpV2> sortedEntries;
             while (in)
             {
@@ -925,9 +918,9 @@ BucketManagerImpl::assumeState(HistoryArchiveState const& has,
                 {
                     std::string err("Failed to rename bucket :");
                     err += strerror(errno);
-                    // it seems there is a race condition with external systems
-                    // retry after sleeping for a second works around the
-                    // problem
+                    // it seems there is a race condition with external
+                    // systems retry after sleeping for a second works
+                    // around the problem
                     std::this_thread::sleep_for(std::chrono::seconds(1));
                     if (!renameBucket(out.getFilename(), v2CanonicalName))
                     {
@@ -936,9 +929,23 @@ BucketManagerImpl::assumeState(HistoryArchiveState const& has,
                     }
                 }
 
-                curr->getV2Filename() = v2CanonicalName;
+                b->getV2Filename() = v2CanonicalName;
             }
         }
+    };
+
+    for (uint32_t i = 0; i < BucketList::kNumLevels; ++i)
+    {
+        auto curr = getBucketByHash(hexToBin256(has.currentBuckets.at(i).curr));
+        auto snap = getBucketByHash(hexToBin256(has.currentBuckets.at(i).snap));
+        if (!(curr && snap))
+        {
+            throw std::runtime_error(
+                "Missing bucket files while assuming saved BucketList state");
+        }
+
+        sortFile(curr, i);
+        sortFile(snap, i);
 
         mBucketList->getLevel(i).setCurr(curr);
         mBucketList->getLevel(i).setSnap(snap);

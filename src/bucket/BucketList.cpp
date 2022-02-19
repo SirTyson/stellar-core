@@ -374,6 +374,14 @@ std::optional<LedgerEntry>
 BucketList::getLedgerEntry(LedgerKey const& k) const
 {
     auto start = std::chrono::steady_clock::now();
+    std::optional<LedgerEntry> result{};
+    auto hot = mHotState.find(k);
+    if (hot != mHotState.end())
+    {
+        result = hot->second;
+        goto exit;
+    }
+
     for (auto const& lev : mLevels)
     {
         std::array<std::shared_ptr<Bucket>, 2> buckets = {lev.getCurr(),
@@ -383,23 +391,29 @@ BucketList::getLedgerEntry(LedgerKey const& k) const
             auto be = b->getBucketEntry(k);
             if (be.has_value())
             {
-                if (be.value().type() == DEADENTRY)
-                {
-                    return std::nullopt;
-                }
-                else
-                {
-                    auto end = std::chrono::steady_clock::now();
-                    CLOG_INFO(
-                        Bucket, "BucketList::getLedgerEntry lookup took {}",
-                        std::chrono::duration_cast<std::chrono::microseconds>(
-                            end - start));
-                    return std::make_optional(be.value().liveEntry());
-                }
+                result = be.value().type() == DEADENTRY
+                             ? std::nullopt
+                             : std::make_optional(be.value().liveEntry());
+                goto exit;
             }
         }
     }
-    return std::nullopt;
+
+/* Dear reviewer,
+ *
+ * Are labels fashionable in modern C++? I saw this patern a lot when doing
+ * stuff with kernels and firmware, but I hear that goto is contraversial in
+ * higher level programming.
+ *
+ * Sincerely,
+ * A C developer
+ */
+exit:
+    auto end = std::chrono::steady_clock::now();
+    CLOG_INFO(
+        Bucket, "BucketList::getLedgerEntry lookup took {}",
+        std::chrono::duration_cast<std::chrono::microseconds>(end - start));
+    return result;
 }
 
 // levelShouldSpill is the set of boundaries at which each level should spill,
@@ -496,6 +510,15 @@ BucketList::getMaxMergeLevel(uint32_t currLedger) const
 }
 
 void
+BucketList::updateHotState(BucketListHotState const& state)
+{
+    for (auto const& [key, val] : state)
+    {
+        mHotState[key] = val;
+    }
+}
+
+void
 BucketList::addBatch(Application& app, uint32_t currLedger,
                      uint32_t currLedgerProtocol,
                      std::vector<LedgerEntry> const& initEntries,
@@ -586,6 +609,21 @@ BucketList::addBatch(Application& app, uint32_t currLedger,
             mLevels[i].prepare(app, currLedger, currLedgerProtocol, snap,
                                shadows, /*countMergeEvents=*/true);
         }
+    }
+
+    for (auto const& e : initEntries)
+    {
+        mHotState.erase(LedgerEntryKey(e));
+    }
+
+    for (auto const& e : liveEntries)
+    {
+        mHotState.erase(LedgerEntryKey(e));
+    }
+
+    for (auto const& e : deadEntries)
+    {
+        mHotState.erase(e);
     }
 
     // In some testing scenarios, we want to inhibit counting level 0 merges

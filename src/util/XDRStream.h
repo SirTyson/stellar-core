@@ -67,8 +67,7 @@ class XDRInputFileStream
 
     operator bool() const
     {
-        auto ret = mIn.good();
-        return ret;
+        return mIn.good();
     }
 
     size_t
