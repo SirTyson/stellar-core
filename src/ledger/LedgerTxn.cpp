@@ -2266,29 +2266,29 @@ LedgerTxn::Impl::hasSponsorshipEntry() const
     return false;
 }
 
-void
-LedgerTxn::noHotState()
-{
-    getImpl()->noHotState();
-}
+// void
+// LedgerTxn::noHotState()
+// {
+//     getImpl()->noHotState();
+// }
 
-void
-LedgerTxn::Impl::noHotState()
-{
-    mSaveHotState = false;
-}
+// void
+// LedgerTxn::Impl::noHotState()
+// {
+//     mSaveHotState = false;
+// }
 
-bool
-LedgerTxn::getHotState()
-{
-    return getImpl()->getHotState();
-}
+// bool
+// LedgerTxn::getHotState()
+// {
+//     return getImpl()->getHotState();
+// }
 
-bool
-LedgerTxn::Impl::getHotState()
-{
-    return mSaveHotState;
-}
+// bool
+// LedgerTxn::Impl::getHotState()
+// {
+//     return mSaveHotState;
+// }
 
 void
 LedgerTxn::prepareNewObjects(size_t s)
