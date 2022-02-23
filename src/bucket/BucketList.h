@@ -10,7 +10,7 @@
 #include "util/XDRStream.h"
 #include "xdrpp/message.h"
 #include <future>
-#include <map>
+#include <set>
 
 namespace stellar
 {
@@ -362,7 +362,11 @@ class BucketList
     // first.
     BucketListHotState mHotState;
 
+    uint64_t NUM_ERASED{0};
+
   public:
+    uint32_t mHotLedger{0};
+
     // Number of bucket levels in the bucketlist. Every bucketlist in the system
     // will have this many levels and it effectively gets wired-in to the
     // protocol. Careful about changing it.

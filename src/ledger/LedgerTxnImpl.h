@@ -178,6 +178,7 @@ class LedgerTxn::Impl
     UnorderedMap<InternalLedgerKey, std::shared_ptr<EntryImplBase>> mActive;
     bool const mShouldUpdateLastModified;
     bool mIsSealed;
+    bool mSaveHotState{true};
     LedgerTxnConsistency mConsistency;
 
     typedef std::map<OfferDescriptor, LedgerKey, IsBetterOfferComparator>
@@ -600,6 +601,8 @@ class LedgerTxn::Impl
     // hasSponsorshipEntry has the strong exception safety guarantee
     bool hasSponsorshipEntry() const;
 
+    void noHotState();
+    bool getHotState();
 #ifdef BUILD_TESTS
     UnorderedMap<AssetPair,
                  std::map<OfferDescriptor, LedgerKey, IsBetterOfferComparator>,

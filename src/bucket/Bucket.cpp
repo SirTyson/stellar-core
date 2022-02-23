@@ -78,8 +78,8 @@ sixbitOfAlnum(uint8_t uch)
 }
 
 template <typename LK>
-static std::optional<ShortLedgerKey>
-getShortLedgerKey(LK const& k, uint32_t protocolVersion)
+std::optional<ShortLedgerKey>
+Bucket::getShortLedgerKey(LK const& k, uint32_t protocolVersion)
 {
     // A ShortLedgerKey has to have the following features:
     //
@@ -180,10 +180,11 @@ getBucketEntryShortLedgerKey(BucketEntry const& be, uint32_t ledgerVersion)
     {
     case LIVEENTRY:
     case INITENTRY:
-        return getShortLedgerKey<LedgerEntry::_data_t>(be.liveEntry().data,
-                                                       ledgerVersion);
+        return Bucket::getShortLedgerKey<LedgerEntry::_data_t>(
+            be.liveEntry().data, ledgerVersion);
     case DEADENTRY:
-        return getShortLedgerKey<LedgerKey>(be.deadEntry(), ledgerVersion);
+        return Bucket::getShortLedgerKey<LedgerKey>(be.deadEntry(),
+                                                    ledgerVersion);
     case METAENTRY:
     default:
         break;
@@ -272,13 +273,16 @@ BucketIndex::BucketIndex(std::shared_ptr<Bucket const> b)
 std::optional<off_t>
 BucketIndex::lookup(LedgerKey const& k) const
 {
-    std::optional<ShortLedgerKey> slk = getShortLedgerKey(k, mLedgerVersion);
+    std::optional<ShortLedgerKey> slk =
+        Bucket::getShortLedgerKey(k, mLedgerVersion);
     if (!slk)
     {
         return std::nullopt;
     }
 
-    auto i = std::lower_bound(mKeys.begin(), mKeys.end(), *slk);
+    auto i =
+        std::lower_bound(mKeys.begin(), mKeys.end(), *slk,
+                         [](auto const& a, auto const& b) { return a < b; });
     if (i == mKeys.end() || *i != *slk)
     {
         return std::nullopt;
@@ -363,15 +367,25 @@ Bucket::getBucketEntry(LedgerKey const& k)
                getBucketEntryShortLedgerKey(
                    be, getBucketVersion(shared_from_this())) == sk)
         {
-            if (be.type() == LIVEENTRY && LedgerEntryKey(be.liveEntry()) == k)
+            LedgerKey currKey;
+            switch (be.type())
+            {
+            case INITENTRY:
+            case LIVEENTRY:
+                currKey = LedgerEntryKey(be.liveEntry());
+                break;
+            case DEADENTRY:
+                currKey = be.deadEntry();
+                break;
+            default:
+                throw std::runtime_error("Indexed meta entry");
+            }
+
+            if (currKey == k)
             {
                 CLOG_TRACE(Bucket, "Found BE for {:x} in bucket {}", sk.key,
                            std::filesystem::path(mV2Filename).filename());
                 return std::make_optional(be);
-            }
-            if (be.type() == DEADENTRY && be.deadEntry() == k)
-            {
-                return std::nullopt;
             }
         }
     }

@@ -158,6 +158,10 @@ class Bucket : public std::enable_shared_from_this<Bucket>,
                          std::vector<LedgerEntry> const& liveEntries,
                          std::vector<LedgerKey> const& deadEntries);
 
+    template <typename LK>
+    static std::optional<ShortLedgerKey>
+    getShortLedgerKey(LK const& k, uint32_t protocolVersion);
+
 #ifdef BUILD_TESTS
     // "Applies" the bucket to the database. For each entry in the bucket,
     // if the entry is init or live, creates or updates the corresponding

@@ -3,7 +3,9 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "ledger/LedgerTxn.h"
+#include "bucket/Bucket.h"
 #include "bucket/BucketList.h"
+#include "catchup/CatchupManager.h"
 #include "crypto/Hex.h"
 #include "crypto/KeyUtils.h"
 #include "crypto/SecretKey.h"
@@ -21,9 +23,13 @@
 #include "xdr/Stellar-ledger-entries.h"
 #include "xdrpp/marshal.h"
 #include <Tracy.hpp>
+#include <fmt/chrono.h>
+#include <fmt/format.h>
 #include <soci.h>
 
 #include "util/XDRCereal.h"
+
+#include "xdrpp/printer.h"
 
 namespace stellar
 {
@@ -2261,6 +2267,30 @@ LedgerTxn::Impl::hasSponsorshipEntry() const
 }
 
 void
+LedgerTxn::noHotState()
+{
+    getImpl()->noHotState();
+}
+
+void
+LedgerTxn::Impl::noHotState()
+{
+    mSaveHotState = false;
+}
+
+bool
+LedgerTxn::getHotState()
+{
+    return getImpl()->getHotState();
+}
+
+bool
+LedgerTxn::Impl::getHotState()
+{
+    return mSaveHotState;
+}
+
+void
 LedgerTxn::prepareNewObjects(size_t s)
 {
     getImpl()->prepareNewObjects(s);
@@ -2644,10 +2674,26 @@ LedgerTxnRoot::Impl::commitChild(EntryIterator iter,
             bulkApply(bleca, bufferThreshold, cons);
         }
 
-        if (mApp.getConfig().MODE_ENABLES_BUCKETLIST)
-        {
-            mBucketList.updateHotState(bleca.getState());
-        }
+        // if (mChild->getHotState() &&
+        // mApp.getConfig().MODE_ENABLES_BUCKETLIST)
+        CLOG_INFO(Bucket, "Child ledger: {} list ledger: {}",
+                  childHeader->ledgerSeq, mBucketList.mHotLedger);
+
+        // In some cases (like catchup) elements are written to the DB, but
+        // mBucketManager.addBatch() is not called. In those cases, we need the
+        // bucket list to return the most up to date element even if it is not
+        // part of the BucketList proper yet. I've tried to implement something
+        // like a hotState that is an in memory map of dirty elements not yet
+        // commited in the bucket list. This does not yet work.
+        // if (mApp.getConfig().MODE_ENABLES_BUCKETLIST &&
+        //     childHeader->ledgerSeq > mBucketList.mHotLedger)
+        // {
+        //     mBucketList.updateHotState(bleca.getState());
+        // }
+        // else
+        // {
+        //     CLOG_INFO(Bucket, "Did not update");
+        // }
 
         // FIXME: there is no medida historgram for this presently,
         // but maybe we would like one?
@@ -3389,6 +3435,9 @@ std::shared_ptr<InternalLedgerEntry const>
 LedgerTxnRoot::Impl::getNewestVersion(InternalLedgerKey const& gkey) const
 {
     ZoneScoped;
+
+    static uint64_t DB_LOOKUP = -1;
+    static uint64_t ERRORS = 0;
     // Right now, only LEDGER_ENTRY are recorded in the SQL database
     if (gkey.type() != InternalLedgerEntryType::LEDGER_ENTRY)
     {
@@ -3409,9 +3458,68 @@ LedgerTxnRoot::Impl::getNewestVersion(InternalLedgerKey const& gkey) const
         ++mPrefetchMisses;
     }
 
+    auto dbLookup = [&]() {
+        try
+        {
+            switch (key.type())
+            {
+            case ACCOUNT:
+                return loadAccount(key);
+            case DATA:
+                return loadData(key);
+            case OFFER:
+                return loadOffer(key);
+            case TRUSTLINE:
+                return loadTrustLine(key);
+            case CLAIMABLE_BALANCE:
+                return loadClaimableBalance(key);
+            case LIQUIDITY_POOL:
+                return loadLiquidityPool(key);
+            default:
+                throw std::runtime_error("Unknown key type");
+            }
+        }
+        catch (NonSociRelatedException&)
+        {
+            throw;
+        }
+        catch (std::exception& e)
+        {
+            printErrorAndAbort(
+                "fatal error when loading ledger entry from LedgerTxnRoot: ",
+                e.what());
+        }
+        catch (...)
+        {
+            printErrorAndAbort(
+                "unknown fatal error when loading ledger entry from "
+                "LedgerTxnRoot");
+        }
+    };
+
+    // if (!mApp.getConfig().MODE_ENABLES_BUCKETLIST || !mChild ||
+    //     !mChild->getHotState())
+    // {
+    //     auto entry = dbLookup();
+    //     if (entry)
+    //     {
+    //         return std::make_shared<InternalLedgerEntry const>(*entry);
+    //     }
+    //     else
+    //     {
+    //         return nullptr;
+    //     }
+    // }
+
     std::shared_ptr<LedgerEntry const> entry;
-    std::shared_ptr<LedgerEntry const> entryDB;
+
+    DB_LOOKUP++;
+    auto start = std::chrono::steady_clock::now();
     auto e = mBucketList.getLedgerEntry(key);
+    auto end = std::chrono::steady_clock::now();
+    CLOG_INFO(
+        Bucket, "BucketList::getLedgerEntry BL lookup: {} took {}", DB_LOOKUP,
+        std::chrono::duration_cast<std::chrono::microseconds>(end - start));
     if (e.has_value())
     {
         releaseAssertOrThrow(LedgerEntryKey(e.value()) == key);
@@ -3419,63 +3527,38 @@ LedgerTxnRoot::Impl::getNewestVersion(InternalLedgerKey const& gkey) const
     }
 
     // Fallback from BL to DB for now. Eventually remove this.
-    try
-    {
-        switch (key.type())
-        {
-        case ACCOUNT:
-            entryDB = loadAccount(key);
-            break;
-        case DATA:
-            entryDB = loadData(key);
-            break;
-        case OFFER:
-            entryDB = loadOffer(key);
-            break;
-        case TRUSTLINE:
-            entryDB = loadTrustLine(key);
-            break;
-        case CLAIMABLE_BALANCE:
-            entryDB = loadClaimableBalance(key);
-            break;
-        case LIQUIDITY_POOL:
-            entryDB = loadLiquidityPool(key);
-            break;
-        default:
-            throw std::runtime_error("Unknown key type");
-        }
-    }
-    catch (NonSociRelatedException&)
-    {
-        throw;
-    }
-    catch (std::exception& e)
-    {
-        printErrorAndAbort(
-            "fatal error when loading ledger entry from LedgerTxnRoot: ",
-            e.what());
-    }
-    catch (...)
-    {
-        printErrorAndAbort("unknown fatal error when loading ledger entry from "
-                           "LedgerTxnRoot");
-    }
-
+    start = std::chrono::steady_clock::now();
+    auto entryDB = dbLookup();
+    end = std::chrono::steady_clock::now();
+    CLOG_INFO(
+        Bucket, "BucketList::getLedgerEntry DB lookup: {} took {}", DB_LOOKUP,
+        std::chrono::duration_cast<std::chrono::microseconds>(end - start));
+    CLOG_INFO(Bucket, "Errors: {}", ERRORS);
     putInEntryCache(key, entryDB, LoadType::IMMEDIATE);
     if (entry)
     {
-        releaseAssert(*entry == *entryDB);
-        return std::make_shared<InternalLedgerEntry const>(*entry);
+        if (*entry != *entryDB)
+        {
+            CLOG_DEBUG(Bucket, "ERROR: Mismatch, BL: {} DB: {}",
+                       xdr::xdr_to_string(*entry),
+                       xdr::xdr_to_string(*entryDB));
+            ++ERRORS;
+        }
+
+        // releaseAssert(*entry == *entryDB);
+        return std::make_shared<InternalLedgerEntry const>(*entryDB);
     }
     else
     {
         // This assert should be here, but currently breaks catchup from
         // historical archive. Until that's fixed, default to returning DB entry
-        // releaseAssert(!entryDB);
+        //        releaseAssert(!entryDB);
         if (entryDB)
         {
-            CLOG_INFO(Bucket, "ERROR: Entry was NULL, DB was not: {}",
-                      xdr_to_string(entryDB, "live"));
+            ++ERRORS;
+            CLOG_DEBUG(Bucket, "ERROR: Mismatch, BL: {} DB: {}",
+                       xdr::xdr_to_string(*entry),
+                       xdr::xdr_to_string(*entryDB));
             return std::make_shared<InternalLedgerEntry const>(*entryDB);
         }
         return nullptr;

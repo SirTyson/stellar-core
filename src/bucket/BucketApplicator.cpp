@@ -92,6 +92,7 @@ BucketApplicator::advance(BucketApplicator::Counters& counters)
         ltx->prepareNewObjects(LEDGER_ENTRY_BATCH_COMMIT_SIZE);
     }
 
+    // ltx->noHotState();
     for (; mBucketIter; ++mBucketIter)
     {
         BucketEntry const& e = *mBucketIter;
