@@ -2679,8 +2679,8 @@ LedgerTxnRoot::Impl::commitChild(EntryIterator iter,
 
         // if (mChild->getHotState() &&
         // mApp.getConfig().MODE_ENABLES_BUCKETLIST)
-        CLOG_INFO(Bucket, "Child ledger: {} list ledger: {}",
-                  childHeader->ledgerSeq, mBucketList.mHotLedger);
+        // CLOG_INFO(Bucket, "Child ledger: {} list ledger: {}",
+        //           childHeader->ledgerSeq, mBucketList.mHotLedger);
 
         // In some cases (like catchup) elements are written to the DB, but
         // mBucketManager.addBatch() is not called. In those cases, we need the
@@ -3544,7 +3544,7 @@ LedgerTxnRoot::Impl::getNewestVersion(InternalLedgerKey const& gkey) const
         Bucket, "BucketList::getLedgerEntry lookup: {} DB took {}", LOOKUP_ID,
         std::chrono::duration_cast<std::chrono::microseconds>(end - start));
 
-    CLOG_DEBUG(Bucket, "Errors: {}", ERRORS);
+    CLOG_INFO(Bucket, "Errors: {}", ERRORS);
 
     putInEntryCache(key, entryDB, LoadType::IMMEDIATE);
     if (entry)

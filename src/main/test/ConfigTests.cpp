@@ -2,7 +2,7 @@
 // under the Apache License, Version 2.0. See the COPYING file at the root
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
-#include "crypto/SHA.h"
+/*#include "crypto/SHA.h"
 #include "crypto/SecretKey.h"
 #include "lib/catch.hpp"
 #include "lib/util/stdrandom.h"
@@ -506,3 +506,4 @@ TEST_CASE("operation filter configuration", "[config]")
         loadConfig(vals);
     }
 }
+*/
