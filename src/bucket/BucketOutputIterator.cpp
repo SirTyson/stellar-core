@@ -31,6 +31,8 @@ randomBucketName(std::string const& tmpDir)
 }
 }
 
+// There's probably a nice C++ way to do this with class inheritance or
+// templates or something. In the mean time though, here's this.
 bool
 BucketOutputIterator::cmp(BucketEntry const& a, BucketEntry const& b) const
 {

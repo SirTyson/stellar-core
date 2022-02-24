@@ -946,6 +946,10 @@ BucketManagerImpl::assumeState(HistoryArchiveState const& has,
         sortFile(curr, i);
         sortFile(snap, i);
 
+        // Dn't index lazily, performance is REALLY bad
+        curr->getIndex();
+        snap->getIndex();
+
         mBucketList->getLevel(i).setCurr(curr);
         mBucketList->getLevel(i).setSnap(snap);
         mBucketList->getLevel(i).setNext(has.currentBuckets.at(i).next);
@@ -1049,6 +1053,9 @@ std::shared_ptr<Bucket>
 BucketManagerImpl::mergeBuckets(HistoryArchiveState const& has)
 {
     std::map<LedgerKey, LedgerEntry> ledgerMap = loadCompleteLedgerState(has);
+
+    // Sort in new order simultaneously in memory
+    // std::set is pretty bad, change this later
     std::set<BucketEntry, BucketEntryIdCmpV2> sortedV2Ledger;
     BucketMetadata meta;
     MergeCounters mc;

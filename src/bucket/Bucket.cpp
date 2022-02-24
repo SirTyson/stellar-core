@@ -188,6 +188,10 @@ getBucketEntryShortLedgerKey(BucketEntry const& be, uint32_t ledgerVersion)
     return std::nullopt;
 }
 
+// Comparison function for ShortLedgerKeys. This should be replaced with a
+// a compare funciton with the header:
+//      bool operator()(uint64_t a, uint64_t) const;
+// For now, this is more convienient for debug asserts.
 bool
 ShortLedgerKey::operator<(ShortLedgerKey const& b) const
 {
@@ -205,10 +209,11 @@ ShortLedgerKey::operator<(ShortLedgerKey const& b) const
         if (aty > bty)
             return false;
 
-        // Else if types are the same order strictly
+        // Else if types are the same type order strictly
         return this->key < b.key;
     }
 
+    // Get most significant 39 bits of accountID associated with entry
     uint64_t aID = this->key & ACCOUNT_ID_MASK;
     uint64_t bID = b.key & ACCOUNT_ID_MASK;
 
@@ -223,11 +228,16 @@ ShortLedgerKey::operator<(ShortLedgerKey const& b) const
     if (aty > bty)
         return false;
 
-    // If accountID's are the same and entrie's are same type, order by
-    // entire key
+    // If accountID's are the same and entries are same type, order by
+    // entire key value
     return this->key < b.key;
 }
 
+// Index currently maps every entry in the bucket to the associated short ledger
+// key. Index stored as two vectors, one stores ShortLedgerKeys sorted in the
+// same scheme as LedgerEntryCmpV2, the other stores offsets into the bucket
+// file for a given short key. If this is too large to store in memory, may need
+// to index a range of bucket entries instead of each one individually.
 BucketIndex::BucketIndex(std::shared_ptr<Bucket const> b)
 {
     if (b->getV2Filename().empty())
@@ -248,7 +258,11 @@ BucketIndex::BucketIndex(std::shared_ptr<Bucket const> b)
         {
             CLOG_TRACE(Bucket, "Indexed {} at {} in {}", bek.value().key, pos,
                        std::filesystem::path(b->getV2Filename()).filename());
+
             // Assert ShortLedgerKeys and Buckets are sorted correctly
+            // These asserts are passing in my tests, commenting out for now
+            // for more accurate perf stats
+
             // for (size_t i = 0; i < bes.size(); ++i)
             // {
             //     releaseAssert(BucketEntryIdCmpV2{}(bes[i], be));
@@ -266,6 +280,9 @@ BucketIndex::BucketIndex(std::shared_ptr<Bucket const> b)
               std::filesystem::path(b->getV2Filename()).filename());
 }
 
+// Lookup currently does a binary search of the index using LedgerEntryCmpV2.
+// This could be further optimised later with bloom filters or something
+// similar.
 std::optional<off_t>
 BucketIndex::lookup(LedgerKey const& k) const
 {
@@ -288,34 +305,28 @@ BucketIndex::lookup(LedgerKey const& k) const
 }
 
 Bucket::Bucket(std::string const& filename, Hash const& hash,
-               std::string const& sortedV2Filename)
-    : mFilename(filename), mV2Filename(sortedV2Filename), mHash(hash)
+               std::string const& v2Filename)
+    : mFilename(filename), mV2Filename(v2Filename), mHash(hash)
 {
     releaseAssert(filename.empty() || fs::exists(filename));
-    releaseAssert(sortedV2Filename.empty() || fs::exists(sortedV2Filename));
+    releaseAssert(v2Filename.empty() || fs::exists(v2Filename));
     if (!filename.empty())
     {
-        CLOG_INFO(Bucket, "Bucket::Bucket() created, file exists : {}",
-                  filename);
-        mSize = fs::size(filename);
-        if (!fs::exists(mSortedV2Filename))
+        if (v2Filename.empty())
         {
-            CLOG_INFO(
-                Bucket,
-                "Bucket::Bucket() V2 sorted file does not exist, creating",
-                mSortedV2Filename);
-            releaseAssert(false);
+            CLOG_TRACE(Bucket,
+                       "Bucket::Bucket() created, file exists : {}, V2 file "
+                       "does not exist",
+                       filename);
         }
         else
         {
-            CLOG_INFO(Bucket, "Bucket::Bucket() V2 sorted file exists : {}",
-                      mSortedV2Filename);
-            CLOG_INFO(Bucket, "mSize: {}", mSize);
-            CLOG_INFO(Bucket, "Sorted Size: {}", fs::size(mSortedV2Filename));
-            // Account for additional space in header
-            // Remove, not a good assert. Just for my own personal dev
-            // releaseAssert(mSize == fs::size(mSortedV2Filename) - 8);
+            CLOG_TRACE(Bucket,
+                       "Bucket::Bucket() created, file exists : {}, V2 file "
+                       "exists: {}",
+                       filename, v2Filename);
         }
+        mSize = fs::size(filename);
     }
 }
 
@@ -323,6 +334,9 @@ Bucket::Bucket()
 {
 }
 
+// Currently the index is created lazily. THIS IS A REALLY BAD IDEA. The first
+// lookup on startup is measured in minutes instead of microseconds due to lazy
+// indexing. Indexing must happen at startime.
 BucketIndex const&
 Bucket::getIndex()
 {
@@ -332,8 +346,10 @@ Bucket::getIndex()
         {
             CLOG_INFO(Bucket,
                       "WARN Bucket::getIndex() bucket with empty filename.");
+
             // Assert that this bucket is not backed by any file to make sure
-            // that V2 is not missing if V1 sorted file is present
+            // that V2 is not missing if V1 file is present
+            // Either both should be missing or both should be present.
             releaseAssert(mFilename.empty());
         }
         else
@@ -377,6 +393,13 @@ Bucket::getBucketEntry(LedgerKey const& k)
                    std::filesystem::path(mV2Filename).filename(), pos.value(),
                    sk.key);
         stream.seek(pos.value());
+
+        // It is possible that there will be ShortLedgerKey collisions even if
+        // two entries have different LedgerKeys. The way the index is ordered
+        // and searched, the position of the first instance of a given
+        // ShortLedgerKey is returned. This means we need to iterate through
+        // all the ShortLedgerKeys that are the same until we find the LedgerKey
+        // we want.
         while (stream && stream.readOne(be) &&
                getBucketEntryShortLedgerKey(
                    be, getBucketVersion(shared_from_this())) == sk)
@@ -547,6 +570,9 @@ Bucket::fresh(BucketManager& bucketManager, uint32_t protocolVersion,
     metaV2.ext.v(1);
     metaV2.ext.v1().flags = BucketMetadataFlags::BUCKET_METADATA_NEW_CMP_FLAG;
 
+    // Re-sort the bucket in memory. This function is only called to create new
+    // buckets at level 0, so bucket should be small enough that an in memory
+    // sort using a vector should be fine.
     BucketEntryIdCmpV2 cmp;
     std::sort(entries.begin(), entries.end(), cmp);
     BucketOutputIterator outV2(bucketManager.getTmpDir(), true, metaV2, mc, ctx,
@@ -1085,7 +1111,7 @@ Bucket::merge(BucketManager& bucketManager, uint32_t maxProtocolVersion,
 
     MergeKey mk{keepDeadEntries, oldBucket, newBucket, shadows};
 
-    // Clear and invalidate old indexes
+    // Invalidate old indexes (probably not actually required)
     oldBucket->mIndex = nullptr;
     newBucket->mIndex = nullptr;
     return out.getBucket(bucketManager, &mk, &outV2);

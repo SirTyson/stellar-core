@@ -362,9 +362,12 @@ class BucketList
     // first.
     BucketListHotState mHotState;
 
+    // Used to keep track how many entries have been "cleaned" from mHotState,
+    // debug only
     uint64_t NUM_ERASED{0};
 
   public:
+    // Not working, ignore
     uint32_t mHotLedger{0};
 
     // Number of bucket levels in the bucketlist. Every bucketlist in the system

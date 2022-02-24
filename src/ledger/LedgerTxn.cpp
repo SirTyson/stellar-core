@@ -2266,6 +2266,7 @@ LedgerTxn::Impl::hasSponsorshipEntry() const
     return false;
 }
 
+// Used in mHotState prototype, ignore
 // void
 // LedgerTxn::noHotState()
 // {
@@ -2528,6 +2529,8 @@ BulkLedgerEntryChangeAccumulator::accumulate(EntryIterator const& iter)
         return;
     }
 
+    // In addition to SQL DB related changes, also accumulate changes in a
+    // format digestable by BucketList
     if (entryPtr.get())
     {
         mState[key.ledgerKey()] = iter.entry().ledgerEntry();
@@ -3436,8 +3439,12 @@ LedgerTxnRoot::Impl::getNewestVersion(InternalLedgerKey const& gkey) const
 {
     ZoneScoped;
 
-    static uint64_t DB_LOOKUP = -1;
+    // UID for each lookup
+    static uint64_t LOOKUP_ID = -1;
+
+    // Number of mismatches between DB and BL
     static uint64_t ERRORS = 0;
+
     // Right now, only LEDGER_ENTRY are recorded in the SQL database
     if (gkey.type() != InternalLedgerEntryType::LEDGER_ENTRY)
     {
@@ -3497,6 +3504,8 @@ LedgerTxnRoot::Impl::getNewestVersion(InternalLedgerKey const& gkey) const
         }
     };
 
+    // mHotState prototype, ignore
+
     // if (!mApp.getConfig().MODE_ENABLES_BUCKETLIST || !mChild ||
     //     !mChild->getHotState())
     // {
@@ -3511,15 +3520,16 @@ LedgerTxnRoot::Impl::getNewestVersion(InternalLedgerKey const& gkey) const
     //     }
     // }
 
-    std::shared_ptr<LedgerEntry const> entry;
+    LOOKUP_ID++;
 
-    DB_LOOKUP++;
     auto start = std::chrono::steady_clock::now();
     auto e = mBucketList.getLedgerEntry(key);
     auto end = std::chrono::steady_clock::now();
     CLOG_INFO(
-        Bucket, "BucketList::getLedgerEntry BL lookup: {} took {}", DB_LOOKUP,
+        Bucket, "BucketList::getLedgerEntry lookup: {} BL took {}", LOOKUP_ID,
         std::chrono::duration_cast<std::chrono::microseconds>(end - start));
+
+    std::shared_ptr<LedgerEntry const> entry = nullptr;
     if (e.has_value())
     {
         releaseAssertOrThrow(LedgerEntryKey(e.value()) == key);
@@ -3531,17 +3541,20 @@ LedgerTxnRoot::Impl::getNewestVersion(InternalLedgerKey const& gkey) const
     auto entryDB = dbLookup();
     end = std::chrono::steady_clock::now();
     CLOG_INFO(
-        Bucket, "BucketList::getLedgerEntry DB lookup: {} took {}", DB_LOOKUP,
+        Bucket, "BucketList::getLedgerEntry lookup: {} DB took {}", LOOKUP_ID,
         std::chrono::duration_cast<std::chrono::microseconds>(end - start));
-    CLOG_INFO(Bucket, "Errors: {}", ERRORS);
+
+    CLOG_DEBUG(Bucket, "Errors: {}", ERRORS);
+
     putInEntryCache(key, entryDB, LoadType::IMMEDIATE);
     if (entry)
     {
         if (*entry != *entryDB)
         {
-            CLOG_DEBUG(Bucket, "ERROR: Mismatch, BL: {} DB: {}",
-                       xdr::xdr_to_string(*entry),
-                       xdr::xdr_to_string(*entryDB));
+            // CLOG_DEBUG(Bucket, "ERROR: Mismatch, BL: {} DB: {}",
+            //            xdr::xdr_to_string(*entry),
+            //            xdr::xdr_to_string(*entryDB));
+            CLOG_INFO(Bucket, "ERROR: Invalid BL lookup: {}", LOOKUP_ID);
             ++ERRORS;
         }
 
@@ -3556,9 +3569,7 @@ LedgerTxnRoot::Impl::getNewestVersion(InternalLedgerKey const& gkey) const
         if (entryDB)
         {
             ++ERRORS;
-            CLOG_DEBUG(Bucket, "ERROR: Mismatch, BL: {} DB: {}",
-                       xdr::xdr_to_string(*entry),
-                       xdr::xdr_to_string(*entryDB));
+            CLOG_INFO(Bucket, "ERROR: Invalid BL lookup: {}", LOOKUP_ID);
             return std::make_shared<InternalLedgerEntry const>(*entryDB);
         }
         return nullptr;

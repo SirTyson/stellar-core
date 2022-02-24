@@ -33,8 +33,12 @@ class BucketOutputIterator
     BucketMetadata mMeta;
     bool mPutMeta{false};
     MergeCounters& mMergeCounters;
+
+    // True if file is sorted using BucketEntryIdCmpV2, based on mMeta
     bool mV2Sorted;
 
+    // Either uses BucketEntryIdCmp or BucketEntryIdCmpV2 depending on flags
+    // set in mMeta
     bool cmp(BucketEntry const& a, BucketEntry const& b) const;
 
   public:
@@ -51,6 +55,9 @@ class BucketOutputIterator
 
     void put(BucketEntry const& e);
 
+    // Publishes constructed bucket to BucketManager and returns constructed
+    // bucket. If v2FileIter is given, the file associated with v2FileIter will
+    // be included in resulting bucket as v2SortedFile.
     std::shared_ptr<Bucket>
     getBucket(BucketManager& bucketManager, MergeKey* mergeKey = nullptr,
               BucketOutputIterator* v2FileIter = nullptr);
@@ -60,6 +67,7 @@ class BucketOutputIterator
     // Returns true if no objects have been written, false otherwise
     bool empty() const;
 
+    // Flushes changes to file and closes file.
     void close();
 };
 }

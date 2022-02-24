@@ -97,6 +97,8 @@ class XDRInputFileStream
     {
         ZoneScoped;
         char szBuf[4];
+        // Note: tellg() may be expnsive. I think it just checks an in memory FD
+        // struct, but need to double check that no IO is happening
         if (mIn.tellg() == mSize || !mIn.read(szBuf, 4))
         {
             return false;

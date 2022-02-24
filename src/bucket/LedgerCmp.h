@@ -106,7 +106,7 @@ struct LedgerEntryCmp
  * doing operator< on them, but that would be comparatively inefficient.
  *
  * Entries that are accounts or account subentries are ordered first, followed
- * by non-account related entries. This means that account subentries that have
+ * by non-account related entries. Account subentries that have
  * the same accountID are grouped together. If two entries have the same
  * accountID, they are then sorted by LedgerEntryType and then by the associated
  * key/key pair for the given type.

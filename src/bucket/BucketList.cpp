@@ -373,6 +373,8 @@ BucketList::getHash() const
 std::optional<LedgerEntry>
 BucketList::getLedgerEntry(LedgerKey const& k) const
 {
+    // mHotState related things in progress, ignore. mHotState will always be
+    // empty.
     CLOG_DEBUG(Bucket, "mHotStateSize: {}", mHotState.size());
     auto hot = mHotState.find(k);
     if (hot != mHotState.end())
@@ -499,6 +501,20 @@ BucketList::getMaxMergeLevel(uint32_t currLedger) const
     return i;
 }
 
+// Note: This does not work
+// Sometimes, like when performing catchup, the DB is updated and read from
+// before the changes are commited to the actual BucketList. mHotState is a map
+// that acts like a "dirty bucket", where the existing LedgerTxn interface can
+// add something to the bucket list without triggering merges, publishing
+// history, or having any other side effects. Why this doesn't currently work:
+// During catchup on startup, the entire ledger state is loaded into the DB
+// using a singular LedgerTxn. So far, I have tried several methods of
+// "cleaning" the dirty bucket, but the cleanup only happens once the LedgerTxn
+// is commited. In the case of catchup, this means mHotState grows to the size
+// of the entire ledger state before being cleaned. My dev machine has super
+// fast lookups under this strategy, completely blowing the SQL DB out of the
+// water! It also stores a 30 GB std::map in RAM, but who doesn't have 30 GB of
+// extra RAM thees days ;)
 void
 BucketList::updateHotState(BucketListHotState const& state)
 {
@@ -642,7 +658,12 @@ BucketList::addBatch(Application& app, uint32_t currLedger,
                                      app.getClock().getIOContext(), doFsync),
                        shadows, countMergeEvents);
     mLevels[0].commit();
+
+    // mHotLedger is the ledger number for the ledger whose entries are in
+    // mHotState and not yet in the proper bucket list
+    // This also doesn't work
     mHotLedger = currLedger;
+
     // We almost always want to try to resolve completed merges to single
     // buckets, as it makes restarts less fragile: fewer saved/restored shadows,
     // fewer buckets for the user to accidentally delete from their buckets

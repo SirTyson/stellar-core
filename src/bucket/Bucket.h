@@ -131,7 +131,7 @@ class Bucket : public std::enable_shared_from_this<Bucket>,
     // exists, but does not check that the hash is the bucket's hash. Caller
     // needs to ensure that.
     Bucket(std::string const& filename, Hash const& hash,
-           std::string const& sortedV2Filename = {});
+           std::string const& v2Filename = {});
 
     Hash const& getHash() const;
     std::string const& getFilename() const;
