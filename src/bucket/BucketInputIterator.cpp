@@ -87,8 +87,9 @@ BucketInputIterator::getMetadata() const
     return mMetadata;
 }
 
-BucketInputIterator::BucketInputIterator(std::shared_ptr<Bucket const> bucket)
-    : mBucket(bucket), mEntryPtr(nullptr), mSeenMetadata(false)
+BucketInputIterator::BucketInputIterator(std::shared_ptr<Bucket const> bucket,
+                                         asio::io_context& ctx)
+    : mBucket(bucket), mEntryPtr(nullptr), mIn(ctx), mSeenMetadata(false)
 {
     // In absence of metadata, we treat every bucket as though it is from ledger
     // protocol 0, which is the protocol of the genesis ledger. At very least

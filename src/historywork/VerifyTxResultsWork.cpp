@@ -22,6 +22,8 @@ VerifyTxResultsWork::VerifyTxResultsWork(Application& app,
                 RETRY_NEVER)
     , mDownloadDir(downloadDir)
     , mCheckpoint(checkpoint)
+    , mHdrIn(app.getClock().getIOContext())
+    , mResIn(app.getClock().getIOContext())
 {
 }
 

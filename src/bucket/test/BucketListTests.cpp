@@ -65,7 +65,7 @@ highBoundInclusive(uint32_t level, uint32_t ledger)
 
 void
 checkBucketSizeAndBounds(BucketList& bl, uint32_t ledgerSeq, uint32_t level,
-                         bool isCurr)
+                         bool isCurr, asio::io_context& ctx)
 {
     std::shared_ptr<Bucket> bucket;
     uint32_t sizeOfBucket = 0;
@@ -86,7 +86,7 @@ checkBucketSizeAndBounds(BucketList& bl, uint32_t ledgerSeq, uint32_t level,
     std::set<uint32_t> ledgers;
     uint32_t lbound = std::numeric_limits<uint32_t>::max();
     uint32_t ubound = 0;
-    for (BucketInputIterator iter(bucket); iter; ++iter)
+    for (BucketInputIterator iter(bucket, ctx); iter; ++iter)
     {
         auto lastModified = (*iter).liveEntry().lastModifiedLedgerSeq;
         ledgers.insert(lastModified);
@@ -149,8 +149,10 @@ TEST_CASE_VERSIONS("bucket list", "[bucket][bucketlist]")
                 for (uint32_t j = 0; j < BucketList::kNumLevels; ++j)
                 {
                     auto const& lev = bl.getLevel(j);
-                    auto currSz = countEntries(lev.getCurr());
-                    auto snapSz = countEntries(lev.getSnap());
+                    auto currSz =
+                        countEntries(lev.getCurr(), clock.getIOContext());
+                    auto snapSz =
+                        countEntries(lev.getSnap(), clock.getIOContext());
                     CHECK(currSz <= BucketList::levelHalf(j) * 100);
                     CHECK(snapSz <= BucketList::levelHalf(j) * 100);
                 }
@@ -215,11 +217,14 @@ TEST_CASE_VERSIONS("bucket list shadowing pre/post proto 12",
                     auto curr = lev.getCurr();
                     auto snap = lev.getSnap();
                     bool hasAlice =
-                        (curr->containsBucketIdentity(BucketEntryAlice) ||
-                         snap->containsBucketIdentity(BucketEntryAlice));
-                    bool hasBob =
-                        (curr->containsBucketIdentity(BucketEntryBob) ||
-                         snap->containsBucketIdentity(BucketEntryBob));
+                        (curr->containsBucketIdentity(BucketEntryAlice,
+                                                      clock.getIOContext()) ||
+                         snap->containsBucketIdentity(BucketEntryAlice,
+                                                      clock.getIOContext()));
+                    bool hasBob = (curr->containsBucketIdentity(
+                                       BucketEntryBob, clock.getIOContext()) ||
+                                   snap->containsBucketIdentity(
+                                       BucketEntryBob, clock.getIOContext()));
                     CHECK(hasAlice);
                     CHECK(hasBob);
                 }
@@ -232,11 +237,14 @@ TEST_CASE_VERSIONS("bucket list shadowing pre/post proto 12",
                     auto curr = lev.getCurr();
                     auto snap = lev.getSnap();
                     bool hasAlice =
-                        (curr->containsBucketIdentity(BucketEntryAlice) ||
-                         snap->containsBucketIdentity(BucketEntryAlice));
-                    bool hasBob =
-                        (curr->containsBucketIdentity(BucketEntryBob) ||
-                         snap->containsBucketIdentity(BucketEntryBob));
+                        (curr->containsBucketIdentity(BucketEntryAlice,
+                                                      clock.getIOContext()) ||
+                         snap->containsBucketIdentity(BucketEntryAlice,
+                                                      clock.getIOContext()));
+                    bool hasBob = (curr->containsBucketIdentity(
+                                       BucketEntryBob, clock.getIOContext()) ||
+                                   snap->containsBucketIdentity(
+                                       BucketEntryBob, clock.getIOContext()));
                     if (protocolVersionIsBefore(
                             app->getConfig().LEDGER_PROTOCOL_VERSION,
                             Bucket::FIRST_PROTOCOL_SHADOWS_REMOVED) ||
@@ -316,9 +324,12 @@ TEST_CASE_VERSIONS("bucket tombstones expire at bottom level",
             }
         }
 
-        EntryCounts e0(bl.getLevel(BucketList::kNumLevels - 3).getCurr());
-        EntryCounts e1(bl.getLevel(BucketList::kNumLevels - 2).getCurr());
-        EntryCounts e2(bl.getLevel(BucketList::kNumLevels - 1).getCurr());
+        EntryCounts e0(bl.getLevel(BucketList::kNumLevels - 3).getCurr(),
+                       clock.getIOContext());
+        EntryCounts e1(bl.getLevel(BucketList::kNumLevels - 2).getCurr(),
+                       clock.getIOContext());
+        EntryCounts e2(bl.getLevel(BucketList::kNumLevels - 1).getCurr(),
+                       clock.getIOContext());
         REQUIRE(e0.nDead != 0);
         REQUIRE(e1.nDead != 0);
         REQUIRE(e2.nDead == 0);
@@ -383,8 +394,8 @@ TEST_CASE_VERSIONS("bucket tombstones mutually-annihilate init entries",
         for (uint32_t k = 0u; k < BucketList::kNumLevels; ++k)
         {
             auto const& lev = bl.getLevel(k);
-            auto currSz = countEntries(lev.getCurr());
-            auto snapSz = countEntries(lev.getSnap());
+            auto currSz = countEntries(lev.getCurr(), clock.getIOContext());
+            auto snapSz = countEntries(lev.getSnap(), clock.getIOContext());
             if (protocolVersionStartsFrom(
                     cfg.LEDGER_PROTOCOL_VERSION,
                     Bucket::FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY))
@@ -436,8 +447,10 @@ TEST_CASE_VERSIONS("single entry bubbling up",
                     uint32_t hb = highBoundInclusive(j, i);
 
                     auto const& lev = bl.getLevel(j);
-                    auto currSz = countEntries(lev.getCurr());
-                    auto snapSz = countEntries(lev.getSnap());
+                    auto currSz =
+                        countEntries(lev.getCurr(), clock.getIOContext());
+                    auto snapSz =
+                        countEntries(lev.getSnap(), clock.getIOContext());
                     CLOG_DEBUG(Bucket, "ledger {}, level {} curr={} snap={}", i,
                                j, currSz, snapSz);
 
@@ -587,8 +600,10 @@ TEST_CASE("BucketList check bucket sizes", "[bucket][bucketlist][count]")
         }
         for (uint32_t level = 0; level < BucketList::kNumLevels; ++level)
         {
-            checkBucketSizeAndBounds(bl, ledgerSeq, level, true);
-            checkBucketSizeAndBounds(bl, ledgerSeq, level, false);
+            checkBucketSizeAndBounds(bl, ledgerSeq, level, true,
+                                     app->getClock().getIOContext());
+            checkBucketSizeAndBounds(bl, ledgerSeq, level, false,
+                                     app->getClock().getIOContext());
         }
     }
 }

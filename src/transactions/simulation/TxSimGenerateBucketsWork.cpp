@@ -182,7 +182,8 @@ TxSimGenerateBucketsWork::setFutureBuckets()
             mGeneratedApplyState.currentBuckets[i - 1].snap;
         auto const& prevSnapBucket = mBuckets[prevSnapHash];
 
-        auto snapVersion = Bucket::getBucketVersion(prevSnapBucket);
+        auto snapVersion = Bucket::getBucketVersion(
+            prevSnapBucket, mApp.getClock().getIOContext());
         if (protocolVersionIsBefore(snapVersion,
                                     Bucket::FIRST_PROTOCOL_SHADOWS_REMOVED))
         {
@@ -220,7 +221,7 @@ TxSimGenerateBucketsWork::startBucketGeneration(
 {
     std::vector<LedgerEntry> initEntries, liveEntries;
     std::vector<LedgerKey> deadEntries;
-    BucketInputIterator iter(oldBucket);
+    BucketInputIterator iter(oldBucket, mApp.getClock().getIOContext());
     uint32_t ledgerVersion = iter.getMetadata().ledgerVersion;
 
     // Deconstruct the existing bucket to use for simulated bucket generation

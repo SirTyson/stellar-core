@@ -144,7 +144,7 @@ VerifyLedgerChainWork::verifyHistoryOfSingleCheckpoint()
 
     FileTransferInfo ft(mDownloadDir, HISTORY_FILE_TYPE_LEDGER,
                         mCurrCheckpoint);
-    XDRInputFileStream hdrIn;
+    XDRInputFileStream hdrIn(mApp.getClock().getIOContext());
     hdrIn.open(ft.localPath_nogz());
 
     bool beginCheckpoint = true;

@@ -657,8 +657,9 @@ TxSimApplyTransactionsWork::onReset()
     }
 
     // Prepare the HistoryArchiveStream
-    mStream = std::make_unique<HistoryArchiveStream>(mDownloadDir, mRange,
-                                                     mApp.getHistoryManager());
+    mStream = std::make_unique<HistoryArchiveStream>(
+        mDownloadDir, mRange, mApp.getHistoryManager(),
+        mApp.getClock().getIOContext());
     mApplyLedgerWork.reset();
     mResults.clear();
 }

@@ -48,8 +48,9 @@ FutureBucket::FutureBucket(Application& app,
     releaseAssert(snap);
     mInputCurrBucketHash = binToHex(curr->getHash());
     mInputSnapBucketHash = binToHex(snap->getHash());
-    if (protocolVersionStartsFrom(Bucket::getBucketVersion(snap),
-                                  Bucket::FIRST_PROTOCOL_SHADOWS_REMOVED))
+    if (protocolVersionStartsFrom(
+            Bucket::getBucketVersion(snap, app.getClock().getIOContext()),
+            Bucket::FIRST_PROTOCOL_SHADOWS_REMOVED))
     {
         if (!mInputShadowBuckets.empty())
         {

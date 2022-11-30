@@ -43,9 +43,9 @@ for_versions_with_differing_bucket_logic(
 }
 
 size_t
-countEntries(std::shared_ptr<Bucket> bucket)
+countEntries(std::shared_ptr<Bucket> bucket, asio::io_context& ctx)
 {
-    EntryCounts e(bucket);
+    EntryCounts e(bucket, ctx);
     return e.sum();
 }
 
@@ -71,9 +71,9 @@ closeLedger(Application& app)
     return closeLedger(app, std::nullopt);
 }
 
-EntryCounts::EntryCounts(std::shared_ptr<Bucket> bucket)
+EntryCounts::EntryCounts(std::shared_ptr<Bucket> bucket, asio::io_context& ctx)
 {
-    BucketInputIterator iter(bucket);
+    BucketInputIterator iter(bucket, ctx);
     if (iter.seenMetadata())
     {
         ++nMeta;

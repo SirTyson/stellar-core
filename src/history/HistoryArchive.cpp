@@ -312,7 +312,8 @@ HistoryArchiveState::containsValidBuckets(Application& app) const
         int32_t version = 0;
         if (!bucket->isEmpty())
         {
-            version = Bucket::getBucketVersion(bucket);
+            version =
+                Bucket::getBucketVersion(bucket, app.getClock().getIOContext());
             if (!nonEmptySeen)
             {
                 nonEmptySeen = true;
@@ -392,8 +393,9 @@ HistoryArchiveState::prepareForPublish(Application& app)
         auto snap =
             app.getBucketManager().getBucketByHash(hexToBin256(prev.snap));
         if (!level.next.isClear() &&
-            protocolVersionStartsFrom(Bucket::getBucketVersion(snap),
-                                      Bucket::FIRST_PROTOCOL_SHADOWS_REMOVED))
+            protocolVersionStartsFrom(
+                Bucket::getBucketVersion(snap, app.getClock().getIOContext()),
+                Bucket::FIRST_PROTOCOL_SHADOWS_REMOVED))
         {
             level.next.clear();
         }

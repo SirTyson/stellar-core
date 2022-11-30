@@ -12,8 +12,14 @@ namespace stellar
 
 HistoryArchiveStream::HistoryArchiveStream(TmpDir const& downloadDir,
                                            LedgerRange const& range,
-                                           HistoryManager const& hm)
-    : mDownloadDir(downloadDir), mRange(range), mHistoryManager(hm)
+                                           HistoryManager const& hm,
+                                           asio::io_context& ctx)
+    : mDownloadDir(downloadDir)
+    , mRange(range)
+    , mHeaderStream(ctx)
+    , mTransactionStream(ctx)
+    , mResultStream(ctx)
+    , mHistoryManager(hm)
 {
     // If we're trying to start reading from some place that's not a checkpoint
     // boundary, we need to scan the stream forward from the checkpoint boundary

@@ -896,7 +896,9 @@ class StopAndRestartBucketMergesTest
             BucketLevel const& level = bl.getLevel(i - 1);
             for (auto bucket : {level.getSnap(), level.getCurr()})
             {
-                for (BucketInputIterator bi(bucket); bi; ++bi)
+                for (BucketInputIterator bi(bucket,
+                                            app.getClock().getIOContext());
+                     bi; ++bi)
                 {
                     BucketEntry const& e = *bi;
                     if (e.type() == LIVEENTRY || e.type() == INITENTRY)

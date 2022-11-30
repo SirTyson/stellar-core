@@ -38,7 +38,6 @@ class Bucket : public std::enable_shared_from_this<Bucket>,
     std::filesystem::path const mFilename;
     Hash const mHash;
     size_t mSize{0};
-    bool mLazyIndex;
 
     std::unique_ptr<BucketIndex const> mIndex{};
 
@@ -51,12 +50,14 @@ class Bucket : public std::enable_shared_from_this<Bucket>,
     // Returns (lazily-constructed) file stream for bucket file. Note
     // this might be in some random position left over from a previous read --
     // must be seek()'ed before use.
-    XDRInputFileStream& getStream();
+    XDRInputFileStream& getStream(asio::io_context& ctx);
 
     // Loads the bucket entry for LedgerKey k. Starts at file offset pos and
     // reads until key is found or the end of the page.
-    std::optional<BucketEntry>
-    getEntryAtOffset(LedgerKey const& k, std::streamoff pos, size_t pageSize);
+    std::optional<BucketEntry> getEntryAtOffset(LedgerKey const& k,
+                                                std::streamoff pos,
+                                                size_t pageSize,
+                                                asio::io_context& ctx);
 
   public:
     // Create an empty bucket. The empty bucket has hash '000000...' and its
@@ -75,7 +76,8 @@ class Bucket : public std::enable_shared_from_this<Bucket>,
 
     // Returns true if a BucketEntry that is key-wise identical to the given
     // BucketEntry exists in the bucket. For testing.
-    bool containsBucketIdentity(BucketEntry const& id) const;
+    bool containsBucketIdentity(BucketEntry const& id,
+                                asio::io_context& ctx) const;
 
     bool isEmpty() const;
 
@@ -89,12 +91,13 @@ class Bucket : public std::enable_shared_from_this<Bucket>,
     void setIndex(std::unique_ptr<BucketIndex const>&& index);
 
     // Loads bucket entry for LedgerKey k.
-    std::optional<BucketEntry> getBucketEntry(LedgerKey const& k);
+    std::optional<BucketEntry> getBucketEntry(LedgerKey const& k,
+                                              asio::io_context& ctx);
 
     // Loads LedgerEntry's for given keys. When a key is found, the
     // entry is added to result and the key is removed from keys.
     void loadKeys(std::set<LedgerKey, LedgerEntryIdCmp>& keys,
-                  std::vector<LedgerEntry>& result);
+                  std::vector<LedgerEntry>& result, asio::io_context& ctx);
 
     // Loads all poolshare trustlines for the given account. Trustlines are
     // stored with their corresponding liquidity pool key in
@@ -105,7 +108,7 @@ class Bucket : public std::enable_shared_from_this<Bucket>,
     void loadPoolShareTrustLinessByAccount(
         AccountID const& accountID, UnorderedSet<LedgerKey>& deadTrustlines,
         UnorderedMap<LedgerKey, LedgerEntry>& liquidityPoolKeyToTrustline,
-        LedgerKeySet& liquidityPoolKeys);
+        LedgerKeySet& liquidityPoolKeys, asio::io_context& ctx);
 
     // At version 11, we added support for INITENTRY and METAENTRY. Before this
     // we were only supporting LIVEENTRY and DEADENTRY.
@@ -163,8 +166,10 @@ class Bucket : public std::enable_shared_from_this<Bucket>,
           bool keepDeadEntries, bool countMergeEvents, asio::io_context& ctx,
           bool doFsync);
 
-    static uint32_t getBucketVersion(std::shared_ptr<Bucket> const& bucket);
+    static uint32_t getBucketVersion(std::shared_ptr<Bucket> const& bucket,
+                                     asio::io_context& ctx);
     static uint32_t
-    getBucketVersion(std::shared_ptr<Bucket const> const& bucket);
+    getBucketVersion(std::shared_ptr<Bucket const> const& bucket,
+                     asio::io_context& ctx);
 };
 }

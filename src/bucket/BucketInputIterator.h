@@ -3,7 +3,7 @@
 // Copyright 2017 Stellar Development Foundation and contributors. Licensed
 // under the Apache License, Version 2.0. See the COPYING file at the root
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
-
+#include "util/asio.h"
 #include "bucket/LedgerCmp.h"
 #include "util/XDRStream.h"
 #include "xdr/Stellar-ledger.h"
@@ -33,6 +33,7 @@ class BucketInputIterator
 
   public:
     operator bool() const;
+    BucketInputIterator(BucketInputIterator&&) = default;
 
     // In general, BucketInputIterators will read-and-extract the first (and
     // only) METAENTRY in a bucket if it's present, immediately upon opening the
@@ -46,7 +47,8 @@ class BucketInputIterator
 
     BucketEntry const& operator*();
 
-    BucketInputIterator(std::shared_ptr<Bucket const> bucket);
+    BucketInputIterator(std::shared_ptr<Bucket const> bucket,
+                        asio::io_context& ctx);
 
     ~BucketInputIterator();
 

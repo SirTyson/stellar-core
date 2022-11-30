@@ -34,6 +34,7 @@ class BucketOutputIterator
     BucketMetadata mMeta;
     bool mPutMeta{false};
     MergeCounters& mMergeCounters;
+    asio::io_context& mCtx;
 
   public:
     // BucketOutputIterators must _always_ be constructed with BucketMetadata,

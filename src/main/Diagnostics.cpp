@@ -13,9 +13,10 @@ namespace diagnostics
 {
 
 void
-bucketStats(std::string const& filename, bool aggregateAccounts)
+bucketStats(std::string const& filename, bool aggregateAccounts,
+            asio::io_context& ctx)
 {
-    XDRInputFileStream in;
+    XDRInputFileStream in(ctx);
     in.open(filename);
 
     BucketEntry tmp;

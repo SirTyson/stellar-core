@@ -26,7 +26,7 @@ BucketApplicator::BucketApplicator(Application& app,
     , mMaxProtocolVersion(maxProtocolVersion)
     , mMinProtocolVersionSeen(minProtocolVersionSeen)
     , mLevel(level)
-    , mBucketIter(bucket)
+    , mBucketIter(bucket, app.getClock().getIOContext())
     , mEntryTypeFilter(filter)
 {
     auto protocolVersion = mBucketIter.getMetadata().ledgerVersion;

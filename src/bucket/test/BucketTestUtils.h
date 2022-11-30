@@ -35,10 +35,11 @@ struct EntryCounts
         return nLive + nInit + nDead + nMeta;
     }
 
-    EntryCounts(std::shared_ptr<stellar::Bucket> bucket);
+    EntryCounts(std::shared_ptr<stellar::Bucket> bucket, asio::io_context& ctx);
 };
 
-size_t countEntries(std::shared_ptr<stellar::Bucket> bucket);
+size_t countEntries(std::shared_ptr<stellar::Bucket> bucket,
+                    asio::io_context& ctx);
 
 Hash closeLedger(Application& app, std::optional<SecretKey> skToSignValue,
                  xdr::xvector<UpgradeType, 6> upgrades = emptyUpgradeSteps);

@@ -30,14 +30,37 @@ namespace stellar
  */
 class XDRInputFileStream
 {
-    std::ifstream mIn;
+    asio::stream_file mIn;
     std::vector<char> mBuf;
+    std::streamoff mPos;
     size_t mSizeLimit;
     size_t mSize;
 
+    size_t
+    read(char* buf, size_t n)
+    {
+        size_t totalRead = 0;
+        for (; totalRead < n;)
+        {
+            asio::error_code error;
+            totalRead += mIn.read_some(asio::buffer(buf, n), error);
+            if (error)
+            {
+                if (error != asio::error::eof)
+                {
+                    throw xdr::xdr_runtime_error("IO failure in readExact");
+                }
+                break;
+            }
+        }
+
+        mPos += totalRead;
+        return totalRead;
+    }
+
   public:
-    XDRInputFileStream(unsigned int sizeLimit = 0)
-        : mSizeLimit{sizeLimit}, mSize{0}
+    XDRInputFileStream(asio::io_context& ctx, unsigned int sizeLimit = 0)
+        : mIn(ctx), mPos{0}, mSizeLimit{sizeLimit}, mSize{0}
     {
     }
 
@@ -52,8 +75,9 @@ class XDRInputFileStream
     open(std::string const& filename)
     {
         ZoneScoped;
-        mIn.open(filename, std::ifstream::binary);
-        if (!mIn)
+        releaseAssert(!mIn.is_open());
+        mIn.open(filename, asio::stream_file::read_only);
+        if (!mIn.is_open())
         {
             std::string msg("failed to open XDR file: ");
             msg += filename;
@@ -62,13 +86,12 @@ class XDRInputFileStream
             CLOG_ERROR(Fs, "{}", msg);
             throw FileSystemException(msg);
         }
-        mIn.exceptions(std::ios::badbit);
-        mSize = fs::size(mIn);
+        mSize = mIn.size();
     }
 
     operator bool() const
     {
-        return mIn.good();
+        return mIn.is_open();
     }
 
     size_t
@@ -80,15 +103,15 @@ class XDRInputFileStream
     std::streamoff
     pos()
     {
-        releaseAssertOrThrow(!mIn.fail());
-        return mIn.tellg();
+        releaseAssertOrThrow(mIn.is_open());
+        return mPos;
     }
 
     void
     seek(size_t pos)
     {
-        releaseAssertOrThrow(!mIn.fail());
-        mIn.seekg(pos);
+        releaseAssertOrThrow(mIn.is_open());
+        mPos = mIn.seek(pos, asio::stream_file::seek_set);
     }
 
     static inline uint32_t
@@ -113,17 +136,9 @@ class XDRInputFileStream
     {
         ZoneScoped;
         char szBuf[4];
-        if (!mIn.read(szBuf, 4))
+        if (read(szBuf, 4) != 4)
         {
-            if (mIn.eof())
-            {
-                mIn.clear(std::ios_base::eofbit);
-                return false;
-            }
-            else
-            {
-                throw xdr::xdr_runtime_error("IO failure in readOne");
-            }
+            return false;
         }
 
         auto sz = getXDRSize(szBuf);
@@ -135,7 +150,7 @@ class XDRInputFileStream
         {
             mBuf.resize(sz);
         }
-        if (!mIn.read(mBuf.data(), sz))
+        if (read(mBuf.data(), sz) != sz)
         {
             throw xdr::xdr_runtime_error(
                 "malformed XDR file or IO failure in readOne");
@@ -160,20 +175,12 @@ class XDRInputFileStream
             mBuf.resize(pageSize);
         }
 
-        if (!mIn.read(mBuf.data(), pageSize))
+        if (auto bytesRead = read(mBuf.data(), pageSize); bytesRead != pageSize)
         {
-            if (mIn.eof())
-            {
-                // Hitting eof just means there's not a full pageSize
-                // worth of data left in the file. Not a problem: resize our
-                // buffer down to the amount the page we _did_ manage to read.
-                mBuf.resize(mIn.gcount());
-                mIn.clear(std::ios_base::eofbit);
-            }
-            else
-            {
-                throw xdr::xdr_runtime_error("IO failure in readPage");
-            }
+            // Hitting eof just means there's not a full pageSize
+            // worth of data left in the file. Not a problem: resize our
+            // buffer down to the amount the page we _did_ manage to read.
+            mBuf.resize(bytesRead);
         }
 
         size_t xdrStart = 0;
@@ -192,7 +199,7 @@ class XDRInputFileStream
                 const size_t extraSz = xdrEnd - extraStart;
                 mBuf.resize(xdrEnd);
                 releaseAssert(extraStart + extraSz == mBuf.size());
-                if (!mIn.read(mBuf.data() + extraStart, extraSz))
+                if (read(mBuf.data() + extraStart, extraSz) != extraSz)
                 {
                     throw xdr::xdr_runtime_error(
                         "malformed XDR file or IO failure in readPage");

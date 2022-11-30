@@ -7,6 +7,7 @@
 #include "bucket/BucketManager.h"
 #include "bucket/LedgerCmp.h"
 #include "ledger/LedgerHashUtils.h"
+#include "main/Application.h"
 #include "main/Config.h"
 #include "util/Fs.h"
 #include "util/LogSlowExecution.h"
@@ -56,11 +57,12 @@ template <class IndexT> class BucketIndexImpl : public BucketIndex
 
     BucketIndexImpl(BucketManager const& bm,
                     std::filesystem::path const& filename,
-                    std::streamoff pageSize);
+                    std::streamoff pageSize, asio::io_context& ctx);
 
     friend std::unique_ptr<BucketIndex const>
     BucketIndex::createIndex(BucketManager const& bm,
-                             std::filesystem::path const& filename);
+                             std::filesystem::path const& filename,
+                             asio::io_context& ctx);
 
   public:
     virtual std::optional<std::streamoff>
@@ -97,7 +99,8 @@ template <class IndexT> class BucketIndexImpl : public BucketIndex
 template <class IndexT>
 BucketIndexImpl<IndexT>::BucketIndexImpl(BucketManager const& bm,
                                          std::filesystem::path const& filename,
-                                         std::streamoff pageSize)
+                                         std::streamoff pageSize,
+                                         asio::io_context& ctx)
     : mPageSize(pageSize)
     , mBloomMissMeter(bm.getBloomMissMeter())
     , mBloomLookupMeter(bm.getBloomLookupMeter())
@@ -140,7 +143,7 @@ BucketIndexImpl<IndexT>::BucketIndexImpl(BucketManager const& bm,
 
     mKeysToOffset.reserve(estimatedIndexEntries);
 
-    XDRInputFileStream in;
+    XDRInputFileStream in(ctx);
     in.open(filename.string());
     std::streamoff pos = 0;
     std::streamoff pageUpperBound = 0;
@@ -262,7 +265,8 @@ upper_bound_pred(LedgerKey const& key, IndexEntryT const& indexEntry)
 
 std::unique_ptr<BucketIndex const>
 BucketIndex::createIndex(BucketManager const& bm,
-                         std::filesystem::path const& filename)
+                         std::filesystem::path const& filename,
+                         asio::io_context& ctx)
 {
     ZoneScoped;
     auto const& cfg = bm.getConfig();
@@ -284,7 +288,7 @@ BucketIndex::createIndex(BucketManager const& bm,
                       "bucket {}",
                       filename);
             return std::unique_ptr<BucketIndexImpl<IndividualIndex> const>(
-                new BucketIndexImpl<IndividualIndex>(bm, filename, 0));
+                new BucketIndexImpl<IndividualIndex>(bm, filename, 0, ctx));
         }
         else
         {
@@ -294,7 +298,7 @@ BucketIndex::createIndex(BucketManager const& bm,
                       "{} in bucket {}",
                       pageSize, filename);
             return std::unique_ptr<BucketIndexImpl<RangeIndex> const>(
-                new BucketIndexImpl<RangeIndex>(bm, filename, pageSize));
+                new BucketIndexImpl<RangeIndex>(bm, filename, pageSize, ctx));
         }
     }
     // BucketIndexImpl throws if BucketManager shuts down before index finishes,

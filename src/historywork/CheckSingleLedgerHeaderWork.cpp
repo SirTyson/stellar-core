@@ -92,7 +92,7 @@ CheckSingleLedgerHeaderWork::doWork()
     // Theoretically we could do this scan in multiple steps with state
     // transitions, but a ledger header file is 30kb: reading it synchronously
     // is nearly instant.
-    XDRInputFileStream in;
+    XDRInputFileStream in(mApp.getClock().getIOContext());
     in.open(mFt->localPath_nogz());
     LedgerHeaderHistoryEntry lhhe;
     size_t headersToRead = mApp.getHistoryManager().getCheckpointFrequency();

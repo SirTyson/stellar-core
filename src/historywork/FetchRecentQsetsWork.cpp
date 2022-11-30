@@ -74,7 +74,7 @@ FetchRecentQsetsWork::doWork()
     for (uint32_t i = firstSeq; i <= lastSeq; i += step)
     {
         CLOG_INFO(History, "Scanning for QSets in checkpoint: {}", i);
-        XDRInputFileStream in;
+        XDRInputFileStream in(mApp.getClock().getIOContext());
         FileTransferInfo fi(*mDownloadDir, HISTORY_FILE_TYPE_SCP, i);
         try
         {

@@ -73,11 +73,11 @@ Bucket::Bucket()
 }
 
 XDRInputFileStream&
-Bucket::getStream()
+Bucket::getStream(asio::io_context& ctx)
 {
     if (!mStream)
     {
-        mStream = std::make_unique<XDRInputFileStream>();
+        mStream = std::make_unique<XDRInputFileStream>(ctx);
         releaseAssertOrThrow(!mFilename.empty());
         mStream->open(mFilename.string());
     }
@@ -103,10 +103,11 @@ Bucket::getSize() const
 }
 
 bool
-Bucket::containsBucketIdentity(BucketEntry const& id) const
+Bucket::containsBucketIdentity(BucketEntry const& id,
+                               asio::io_context& ctx) const
 {
     BucketEntryIdCmp cmp;
-    BucketInputIterator iter(shared_from_this());
+    BucketInputIterator iter(shared_from_this(), ctx);
     while (iter)
     {
         if (!(cmp(*iter, id) || cmp(id, *iter)))
@@ -139,10 +140,10 @@ Bucket::freeIndex()
 
 std::optional<BucketEntry>
 Bucket::getEntryAtOffset(LedgerKey const& k, std::streamoff pos,
-                         size_t pageSize)
+                         size_t pageSize, asio::io_context& ctx)
 {
     ZoneScoped;
-    auto& stream = getStream();
+    auto& stream = getStream(ctx);
     stream.seek(pos);
 
     BucketEntry be;
@@ -164,13 +165,13 @@ Bucket::getEntryAtOffset(LedgerKey const& k, std::streamoff pos,
 }
 
 std::optional<BucketEntry>
-Bucket::getBucketEntry(LedgerKey const& k)
+Bucket::getBucketEntry(LedgerKey const& k, asio::io_context& ctx)
 {
     ZoneScoped;
     auto pos = getIndex().lookup(k);
     if (pos.has_value())
     {
-        return getEntryAtOffset(k, pos.value(), getIndex().getPageSize());
+        return getEntryAtOffset(k, pos.value(), getIndex().getPageSize(), ctx);
     }
 
     return std::nullopt;
@@ -183,7 +184,7 @@ Bucket::getBucketEntry(LedgerKey const& k)
 // from keys so that it will be searched for again at a lower level.
 void
 Bucket::loadKeys(std::set<LedgerKey, LedgerEntryIdCmp>& keys,
-                 std::vector<LedgerEntry>& result)
+                 std::vector<LedgerEntry>& result, asio::io_context& ctx)
 {
     auto currKeyIt = keys.begin();
     auto const& index = getIndex();
@@ -194,8 +195,8 @@ Bucket::loadKeys(std::set<LedgerKey, LedgerEntryIdCmp>& keys,
         indexIter = newIndexIter;
         if (offOp)
         {
-            auto entryOp =
-                getEntryAtOffset(*currKeyIt, *offOp, getIndex().getPageSize());
+            auto entryOp = getEntryAtOffset(*currKeyIt, *offOp,
+                                            getIndex().getPageSize(), ctx);
             if (entryOp)
             {
                 if (entryOp->type() != DEADENTRY)
@@ -216,7 +217,7 @@ void
 Bucket::loadPoolShareTrustLinessByAccount(
     AccountID const& accountID, UnorderedSet<LedgerKey>& deadTrustlines,
     UnorderedMap<LedgerKey, LedgerEntry>& liquidityPoolKeyToTrustline,
-    LedgerKeySet& liquidityPoolKeys)
+    LedgerKeySet& liquidityPoolKeys, asio::io_context& ctx)
 {
     // Takes a LedgerKey or LedgerEntry::_data_t, returns true if entry is a
     // poolshare trusline for the given accountID
@@ -236,7 +237,7 @@ Bucket::loadPoolShareTrustLinessByAccount(
     }
 
     BucketEntry be;
-    auto& stream = getStream();
+    auto& stream = getStream(ctx);
     stream.seek(searchRange.first);
     while (stream && stream.pos() < searchRange.second && stream.readOne(be))
     {
@@ -821,10 +822,13 @@ Bucket::merge(BucketManager& bucketManager, uint32_t maxProtocolVersion,
     releaseAssert(newBucket);
 
     MergeCounters mc;
-    BucketInputIterator oi(oldBucket);
-    BucketInputIterator ni(newBucket);
-    std::vector<BucketInputIterator> shadowIterators(shadows.begin(),
-                                                     shadows.end());
+    BucketInputIterator oi(oldBucket, ctx);
+    BucketInputIterator ni(newBucket, ctx);
+    std::vector<BucketInputIterator> shadowIterators;
+    for (auto shadow : shadows)
+    {
+        shadowIterators.emplace_back(shadow, ctx);
+    }
 
     uint32_t protocolVersion;
     bool keepShadowedLifecycleEntries;
@@ -876,18 +880,20 @@ Bucket::merge(BucketManager& bucketManager, uint32_t maxProtocolVersion,
 }
 
 uint32_t
-Bucket::getBucketVersion(std::shared_ptr<Bucket> const& bucket)
+Bucket::getBucketVersion(std::shared_ptr<Bucket> const& bucket,
+                         asio::io_context& ctx)
 {
     releaseAssert(bucket);
-    BucketInputIterator it(bucket);
+    BucketInputIterator it(bucket, ctx);
     return it.getMetadata().ledgerVersion;
 }
 
 uint32_t
-Bucket::getBucketVersion(std::shared_ptr<Bucket const> const& bucket)
+Bucket::getBucketVersion(std::shared_ptr<Bucket const> const& bucket,
+                         asio::io_context& ctx)
 {
     releaseAssert(bucket);
-    BucketInputIterator it(bucket);
+    BucketInputIterator it(bucket, ctx);
     return it.getMetadata().ledgerVersion;
 }
 }

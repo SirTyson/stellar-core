@@ -48,6 +48,7 @@ BucketOutputIterator::BucketOutputIterator(std::string const& tmpDir,
     , mKeepDeadEntries(keepDeadEntries)
     , mMeta(meta)
     , mMergeCounters(mc)
+    , mCtx(ctx)
 {
     ZoneScoped;
     CLOG_TRACE(Bucket, "BucketOutputIterator opening file to write: {}",
@@ -151,7 +152,7 @@ BucketOutputIterator::getBucket(BucketManager& bucketManager,
         if (auto b = bucketManager.getBucketIfExists(hash);
             !b || !b->isIndexed())
         {
-            index = BucketIndex::createIndex(bucketManager, mFilename);
+            index = BucketIndex::createIndex(bucketManager, mFilename, mCtx);
         }
     }
 

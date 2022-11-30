@@ -708,7 +708,9 @@ diagBucketStats(CommandLineArgs const& args)
          clara::Opt{aggAccountStats}["--aggregate-account-stats"](
              "aggregate entries on a per account basis")},
         [&] {
-            diagnostics::bucketStats(bucketFile, aggAccountStats);
+            VirtualClock clock(VirtualClock::REAL_TIME);
+            diagnostics::bucketStats(bucketFile, aggAccountStats,
+                                     clock.getIOContext());
             return 0;
         });
 }
@@ -1005,7 +1007,8 @@ runDumpXDR(CommandLineArgs const& args)
 
     return runWithHelp(args, {compactParser(compact), fileNameParser(xdr)},
                        [&] {
-                           dumpXdrStream(xdr, compact);
+                           VirtualClock clock(VirtualClock::REAL_TIME);
+                           dumpXdrStream(xdr, compact, clock.getIOContext());
                            return 0;
                        });
 }
@@ -1646,7 +1649,7 @@ runSimulateBuckets(CommandLineArgs const& args)
                 // Ensure that LedgerManager's view of LCL is consistent with
                 // the bucketlist
                 FileTransferInfo ft(dir, HISTORY_FILE_TYPE_LEDGER, checkpoint);
-                XDRInputFileStream hdrIn;
+                XDRInputFileStream hdrIn(app->getClock().getIOContext());
                 hdrIn.open(ft.localPath_nogz());
                 LedgerHeaderHistoryEntry curr;
                 // Read the last LedgerHeaderHistoryEntry to use as LCL

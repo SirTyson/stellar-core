@@ -3,7 +3,7 @@
 // Copyright 2022 Stellar Development Foundation and contributors. Licensed
 // under the Apache License, Version 2.0. See the COPYING file at the root
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
-
+#include "util/asio.h"
 #include "bucket/LedgerCmp.h"
 #include "util/GlobalChecks.h"
 #include "util/NonCopyable.h"
@@ -67,7 +67,8 @@ class BucketIndex : public NonMovableOrCopyable
     // if file size is less than the cutoff, individual key index is used.
     // Otherwise range index is used, with the range defined by pageSize.
     static std::unique_ptr<BucketIndex const>
-    createIndex(BucketManager const& bm, std::filesystem::path const& filename);
+    createIndex(BucketManager const& bm, std::filesystem::path const& filename,
+                asio::io_context& ctx);
 
     virtual ~BucketIndex() = default;
 

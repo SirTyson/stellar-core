@@ -902,7 +902,7 @@ BucketManagerImpl::getLedgerEntry(LedgerKey const& k) const
 {
     releaseAssertOrThrow(getConfig().isUsingBucketListDB());
     auto timer = getPointLoadTimer(k.type()).TimeScope();
-    return mBucketList->getLedgerEntry(k);
+    return mBucketList->getLedgerEntry(k, mApp.getClock().getIOContext());
 }
 
 std::vector<LedgerEntry>
@@ -911,7 +911,7 @@ BucketManagerImpl::loadKeys(
 {
     releaseAssertOrThrow(getConfig().isUsingBucketListDB());
     auto timer = getBulkLoadTimer("prefetch").TimeScope();
-    return mBucketList->loadKeys(keys);
+    return mBucketList->loadKeys(keys, mApp.getClock().getIOContext());
 }
 
 std::vector<LedgerEntry>
@@ -921,7 +921,7 @@ BucketManagerImpl::loadPoolShareTrustLinesByAccountAndAsset(
     releaseAssertOrThrow(getConfig().isUsingBucketListDB());
     auto timer = getBulkLoadTimer("poolshareTrustlines").TimeScope();
     return mBucketList->loadPoolShareTrustLinesByAccountAndAsset(
-        accountID, asset, getConfig());
+        accountID, asset, getConfig(), mApp.getClock().getIOContext());
 }
 
 std::vector<InflationWinner>
@@ -930,7 +930,8 @@ BucketManagerImpl::loadInflationWinners(size_t maxWinners,
 {
     releaseAssertOrThrow(getConfig().isUsingBucketListDB());
     auto timer = getBulkLoadTimer("inflationWinners").TimeScope();
-    return mBucketList->loadInflationWinners(maxWinners, minBalance);
+    return mBucketList->loadInflationWinners(maxWinners, minBalance,
+                                             mApp.getClock().getIOContext());
 }
 
 medida::Meter&
@@ -1054,11 +1055,12 @@ BucketManagerImpl::isShutdown() const
 // old to new.
 static void
 loadEntriesFromBucket(std::shared_ptr<Bucket> b, std::string const& name,
-                      std::map<LedgerKey, LedgerEntry>& map)
+                      std::map<LedgerKey, LedgerEntry>& map,
+                      asio::io_context& ctx)
 {
     using namespace std::chrono;
     medida::Timer timer;
-    BucketInputIterator in(b);
+    BucketInputIterator in(b, ctx);
     timer.Time([&]() {
         while (in)
         {
@@ -1122,7 +1124,8 @@ BucketManagerImpl::loadCompleteLedgerState(HistoryArchiveState const& has)
             throw std::runtime_error(std::string("missing bucket: ") +
                                      binToHex(pair.first));
         }
-        loadEntriesFromBucket(b, pair.second, ledgerMap);
+        loadEntriesFromBucket(b, pair.second, ledgerMap,
+                              mApp.getClock().getIOContext());
     }
     return ledgerMap;
 }
@@ -1152,7 +1155,8 @@ visitEntriesInBucket(std::shared_ptr<Bucket const> b, std::string const& name,
                      std::optional<int64_t> minLedger,
                      std::function<bool(LedgerEntry const&)> const& filterEntry,
                      std::function<bool(LedgerEntry const&)> const& acceptEntry,
-                     UnorderedSet<LedgerKey>& processedEntries)
+                     UnorderedSet<LedgerKey>& processedEntries,
+                     asio::io_context& ctx)
 {
     using namespace std::chrono;
     medida::Timer timer;
@@ -1160,7 +1164,7 @@ visitEntriesInBucket(std::shared_ptr<Bucket const> b, std::string const& name,
     UnorderedMap<LedgerKey, LedgerEntry> bucketEntries;
     bool stopIteration = false;
     timer.Time([&]() {
-        for (BucketInputIterator in(b); in; ++in)
+        for (BucketInputIterator in(b, ctx); in; ++in)
         {
             BucketEntry const& e = *in;
             if (e.type() == LIVEENTRY || e.type() == INITENTRY)
@@ -1245,7 +1249,8 @@ BucketManagerImpl::visitLedgerEntries(
                                          binToHex(pair.first));
             }
             if (!visitEntriesInBucket(b, pair.second, minLedger, filterEntry,
-                                      acceptEntry, deletedEntries))
+                                      acceptEntry, deletedEntries,
+                                      mApp.getClock().getIOContext()))
             {
                 break;
             }

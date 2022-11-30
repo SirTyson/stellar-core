@@ -270,7 +270,8 @@ BucketListIsConsistentWithDatabase::checkOnBucketApply(
 
         bool hasPreviousEntry = false;
         BucketEntry previousEntry;
-        for (BucketInputIterator iter(bucket); iter; ++iter)
+        for (BucketInputIterator iter(bucket, mApp.getClock().getIOContext());
+             iter; ++iter)
         {
             auto const& e = *iter;
             if (hasPreviousEntry && !BucketEntryIdCmp{}(previousEntry, e))

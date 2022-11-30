@@ -37,9 +37,10 @@ uint32_t const CatchupWork::PUBLISH_QUEUE_UNBLOCK_APPLICATION = 8;
 uint32_t const CatchupWork::PUBLISH_QUEUE_MAX_SIZE = 16;
 
 static std::shared_ptr<LedgerHeaderHistoryEntry>
-getHistoryEntryForLedger(uint32_t ledgerSeq, FileTransferInfo const& ft)
+getHistoryEntryForLedger(uint32_t ledgerSeq, FileTransferInfo const& ft,
+                         asio::io_context& ctx)
 {
-    XDRInputFileStream in;
+    XDRInputFileStream in(ctx);
     in.open(ft.localPath_nogz());
 
     auto lhhe = std::make_shared<LedgerHeaderHistoryEntry>();
@@ -58,7 +59,8 @@ getHistoryEntryForLedger(uint32_t ledgerSeq, FileTransferInfo const& ft)
 static bool
 setHerderStateTo(FileTransferInfo const& ft, uint32_t ledger, Application& app)
 {
-    auto entry = getHistoryEntryForLedger(ledger, ft);
+    auto entry =
+        getHistoryEntryForLedger(ledger, ft, app.getClock().getIOContext());
     if (!entry)
     {
         CLOG_ERROR(History,

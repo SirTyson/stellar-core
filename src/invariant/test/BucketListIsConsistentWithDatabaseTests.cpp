@@ -174,7 +174,7 @@ struct BucketListGenerator
                 BucketOutputIterator out(bmApply.getTmpDir(), keepDead, meta,
                                          mergeCounters, mClock.getIOContext(),
                                          /*doFsync=*/true);
-                for (BucketInputIterator in(b); in; ++in)
+                for (BucketInputIterator in(b, mClock.getIOContext()); in; ++in)
                 {
                     out.put(*in);
                 }
@@ -200,9 +200,10 @@ struct BucketListGenerator
 };
 
 bool
-doesBucketContain(std::shared_ptr<Bucket const> bucket, const BucketEntry& be)
+doesBucketContain(std::shared_ptr<Bucket const> bucket, const BucketEntry& be,
+                  asio::io_context& ctx)
 {
-    for (BucketInputIterator iter(bucket); iter; ++iter)
+    for (BucketInputIterator iter(bucket, ctx); iter; ++iter)
     {
         if (*iter == be)
         {
@@ -213,14 +214,15 @@ doesBucketContain(std::shared_ptr<Bucket const> bucket, const BucketEntry& be)
 }
 
 bool
-doesBucketListContain(BucketList& bl, const BucketEntry& be)
+doesBucketListContain(BucketList& bl, const BucketEntry& be,
+                      asio::io_context& ctx)
 {
     for (uint32_t i = 0; i < BucketList::kNumLevels; ++i)
     {
         auto const& level = bl.getLevel(i);
         for (auto const& bucket : {level.getCurr(), level.getSnap()})
         {
-            if (doesBucketContain(bucket, be))
+            if (doesBucketContain(bucket, be, ctx))
             {
                 return true;
             }
@@ -874,18 +876,24 @@ TEST_CASE("BucketListIsConsistentWithDatabase merged LIVEENTRY and DEADENTRY",
                 REQUIRE_NOTHROW(blg.applyBuckets(appApply));
                 REQUIRE(exists(*blg.mAppGenerate, *blg.mSelected));
                 REQUIRE(exists(*appApply, *blg.mSelected));
+
+                blg.generateLedgers(10);
+                REQUIRE(doesBucketListContain(blGenerate, dead,
+                                              clock.getIOContext()));
+                REQUIRE((doesBucketListContain(blGenerate, live,
+                                               clock.getIOContext()) ||
+                         doesBucketListContain(blGenerate, init,
+                                               clock.getIOContext())));
+
+                blg.generateLedgers(100);
+                REQUIRE(!doesBucketListContain(blGenerate, dead,
+                                               clock.getIOContext()));
+                REQUIRE(!(doesBucketListContain(blGenerate, live,
+                                                clock.getIOContext()) ||
+                          doesBucketListContain(blGenerate, init,
+                                                clock.getIOContext())));
+                REQUIRE(!exists(*blg.mAppGenerate, *blg.mSelected));
             }
-
-            blg.generateLedgers(10);
-            REQUIRE(doesBucketListContain(blGenerate, dead));
-            REQUIRE((doesBucketListContain(blGenerate, live) ||
-                     doesBucketListContain(blGenerate, init)));
-
-            blg.generateLedgers(100);
-            REQUIRE(!doesBucketListContain(blGenerate, dead));
-            REQUIRE(!(doesBucketListContain(blGenerate, live) ||
-                      doesBucketListContain(blGenerate, init)));
-            REQUIRE(!exists(*blg.mAppGenerate, *blg.mSelected));
 
             {
                 VirtualClock clock;
@@ -893,9 +901,12 @@ TEST_CASE("BucketListIsConsistentWithDatabase merged LIVEENTRY and DEADENTRY",
                     createTestApplication(clock, getTestConfig(1));
                 REQUIRE_NOTHROW(blg.applyBuckets(appApply));
                 auto& blApply = appApply->getBucketManager().getBucketList();
-                REQUIRE(!doesBucketListContain(blApply, dead));
-                REQUIRE(!(doesBucketListContain(blApply, live) ||
-                          doesBucketListContain(blApply, init)));
+                REQUIRE(!doesBucketListContain(blApply, dead,
+                                               clock.getIOContext()));
+                REQUIRE(!(doesBucketListContain(blApply, live,
+                                                clock.getIOContext()) ||
+                          doesBucketListContain(blApply, init,
+                                                clock.getIOContext())));
                 REQUIRE(!exists(*appApply, *blg.mSelected));
             }
 

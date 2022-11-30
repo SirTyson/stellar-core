@@ -4,6 +4,7 @@
 // under the Apache License, Version 2.0. See the COPYING file at the root
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
+#include "util/asio.h"
 #include "bucket/FutureBucket.h"
 #include "bucket/LedgerCmp.h"
 #include "overlay/StellarXDR.h"
@@ -456,18 +457,20 @@ class BucketList
     // of the concatenation of the hashes of the `curr` and `snap` buckets.
     Hash getHash() const;
 
-    std::shared_ptr<LedgerEntry> getLedgerEntry(LedgerKey const& k) const;
+    std::shared_ptr<LedgerEntry> getLedgerEntry(LedgerKey const& k,
+                                                asio::io_context& ctx) const;
 
     std::vector<LedgerEntry>
-    loadKeys(std::set<LedgerKey, LedgerEntryIdCmp> const& inKeys) const;
+    loadKeys(std::set<LedgerKey, LedgerEntryIdCmp> const& inKeys,
+             asio::io_context& ctx) const;
 
-    std::vector<LedgerEntry>
-    loadPoolShareTrustLinesByAccountAndAsset(AccountID const& accountID,
-                                             Asset const& asset,
-                                             Config const& cfg) const;
+    std::vector<LedgerEntry> loadPoolShareTrustLinesByAccountAndAsset(
+        AccountID const& accountID, Asset const& asset, Config const& cfg,
+        asio::io_context& ctx) const;
 
-    std::vector<InflationWinner> loadInflationWinners(size_t maxWinners,
-                                                      int64_t minBalance) const;
+    std::vector<InflationWinner>
+    loadInflationWinners(size_t maxWinners, int64_t minBalance,
+                         asio::io_context& ctx) const;
 
     // Restart any merges that might be running on background worker threads,
     // merging buckets between levels. This needs to be called after forcing a

@@ -53,7 +53,8 @@ IndexBucketsWork::IndexWork::postWork()
             }
 
             self->mIndex = BucketIndex::createIndex(
-                app.getBucketManager(), self->mBucket->getFilename());
+                app.getBucketManager(), self->mBucket->getFilename(),
+                app.getClock().getIOContext());
 
             app.postOnMainThread(
                 [weak]() {

@@ -141,6 +141,8 @@ AS_IF([test x != "x$LIBCXX_PATH"], [
   LDFLAGS="$LDFLAGS -L$LIBCXX_PATH -stdlib=libc++ -lc++abi -Wl,-rpath -Wl,$LIBCXX_PATH"
 ])
 
+LDFLAGS="$LDFLAGS -luring"
+
 AC_ARG_ENABLE([undefinedcheck],
   AS_HELP_STRING([--enable-undefinedcheck],
         [build with undefinedcheck (undefined-behavior-sanitizer) instrumentation]))
@@ -311,7 +313,7 @@ soci_LIBS='$(top_builddir)/lib/libsoci.a'
 AC_SUBST(soci_CFLAGS)
 AC_SUBST(soci_LIBS)
 
-libasio_CFLAGS='-DASIO_SEPARATE_COMPILATION=1 -DASIO_STANDALONE -isystem $(top_srcdir)/lib/asio/asio/include'
+libasio_CFLAGS='-DASIO_SEPARATE_COMPILATION=1 -DASIO_STANDALONE -DASIO_DISABLE_EPOLL -isystem $(top_srcdir)/lib/asio/asio/include'
 AC_SUBST(libasio_CFLAGS)
 
 AC_ARG_ENABLE(postgres,

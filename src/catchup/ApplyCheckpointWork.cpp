@@ -36,6 +36,8 @@ ApplyCheckpointWork::ApplyCheckpointWork(Application& app,
     , mLedgerRange(range)
     , mCheckpoint(
           app.getHistoryManager().checkpointContainingLedger(range.mFirst))
+    , mHdrIn(app.getClock().getIOContext())
+    , mTxIn(app.getClock().getIOContext())
     , mOnFailure(cb)
 {
     // Ledger range check to enforce application of a single checkpoint

@@ -353,7 +353,7 @@ TEST_CASE("Tx results verification", "[batching][resultsverification]")
     SECTION("hash mismatch")
     {
         FileTransferInfo ft(tmpDir, HISTORY_FILE_TYPE_LEDGER, range.last());
-        XDRInputFileStream res;
+        XDRInputFileStream res(catchupSimulation.getClock().getIOContext());
         res.open(ft.localPath_nogz());
         std::vector<LedgerHeaderHistoryEntry> entries;
         LedgerHeaderHistoryEntry curr;
@@ -387,7 +387,7 @@ TEST_CASE("Tx results verification", "[batching][resultsverification]")
         REQUIRE(getResults->getState() == BasicWork::State::WORK_SUCCESS);
 
         FileTransferInfo ft(tmpDir, HISTORY_FILE_TYPE_RESULTS, range.last());
-        XDRInputFileStream res;
+        XDRInputFileStream res(catchupSimulation.getClock().getIOContext());
         res.open(ft.localPath_nogz());
         std::vector<TransactionHistoryResultEntry> entries;
         TransactionHistoryResultEntry curr;

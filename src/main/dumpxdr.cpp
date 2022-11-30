@@ -62,13 +62,13 @@ dumpstream(XDRInputFileStream& in, bool compact)
 }
 
 void
-dumpXdrStream(std::string const& filename, bool compact)
+dumpXdrStream(std::string const& filename, bool compact, asio::io_context& ctx)
 {
     std::regex rx(".*(ledger|bucket|transactions|results|meta|scp)-.+\\.xdr");
     std::smatch sm;
     if (std::regex_match(filename, sm, rx))
     {
-        XDRInputFileStream in;
+        XDRInputFileStream in(ctx);
         in.open(filename);
 
         if (sm[1] == "ledger")

@@ -175,7 +175,7 @@ TEST_CASE_VERSIONS("merging bucket entries", "[bucket]")
                                         /*countMergeEvents=*/true,
                                         clock.getIOContext(),
                                         /*doFsync=*/true);
-                CHECK(countEntries(b1) == 1);
+                CHECK(countEntries(b1, clock.getIOContext()) == 1);
             }
         };
 
@@ -216,7 +216,7 @@ TEST_CASE_VERSIONS("merging bucket entries", "[bucket]")
                               /*keepDeadEntries=*/true,
                               /*countMergeEvents=*/true, clock.getIOContext(),
                               /*doFsync=*/true);
-            EntryCounts e(b1);
+            EntryCounts e(b1, clock.getIOContext());
             CHECK(e.sum() == live.size());
             CLOG_DEBUG(Bucket, "post-merge live count: {} of {}", e.nLive,
                        live.size());
@@ -272,7 +272,7 @@ TEST_CASE_VERSIONS("merging bucket entries", "[bucket]")
                               /*shadows=*/{}, /*keepDeadEntries=*/true,
                               /*countMergeEvents=*/true, clock.getIOContext(),
                               /*doFsync=*/true);
-            CHECK(countEntries(b3) == liveCount);
+            CHECK(countEntries(b3, clock.getIOContext()) == liveCount);
         }
     });
 }
@@ -377,7 +377,7 @@ TEST_CASE("merges proceed old-style despite newer shadows",
                           /*keepDeadEntries=*/true,
                           /*countMergeEvents=*/true, clock.getIOContext(),
                           /*doFsync=*/true);
-        REQUIRE(Bucket::getBucketVersion(bucket) == v11);
+        REQUIRE(Bucket::getBucketVersion(bucket, clock.getIOContext()) == v11);
     }
     SECTION("shadow versions mixed, pick lower")
     {
@@ -389,7 +389,7 @@ TEST_CASE("merges proceed old-style despite newer shadows",
                           /*keepDeadEntries=*/true,
                           /*countMergeEvents=*/true, clock.getIOContext(),
                           /*doFsync=*/true);
-        REQUIRE(Bucket::getBucketVersion(bucket) == v11);
+        REQUIRE(Bucket::getBucketVersion(bucket, clock.getIOContext()) == v11);
     }
     SECTION("refuse to merge new version with shadow")
     {
@@ -510,7 +510,7 @@ TEST_CASE_VERSIONS("merging bucket entries with initentry",
             // entries. Pre-initEra, the INIT will downgrade to a LIVE during
             // fresh(), and that will be killed by the DEAD, leaving 1
             // (tombstone) entry.
-            EntryCounts e(b1);
+            EntryCounts e(b1, clock.getIOContext());
             CHECK(e.nInit == 0);
             CHECK(e.nLive == 0);
             if (initEra)
@@ -552,7 +552,7 @@ TEST_CASE_VERSIONS("merging bucket entries with initentry",
                 /*doFsync=*/true);
             // The same thing should happen here as above, except that the INIT
             // will merge-over the LIVE during fresh().
-            EntryCounts e(b1);
+            EntryCounts e(b1, clock.getIOContext());
             CHECK(e.nInit == 0);
             CHECK(e.nLive == 0);
             if (initEra)
@@ -582,7 +582,9 @@ TEST_CASE_VERSIONS("merging bucket entries with initentry",
                 Bucket::fresh(bm, vers, {}, {}, {deadEntry},
                               /*countMergeEvents=*/true, clock.getIOContext(),
                               /*doFsync=*/true);
-            EntryCounts eold(bold), emed(bmed), enew(bnew);
+            EntryCounts eold(bold, clock.getIOContext()),
+                emed(bmed, clock.getIOContext()),
+                enew(bnew, clock.getIOContext());
             if (initEra)
             {
                 CHECK(eold.nMeta == 1);
@@ -620,7 +622,8 @@ TEST_CASE_VERSIONS("merging bucket entries with initentry",
                 /*keepDeadEntries=*/true,
                 /*countMergeEvents=*/true, clock.getIOContext(),
                 /*doFsync=*/true);
-            EntryCounts emerge1(bmerge1), emerge2(bmerge2);
+            EntryCounts emerge1(bmerge1, clock.getIOContext()),
+                emerge2(bmerge2, clock.getIOContext());
             if (initEra)
             {
                 CHECK(emerge1.nMeta == 1);
@@ -702,7 +705,7 @@ TEST_CASE_VERSIONS("merging bucket entries with initentry with shadows",
                               /*keepDeadEntries=*/true,
                               /*countMergeEvents=*/true, clock.getIOContext(),
                               /*doFsync=*/true);
-            EntryCounts e(merged);
+            EntryCounts e(merged, clock.getIOContext());
             if (initEra)
             {
                 CHECK(e.nMeta == 1);
@@ -757,7 +760,7 @@ TEST_CASE_VERSIONS("merging bucket entries with initentry with shadows",
                               /*keepDeadEntries=*/true,
                               /*countMergeEvents=*/true, clock.getIOContext(),
                               /*doFsync=*/true);
-            EntryCounts e43(merge43);
+            EntryCounts e43(merge43, clock.getIOContext());
             if (initEra)
             {
                 // New-style, we preserve the dead entry.
@@ -783,7 +786,7 @@ TEST_CASE_VERSIONS("merging bucket entries with initentry with shadows",
                               /*keepDeadEntries=*/true,
                               /*countMergeEvents=*/true, clock.getIOContext(),
                               /*doFsync=*/true);
-            EntryCounts e21(merge21);
+            EntryCounts e21(merge21, clock.getIOContext());
             if (initEra)
             {
                 // New-style, they mutually annihilate.
@@ -815,7 +818,7 @@ TEST_CASE_VERSIONS("merging bucket entries with initentry with shadows",
                 /*keepDeadEntries=*/true,
                 /*countMergeEvents=*/true, clock.getIOContext(),
                 /*doFsync=*/true);
-            EntryCounts e54321(merge21);
+            EntryCounts e54321(merge21, clock.getIOContext());
             if (initEra)
             {
                 // New-style, we should get a second mutual annihilation.
@@ -866,7 +869,7 @@ TEST_CASE_VERSIONS("merging bucket entries with initentry with shadows",
                               /*keepDeadEntries=*/true,
                               /*countMergeEvents=*/true, clock.getIOContext(),
                               /*doFsync=*/true);
-            EntryCounts e32(merge32);
+            EntryCounts e32(merge32, clock.getIOContext());
             if (initEra)
             {
                 // New-style, we preserve the init entry.
@@ -893,7 +896,7 @@ TEST_CASE_VERSIONS("merging bucket entries with initentry with shadows",
                               /*keepDeadEntries=*/true,
                               /*countMergeEvents=*/true, clock.getIOContext(),
                               /*doFsync=*/true);
-            EntryCounts e321(merge321);
+            EntryCounts e321(merge321, clock.getIOContext());
             if (initEra)
             {
                 // New-style, init meets dead and they annihilate.

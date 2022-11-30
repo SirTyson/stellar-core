@@ -25,4 +25,13 @@
 #define ASIO_STANDALONE
 #endif
 
+// Enable io_uring on linux
+#ifndef ASIO_DISABLE_EPOLL
+#define ASIO_DISABLE_EPOLL
+#endif
+
+#ifndef ASIO_HAS_IO_URING
+#define ASIO_HAS_IO_URING
+#endif
+
 #include <asio.hpp>

@@ -180,8 +180,10 @@ ApplyBucketsWork::startLevel()
     if (mApplying || applySnap)
     {
         mSnapBucket = getBucket(i.snap);
-        mMinProtocolVersionSeen = std::min(
-            mMinProtocolVersionSeen, Bucket::getBucketVersion(mSnapBucket));
+        mMinProtocolVersionSeen =
+            std::min(mMinProtocolVersionSeen,
+                     Bucket::getBucketVersion(mSnapBucket,
+                                              mApp.getClock().getIOContext()));
         mSnapApplicator = std::make_unique<BucketApplicator>(
             mApp, mMaxProtocolVersion, mMinProtocolVersionSeen, mLevel,
             mSnapBucket, mEntryTypeFilter);
@@ -192,8 +194,10 @@ ApplyBucketsWork::startLevel()
     if (mApplying || applyCurr)
     {
         mCurrBucket = getBucket(i.curr);
-        mMinProtocolVersionSeen = std::min(
-            mMinProtocolVersionSeen, Bucket::getBucketVersion(mCurrBucket));
+        mMinProtocolVersionSeen =
+            std::min(mMinProtocolVersionSeen,
+                     Bucket::getBucketVersion(mCurrBucket,
+                                              mApp.getClock().getIOContext()));
         mCurrApplicator = std::make_unique<BucketApplicator>(
             mApp, mMaxProtocolVersion, mMinProtocolVersionSeen, mLevel,
             mCurrBucket, mEntryTypeFilter);

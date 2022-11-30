@@ -170,8 +170,9 @@ BucketLevel::prepare(Application& app, uint32_t currLedger,
                     : mCurr;
 
     auto shadowsBasedOnProtocol =
-        protocolVersionStartsFrom(Bucket::getBucketVersion(snap),
-                                  Bucket::FIRST_PROTOCOL_SHADOWS_REMOVED)
+        protocolVersionStartsFrom(
+            Bucket::getBucketVersion(snap, app.getClock().getIOContext()),
+            Bucket::FIRST_PROTOCOL_SHADOWS_REMOVED)
             ? std::vector<std::shared_ptr<Bucket>>()
             : shadows;
     mNextCurr = FutureBucket(app, curr, snap, shadowsBasedOnProtocol,
@@ -394,13 +395,13 @@ BucketList::loopAllBuckets(std::function<bool(std::shared_ptr<Bucket>)> f) const
 }
 
 std::shared_ptr<LedgerEntry>
-BucketList::getLedgerEntry(LedgerKey const& k) const
+BucketList::getLedgerEntry(LedgerKey const& k, asio::io_context& ctx) const
 {
     ZoneScoped;
     std::shared_ptr<LedgerEntry> result{};
 
     auto f = [&](std::shared_ptr<Bucket> b) {
-        auto be = b->getBucketEntry(k);
+        auto be = b->getBucketEntry(k, ctx);
         if (be.has_value())
         {
             result =
@@ -420,7 +421,8 @@ BucketList::getLedgerEntry(LedgerKey const& k) const
 }
 
 std::vector<LedgerEntry>
-BucketList::loadKeys(std::set<LedgerKey, LedgerEntryIdCmp> const& inKeys) const
+BucketList::loadKeys(std::set<LedgerKey, LedgerEntryIdCmp> const& inKeys,
+                     asio::io_context& ctx) const
 {
     ZoneScoped;
     std::vector<LedgerEntry> entries;
@@ -428,7 +430,7 @@ BucketList::loadKeys(std::set<LedgerKey, LedgerEntryIdCmp> const& inKeys) const
     // Make a copy of the key set, this loop is destructive
     auto keys = inKeys;
     auto f = [&](std::shared_ptr<Bucket> b) {
-        b->loadKeys(keys, entries);
+        b->loadKeys(keys, entries, ctx);
         return keys.empty();
     };
 
@@ -437,9 +439,9 @@ BucketList::loadKeys(std::set<LedgerKey, LedgerEntryIdCmp> const& inKeys) const
 }
 
 std::vector<LedgerEntry>
-BucketList::loadPoolShareTrustLinesByAccountAndAsset(AccountID const& accountID,
-                                                     Asset const& asset,
-                                                     Config const& cfg) const
+BucketList::loadPoolShareTrustLinesByAccountAndAsset(
+    AccountID const& accountID, Asset const& asset, Config const& cfg,
+    asio::io_context& ctx) const
 {
     ZoneScoped;
     UnorderedMap<LedgerKey, LedgerEntry> liquidityPoolToTrustline;
@@ -450,13 +452,13 @@ BucketList::loadPoolShareTrustLinesByAccountAndAsset(AccountID const& accountID,
     auto trustLineLoop = [&](std::shared_ptr<Bucket> b) {
         b->loadPoolShareTrustLinessByAccount(accountID, deadTrustlines,
                                              liquidityPoolToTrustline,
-                                             liquidityPoolKeysToSearch);
+                                             liquidityPoolKeysToSearch, ctx);
         return false; // continue
     };
     loopAllBuckets(trustLineLoop);
 
     // Load all the LiquidityPool entries that the account has a trustline for.
-    auto liquidityPoolEntries = loadKeys(liquidityPoolKeysToSearch);
+    auto liquidityPoolEntries = loadKeys(liquidityPoolKeysToSearch, ctx);
     // pools always exist when there are trustlines
     releaseAssertOrThrow(liquidityPoolEntries.size() ==
                          liquidityPoolKeysToSearch.size());
@@ -482,13 +484,14 @@ BucketList::loadPoolShareTrustLinesByAccountAndAsset(AccountID const& accountID,
 }
 
 std::vector<InflationWinner>
-BucketList::loadInflationWinners(size_t maxWinners, int64_t minBalance) const
+BucketList::loadInflationWinners(size_t maxWinners, int64_t minBalance,
+                                 asio::io_context& ctx) const
 {
     UnorderedMap<AccountID, int64_t> voteCount;
     UnorderedSet<AccountID> seen;
 
     auto countVotesInBucket = [&](std::shared_ptr<Bucket> b) {
-        for (BucketInputIterator in(b); in; ++in)
+        for (BucketInputIterator in(b, ctx); in; ++in)
         {
             BucketEntry const& be = *in;
             if (be.type() == DEADENTRY)
@@ -828,7 +831,8 @@ BucketList::restartMerges(Application& app, uint32_t maxProtocolVersion,
                 return;
             }
 
-            auto version = Bucket::getBucketVersion(snap);
+            auto version =
+                Bucket::getBucketVersion(snap, app.getClock().getIOContext());
             if (protocolVersionIsBefore(version,
                                         Bucket::FIRST_PROTOCOL_SHADOWS_REMOVED))
             {

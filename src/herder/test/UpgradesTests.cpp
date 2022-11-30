@@ -1453,8 +1453,10 @@ TEST_CASE("upgrade to version 11", "[upgrades]")
         for (uint32_t level = 0; level < BucketList::kNumLevels; ++level)
         {
             auto& lev = bm.getBucketList().getLevel(level);
-            BucketTestUtils::EntryCounts currCounts(lev.getCurr());
-            BucketTestUtils::EntryCounts snapCounts(lev.getSnap());
+            BucketTestUtils::EntryCounts currCounts(lev.getCurr(),
+                                                    clock.getIOContext());
+            BucketTestUtils::EntryCounts snapCounts(lev.getSnap(),
+                                                    clock.getIOContext());
             CLOG_INFO(
                 Bucket,
                 "post-ledger {} close, init counts: level {}, {} in curr, "
@@ -1488,11 +1490,16 @@ TEST_CASE("upgrade to version 11", "[upgrades]")
             auto lev0Snap = lev0.getSnap();
             auto lev1Curr = lev1.getCurr();
             auto lev1Snap = lev1.getSnap();
-            BucketTestUtils::EntryCounts lev0CurrCounts(lev0Curr);
-            BucketTestUtils::EntryCounts lev0SnapCounts(lev0Snap);
-            BucketTestUtils::EntryCounts lev1CurrCounts(lev1Curr);
-            auto getVers = [](std::shared_ptr<Bucket> b) -> uint32_t {
-                return BucketInputIterator(b).getMetadata().ledgerVersion;
+            BucketTestUtils::EntryCounts lev0CurrCounts(lev0Curr,
+                                                        clock.getIOContext());
+            BucketTestUtils::EntryCounts lev0SnapCounts(lev0Snap,
+                                                        clock.getIOContext());
+            BucketTestUtils::EntryCounts lev1CurrCounts(lev1Curr,
+                                                        clock.getIOContext());
+            auto getVers = [&clock](std::shared_ptr<Bucket> b) -> uint32_t {
+                return BucketInputIterator(b, clock.getIOContext())
+                    .getMetadata()
+                    .ledgerVersion;
             };
             switch (ledgerSeq)
             {
@@ -1578,8 +1585,10 @@ TEST_CASE("upgrade to version 12", "[upgrades]")
             auto lev0Snap = lev0.getSnap();
             auto lev1Curr = lev1.getCurr();
             auto lev1Snap = lev1.getSnap();
-            auto getVers = [](std::shared_ptr<Bucket> b) -> uint32_t {
-                return BucketInputIterator(b).getMetadata().ledgerVersion;
+            auto getVers = [&clock](std::shared_ptr<Bucket> b) -> uint32_t {
+                return BucketInputIterator(b, clock.getIOContext())
+                    .getMetadata()
+                    .ledgerVersion;
             };
             switch (ledgerSeq)
             {

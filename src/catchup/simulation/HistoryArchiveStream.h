@@ -40,7 +40,7 @@ class HistoryArchiveStream
 
   public:
     HistoryArchiveStream(TmpDir const& downloadDir, LedgerRange const& range,
-                         HistoryManager const& hm);
+                         HistoryManager const& hm, asio::io_context& ctx);
 
     bool getNextLedger(LedgerHeaderHistoryEntry& header,
                        TransactionHistoryEntry& transaction,
