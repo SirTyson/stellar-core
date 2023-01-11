@@ -48,7 +48,7 @@ class XDRInputFileStream
             {
                 if (error != asio::error::eof)
                 {
-                    throw xdr::xdr_runtime_error("IO failure in readExact");
+                    throw xdr::xdr_runtime_error("IO failure in read");
                 }
                 break;
             }
@@ -75,8 +75,25 @@ class XDRInputFileStream
     open(std::string const& filename)
     {
         ZoneScoped;
-        releaseAssert(!mIn.is_open());
-        mIn.open(filename, asio::stream_file::read_only);
+        // if (!fs::exists(filename))
+        // {
+        //     std::string msg("failed to open XDR file: ");
+        //     msg += filename;
+        //     msg += ", reason: ";
+        //     msg += std::to_string(errno);
+        //     CLOG_ERROR(Fs, "{}", msg);
+        //     throw FileSystemException(msg);
+        // }
+        try
+        {
+            mIn.open(filename, asio::stream_file::read_only);
+        }
+        catch (std::exception const& e)
+        {
+            CLOG_ERROR(Fs, "{}", e.what());
+            throw FileSystemException(e.what());
+        }
+
         if (!mIn.is_open())
         {
             std::string msg("failed to open XDR file: ");
