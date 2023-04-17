@@ -38,6 +38,13 @@ void generateScaledDeadEntries(
         poolIDToParam,
     uint32_t partition);
 
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+void generateScaledRentEntries(
+    std::vector<RentEntry>& entries, std::vector<RentEntry> const& oldEntries,
+    UnorderedMap<PoolID, LiquidityPoolConstantProductParameters>& poolIDToParam,
+    uint32_t partition);
+#endif
+
 SignerKey generateScaledEd25519Signer(SignerKey const& signer,
                                       uint32_t partition);
 SignerKey generateScaledEd25519Signer(Signer const& signer, uint32_t partition);

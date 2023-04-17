@@ -95,6 +95,10 @@ EntryCounts::EntryCounts(std::shared_ptr<Bucket> bucket)
             // This should never happen: only the first record can be METAENTRY
             // and it is counted above.
             abort();
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+        case RENTENTRY:
+            ++nRent;
+#endif
         }
         ++iter;
     }

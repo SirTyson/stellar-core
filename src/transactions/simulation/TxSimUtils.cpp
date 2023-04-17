@@ -467,6 +467,17 @@ generateScaledDeadEntries(
     }
 }
 
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+void
+generateScaledRentEntries(
+    std::vector<RentEntry>& entries, std::vector<RentEntry> const& oldEntries,
+    UnorderedMap<PoolID, LiquidityPoolConstantProductParameters>& poolIDToParam,
+    uint32_t partition)
+{
+    // TODO: Implement
+}
+#endif
+
 void
 mutateScaledOperation(
     Operation& op, AbstractLedgerTxn& ltx,

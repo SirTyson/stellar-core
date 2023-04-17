@@ -219,6 +219,11 @@ TxSimGenerateBucketsWork::startBucketGeneration(
     std::shared_ptr<Bucket> const& oldBucket)
 {
     std::vector<LedgerEntry> initEntries, liveEntries;
+
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+    std::vector<RentEntry> rentEntries;
+#endif
+
     std::vector<LedgerKey> deadEntries;
     BucketInputIterator iter(oldBucket);
     uint32_t ledgerVersion = iter.getMetadata().ledgerVersion;
@@ -240,6 +245,11 @@ TxSimGenerateBucketsWork::startBucketGeneration(
         case DEADENTRY:
             deadEntries.emplace_back(entry.deadEntry());
             break;
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+        case RENTENTRY:
+            rentEntries.emplace_back(entry.rentEntry());
+            break;
+#endif
         }
     }
 
@@ -254,6 +264,11 @@ TxSimGenerateBucketsWork::startBucketGeneration(
     newLiveEntries.reserve(liveEntries.size());
     newDeadEntries.reserve(deadEntries.size());
 
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+    std::vector<RentEntry> newRentEntries;
+    newRentEntries.reserve(rentEntries.size());
+#endif
+
     mIntermediateBuckets.emplace_back(oldBucket);
 
     for (uint32_t count = 1; count < mMultiplier; count++)
@@ -264,6 +279,11 @@ TxSimGenerateBucketsWork::startBucketGeneration(
                                   count);
         generateScaledDeadEntries(newDeadEntries, deadEntries, mPoolIDToParam,
                                   count);
+
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+        generateScaledRentEntries(newRentEntries, rentEntries, mPoolIDToParam,
+                                  count);
+#endif
 
         mIntermediateBuckets.emplace_back(Bucket::fresh(
             mApp.getBucketManager(), ledgerVersion, newInitEntries,

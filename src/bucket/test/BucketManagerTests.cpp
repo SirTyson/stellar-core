@@ -703,6 +703,8 @@ class StopAndRestartBucketMergesTest
                       mMergeCounters.mNewLiveEntries);
             CLOG_INFO(Bucket, "NewDeadEntries: {}",
                       mMergeCounters.mNewDeadEntries);
+            CLOG_INFO(Bucket, "NewRentEntries: {}",
+                      mMergeCounters.mNewRentEntries);
             CLOG_INFO(Bucket, "OldMetaEntries: {}",
                       mMergeCounters.mOldMetaEntries);
             CLOG_INFO(Bucket, "OldInitEntries: {}",
@@ -711,6 +713,8 @@ class StopAndRestartBucketMergesTest
                       mMergeCounters.mOldLiveEntries);
             CLOG_INFO(Bucket, "OldDeadEntries: {}",
                       mMergeCounters.mOldDeadEntries);
+            CLOG_INFO(Bucket, "OldRentEntries: {}",
+                      mMergeCounters.mOldRentEntries);
             CLOG_INFO(Bucket, "OldEntriesDefaultAccepted: {}",
                       mMergeCounters.mOldEntriesDefaultAccepted);
             CLOG_INFO(Bucket, "NewEntriesDefaultAccepted: {}",
@@ -733,6 +737,8 @@ class StopAndRestartBucketMergesTest
                       mMergeCounters.mInitEntryShadowElisions);
             CLOG_INFO(Bucket, "DeadEntryShadowElisions: {}",
                       mMergeCounters.mDeadEntryShadowElisions);
+            CLOG_INFO(Bucket, "ReinitEntryShadowElisions: {}",
+                      mMergeCounters.mRentEntryShadowElisions);
             CLOG_INFO(Bucket, "OutputIteratorTombstoneElisions: {}",
                       mMergeCounters.mOutputIteratorTombstoneElisions);
             CLOG_INFO(Bucket, "OutputIteratorBufferUpdates: {}",
@@ -759,11 +765,13 @@ class StopAndRestartBucketMergesTest
             CHECK(mMergeCounters.mNewInitEntries != 0);
             CHECK(mMergeCounters.mNewLiveEntries != 0);
             CHECK(mMergeCounters.mNewDeadEntries != 0);
+            CHECK(mMergeCounters.mNewRentEntries == 0);
 
             CHECK(mMergeCounters.mOldMetaEntries == 0);
             CHECK(mMergeCounters.mOldInitEntries != 0);
             CHECK(mMergeCounters.mOldLiveEntries != 0);
             CHECK(mMergeCounters.mOldDeadEntries != 0);
+            CHECK(mMergeCounters.mOldRentEntries == 0);
 
             CHECK(mMergeCounters.mOldEntriesDefaultAccepted != 0);
             CHECK(mMergeCounters.mNewEntriesDefaultAccepted != 0);
@@ -787,6 +795,7 @@ class StopAndRestartBucketMergesTest
             CHECK(mMergeCounters.mMetaEntryShadowElisions == 0);
             CHECK(mMergeCounters.mInitEntryShadowElisions == 0);
             CHECK(mMergeCounters.mDeadEntryShadowElisions == 0);
+            CHECK(mMergeCounters.mRentEntryShadowElisions == 0);
 
             CHECK(mMergeCounters.mOutputIteratorBufferUpdates != 0);
             CHECK(mMergeCounters.mOutputIteratorActualWrites != 0);
@@ -804,11 +813,13 @@ class StopAndRestartBucketMergesTest
             CHECK(mMergeCounters.mNewInitEntries == 0);
             CHECK(mMergeCounters.mNewLiveEntries != 0);
             CHECK(mMergeCounters.mNewDeadEntries != 0);
+            CHECK(mMergeCounters.mNewRentEntries == 0);
 
             CHECK(mMergeCounters.mOldMetaEntries == 0);
             CHECK(mMergeCounters.mOldInitEntries == 0);
             CHECK(mMergeCounters.mOldLiveEntries != 0);
             CHECK(mMergeCounters.mOldDeadEntries != 0);
+            CHECK(mMergeCounters.mOldRentEntries == 0);
 
             CHECK(mMergeCounters.mOldEntriesDefaultAccepted != 0);
             CHECK(mMergeCounters.mNewEntriesDefaultAccepted != 0);
@@ -822,6 +833,7 @@ class StopAndRestartBucketMergesTest
             CHECK(mMergeCounters.mLiveEntryShadowElisions != 0);
             CHECK(mMergeCounters.mInitEntryShadowElisions == 0);
             CHECK(mMergeCounters.mDeadEntryShadowElisions != 0);
+            CHECK(mMergeCounters.mRentEntryShadowElisions == 0);
 
             CHECK(mMergeCounters.mOutputIteratorBufferUpdates != 0);
             CHECK(mMergeCounters.mOutputIteratorActualWrites != 0);
@@ -855,6 +867,8 @@ class StopAndRestartBucketMergesTest
                   other.mMergeCounters.mNewLiveEntries);
             CHECK(mMergeCounters.mNewDeadEntries ==
                   other.mMergeCounters.mNewDeadEntries);
+            CHECK(mMergeCounters.mNewRentEntries ==
+                  other.mMergeCounters.mNewRentEntries);
             CHECK(mMergeCounters.mOldMetaEntries ==
                   other.mMergeCounters.mOldMetaEntries);
             CHECK(mMergeCounters.mOldInitEntries ==
@@ -863,6 +877,8 @@ class StopAndRestartBucketMergesTest
                   other.mMergeCounters.mOldLiveEntries);
             CHECK(mMergeCounters.mOldDeadEntries ==
                   other.mMergeCounters.mOldDeadEntries);
+            CHECK(mMergeCounters.mOldRentEntries ==
+                  other.mMergeCounters.mOldRentEntries);
 
             CHECK(mMergeCounters.mOldEntriesDefaultAccepted ==
                   other.mMergeCounters.mOldEntriesDefaultAccepted);
@@ -887,6 +903,8 @@ class StopAndRestartBucketMergesTest
                   other.mMergeCounters.mInitEntryShadowElisions);
             CHECK(mMergeCounters.mDeadEntryShadowElisions ==
                   other.mMergeCounters.mDeadEntryShadowElisions);
+            CHECK(mMergeCounters.mRentEntryShadowElisions ==
+                  other.mMergeCounters.mRentEntryShadowElisions);
 
             CHECK(mMergeCounters.mOutputIteratorTombstoneElisions ==
                   other.mMergeCounters.mOutputIteratorTombstoneElisions);

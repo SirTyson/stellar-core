@@ -70,6 +70,12 @@ struct MergeCounters
     uint64_t mInitEntryShadowElisions{0};
     uint64_t mDeadEntryShadowElisions{0};
 
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+    uint64_t mNewRentEntries{0};
+    uint64_t mOldRentEntries{0};
+    uint64_t mRentEntryShadowElisions{0};
+#endif
+
     uint64_t mOutputIteratorTombstoneElisions{0};
     uint64_t mOutputIteratorBufferUpdates{0};
     uint64_t mOutputIteratorActualWrites{0};

@@ -306,6 +306,12 @@ MergeCounters::operator+=(MergeCounters const& delta)
     mInitEntryShadowElisions += delta.mInitEntryShadowElisions;
     mDeadEntryShadowElisions += delta.mDeadEntryShadowElisions;
 
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+    mNewRentEntries += delta.mNewRentEntries;
+    mOldRentEntries += delta.mOldRentEntries;
+    mRentEntryShadowElisions += delta.mRentEntryShadowElisions;
+#endif
+
     mOutputIteratorTombstoneElisions += delta.mOutputIteratorTombstoneElisions;
     mOutputIteratorBufferUpdates += delta.mOutputIteratorBufferUpdates;
     mOutputIteratorActualWrites += delta.mOutputIteratorActualWrites;
@@ -347,6 +353,12 @@ MergeCounters::operator==(MergeCounters const& other) const
         mLiveEntryShadowElisions == other.mLiveEntryShadowElisions &&
         mInitEntryShadowElisions == other.mInitEntryShadowElisions &&
         mDeadEntryShadowElisions == other.mDeadEntryShadowElisions &&
+
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+        mNewRentEntries == other.mNewRentEntries &&
+        mOldRentEntries == other.mOldRentEntries &&
+        mRentEntryShadowElisions == other.mRentEntryShadowElisions &&
+#endif
 
         mOutputIteratorTombstoneElisions ==
             other.mOutputIteratorTombstoneElisions &&

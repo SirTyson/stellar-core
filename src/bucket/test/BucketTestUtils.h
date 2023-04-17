@@ -24,15 +24,27 @@ struct EntryCounts
     size_t nInit{0};
     size_t nLive{0};
     size_t nDead{0};
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+    size_t nRent{0};
+#endif
+
     size_t
     sum() const
     {
-        return nLive + nInit + nDead;
+        return
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+            nRent +
+#endif
+            nLive + nInit + nDead;
     }
     size_t
     sumIncludingMeta() const
     {
-        return nLive + nInit + nDead + nMeta;
+        return
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+            nRent +
+#endif
+            nLive + nInit + nDead + nMeta;
     }
 
     EntryCounts(std::shared_ptr<stellar::Bucket> bucket);

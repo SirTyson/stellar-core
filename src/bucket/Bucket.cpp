@@ -425,6 +425,11 @@ countShadowedEntryType(MergeCounters& mc, BucketEntry const& e)
     case DEADENTRY:
         ++mc.mDeadEntryShadowElisions;
         break;
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+    case RENTENTRY:
+        ++mc.mRentEntryShadowElisions;
+        break;
+#endif
     }
 }
 
@@ -534,6 +539,11 @@ countOldEntryType(MergeCounters& mc, BucketEntry const& e)
     case DEADENTRY:
         ++mc.mOldDeadEntries;
         break;
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+    case RENTENTRY:
+        ++mc.mOldRentEntries;
+        break;
+#endif
     }
 }
 
@@ -554,6 +564,11 @@ countNewEntryType(MergeCounters& mc, BucketEntry const& e)
     case DEADENTRY:
         ++mc.mNewDeadEntries;
         break;
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+    case RENTENTRY:
+        ++mc.mNewRentEntries;
+        break;
+#endif
     }
 }
 
