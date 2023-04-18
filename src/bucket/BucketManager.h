@@ -241,6 +241,17 @@ class BucketManager : NonMovableOrCopyable
     // This interface exists only for checking that the BucketDir isn't
     // leaking buckets, in tests.
     virtual std::set<Hash> getBucketHashesInBucketDirForTesting() const = 0;
+
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+    // Set rent fee for testing purposes
+    virtual void setRentFee(int64_t fee) = 0;
+#endif
+#endif
+
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+    // Returns rent fee rate per byte in stroops based on the current BucketList
+    // size
+    virtual int64_t getRentFee() const = 0;
 #endif
 
     // Return the set of buckets referenced by the BucketList

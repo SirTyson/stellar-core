@@ -84,6 +84,11 @@ class BucketManagerImpl : public BucketManager
     bool mUseFakeTestValuesForNextClose{false};
     uint32_t mFakeTestProtocolVersion;
     uint256 mFakeTestBucketListHash;
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+    // If not null, this value is used as the rent fee instead of basing the fee
+    // off BucketList size
+    std::optional<int64_t> rentFeeOverride{};
+#endif
 #endif
 
   protected:
@@ -152,6 +157,19 @@ class BucketManagerImpl : public BucketManager
                                               uint256 const& hash) override;
 
     std::set<Hash> getBucketHashesInBucketDirForTesting() const override;
+
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+    virtual void
+    setRentFee(int64_t fee) override
+    {
+        rentFeeOverride = std::make_optional(fee);
+    }
+#endif
+
+#endif
+
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+    virtual int64_t getRentFee() const override;
 #endif
 
     std::set<Hash> getBucketListReferencedBuckets() const override;

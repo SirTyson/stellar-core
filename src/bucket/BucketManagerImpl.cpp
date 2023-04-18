@@ -859,6 +859,22 @@ BucketManagerImpl::getBucketHashesInBucketDirForTesting() const
 }
 #endif
 
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+int64_t
+BucketManagerImpl::getRentFee() const
+{
+#ifdef BUILD_TESTS
+    if (rentFeeOverride.has_value())
+    {
+        return *rentFeeOverride;
+    }
+#endif
+
+    // TODO: calculate fees based on BucketList size
+    return 1;
+}
+#endif
+
 // updates the given LedgerHeader to reflect the current state of the bucket
 // list
 void

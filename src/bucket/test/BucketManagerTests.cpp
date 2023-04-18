@@ -622,6 +622,132 @@ TEST_CASE_VERSIONS(
     });
 }
 
+//#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+TEST_CASE("rent charges", "[bucket][bucketmanager]")
+{
+    Config cfg(getTestConfig());
+    VirtualClock clock{};
+    std::shared_ptr<BucketTestApplication> app =
+        createTestApplication<BucketTestApplication>(clock, cfg);
+
+    app->getBucketManager().setRentFee(1);
+
+    // Insert a single entry and check rent value as it moves through the
+    // BucketList
+    auto entry = LedgerTestUtils::generateValidLedgerEntryOfType(
+        LedgerEntryType::CONTRACT_DATA);
+    app->getLedgerManager().setNextLedgerEntryBatchForBucketTesting({}, {entry},
+                                                                    {});
+    closeLedger(*app);
+
+    auto& bl = app->getBucketManager().getBucketList();
+    auto getEntry = [&](auto b) -> std::optional<ContractDataEntry> {
+        for (BucketInputIterator iter(b); iter; ++iter)
+        {
+            auto key = getBucketLedgerKey(*iter);
+            if (key == LedgerEntryKey(entry))
+            {
+                return {(*iter).liveEntry().data.contractData()};
+            }
+        }
+
+        return {};
+    };
+
+    // Track where entry is in BucketList
+    auto level = 0;
+    bool snap = false;
+    std::vector<int64_t> rentCharges(BucketList::kNumLevels, 0);
+
+    // Close ledgers until entry is in bottom level
+    auto ledger = app->getLedgerManager().getLastClosedLedgerNum();
+    auto rentCharge = 0;
+    while (level != BucketList::kNumLevels - 1)
+    {
+        closeLedger(*app);
+        ++ledger;
+
+        rentCharges[level] -= app->getBucketManager().getRentFee();
+
+        if (snap)
+        {
+            // Check for outgoing spills
+            if (BucketList::levelShouldSpill(ledger, level))
+            {
+                CLOG_FATAL(Bucket, "level {} spilling on ledger {}", level,
+                           ledger);
+
+                snap = false;
+                ++level;
+
+                auto onDiskEntry = getEntry(bl.getLevel(level).getCurr());
+                REQUIRE(onDiskEntry);
+                if (level > 1)
+                {
+                    REQUIRE(onDiskEntry->meta.rentBalance() ==
+                            rentCharges[level - 2]);
+                }
+
+                if (level != 0)
+                {
+                    CLOG_FATAL(Bucket,
+                               "Up to date rent charge: {}, last level {}",
+                               rentCharges[level], rentCharges[level - 1]);
+                }
+            }
+        }
+        else
+        {
+            // Check in entry has snapped
+            if (BucketList::levelShouldSpill(ledger, level))
+            {
+                snap = true;
+
+                CLOG_FATAL(Bucket, "level {} snapping on ledger {}", level,
+                           ledger);
+
+                if (level != 0)
+                {
+                    CLOG_FATAL(Bucket,
+                               "Up to date rent charge: {}, last level {}",
+                               rentCharges[level], rentCharges[level - 1]);
+                }
+                auto snapB = bl.getLevel(level).getSnap();
+                REQUIRE(getEntry(snapB));
+                auto currB = bl.getLevel(level).getCurr();
+                REQUIRE(!getEntry(currB));
+            }
+            // Check for incoming spills except on level 0. Level 0 pays no rent
+            else if (level != 0 &&
+                     BucketList::levelShouldSpill(ledger, level - 1))
+            {
+                CLOG_FATAL(Bucket, "level {} recieving spill on ledger {}",
+                           level, ledger);
+
+                CLOG_FATAL(Bucket, "Up to date rent charge: {}, last level {}",
+                           rentCharges[level], rentCharges[level - 1]);
+            }
+        }
+    }
+
+    // Close ledgers until the bottom level recieves a 2nd spill to make sure
+    // incoming spills charge bottom level rent correctly
+    do
+    {
+        closeLedger(*app);
+        ++ledger;
+    } while (!BucketList::levelShouldSpill(ledger, BucketList::kNumLevels - 2));
+
+    CLOG_FATAL(Bucket, "level {} recieving 2nd spill on ledger {}", level,
+               ledger);
+
+    for (auto i = 0; i < rentCharges.size(); ++i)
+    {
+        CLOG_FATAL(Bucket, "Rent charge for level {}: {}", i, rentCharges[i]);
+    }
+}
+//#endif
+
 // Running one of these tests involves comparing three timelines with different
 // application lifecycles for identical outcomes.
 //

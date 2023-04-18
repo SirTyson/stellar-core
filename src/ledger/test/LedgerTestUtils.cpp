@@ -336,6 +336,8 @@ makeValid(ConfigSettingEntry& ce)
 void
 makeValid(ContractDataEntry& cde)
 {
+    cde.meta.t(ContractDataType::RECOVERABLE);
+    cde.meta.rentBalance() = 0;
 }
 
 void
