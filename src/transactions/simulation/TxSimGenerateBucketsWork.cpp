@@ -80,7 +80,7 @@ TxSimGenerateBucketsWork::checkOrStartMerges()
         std::vector<std::shared_ptr<Bucket>> shadows;
         mMergesInProgress.emplace_back(mApp, b1, b2, shadows,
                                        mApp.getConfig().LEDGER_PROTOCOL_VERSION,
-                                       false, mLevel);
+                                       false, mLevel, /*rentToApply=*/0);
     }
 
     return false;
@@ -201,7 +201,7 @@ TxSimGenerateBucketsWork::setFutureBuckets()
             std::vector<std::shared_ptr<Bucket>> shadows;
             mGeneratedApplyState.currentBuckets[i].next =
                 FutureBucket(mApp, preparedCurr, prevSnapBucket, shadows,
-                             snapVersion, false, i);
+                             snapVersion, false, i, /*rentToApply=*/0);
         }
     }
 }

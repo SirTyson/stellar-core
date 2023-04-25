@@ -853,7 +853,7 @@ Bucket::merge(BucketManager& bucketManager, uint32_t maxProtocolVersion,
               std::shared_ptr<Bucket> const& newBucket,
               std::vector<std::shared_ptr<Bucket>> const& shadows,
               bool keepDeadEntries, bool countMergeEvents,
-              asio::io_context& ctx, bool doFsync)
+              asio::io_context& ctx, bool doFsync, int64 const rentToApply)
 {
     ZoneScoped;
     // This is the key operation in the scheme: merging two (read-only)

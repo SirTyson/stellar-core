@@ -8,6 +8,7 @@
 #include "bucket/LedgerCmp.h"
 #include "overlay/StellarXDR.h"
 #include "xdrpp/message.h"
+#include "xdrpp/types.h"
 #include <future>
 #include <optional>
 #include <set>
@@ -373,7 +374,7 @@ class BucketLevel
     void prepare(Application& app, uint32_t currLedger,
                  uint32_t currLedgerProtocol, std::shared_ptr<Bucket> snap,
                  std::vector<std::shared_ptr<Bucket>> const& shadows,
-                 bool countMergeEvents);
+                 bool countMergeEvents, int64_t const rentToApply);
     std::shared_ptr<Bucket> snap();
 };
 
@@ -398,6 +399,14 @@ class BucketListDepth
 class BucketList
 {
     std::vector<BucketLevel> mLevels;
+
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+    std::optional<RentMetadata> mRentMetadata;
+
+    // Returns in-memory rent metadata if it exists, otherwise loads it from
+    // BucketList
+    RentMetadata& getRentMetadata(Application& app);
+#endif
 
     // Loops through all buckets, starting with curr at level 0, then snap at
     // level 0, etc. Calls f on each bucket. Exits early if function

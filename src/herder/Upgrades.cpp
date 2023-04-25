@@ -1427,6 +1427,11 @@ ConfigUpgradeSetFrame::isValidForApply() const
             // Validation should be implemented when implementing/tuning
             // the respective settings.
             valid = true;
+
+        case ConfigSettingID::CONFIG_SETTING_RENT_METADATA:
+            // Rent metadata is updated automatically by the protocol, should
+            // never by upgraded
+            valid = false;
             break;
         }
         if (!valid)

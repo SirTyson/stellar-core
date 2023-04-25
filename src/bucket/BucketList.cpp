@@ -159,7 +159,7 @@ void
 BucketLevel::prepare(Application& app, uint32_t currLedger,
                      uint32_t currLedgerProtocol, std::shared_ptr<Bucket> snap,
                      std::vector<std::shared_ptr<Bucket>> const& shadows,
-                     bool countMergeEvents)
+                     bool countMergeEvents, int64_t const rentToApply)
 {
     ZoneScoped;
     // If more than one absorb is pending at the same time, we have a logic
@@ -174,8 +174,9 @@ BucketLevel::prepare(Application& app, uint32_t currLedger,
                                   Bucket::FIRST_PROTOCOL_SHADOWS_REMOVED)
             ? std::vector<std::shared_ptr<Bucket>>()
             : shadows;
-    mNextCurr = FutureBucket(app, curr, snap, shadowsBasedOnProtocol,
-                             currLedgerProtocol, countMergeEvents, mLevel);
+    mNextCurr =
+        FutureBucket(app, curr, snap, shadowsBasedOnProtocol,
+                     currLedgerProtocol, countMergeEvents, mLevel, rentToApply);
     releaseAssert(mNextCurr.isMerging());
 }
 
@@ -370,6 +371,22 @@ BucketList::getHash() const
     }
     return hsh.finish();
 }
+
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+RentMetadata&
+BucketList::getRentMetadata(Application& app)
+{
+    if (!mRentMetadata.has_value())
+    {
+        LedgerTxn ltx(app.getLedgerTxnRoot());
+        LedgerKey key(CONFIG_SETTING);
+        auto le = ltx.loadWithoutRecord(key).current();
+        mRentMetadata = {le.data.configSetting().rentMetadata()};
+    }
+
+    return mRentMetadata.value();
+}
+#endif
 
 void
 BucketList::loopAllBuckets(std::function<bool(std::shared_ptr<Bucket>)> f) const
@@ -742,10 +759,11 @@ BucketList::addBatch(Application& app, uint32_t currLedger,
              * else spilled/added to it.
              */
 
+            // TODO: Rent
             auto snap = mLevels[i - 1].snap();
             mLevels[i].commit();
             mLevels[i].prepare(app, currLedger, currLedgerProtocol, snap,
-                               shadows, /*countMergeEvents=*/true);
+                               shadows, /*countMergeEvents=*/true, 0);
         }
     }
 
@@ -761,7 +779,7 @@ BucketList::addBatch(Application& app, uint32_t currLedger,
                                      initEntries, liveEntries, deadEntries,
                                      countMergeEvents,
                                      app.getClock().getIOContext(), doFsync),
-                       shadows, countMergeEvents);
+                       shadows, countMergeEvents, /*rentToApply=*/0);
     mLevels[0].commit();
 
     // We almost always want to try to resolve completed merges to single
@@ -843,9 +861,11 @@ BucketList::restartMerges(Application& app, uint32_t maxProtocolVersion,
             // re-start the merge via prepare, mimicking the logic in `addBatch`
             auto mergeStartLedger =
                 roundDown(ledger, BucketList::levelHalf(i - 1));
+            // TODO: rent
             level.prepare(
                 app, mergeStartLedger, version, snap, /* shadows= */ {},
-                !app.getConfig().ARTIFICIALLY_REDUCE_MERGE_COUNTS_FOR_TESTING);
+                !app.getConfig().ARTIFICIALLY_REDUCE_MERGE_COUNTS_FOR_TESTING,
+                0);
         }
     }
 }

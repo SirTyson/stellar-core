@@ -71,6 +71,7 @@ class FutureBucket
     std::string mInputSnapBucketHash;
     std::vector<std::string> mInputShadowBucketHashes;
     std::string mOutputBucketHash;
+    int64_t mRentToApply{0};
 
     void checkHashesMatch() const;
     void checkState() const;
@@ -86,7 +87,7 @@ class FutureBucket
                  std::shared_ptr<Bucket> const& snap,
                  std::vector<std::shared_ptr<Bucket>> const& shadows,
                  uint32_t maxProtocolVersion, bool countMergeEvents,
-                 uint32_t level);
+                 uint32_t level, int64_t const rentToApply);
 
     FutureBucket() = default;
     FutureBucket(FutureBucket const& other) = default;
@@ -127,6 +128,12 @@ class FutureBucket
     // Return all hashes referenced by this future.
     std::vector<std::string> getHashes() const;
 
+    // TODO: Figure out versioning here. Since we didn't serialize with a
+    // version number, this is a breaking change and all in-progress
+    // FutureBuckets on disk will be invalid. This means this function will
+    // throw on startup if new-db is not ran first. new-db may also throw, it
+    // may be necessary to manually delete the buckets folder and run new-db
+    // (for now)
     template <class Archive>
     void
     load(Archive& ar)
@@ -139,6 +146,9 @@ class FutureBucket
             ar(cereal::make_nvp("curr", mInputCurrBucketHash));
             ar(cereal::make_nvp("snap", mInputSnapBucketHash));
             ar(cereal::make_nvp("shadow", mInputShadowBucketHashes));
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+            ar(cereal::make_nvp("rentToApply", mRentToApply));
+#endif
             break;
         case FB_HASH_OUTPUT:
             ar(cereal::make_nvp("output", mOutputBucketHash));
@@ -166,6 +176,9 @@ class FutureBucket
             ar(cereal::make_nvp("curr", mInputCurrBucketHash));
             ar(cereal::make_nvp("snap", mInputSnapBucketHash));
             ar(cereal::make_nvp("shadow", mInputShadowBucketHashes));
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+            ar(cereal::make_nvp("rentToApply", mRentToApply));
+#endif
             break;
         case FB_LIVE_OUTPUT:
         case FB_HASH_OUTPUT:

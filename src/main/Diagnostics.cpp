@@ -72,6 +72,12 @@ bucketStats(std::string const& filename, bool aggregateAccounts)
             break;
         case METAENTRY:
             root["LEDGER_VERSION"] = tmp.metaEntry().ledgerVersion;
+            break;
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+        case RENTENTRY:
+            // TODO: Additional stats
+            break;
+#endif
         }
     }
     Json::Value& be = root["BUCKET_ENTRIES"];
