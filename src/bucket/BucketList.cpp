@@ -159,7 +159,8 @@ void
 BucketLevel::prepare(Application& app, uint32_t currLedger,
                      uint32_t currLedgerProtocol, std::shared_ptr<Bucket> snap,
                      std::vector<std::shared_ptr<Bucket>> const& shadows,
-                     bool countMergeEvents, int64_t const rentToApply)
+                     bool countMergeEvents, int64_t const currRentToApply,
+                     int64_t const snapRentToApply)
 {
     ZoneScoped;
     // If more than one absorb is pending at the same time, we have a logic
@@ -174,9 +175,9 @@ BucketLevel::prepare(Application& app, uint32_t currLedger,
                                   Bucket::FIRST_PROTOCOL_SHADOWS_REMOVED)
             ? std::vector<std::shared_ptr<Bucket>>()
             : shadows;
-    mNextCurr =
-        FutureBucket(app, curr, snap, shadowsBasedOnProtocol,
-                     currLedgerProtocol, countMergeEvents, mLevel, rentToApply);
+    mNextCurr = FutureBucket(app, curr, snap, shadowsBasedOnProtocol,
+                             currLedgerProtocol, countMergeEvents, mLevel,
+                             currRentToApply, snapRentToApply);
     releaseAssert(mNextCurr.isMerging());
 }
 
@@ -373,20 +374,51 @@ BucketList::getHash() const
 }
 
 #ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
-RentMetadata&
-BucketList::getRentMetadata(Application& app)
+// TODO: Move to bucket manager
+static void
+updateRentMeta(RentMeta& meta, int64_t rentFee)
 {
-    if (!mRentMetadata.has_value())
+    for (auto& entry : meta.outstandingCurrRent)
     {
-        LedgerTxn ltx(app.getLedgerTxnRoot());
-        LedgerKey key(CONFIG_SETTING);
-        auto le = ltx.loadWithoutRecord(key).current();
-        mRentMetadata = {le.data.configSetting().rentMetadata()};
+        entry += rentFee;
     }
 
-    return mRentMetadata.value();
+    for (auto& entry : meta.outstandingSnapRent)
+    {
+        entry += rentFee;
+    }
 }
 #endif
+
+static inline int64_t
+getOutstandingRent(RentMeta const& meta, uint32_t level, bool isCurr)
+{
+    return isCurr ? meta.outstandingCurrRent.at(level)
+                  : meta.outstandingSnapRent.at(level);
+}
+
+int64_t
+BucketList::getMergeSnapshotRent(uint32_t level, bool isCurr) const
+{
+    // TODO: Implement
+    return 0;
+}
+
+static void
+snapOutstandingRent(RentMeta& meta, uint32_t level)
+{
+    CLOG_FATAL(Bucket, "Level {} snapped", level);
+    meta.outstandingSnapRent[level] = meta.outstandingCurrRent[level];
+    meta.outstandingCurrRent[level] = 0;
+}
+
+static void
+commitOutstandingRent(RentMeta& meta, uint32_t level,
+                      int64_t const rentAppliedToCurr)
+{
+    CLOG_FATAL(Bucket, "Level {} commited", level);
+    meta.outstandingCurrRent[level] -= rentAppliedToCurr;
+}
 
 void
 BucketList::loopAllBuckets(std::function<bool(std::shared_ptr<Bucket>)> f) const
@@ -410,30 +442,47 @@ BucketList::loopAllBuckets(std::function<bool(std::shared_ptr<Bucket>)> f) const
     }
 }
 
-std::shared_ptr<LedgerEntry>
+static bool
+paysRent(LedgerEntry const& entry)
+{
+    auto t = entry.data.type();
+    return t == LedgerEntryType::CONTRACT_CODE ||
+           t == LedgerEntryType::CONTRACT_DATA;
+}
+
+std::tuple<std::shared_ptr<LedgerEntry>, uint32_t, bool>
 BucketList::getLedgerEntry(LedgerKey const& k) const
 {
     ZoneScoped;
-    std::shared_ptr<LedgerEntry> result{};
-
-    auto f = [&](std::shared_ptr<Bucket> b) {
-        auto be = b->getBucketEntry(k);
-        if (be.has_value())
+    for (auto levelIter = 0; levelIter < kNumLevels; ++levelIter)
+    {
+        auto isCurr = true;
+        auto& level = getLevel(levelIter);
+        std::array<std::shared_ptr<Bucket>, 2> buckets = {level.getCurr(),
+                                                          level.getSnap()};
+        for (auto& b : buckets)
         {
-            result =
-                be.value().type() == DEADENTRY
-                    ? nullptr
-                    : std::make_shared<LedgerEntry>(be.value().liveEntry());
-            return true;
-        }
-        else
-        {
-            return false;
-        }
-    };
+            if (!b->isEmpty())
+            {
+                auto be = b->getBucketEntry(k);
+                if (be.has_value())
+                {
+                    std::shared_ptr<LedgerEntry> entry{nullptr};
+                    if (be.value().type() != DEADENTRY)
+                    {
+                        entry = std::make_shared<LedgerEntry>(
+                            be.value().liveEntry());
+                    }
 
-    loopAllBuckets(f);
-    return result;
+                    return {entry, levelIter, isCurr};
+                }
+            }
+
+            isCurr = false;
+        }
+    }
+
+    return {nullptr, kNumLevels, false};
 }
 
 std::vector<LedgerEntry>
@@ -678,7 +727,12 @@ BucketList::addBatch(Application& app, uint32_t currLedger,
                      uint32_t currLedgerProtocol,
                      std::vector<LedgerEntry> const& initEntries,
                      std::vector<LedgerEntry> const& liveEntries,
-                     std::vector<LedgerKey> const& deadEntries)
+                     std::vector<LedgerKey> const& deadEntries
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+                     ,
+                     RentMeta& rentMeta
+#endif
+)
 {
     ZoneScoped;
     releaseAssert(currLedger > 0);
@@ -760,10 +814,23 @@ BucketList::addBatch(Application& app, uint32_t currLedger,
              */
 
             // TODO: Rent
+
+            // TODO: Refactor and combine these with a snapLevel function
             auto snap = mLevels[i - 1].snap();
+            snapOutstandingRent(rentMeta, i - 1);
+
+            // TODO: Refactor
+            auto rentAppliedByFutureBucket =
+                mLevels[i].getNext().mCurrRentToApply;
             mLevels[i].commit();
+            commitOutstandingRent(rentMeta, i, rentAppliedByFutureBucket);
+
             mLevels[i].prepare(app, currLedger, currLedgerProtocol, snap,
-                               shadows, /*countMergeEvents=*/true, 0);
+                               shadows, /*countMergeEvents=*/true,
+                               getOutstandingRent(rentMeta, i, true),
+                               getOutstandingRent(rentMeta, i - 1, false));
+
+            // Update outstnading rent values
         }
     }
 
@@ -774,12 +841,27 @@ BucketList::addBatch(Application& app, uint32_t currLedger,
         !app.getConfig().ARTIFICIALLY_REDUCE_MERGE_COUNTS_FOR_TESTING;
     bool doFsync = !app.getConfig().DISABLE_XDR_FSYNC;
     releaseAssert(shadows.size() == 0);
-    mLevels[0].prepare(app, currLedger, currLedgerProtocol,
-                       Bucket::fresh(app.getBucketManager(), currLedgerProtocol,
-                                     initEntries, liveEntries, deadEntries,
-                                     countMergeEvents,
-                                     app.getClock().getIOContext(), doFsync),
-                       shadows, countMergeEvents, /*rentToApply=*/0);
+
+    // TODO: Get rid of copy
+    auto liveEntriesCopy = liveEntries;
+
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+    updateRentMeta(rentMeta, app.getBucketManager().getRentFee());
+    LedgerEntry le;
+    le.data.type(LedgerEntryType::CONFIG_SETTING);
+    le.data.configSetting().configSettingID(
+        ConfigSettingID::CONFIG_SETTING_RENT_METADATA);
+    le.data.configSetting().rentMeta() = rentMeta;
+    liveEntriesCopy.push_back(le);
+#endif
+
+    // TODO: Rent
+    mLevels[0].prepare(
+        app, currLedger, currLedgerProtocol,
+        Bucket::fresh(app.getBucketManager(), currLedgerProtocol, initEntries,
+                      liveEntriesCopy, deadEntries, countMergeEvents,
+                      app.getClock().getIOContext(), doFsync),
+        shadows, countMergeEvents, 0, app.getBucketManager().getRentFee());
     mLevels[0].commit();
 
     // We almost always want to try to resolve completed merges to single
@@ -798,7 +880,12 @@ BucketList::addBatch(Application& app, uint32_t currLedger,
 
 void
 BucketList::restartMerges(Application& app, uint32_t maxProtocolVersion,
-                          uint32_t ledger)
+                          uint32_t ledger
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+                          ,
+                          RentMeta& rentMeta
+#endif
+)
 {
     ZoneScoped;
     for (uint32_t i = 0; i < static_cast<uint32>(mLevels.size()); i++)
@@ -865,7 +952,8 @@ BucketList::restartMerges(Application& app, uint32_t maxProtocolVersion,
             level.prepare(
                 app, mergeStartLedger, version, snap, /* shadows= */ {},
                 !app.getConfig().ARTIFICIALLY_REDUCE_MERGE_COUNTS_FOR_TESTING,
-                0);
+                getOutstandingRent(rentMeta, i + 1, false),
+                getOutstandingRent(rentMeta, i, true));
         }
     }
 }

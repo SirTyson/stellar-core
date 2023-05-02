@@ -451,7 +451,8 @@ Bucket::checkProtocolLegality(BucketEntry const& entry,
 inline void
 maybePut(BucketOutputIterator& out, BucketEntry const& entry,
          std::vector<BucketInputIterator>& shadowIterators,
-         bool keepShadowedLifecycleEntries, MergeCounters& mc)
+         bool keepShadowedLifecycleEntries, MergeCounters& mc,
+         int64_t const rentToApply)
 {
     // In ledgers before protocol 11, keepShadowedLifecycleEntries will be
     // `false` and we will drop all shadowed entries here.
@@ -518,8 +519,29 @@ maybePut(BucketOutputIterator& out, BucketEntry const& entry,
             return;
         }
     }
-    // Nothing shadowed.
-    out.put(entry);
+
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+    // Apply rent
+    if (auto t = entry.type(); t == LIVEENTRY || t == INITENTRY)
+    {
+        // TODO: Get rid of copy
+        auto entryCopy = entry;
+        auto& le = entryCopy.liveEntry();
+        if (le.data.type() == CONTRACT_CODE)
+        {
+            le.data.contractCode().rentBalance -= rentToApply;
+        }
+        else if (le.data.type() == CONTRACT_DATA)
+        {
+            le.data.contractData().rentBalance -= rentToApply;
+        }
+
+        out.put(entryCopy);
+    }
+    else
+#endif
+        // Nothing shadowed.
+        out.put(entry);
 }
 
 static void
@@ -682,7 +704,8 @@ mergeCasesWithDefaultAcceptance(
     BucketEntryIdCmp const& cmp, MergeCounters& mc, BucketInputIterator& oi,
     BucketInputIterator& ni, BucketOutputIterator& out,
     std::vector<BucketInputIterator>& shadowIterators, uint32_t protocolVersion,
-    bool keepShadowedLifecycleEntries)
+    bool keepShadowedLifecycleEntries, int64_t const oldRentToApply,
+    int64_t const newRentToApply)
 {
     if (!ni || (oi && ni && cmp(*oi, *ni)))
     {
@@ -695,7 +718,8 @@ mergeCasesWithDefaultAcceptance(
         ++mc.mOldEntriesDefaultAccepted;
         Bucket::checkProtocolLegality(*oi, protocolVersion);
         countOldEntryType(mc, *oi);
-        maybePut(out, *oi, shadowIterators, keepShadowedLifecycleEntries, mc);
+        maybePut(out, *oi, shadowIterators, keepShadowedLifecycleEntries, mc,
+                 oldRentToApply);
         ++oi;
         return true;
     }
@@ -710,7 +734,8 @@ mergeCasesWithDefaultAcceptance(
         ++mc.mNewEntriesDefaultAccepted;
         Bucket::checkProtocolLegality(*ni, protocolVersion);
         countNewEntryType(mc, *ni);
-        maybePut(out, *ni, shadowIterators, keepShadowedLifecycleEntries, mc);
+        maybePut(out, *ni, shadowIterators, keepShadowedLifecycleEntries, mc,
+                 newRentToApply);
         ++ni;
         return true;
     }
@@ -724,7 +749,8 @@ mergeCasesWithEqualKeys(MergeCounters& mc, BucketInputIterator& oi,
                         BucketInputIterator& ni, BucketOutputIterator& out,
                         std::vector<BucketInputIterator>& shadowIterators,
                         uint32_t protocolVersion,
-                        bool keepShadowedLifecycleEntries)
+                        bool keepShadowedLifecycleEntries,
+                        int64_t const newRentToApply)
 {
     // Old and new are for the same key and neither is INIT, take the new
     // key. If either key is INIT, we have to make some adjustments:
@@ -810,7 +836,7 @@ mergeCasesWithEqualKeys(MergeCounters& mc, BucketInputIterator& oi,
         newLive.liveEntry() = newEntry.liveEntry();
         ++mc.mNewInitEntriesMergedWithOldDead;
         maybePut(out, newLive, shadowIterators, keepShadowedLifecycleEntries,
-                 mc);
+                 mc, newRentToApply);
     }
     else if (oldEntry.type() == INITENTRY)
     {
@@ -823,7 +849,7 @@ mergeCasesWithEqualKeys(MergeCounters& mc, BucketInputIterator& oi,
             newInit.liveEntry() = newEntry.liveEntry();
             ++mc.mOldInitEntriesMergedWithNewLive;
             maybePut(out, newInit, shadowIterators,
-                     keepShadowedLifecycleEntries, mc);
+                     keepShadowedLifecycleEntries, mc, newRentToApply);
         }
         else
         {
@@ -841,7 +867,7 @@ mergeCasesWithEqualKeys(MergeCounters& mc, BucketInputIterator& oi,
         // Neither is in INIT state, take the newer one.
         ++mc.mNewEntriesMergedWithOldNeitherInit;
         maybePut(out, newEntry, shadowIterators, keepShadowedLifecycleEntries,
-                 mc);
+                 mc, newRentToApply);
     }
     ++oi;
     ++ni;
@@ -853,7 +879,8 @@ Bucket::merge(BucketManager& bucketManager, uint32_t maxProtocolVersion,
               std::shared_ptr<Bucket> const& newBucket,
               std::vector<std::shared_ptr<Bucket>> const& shadows,
               bool keepDeadEntries, bool countMergeEvents,
-              asio::io_context& ctx, bool doFsync, int64 const rentToApply)
+              asio::io_context& ctx, bool doFsync, int64 const oldRentToApply,
+              int64 const newRentToApply)
 {
     ZoneScoped;
     // This is the key operation in the scheme: merging two (read-only)
@@ -900,13 +927,13 @@ Bucket::merge(BucketManager& bucketManager, uint32_t maxProtocolVersion,
             }
         }
 
-        if (!mergeCasesWithDefaultAcceptance(cmp, mc, oi, ni, out,
-                                             shadowIterators, protocolVersion,
-                                             keepShadowedLifecycleEntries))
+        if (!mergeCasesWithDefaultAcceptance(
+                cmp, mc, oi, ni, out, shadowIterators, protocolVersion,
+                keepShadowedLifecycleEntries, oldRentToApply, newRentToApply))
         {
-            mergeCasesWithEqualKeys(mc, oi, ni, out, shadowIterators,
-                                    protocolVersion,
-                                    keepShadowedLifecycleEntries);
+            mergeCasesWithEqualKeys(
+                mc, oi, ni, out, shadowIterators, protocolVersion,
+                keepShadowedLifecycleEntries, newRentToApply);
         }
     }
     if (countMergeEvents)

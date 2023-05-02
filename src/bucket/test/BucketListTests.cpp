@@ -136,6 +136,12 @@ TEST_CASE_VERSIONS("bucket list", "[bucket][bucketlist]")
             Application::pointer app = createTestApplication(clock, cfg);
             BucketList bl;
             CLOG_DEBUG(Bucket, "Adding batches to bucket list");
+
+// TODO: Retn checks
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+            RentMeta meta;
+#endif
+
             for (uint32_t i = 1;
                  !app->getClock().getIOContext().stopped() && i < 130; ++i)
             {
@@ -149,7 +155,12 @@ TEST_CASE_VERSIONS("bucket list", "[bucket][bucketlist]")
                             CONFIG_SETTING
 #endif
                         },
-                        5));
+                        5)
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+                        ,
+                    meta
+#endif
+                );
                 if (i % 10 == 0)
                     CLOG_DEBUG(Bucket, "Added batch {}, hash={}", i,
                                binToHex(bl.getHash()));
@@ -209,6 +220,9 @@ TEST_CASE_VERSIONS("bucket list shadowing pre/post proto 12",
             BucketEntryBob.liveEntry().data.account() = bob;
             liveBatch.push_back(BucketEntryBob.liveEntry());
 
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+            RentMeta meta;
+#endif
             bl.addBatch(
                 *app, i, getAppLedgerVersion(app), {}, liveBatch,
                 LedgerTestUtils::generateValidLedgerEntryKeysWithExclusions(
@@ -217,7 +231,12 @@ TEST_CASE_VERSIONS("bucket list shadowing pre/post proto 12",
                         CONFIG_SETTING
 #endif
                     },
-                    5));
+                    5)
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+                    ,
+                meta
+#endif
+            );
             if (i % 100 == 0)
             {
                 CLOG_DEBUG(Bucket, "Added batch {}, hash={}", i,
@@ -286,6 +305,10 @@ TEST_CASE_VERSIONS("bucket tombstones expire at bottom level",
         BucketManager& bm = app->getBucketManager();
         auto& mergeTimer = bm.getMergeTimer();
         CLOG_INFO(Bucket, "Establishing random bucketlist");
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+        RentMeta meta;
+#endif
+
         for (uint32_t i = 0; i < BucketList::kNumLevels; ++i)
         {
             auto& level = bl.getLevel(i);
@@ -331,7 +354,12 @@ TEST_CASE_VERSIONS("bucket tombstones expire at bottom level",
                             CONFIG_SETTING
 #endif
                         },
-                        5));
+                        5)
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+                        ,
+                    meta
+#endif
+                );
                 app->getClock().crank(false);
                 for (uint32_t k = 0u; k < BucketList::kNumLevels; ++k)
                 {
@@ -409,7 +437,17 @@ TEST_CASE_VERSIONS("bucket tombstones mutually-annihilate init entries",
                     deadEntries.push_back(LedgerEntryKey(e));
                 }
             }
-            bl.addBatch(*app, i, vers, initEntries, liveEntries, deadEntries);
+
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+            RentMeta meta;
+#endif
+
+            bl.addBatch(*app, i, vers, initEntries, liveEntries, deadEntries
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+                        ,
+                        meta
+#endif
+            );
             app->getClock().crank(false);
             for (uint32_t k = 0u; k < BucketList::kNumLevels; ++k)
             {
@@ -452,10 +490,19 @@ TEST_CASE_VERSIONS("single entry bubbling up",
             std::vector<stellar::LedgerKey> emptySet;
             std::vector<stellar::LedgerEntry> emptySetEntry;
 
+            // TODO: Test rent
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+            RentMeta meta;
+#endif
+
             CLOG_DEBUG(Bucket, "Adding single entry in lowest level");
             bl.addBatch(*app, 1, getAppLedgerVersion(app), {},
-                        LedgerTestUtils::generateValidLedgerEntries(1),
-                        emptySet);
+                        LedgerTestUtils::generateValidLedgerEntries(1), emptySet
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+                        ,
+                        meta
+#endif
+            );
 
             CLOG_DEBUG(Bucket, "Adding empty batches to bucket list");
             for (uint32_t i = 2;
@@ -463,7 +510,12 @@ TEST_CASE_VERSIONS("single entry bubbling up",
             {
                 app->getClock().crank(false);
                 bl.addBatch(*app, i, getAppLedgerVersion(app), {},
-                            emptySetEntry, emptySet);
+                            emptySetEntry, emptySet
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+                            ,
+                            meta
+#endif
+                );
                 if (i % 10 == 0)
                     CLOG_DEBUG(Bucket, "Added batch {}, hash={}", i,
                                binToHex(bl.getHash()));
@@ -615,6 +667,11 @@ TEST_CASE("BucketList check bucket sizes", "[bucket][bucketlist][count]")
     BucketList& bl = app->getBucketManager().getBucketList();
     std::vector<LedgerKey> emptySet;
     auto ledgers = LedgerTestUtils::generateValidUniqueLedgerEntries(256);
+
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+    RentMeta meta;
+#endif
+
     for (uint32_t ledgerSeq = 1; ledgerSeq <= 256; ++ledgerSeq)
     {
         if (ledgerSeq >= 2)
@@ -622,7 +679,12 @@ TEST_CASE("BucketList check bucket sizes", "[bucket][bucketlist][count]")
             app->getClock().crank(false);
             ledgers[ledgerSeq - 1].lastModifiedLedgerSeq = ledgerSeq;
             bl.addBatch(*app, ledgerSeq, getAppLedgerVersion(app), {},
-                        {ledgers[ledgerSeq - 1]}, emptySet);
+                        {ledgers[ledgerSeq - 1]}, emptySet
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+                        ,
+                        meta
+#endif
+            );
         }
         for (uint32_t level = 0; level < BucketList::kNumLevels; ++level)
         {

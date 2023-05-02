@@ -78,9 +78,9 @@ TxSimGenerateBucketsWork::checkOrStartMerges()
         auto b2 = mIntermediateBuckets.front();
         mIntermediateBuckets.pop_front();
         std::vector<std::shared_ptr<Bucket>> shadows;
-        mMergesInProgress.emplace_back(mApp, b1, b2, shadows,
-                                       mApp.getConfig().LEDGER_PROTOCOL_VERSION,
-                                       false, mLevel, /*rentToApply=*/0);
+        mMergesInProgress.emplace_back(
+            mApp, b1, b2, shadows, mApp.getConfig().LEDGER_PROTOCOL_VERSION,
+            false, mLevel, /*currRentToApply=*/0, /*snapRentToApply=*/0);
     }
 
     return false;
@@ -199,9 +199,9 @@ TxSimGenerateBucketsWork::setFutureBuckets()
             // reconstruct the exact shadows, plus it should not really matter
             // anyway
             std::vector<std::shared_ptr<Bucket>> shadows;
-            mGeneratedApplyState.currentBuckets[i].next =
-                FutureBucket(mApp, preparedCurr, prevSnapBucket, shadows,
-                             snapVersion, false, i, /*rentToApply=*/0);
+            mGeneratedApplyState.currentBuckets[i].next = FutureBucket(
+                mApp, preparedCurr, prevSnapBucket, shadows, snapVersion, false,
+                i, /*currRentToApply=*/0, /*snapRentToApply=*/0);
         }
     }
 }

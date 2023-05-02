@@ -834,7 +834,12 @@ BucketManagerImpl::addBatch(Application& app, uint32_t currLedger,
     mBucketObjectInsertBatch.Mark(initEntries.size() + liveEntries.size() +
                                   deadEntries.size());
     mBucketList->addBatch(app, currLedger, currLedgerProtocol, initEntries,
-                          liveEntries, deadEntries);
+                          liveEntries, deadEntries
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+                          ,
+                          *mRentMeta
+#endif
+    );
 }
 
 #ifdef BUILD_TESTS
@@ -873,6 +878,23 @@ BucketManagerImpl::getRentFee() const
     // TODO: calculate fees based on BucketList size
     return 1;
 }
+
+void
+BucketManagerImpl::loadRentMeta()
+{
+    releaseAssert(mApp.getConfig().isUsingBucketListDB());
+    LedgerKey key(CONFIG_SETTING);
+    auto le = getLedgerEntry(key);
+
+    if (!le)
+    {
+        throw std::runtime_error(
+            "Invalid BucketList state: RentMeta not found");
+    }
+
+    mRentMeta = le->data.configSetting().rentMeta();
+}
+
 #endif
 
 // updates the given LedgerHeader to reflect the current state of the bucket
@@ -945,7 +967,9 @@ BucketManagerImpl::getLedgerEntry(LedgerKey const& k) const
 {
     releaseAssertOrThrow(getConfig().isUsingBucketListDB());
     auto timer = getPointLoadTimer(k.type()).TimeScope();
-    return mBucketList->getLedgerEntry(k);
+    std::shared_ptr<LedgerEntry> entry;
+    std::tie(entry, std::ignore, std::ignore) = mBucketList->getLedgerEntry(k);
+    return entry;
 }
 
 std::vector<LedgerEntry>
@@ -1076,7 +1100,16 @@ BucketManagerImpl::assumeState(HistoryArchiveState const& has,
         mBucketList->getLevel(i).setNext(nextFuture);
     }
 
-    mBucketList->restartMerges(mApp, maxProtocolVersion, has.currentLedger);
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+    loadRentMeta();
+#endif
+
+    mBucketList->restartMerges(mApp, maxProtocolVersion, has.currentLedger
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+                               ,
+                               *mRentMeta
+#endif
+    );
     cleanupStaleFiles();
 }
 

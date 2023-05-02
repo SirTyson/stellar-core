@@ -34,12 +34,14 @@ FutureBucket::FutureBucket(Application& app,
                            std::shared_ptr<Bucket> const& snap,
                            std::vector<std::shared_ptr<Bucket>> const& shadows,
                            uint32_t maxProtocolVersion, bool countMergeEvents,
-                           uint32_t level, int64_t const rentToApply)
+                           uint32_t level, int64_t const currRentToApply,
+                           int64_t const snapRentToApply)
     : mState(FB_LIVE_INPUTS)
     , mInputCurrBucket(curr)
     , mInputSnapBucket(snap)
     , mInputShadowBuckets(shadows)
-    , mRentToApply(rentToApply)
+    , mCurrRentToApply(currRentToApply)
+    , mSnapRentToApply(snapRentToApply)
 {
     ZoneScoped;
     // Constructed with a bunch of inputs, _immediately_ commence merging
@@ -349,7 +351,8 @@ FutureBucket::startMerge(Application& app, uint32_t maxProtocolVersion,
     using task_t = std::packaged_task<std::shared_ptr<Bucket>()>;
     std::shared_ptr<task_t> task = std::make_shared<task_t>(
         [curr, snap, &bm, shadows, maxProtocolVersion, countMergeEvents, level,
-         rentToApply = mRentToApply, &timer, &app]() mutable {
+         currRentToApply = mCurrRentToApply, snapRentToApply = mSnapRentToApply,
+         &timer, &app]() mutable {
             auto timeScope = timer.TimeScope();
             CLOG_TRACE(Bucket, "Worker merging curr={} with snap={}",
                        hexAbbrev(curr->getHash()), hexAbbrev(snap->getHash()));
@@ -363,7 +366,8 @@ FutureBucket::startMerge(Application& app, uint32_t maxProtocolVersion,
                     bm, maxProtocolVersion, curr, snap, shadows,
                     BucketList::keepDeadEntries(level), countMergeEvents,
                     app.getClock().getIOContext(),
-                    !app.getConfig().DISABLE_XDR_FSYNC, rentToApply);
+                    !app.getConfig().DISABLE_XDR_FSYNC, currRentToApply,
+                    snapRentToApply);
 
                 if (res)
                 {

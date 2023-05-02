@@ -88,7 +88,13 @@ class BucketManagerImpl : public BucketManager
     // If not null, this value is used as the rent fee instead of basing the fee
     // off BucketList size
     std::optional<int64_t> rentFeeOverride{};
-#endif
+#endif // ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+#endif // BUILD_TESTS
+
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+    std::optional<RentMeta> mRentMeta;
+
+    void loadRentMeta();
 #endif
 
   protected:

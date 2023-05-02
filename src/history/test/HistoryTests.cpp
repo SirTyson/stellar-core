@@ -1140,12 +1140,21 @@ TEST_CASE_VERSIONS(
             auto& lm = app->getLedgerManager();
             auto& bl = app->getBucketManager().getBucketList();
 
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+            RentMeta meta;
+#endif
+
             while (hm.getPublishQueueCount() != 1)
             {
                 uint32_t ledger = lm.getLastClosedLedgerNum() + 1;
                 bl.addBatch(
                     *app, ledger, cfg.LEDGER_PROTOCOL_VERSION, {},
-                    LedgerTestUtils::generateValidUniqueLedgerEntries(8), {});
+                    LedgerTestUtils::generateValidUniqueLedgerEntries(8), {}
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+                    ,
+                    meta
+#endif
+                );
                 clock.crank(true);
             }
 

@@ -71,8 +71,12 @@ class FutureBucket
     std::string mInputSnapBucketHash;
     std::vector<std::string> mInputShadowBucketHashes;
     std::string mOutputBucketHash;
-    int64_t mRentToApply{0};
 
+  public:
+    int64_t mCurrRentToApply{0};
+    int64_t mSnapRentToApply{0};
+
+  private:
     void checkHashesMatch() const;
     void checkState() const;
     void startMerge(Application& app, uint32_t maxProtocolVersion,
@@ -87,7 +91,8 @@ class FutureBucket
                  std::shared_ptr<Bucket> const& snap,
                  std::vector<std::shared_ptr<Bucket>> const& shadows,
                  uint32_t maxProtocolVersion, bool countMergeEvents,
-                 uint32_t level, int64_t const rentToApply);
+                 uint32_t level, int64_t const currRentToApply,
+                 int64_t const snapRentToApply);
 
     FutureBucket() = default;
     FutureBucket(FutureBucket const& other) = default;
@@ -146,9 +151,6 @@ class FutureBucket
             ar(cereal::make_nvp("curr", mInputCurrBucketHash));
             ar(cereal::make_nvp("snap", mInputSnapBucketHash));
             ar(cereal::make_nvp("shadow", mInputShadowBucketHashes));
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
-            ar(cereal::make_nvp("rentToApply", mRentToApply));
-#endif
             break;
         case FB_HASH_OUTPUT:
             ar(cereal::make_nvp("output", mOutputBucketHash));
@@ -176,9 +178,6 @@ class FutureBucket
             ar(cereal::make_nvp("curr", mInputCurrBucketHash));
             ar(cereal::make_nvp("snap", mInputSnapBucketHash));
             ar(cereal::make_nvp("shadow", mInputShadowBucketHashes));
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
-            ar(cereal::make_nvp("rentToApply", mRentToApply));
-#endif
             break;
         case FB_LIVE_OUTPUT:
         case FB_HASH_OUTPUT:

@@ -171,7 +171,8 @@ class Bucket : public std::enable_shared_from_this<Bucket>,
           std::shared_ptr<Bucket> const& newBucket,
           std::vector<std::shared_ptr<Bucket>> const& shadows,
           bool keepDeadEntries, bool countMergeEvents, asio::io_context& ctx,
-          bool doFsync, int64_t const rentToApply);
+          bool doFsync, int64_t const oldRentToApply,
+          int64_t const newRentToApply);
 
     static uint32_t getBucketVersion(std::shared_ptr<Bucket> const& bucket);
     static uint32_t

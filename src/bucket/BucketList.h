@@ -12,6 +12,7 @@
 #include <future>
 #include <optional>
 #include <set>
+#include <tuple>
 
 namespace stellar
 {
@@ -374,7 +375,8 @@ class BucketLevel
     void prepare(Application& app, uint32_t currLedger,
                  uint32_t currLedgerProtocol, std::shared_ptr<Bucket> snap,
                  std::vector<std::shared_ptr<Bucket>> const& shadows,
-                 bool countMergeEvents, int64_t const rentToApply);
+                 bool countMergeEvents, int64_t const currRentToApply,
+                 int64_t const snapRentToApply);
     std::shared_ptr<Bucket> snap();
 };
 
@@ -401,11 +403,11 @@ class BucketList
     std::vector<BucketLevel> mLevels;
 
 #ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
-    std::optional<RentMetadata> mRentMetadata;
+    std::optional<RentMeta> mRentMeta;
 
     // Returns in-memory rent metadata if it exists, otherwise loads it from
     // BucketList
-    RentMetadata& getRentMetadata(Application& app);
+    RentMeta& getRentMeta(Application& app);
 #endif
 
     // Loops through all buckets, starting with curr at level 0, then snap at
@@ -465,7 +467,12 @@ class BucketList
     // of the concatenation of the hashes of the `curr` and `snap` buckets.
     Hash getHash() const;
 
-    std::shared_ptr<LedgerEntry> getLedgerEntry(LedgerKey const& k) const;
+    // Returns first occurence of LedgerEntry with the given key and the
+    // bucket that the entry was found in in the form <LedgerEntry, level,
+    // isCurrBucket>. If entry is not found, LedgerEntry == nullptr and level ==
+    // kNumLevels
+    std::tuple<std::shared_ptr<LedgerEntry>, uint32_t, bool>
+    getLedgerEntry(LedgerKey const& k) const;
 
     std::vector<LedgerEntry>
     loadKeys(std::set<LedgerKey, LedgerEntryIdCmp> const& inKeys) const;
@@ -477,6 +484,8 @@ class BucketList
 
     std::vector<InflationWinner> loadInflationWinners(size_t maxWinners,
                                                       int64_t minBalance) const;
+
+    int64_t getMergeSnapshotRent(uint32_t level, bool isCurr) const;
 
     // Restart any merges that might be running on background worker threads,
     // merging buckets between levels. This needs to be called after forcing a
@@ -491,7 +500,12 @@ class BucketList
     // input/output hashes, and restart live merges from currs and snaps of the
     // bucketlist at that ledger.
     void restartMerges(Application& app, uint32_t maxProtocolVersion,
-                       uint32_t ledger);
+                       uint32_t ledger
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+                       ,
+                       RentMeta& rentMeta
+#endif
+    );
 
     // Run through the levels and check for FutureBuckets that are done merging;
     // if so, call resolve() on them, changing state from FB_LIVE_INPUTS to
@@ -517,6 +531,11 @@ class BucketList
                   uint32_t currLedgerProtocol,
                   std::vector<LedgerEntry> const& initEntries,
                   std::vector<LedgerEntry> const& liveEntries,
-                  std::vector<LedgerKey> const& deadEntries);
+                  std::vector<LedgerKey> const& deadEntries
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+                  ,
+                  RentMeta& rentMeta
+#endif
+    );
 };
 }

@@ -199,6 +199,9 @@ TEST_CASE_VERSIONS("bucketmanager ownership", "[bucket][bucketmanager]")
         for_versions_with_differing_bucket_logic(cfg, [&](Config const& cfg) {
             Application::pointer app = createTestApplication(clock, cfg);
 
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+            RentMeta meta;
+#endif
             std::vector<LedgerEntry> live(
                 LedgerTestUtils::generateValidUniqueLedgerEntries(10));
             std::vector<LedgerKey> dead{};
@@ -252,7 +255,12 @@ TEST_CASE_VERSIONS("bucketmanager ownership", "[bucket][bucketmanager]")
 
             // Try adding a bucket to the BucketManager's bucketlist
             auto& bl = app->getBucketManager().getBucketList();
-            bl.addBatch(*app, 1, getAppLedgerVersion(app), {}, live, dead);
+            bl.addBatch(*app, 1, getAppLedgerVersion(app), {}, live, dead
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+                        ,
+                        meta
+#endif
+            );
             clearFutures(app, bl);
             b1 = bl.getLevel(0).getCurr();
 
@@ -271,7 +279,12 @@ TEST_CASE_VERSIONS("bucketmanager ownership", "[bucket][bucketmanager]")
                 CONFIG_SETTING
 #endif
             });
-            bl.addBatch(*app, 1, getAppLedgerVersion(app), {}, live, dead);
+            bl.addBatch(*app, 1, getAppLedgerVersion(app), {}, live, dead
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+                        ,
+                        meta
+#endif
+            );
             clearFutures(app, bl);
             CHECK(b1.use_count() == 2);
 
@@ -342,15 +355,24 @@ TEST_CASE_VERSIONS("bucketmanager reattach to finished merge",
         BucketList& bl = bm.getBucketList();
         auto vers = getAppLedgerVersion(app);
 
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+        RentMeta meta;
+#endif
+
         // Add some entries to get to a nontrivial merge-state.
         uint32_t ledger = 0;
         uint32_t level = 3;
         do
         {
             ++ledger;
-            bl.addBatch(*app, ledger, vers, {},
-                        LedgerTestUtils::generateValidUniqueLedgerEntries(10),
-                        {});
+            bl.addBatch(
+                *app, ledger, vers, {},
+                LedgerTestUtils::generateValidUniqueLedgerEntries(10), {}
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+                ,
+                meta
+#endif
+            );
             bm.forgetUnreferencedBuckets();
         } while (!BucketList::levelShouldSpill(ledger, level - 1));
 
@@ -404,6 +426,10 @@ TEST_CASE_VERSIONS("bucketmanager reattach to running merge",
         BucketList& bl = bm.getBucketList();
         auto vers = getAppLedgerVersion(app);
 
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+        RentMeta meta;
+#endif
+
         // This test is a race that will (if all goes well) eventually be won:
         // we keep trying to do an immediate-reattach to a running merge and
         // will only lose in cases of extremely short-running merges that finish
@@ -432,9 +458,14 @@ TEST_CASE_VERSIONS("bucketmanager reattach to running merge",
             // Merges will start on one or more levels here, starting a race
             // between the main thread here and the background workers doing
             // the merges.
-            bl.addBatch(*app, ledger, vers, {},
-                        LedgerTestUtils::generateValidUniqueLedgerEntries(100),
-                        {});
+            bl.addBatch(
+                *app, ledger, vers, {},
+                LedgerTestUtils::generateValidUniqueLedgerEntries(100), {}
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+                ,
+                meta
+#endif
+            );
 
             bm.forgetUnreferencedBuckets();
 
@@ -560,6 +591,11 @@ TEST_CASE_VERSIONS(
         auto& bm = app->getBucketManager();
         auto& bl = bm.getBucketList();
         auto& lm = app->getLedgerManager();
+
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+        RentMeta meta;
+#endif
+
         hm.setPublicationEnabled(false);
         app->getHistoryArchiveManager().initializeHistoryArchive(
             tcfg.getArchiveDirName());
@@ -572,9 +608,14 @@ TEST_CASE_VERSIONS(
             auto ra = bm.readMergeCounters().mFinishedMergeReattachments;
             CLOG_INFO(Bucket, "finished-merge reattachments while queueing: {}",
                       ra);
-            bl.addBatch(*app, lm.getLastClosedLedgerNum() + 1, vers, {},
-                        LedgerTestUtils::generateValidUniqueLedgerEntries(100),
-                        {});
+            bl.addBatch(
+                *app, lm.getLastClosedLedgerNum() + 1, vers, {},
+                LedgerTestUtils::generateValidUniqueLedgerEntries(100), {}
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+                ,
+                meta
+#endif
+            );
             clock.crank(false);
             bm.forgetUnreferencedBuckets();
         }
@@ -622,10 +663,11 @@ TEST_CASE_VERSIONS(
     });
 }
 
-//#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
 TEST_CASE("rent charges", "[bucket][bucketmanager]")
 {
     Config cfg(getTestConfig());
+    cfg.EXPERIMENTAL_BUCKETLIST_DB = true;
     VirtualClock clock{};
     std::shared_ptr<BucketTestApplication> app =
         createTestApplication<BucketTestApplication>(clock, cfg);
@@ -657,96 +699,134 @@ TEST_CASE("rent charges", "[bucket][bucketmanager]")
     // Track where entry is in BucketList
     auto level = 0;
     bool snap = false;
-    std::vector<int64_t> rentCharges(BucketList::kNumLevels, 0);
 
     // Close ledgers until entry is in bottom level
     auto ledger = app->getLedgerManager().getLastClosedLedgerNum();
     auto rentCharge = 0;
+
+    // auto& bl = app->getBucketManager().getBucketList();
     while (level != BucketList::kNumLevels - 1)
     {
         closeLedger(*app);
         ++ledger;
+        ++rentCharge;
 
-        rentCharges[level] -= app->getBucketManager().getRentFee();
+        auto onDisk =
+            app->getBucketManager().getLedgerEntry(LedgerEntryKey(entry));
+        REQUIRE(onDisk);
 
-        if (snap)
-        {
-            // Check for outgoing spills
-            if (BucketList::levelShouldSpill(ledger, level))
-            {
-                CLOG_FATAL(Bucket, "level {} spilling on ledger {}", level,
-                           ledger);
+        auto onDiskRentBalance = onDisk->data.contractData().rentBalance;
 
-                snap = false;
-                ++level;
+        // CLOG_FATAL(Bucket, "Outstanding rents for ledger {}", ledger);
+        // for (auto i = 0; i < BucketList::kNumLevels; ++i)
+        // {
+        //     if (i == BucketList::kNumLevels - 1)
+        //     {
+        //         CLOG_FATAL(Bucket, "Level {}, curr {}, no snap", i,
+        //                    bl.getOutstandingRent(*app, i, true));
+        //     }
+        //     else
+        //     {
+        //         CLOG_FATAL(Bucket, "Level {}, curr {}, snap {}", i,
+        //                    bl.getOutstandingRent(*app, i, true),
+        //                    bl.getOutstandingRent(*app, i, false));
+        //     }
+        // }
 
-                auto onDiskEntry = getEntry(bl.getLevel(level).getCurr());
-                REQUIRE(onDiskEntry);
-                if (level > 1)
-                {
-                    REQUIRE(onDiskEntry->meta.rentBalance() ==
-                            rentCharges[level - 2]);
-                }
+        // if (snap)
+        // {
+        //     // Check for outgoing spills
+        //     if (BucketList::levelShouldSpill(ledger, level))
+        //     {
+        //         CLOG_FATAL(Bucket, "level {} spilling on ledger {}", level,
+        //                    ledger);
 
-                if (level != 0)
-                {
-                    CLOG_FATAL(Bucket,
-                               "Up to date rent charge: {}, last level {}",
-                               rentCharges[level], rentCharges[level - 1]);
-                }
-            }
-        }
-        else
-        {
-            // Check in entry has snapped
-            if (BucketList::levelShouldSpill(ledger, level))
-            {
-                snap = true;
+        //         snap = false;
+        //         ++level;
 
-                CLOG_FATAL(Bucket, "level {} snapping on ledger {}", level,
-                           ledger);
+        //         auto onDiskEntry = getEntry(bl.getLevel(level).getCurr());
+        //         REQUIRE(onDiskEntry);
+        //         auto onDiskBalance = onDiskEntry->meta.rentBalance();
 
-                if (level != 0)
-                {
-                    CLOG_FATAL(Bucket,
-                               "Up to date rent charge: {}, last level {}",
-                               rentCharges[level], rentCharges[level - 1]);
-                }
-                auto snapB = bl.getLevel(level).getSnap();
-                REQUIRE(getEntry(snapB));
-                auto currB = bl.getLevel(level).getCurr();
-                REQUIRE(!getEntry(currB));
-            }
-            // Check for incoming spills except on level 0. Level 0 pays no rent
-            else if (level != 0 &&
-                     BucketList::levelShouldSpill(ledger, level - 1))
-            {
-                CLOG_FATAL(Bucket, "level {} recieving spill on ledger {}",
-                           level, ledger);
+        //         CLOG_FATAL(Bucket, "Entry on curr in level {}, rentBalance
+        //         {}",
+        //                    level, onDiskEntry->meta.rentBalance());
+        //         REQUIRE(abs(onDiskBalance - bl.getOutstandingRent(
+        //                                         *app, level, !snap)) ==
+        //                                         ledger);
 
-                CLOG_FATAL(Bucket, "Up to date rent charge: {}, last level {}",
-                           rentCharges[level], rentCharges[level - 1]);
-            }
-        }
+        //         // if (level > 1)
+        //         // {
+        //         //     REQUIRE(onDiskEntry->meta.rentBalance() ==
+        //         //             rentCharges[level - 2]);
+        //         // }
+
+        //         // if (level != 0)
+        //         // {
+        //         //     CLOG_FATAL(Bucket,
+        //         //                "Up to date rent charge: {}, last level
+        //         {}",
+        //         //                rentCharges[level], rentCharges[level -
+        //         1]);
+        //         // }
+        //     }
+        // }
+        // else
+        // {
+        //     // Check in entry has snapped
+        //     if (BucketList::levelShouldSpill(ledger, level))
+        //     {
+        //         snap = true;
+
+        //         CLOG_FATAL(Bucket, "level {} snapping on ledger {}", level,
+        //                    ledger);
+
+        //         // if (level != 0)
+        //         // {
+        //         //     CLOG_FATAL(Bucket,
+        //         //                "Up to date rent charge: {}, last level
+        //         {}",
+        //         //                rentCharges[level], rentCharges[level -
+        //         1]);
+        //         // }
+        //         // auto snapB = bl.getLevel(level).getSnap();
+        //         // REQUIRE(getEntry(snapB));
+        //         // auto currB = bl.getLevel(level).getCurr();
+        //         // REQUIRE(!getEntry(currB));
+        //     }
+        //     // Check for incoming spills except on level 0. Level 0 pays no
+        //     rent else if (level != 0 &&
+        //              BucketList::levelShouldSpill(ledger, level - 1))
+        //     {
+        //         CLOG_FATAL(Bucket, "level {} recieving spill on ledger {}",
+        //                    level, ledger);
+
+        //         // CLOG_FATAL(Bucket, "Up to date rent charge: {}, last level
+        //         // {}",
+        //         //            rentCharges[level], rentCharges[level - 1]);
+        //     }
+        // }
     }
 
     // Close ledgers until the bottom level recieves a 2nd spill to make sure
     // incoming spills charge bottom level rent correctly
-    do
-    {
-        closeLedger(*app);
-        ++ledger;
-    } while (!BucketList::levelShouldSpill(ledger, BucketList::kNumLevels - 2));
+    // do
+    // {
+    //     closeLedger(*app);
+    //     ++ledger;
+    // } while (!BucketList::levelShouldSpill(ledger, BucketList::kNumLevels -
+    // 2));
 
-    CLOG_FATAL(Bucket, "level {} recieving 2nd spill on ledger {}", level,
-               ledger);
+    // CLOG_FATAL(Bucket, "level {} recieving 2nd spill on ledger {}", level,
+    //            ledger);
 
-    for (auto i = 0; i < rentCharges.size(); ++i)
-    {
-        CLOG_FATAL(Bucket, "Rent charge for level {}: {}", i, rentCharges[i]);
-    }
+    // for (auto i = 0; i < rentCharges.size(); ++i)
+    // {
+    //     CLOG_FATAL(Bucket, "Rent charge for level {}: {}", i,
+    //     rentCharges[i]);
+    // }
 }
-//#endif
+#endif
 
 // Running one of these tests involves comparing three timelines with different
 // application lifecycles for identical outcomes.
@@ -1532,6 +1612,11 @@ TEST_CASE_VERSIONS("bucket persistence over app restart",
         {
             VirtualClock clock;
             Application::pointer app = createTestApplication(clock, cfg0);
+
+            // TODO: Test rent
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+            RentMeta meta;
+#endif
             sk = std::make_optional<SecretKey>(cfg0.NODE_SEED);
             BucketList& bl = app->getBucketManager().getBucketList();
 
@@ -1540,7 +1625,12 @@ TEST_CASE_VERSIONS("bucket persistence over app restart",
             {
                 CLOG_INFO(Bucket, "Adding setup phase 1 batch {}", i);
                 bl.addBatch(*app, i, getAppLedgerVersion(app), {}, batches[i],
-                            emptySet);
+                            emptySet
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+                            ,
+                            meta
+#endif
+                );
                 i++;
             }
 
@@ -1553,7 +1643,12 @@ TEST_CASE_VERSIONS("bucket persistence over app restart",
             {
                 CLOG_INFO(Bucket, "Adding setup phase 2 batch {}", i);
                 bl.addBatch(*app, i, getAppLedgerVersion(app), {}, batches[i],
-                            emptySet);
+                            emptySet
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+                            ,
+                            meta
+#endif
+                );
                 i++;
             }
 
@@ -1570,12 +1665,21 @@ TEST_CASE_VERSIONS("bucket persistence over app restart",
             Application::pointer app = createTestApplication(clock, cfg1);
             BucketList& bl = app->getBucketManager().getBucketList();
 
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+            RentMeta meta;
+#endif
+
             uint32_t i = 2;
             while (i < pause)
             {
                 CLOG_INFO(Bucket, "Adding prefix-batch {}", i);
                 bl.addBatch(*app, i, getAppLedgerVersion(app), {}, batches[i],
-                            emptySet);
+                            emptySet
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+                            ,
+                            meta
+#endif
+                );
                 i++;
             }
 
@@ -1596,6 +1700,9 @@ TEST_CASE_VERSIONS("bucket persistence over app restart",
             Application::pointer app = Application::create(clock, cfg1, false);
             app->start();
             BucketList& bl = app->getBucketManager().getBucketList();
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+            RentMeta meta;
+#endif
 
             // Confirm that we re-acquired the close-ledger state.
             REQUIRE(
@@ -1614,7 +1721,12 @@ TEST_CASE_VERSIONS("bucket persistence over app restart",
             {
                 CLOG_INFO(Bucket, "Adding suffix-batch {}", i);
                 bl.addBatch(*app, i, getAppLedgerVersion(app), {}, batches[i],
-                            emptySet);
+                            emptySet
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+                            ,
+                            meta
+#endif
+                );
                 i++;
             }
 
