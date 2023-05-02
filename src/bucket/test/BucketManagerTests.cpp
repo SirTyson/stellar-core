@@ -667,6 +667,7 @@ TEST_CASE_VERSIONS(
 TEST_CASE("rent charges", "[bucket][bucketmanager]")
 {
     Config cfg(getTestConfig());
+    cfg.USE_CONFIG_FOR_GENESIS = true;
     cfg.EXPERIMENTAL_BUCKETLIST_DB = true;
     VirtualClock clock{};
     std::shared_ptr<BucketTestApplication> app =

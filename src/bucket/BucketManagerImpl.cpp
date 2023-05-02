@@ -833,6 +833,8 @@ BucketManagerImpl::addBatch(Application& app, uint32_t currLedger,
     auto timer = mBucketAddBatch.TimeScope();
     mBucketObjectInsertBatch.Mark(initEntries.size() + liveEntries.size() +
                                   deadEntries.size());
+
+    releaseAssert(mRentMeta);
     mBucketList->addBatch(app, currLedger, currLedgerProtocol, initEntries,
                           liveEntries, deadEntries
 #ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION

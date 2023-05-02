@@ -3,6 +3,7 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "ledger/NetworkConfig.h"
+#include "bucket/BucketList.h"
 #include "util/ProtocolVersion.h"
 
 namespace stellar
@@ -244,6 +245,24 @@ initialMemCostParamsEntry()
     return entry;
 }
 
+ConfigSettingEntry
+initialRentMetaEntry()
+{
+    ConfigSettingEntry entry(CONFIG_SETTING_RENT_METADATA);
+    for (auto i = 0; i < BucketList::kNumLevels; ++i)
+    {
+        entry.rentMeta().outstandingCurrRent.emplace_back(0);
+    }
+
+    // Last level has no snap bucket
+    for (auto i = 0; i < BucketList::kNumLevels - 1; ++i)
+    {
+        entry.rentMeta().outstandingSnapRent.emplace_back(0);
+    }
+
+    return entry;
+}
+
 #endif
 }
 
@@ -259,6 +278,7 @@ SorobanNetworkConfig::createLedgerEntriesForV20(AbstractLedgerTxn& ltx)
     createConfigSettingEntry(initialContractBandwidthSettingsEntry(), ltx);
     createConfigSettingEntry(initialCpuCostParamsEntry(), ltx);
     createConfigSettingEntry(initialMemCostParamsEntry(), ltx);
+    createConfigSettingEntry(initialRentMetaEntry(), ltx);
 #endif
 }
 
