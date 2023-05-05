@@ -773,6 +773,26 @@ mergeCasesWithEqualKeys(MergeCounters& mc, BucketInputIterator& oi,
     //     because even if there is a subsequent (newer) INIT entry, the
     //     invariant is maintained for that newer entry too (it is still
     //     preceded by a DEAD state).
+    //
+    // For Soroban types, we must also consider which entries are
+    // LIFETIME_EXTENSION entries and DATA_ENTRIES. Becuase LIFETIME_EXTENSION
+    // and DATA_ENTRIES share the same key, we must do an additional check when
+    // merging CONTRACT_DATA and CONTRACT_CODE entries as follows:
+    //
+    //      old       |       new      |   result
+    // ---------------+----------------+-------------------------------
+    //  INIT          |  INIT          |   error
+    //  LIVE          |  INIT          |   error
+    //  DEAD          |  INIT=x        |   LIVE=x
+    //  INIT=x        |  LIVE - DATA=y |   INIT=y
+    //  INIT=x        |  LIVE - EXT=y  |   INIT with lifetime=y, data=x
+    //  LIVE - EXT=x  |  LIVE - EXT=y  |   LIVE=y
+    //  LIVE - EXT=x  |  LIVE - DATA=y |   LIVE=y
+    //  LIVE - DATA=x |  LIVE - EXT=y  |   LIVE with lifetime=y, data=x
+    //  INIT          |  DEAD          |   empty
+    //
+    // Note that LIFETIME_EXTENSION entries may not be INIT entries but must be
+    // LIVEENTRIES
 
     BucketEntry const& oldEntry = *oi;
     BucketEntry const& newEntry = *ni;
@@ -780,6 +800,28 @@ mergeCasesWithEqualKeys(MergeCounters& mc, BucketInputIterator& oi,
     Bucket::checkProtocolLegality(newEntry, protocolVersion);
     countOldEntryType(mc, oldEntry);
     countNewEntryType(mc, newEntry);
+
+    auto replaceLifetime = [](LedgerEntry& entryToReplace,
+                              LedgerEntry const& entryWithLifetime) {
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+        if (entryToReplace.data.type() == CONTRACT_CODE)
+        {
+            releaseAssert(entryWithLifetime.data.type() == CONTRACT_CODE);
+            entryToReplace.data.contractCode().expirationLedgerSeq =
+                entryWithLifetime.data.contractCode().expirationLedgerSeq;
+        }
+        else if (entryToReplace.data.type() == CONTRACT_DATA)
+        {
+            releaseAssert(entryWithLifetime.data.type() == CONTRACT_DATA);
+            entryToReplace.data.contractData().expirationLedgerSeq =
+                entryWithLifetime.data.contractData().expirationLedgerSeq;
+        }
+        else
+        {
+            releaseAssert(false);
+        }
+#endif
+    };
 
     if (newEntry.type() == INITENTRY)
     {
@@ -805,7 +847,19 @@ mergeCasesWithEqualKeys(MergeCounters& mc, BucketInputIterator& oi,
             // Merge a create+update to a fresher create.
             BucketEntry newInit;
             newInit.type(INITENTRY);
-            newInit.liveEntry() = newEntry.liveEntry();
+
+            if (isLifetimeExtensionEntry(newEntry.liveEntry()))
+            {
+                // New entry is lifetime extension, keep oldEntry data with
+                // newEntry lifetime
+                newInit.liveEntry() = oldEntry.liveEntry();
+                replaceLifetime(newInit.liveEntry(), newEntry.liveEntry());
+            }
+            else
+            {
+                newInit.liveEntry() = newEntry.liveEntry();
+            }
+
             ++mc.mOldInitEntriesMergedWithNewLive;
             maybePut(out, newInit, shadowIterators,
                      keepShadowedLifecycleEntries, mc);
@@ -823,10 +877,30 @@ mergeCasesWithEqualKeys(MergeCounters& mc, BucketInputIterator& oi,
     }
     else
     {
-        // Neither is in INIT state, take the newer one.
+        // Neither is in INIT state
+
+        // TODO: Update merge counter with Soroban metrics
         ++mc.mNewEntriesMergedWithOldNeitherInit;
-        maybePut(out, newEntry, shadowIterators, keepShadowedLifecycleEntries,
-                 mc);
+
+        // If both are live entries, new entry is lifetime extension and old
+        // entry is not, put oldEntry data with newEntry lifetime
+        if (newEntry.type() == LIVEENTRY && oldEntry.type() == LIVEENTRY &&
+            isLifetimeExtensionEntry(newEntry.liveEntry()) &&
+            !isLifetimeExtensionEntry(oldEntry.liveEntry()))
+        {
+            BucketEntry newResult;
+            newResult.type(LIVEENTRY);
+            newResult.liveEntry() = oldEntry.liveEntry();
+            replaceLifetime(newResult.liveEntry(), newEntry.liveEntry());
+            maybePut(out, newResult, shadowIterators,
+                     keepShadowedLifecycleEntries, mc);
+        }
+        // Just take newer one
+        else
+        {
+            maybePut(out, newEntry, shadowIterators,
+                     keepShadowedLifecycleEntries, mc);
+        }
     }
     ++oi;
     ++ni;

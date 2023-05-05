@@ -216,6 +216,22 @@ template bool isAssetValid<TrustLineAsset>(TrustLineAsset const&, uint32_t);
 template bool isAssetValid<ChangeTrustAsset>(ChangeTrustAsset const&, uint32_t);
 
 bool
+isLifetimeExtensionEntry(LedgerEntry const& le)
+{
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+    if (le.data.type() == CONTRACT_CODE)
+    {
+        return le.data.contractCode().body.t() == LIFETIME_EXTENSION;
+    }
+    else if (le.data.type() == CONTRACT_DATA)
+    {
+        return le.data.contractData().body.t() == LIFETIME_EXTENSION;
+    }
+#endif
+    return false;
+}
+
+bool
 compareAsset(Asset const& first, Asset const& second)
 {
     if (first.type() != second.type())
