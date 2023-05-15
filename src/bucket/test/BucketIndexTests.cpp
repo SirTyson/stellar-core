@@ -37,6 +37,11 @@ class BucketIndexTest
     stellar::uniform_int_distribution<uint8_t> mDist;
     uint32_t mLevelsToBuild;
 
+    bool const mLifetimeEntriesOnly;
+
+    uint32_t const ORIGINAL_EXPIRATION = 5000;
+    uint32_t const NEW_EXPIRATION = 6000;
+
     static void
     validateResults(UnorderedMap<LedgerKey, LedgerEntry> const& validEntries,
                     std::vector<LedgerEntry> const& blEntries)
@@ -57,24 +62,50 @@ class BucketIndexTest
         do
         {
             ++ledger;
-            auto entries =
-                LedgerTestUtils::generateValidLedgerEntriesWithExclusions(
-                    {
+            std::vector<LedgerEntry> entries;
+
 #ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
-                        CONFIG_SETTING
+            if (mLifetimeEntriesOnly)
+            {
+                entries =
+                    LedgerTestUtils::generateValidUniqueLedgerEntriesWithTypes(
+                        {CONTRACT_DATA, CONTRACT_CODE}, 10);
+                for (auto& e : entries)
+                {
+                    if (e.data.type() == CONTRACT_DATA)
+                    {
+                        e.data.contractData().expirationLedgerSeq =
+                            ORIGINAL_EXPIRATION;
+                    }
+                    else
+                    {
+                        e.data.contractCode().expirationLedgerSeq =
+                            ORIGINAL_EXPIRATION;
+                    }
+                }
+            }
+            else
 #endif
-                    },
-                    10);
+                entries =
+                    LedgerTestUtils::generateValidLedgerEntriesWithExclusions(
+                        {
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+                            CONFIG_SETTING
+#endif
+                        },
+                        10);
             f(entries);
             closeLedger(*mApp);
         } while (!BucketList::levelShouldSpill(ledger, mLevelsToBuild - 1));
     }
 
   public:
-    BucketIndexTest(Config const& cfg, uint32_t levels = 6)
+    BucketIndexTest(Config const& cfg, uint32_t levels = 6,
+                    bool lifetimeEntriesOnly = false)
         : mClock(std::make_unique<VirtualClock>())
         , mApp(createTestApplication<BucketTestApplication>(*mClock, cfg))
         , mLevelsToBuild(levels)
+        , mLifetimeEntriesOnly(lifetimeEntriesOnly)
     {
     }
 
@@ -93,8 +124,9 @@ class BucketIndexTest
             {
                 for (auto const& e : entries)
                 {
-                    mTestEntries.emplace(LedgerEntryKey(e), e);
-                    mKeysToSearch.emplace(LedgerEntryKey(e));
+                    auto k = LedgerEntryKey(e);
+                    mTestEntries.emplace(k, e);
+                    mKeysToSearch.emplace(k);
                 }
             }
             mApp->getLedgerManager().setNextLedgerEntryBatchForBucketTesting(
@@ -157,6 +189,94 @@ class BucketIndexTest
         };
 
         buildBucketList(f);
+    }
+
+    void
+    insertLifetimeExtnesions()
+    {
+        std::vector<LedgerEntry> toInsert;
+        std::vector<LedgerEntry> shadows;
+
+        for (auto& [k, e] : mTestEntries)
+        {
+            // Select 50% of entries to have new expiration ledger
+            if (isEntryTypeWithLifetime(e) && rand_flip())
+            {
+                auto extensionEntry = e;
+                bool shadow = rand_flip();
+                if (e.data.type() == CONTRACT_DATA)
+                {
+                    e.data.contractData().expirationLedgerSeq = NEW_EXPIRATION;
+                    extensionEntry.data.contractData().body.t(
+                        ContractEntryType::LIFETIME_EXTENSION);
+                    if (shadow)
+                    {
+                        // Insert dummy expiration that will be shadowed later
+                        extensionEntry.data.contractData().expirationLedgerSeq =
+                            0;
+                        shadows.emplace_back(extensionEntry);
+                    }
+                    else
+                    {
+                        extensionEntry.data.contractData().expirationLedgerSeq =
+                            NEW_EXPIRATION;
+                    }
+                }
+                else
+                {
+                    e.data.contractCode().expirationLedgerSeq = NEW_EXPIRATION;
+                    extensionEntry.data.contractCode().body.t(
+                        ContractEntryType::LIFETIME_EXTENSION);
+                    if (shadow)
+                    {
+                        extensionEntry.data.contractCode().expirationLedgerSeq =
+                            0;
+                        shadows.emplace_back(extensionEntry);
+                    }
+                    else
+                    {
+                        extensionEntry.data.contractCode().expirationLedgerSeq =
+                            NEW_EXPIRATION;
+                    }
+                }
+
+                toInsert.emplace_back(extensionEntry);
+
+                // Insert in batches of 10
+                if (toInsert.size() == 10)
+                {
+                    mApp->getLedgerManager()
+                        .setNextLedgerEntryBatchForBucketTesting({}, toInsert,
+                                                                 {});
+                    closeLedger(*mApp);
+                    toInsert.clear();
+                }
+            }
+        }
+
+        if (!toInsert.empty())
+        {
+            mApp->getLedgerManager().setNextLedgerEntryBatchForBucketTesting(
+                {}, toInsert, {});
+            closeLedger(*mApp);
+        }
+
+        // Update shadows with correct expiration ledger
+        for (auto& e : shadows)
+        {
+            if (e.data.type() == CONTRACT_DATA)
+            {
+                e.data.contractData().expirationLedgerSeq = NEW_EXPIRATION;
+            }
+            else
+            {
+                e.data.contractCode().expirationLedgerSeq = NEW_EXPIRATION;
+            }
+        }
+
+        mApp->getLedgerManager().setNextLedgerEntryBatchForBucketTesting(
+            {}, shadows, {});
+        closeLedger(*mApp);
     }
 
     virtual void
@@ -454,6 +574,21 @@ TEST_CASE("loadPoolShareTrustLinesByAccountAndAsset does not load shadows",
 
     testAllIndexTypes(f);
 }
+
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+TEST_CASE("load LIFETIME_EXTENSION entries", "[bucket][bucketindex]")
+{
+    auto f = [&](Config& cfg) {
+        auto test =
+            BucketIndexTest(cfg, /*levels=*/6, /*lifetimeEntriesOnly=*/true);
+        test.buildGeneralTest();
+        test.insertLifetimeExtnesions();
+        test.run();
+    };
+
+    testAllIndexTypes(f);
+}
+#endif
 
 TEST_CASE("serialize bucket indexes", "[bucket][bucketindex][!hide]")
 {

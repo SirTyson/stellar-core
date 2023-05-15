@@ -46,6 +46,7 @@ std::string formatSize(size_t size);
 // returns true if the asset is well formed for the specified protocol version
 template <typename T> bool isAssetValid(T const& cur, uint32_t ledgerVersion);
 
+bool isEntryTypeWithLifetime(LedgerEntry const& le);
 bool isLifetimeExtensionEntry(LedgerEntry const& le);
 
 // returns the issuer for the given asset

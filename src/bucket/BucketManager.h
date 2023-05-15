@@ -206,7 +206,7 @@ class BucketManager : NonMovableOrCopyable
                                std::unique_ptr<BucketIndex const>&& index) = 0;
 
     // Look up a ledger entry from the BucketList. Returns nullopt if the LE is
-    // dead / nonexistent.
+    // dead / nonexistent / expired.
     virtual std::shared_ptr<LedgerEntry>
     getLedgerEntry(LedgerKey const& k) const = 0;
 

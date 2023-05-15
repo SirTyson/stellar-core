@@ -216,6 +216,16 @@ template bool isAssetValid<TrustLineAsset>(TrustLineAsset const&, uint32_t);
 template bool isAssetValid<ChangeTrustAsset>(ChangeTrustAsset const&, uint32_t);
 
 bool
+isEntryTypeWithLifetime(LedgerEntry const& le)
+{
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+    return le.data.type() == CONTRACT_CODE || le.data.type() == CONTRACT_DATA;
+#endif
+
+    return false;
+}
+
+bool
 isLifetimeExtensionEntry(LedgerEntry const& le)
 {
 #ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
