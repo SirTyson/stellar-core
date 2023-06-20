@@ -192,7 +192,7 @@ deployContractWithSourceAccount(Application& app, RustBuf const& contractWasm,
             app.getLedgerManager().getSorobanNetworkConfig(ltx);
         auto lcl = app.getLedgerManager().getLastClosedLedgerNum();
         auto expectedExpiration = networkConfig.stateExpirationSettings()
-                                      .minRestorableEntryExpiration +
+                                      .minPersistentEntryExpiration +
                                   lcl;
 
         auto codeLtxe = ltx.load(contractCodeLedgerKey);
@@ -261,7 +261,7 @@ deployContractWithSourceAccount(Application& app, RustBuf const& contractWasm,
     auto networkConfig = app.getLedgerManager().getSorobanNetworkConfig(ltx);
     auto lcl = app.getLedgerManager().getLastClosedLedgerNum();
     auto expectedExpiration =
-        networkConfig.stateExpirationSettings().minRestorableEntryExpiration +
+        networkConfig.stateExpirationSettings().minPersistentEntryExpiration +
         lcl;
 
     auto instanceLtxe = ltx.load(contractSourceRefLedgerKey);
@@ -729,7 +729,7 @@ TEST_CASE("contract storage", "[tx][soroban]")
         auto expectedTempExpiration =
             stateExpirationSettings.minTempEntryExpiration + lcl;
         auto expectedRestorableExpiration =
-            stateExpirationSettings.minRestorableEntryExpiration + lcl;
+            stateExpirationSettings.minPersistentEntryExpiration + lcl;
 
         checkContractDataExpiration("unique", EXCLUSIVE,
                                     expectedRestorableExpiration);
@@ -760,7 +760,7 @@ TEST_CASE("contract storage", "[tx][soroban]")
                          EXCLUSIVE, std::nullopt);
 
         auto expectedInitialExpiration =
-            stateExpirationSettings.minRestorableEntryExpiration + lcl;
+            stateExpirationSettings.minPersistentEntryExpiration + lcl;
 
         checkContractDataExpiration("rw", EXCLUSIVE,
                                     expectedInitialExpiration + autoBump);
@@ -842,7 +842,7 @@ TEST_CASE("contract storage", "[tx][soroban]")
     //     REQUIRE(tx->apply(*app, *ltx, *txm));
 
     //     auto expectedExpiration =
-    //         stateExpirationSettings.minRestorableEntryExpiration + lcl +
+    //         stateExpirationSettings.minPersistentEntryExpiration + lcl +
     //         autoBump;
 
     //     std::vector<LedgerEntry> init;

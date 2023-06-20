@@ -1440,6 +1440,12 @@ ConfigUpgradeSetFrame::isValidForApply() const
             // the respective settings.
             valid = true;
             break;
+        case ConfigSettingID::CONFIG_SETTING_BUCKETLIST_SIZE_WINDOW:
+            // While the BucketList size window is stored in a ConfigSetting
+            // entry, the BucketList defines these values, they should never be
+            // changed via upgrade
+            valid = false;
+            break;
         }
         if (!valid)
         {

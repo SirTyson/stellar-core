@@ -1597,7 +1597,7 @@ TransactionFrame::applyExpirationBumps(Application& app, AbstractLedgerTxn& ltx)
 
     auto maxExpirationLedger = lcl + expirationSettings.maxEntryExpiration;
     auto minRestorableExpirationLedger =
-        lcl + expirationSettings.minRestorableEntryExpiration;
+        lcl + expirationSettings.minPersistentEntryExpiration;
     auto minTempExpirationLedger =
         lcl + expirationSettings.minTempEntryExpiration;
     auto autoBumpLedgers = expirationSettings.autoBumpLedgers;
