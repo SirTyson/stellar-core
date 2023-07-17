@@ -311,6 +311,12 @@ EntryIterator::entryPtr() const
     return getImpl()->entryPtr();
 }
 
+EntryChangeType
+EntryIterator::type() const
+{
+    return getImpl()->type();
+}
+
 bool
 EntryIterator::entryExists() const
 {
@@ -507,7 +513,7 @@ LedgerTxn::Impl::commitChild(EntryIterator iter,
         for (; (bool)iter; ++iter)
         {
             updateEntry(iter.key(), /* keyHint */ nullptr, iter.entryPtr(),
-                        /* effectiveActive */ false);
+                        /* effectiveActive */ false, iter.type());
         }
 
         // We will show that the following update procedure leaves the self
@@ -611,6 +617,12 @@ LedgerTxn::restore(InternalLedgerEntry const& entry)
 {
     return getImpl()->restore(*this, entry);
 }
+
+void
+LedgerTxn::maybeEvict(InternalLedgerEntry const& entry)
+{
+    getImpl()->maybeEvict(*this, entry);
+}
 #endif
 
 LedgerTxnEntry
@@ -634,7 +646,7 @@ LedgerTxn::Impl::createRestoreCommon(LedgerTxn& self,
     // because the entry would have been a LIVE before the delete. If it were an
     // INIT instead, the key would've been annihilated.
     updateEntry(entry.toKey(), &it, LedgerEntryPtr::Init(current),
-                /* effectiveActive */ true);
+                /* effectiveActive */ true, EntryChangeType::TRANSACTION);
     return ltxe;
 }
 
@@ -706,6 +718,29 @@ LedgerTxn::Impl::restore(LedgerTxn& self, InternalLedgerEntry const& entry)
 
     return createRestoreCommon(self, entry);
 }
+
+void
+LedgerTxn::Impl::maybeEvict(LedgerTxn& self, InternalLedgerEntry const& entry)
+{
+    throwIfSealed();
+    throwIfChild();
+
+    auto key = entry.toKey();
+    auto txle = self.loadWithoutRecord(key, /*isExpired=*/true);
+
+    // When scanning the BucketList, we call maybeEvict on every BucketEntry
+    // that has an expirationLedger > currentLedger. Due to the structure of the
+    // BucketList, the entry may have received an update on a more recent level
+    // or have already been evicted. !txle checks if the entry has already been
+    // evicted and the equality check makes sure this is the most recent version
+    // of the entry
+    if (!txle || txle.current() != entry)
+    {
+        return;
+    }
+
+    // TODO: Meta
+}
 #endif
 
 void
@@ -734,7 +769,7 @@ LedgerTxn::Impl::createWithoutLoading(InternalLedgerEntry const& entry)
     updateEntry(
         key, /* keyHint */ nullptr,
         LedgerEntryPtr::Init(std::make_shared<InternalLedgerEntry>(entry)),
-        /* effectiveActive */ false);
+        /* effectiveActive */ false, EntryChangeType::TRANSACTION);
 }
 
 void
@@ -759,7 +794,7 @@ LedgerTxn::Impl::updateWithoutLoading(InternalLedgerEntry const& entry)
     updateEntry(
         key, /* keyHint */ nullptr,
         LedgerEntryPtr::Live(std::make_shared<InternalLedgerEntry>(entry)),
-        /* effectiveActive */ false);
+        /* effectiveActive */ false, EntryChangeType::TRANSACTION);
 }
 
 void
@@ -822,7 +857,8 @@ LedgerTxn::Impl::erase(InternalLedgerKey const& key)
     auto activeIter = mActive.find(key);
     bool isActive = activeIter != mActive.end();
 
-    updateEntry(key, &newest.second, LedgerEntryPtr::Delete(), false);
+    updateEntry(key, &newest.second, LedgerEntryPtr::Delete(), false,
+                EntryChangeType::TRANSACTION);
     // Note: Cannot throw after this point because the entry will not be
     // deactivated in that case
 
@@ -850,7 +886,8 @@ LedgerTxn::Impl::eraseWithoutLoading(InternalLedgerKey const& key)
     auto activeIter = mActive.find(key);
     bool isActive = activeIter != mActive.end();
 
-    updateEntry(key, /* keyHint */ nullptr, LedgerEntryPtr::Delete(), false);
+    updateEntry(key, /* keyHint */ nullptr, LedgerEntryPtr::Delete(), false,
+                EntryChangeType::TRANSACTION);
     // Note: Cannot throw after this point because the entry will not be
     // deactivated in that case
 
@@ -873,23 +910,21 @@ UnorderedMap<LedgerKey, LedgerEntry>
 LedgerTxn::Impl::getAllOffers()
 {
     auto offers = mParent.getAllOffers();
-    for (auto const& kv : mEntry)
+    for (auto const& [key, mapEntry] : mEntry)
     {
-        auto const& key = kv.first;
-        auto const& entry = kv.second;
         if (key.type() != InternalLedgerEntryType::LEDGER_ENTRY ||
             key.ledgerKey().type() != OFFER)
         {
             continue;
         }
-        if (entry.isDeleted())
+        if (mapEntry.ptr.isDeleted())
         {
             offers.erase(key.ledgerKey());
             continue;
         }
         // This can throw, but getAllOffers only has the basic exception safety
         // guarantee anyway.
-        offers[key.ledgerKey()] = entry->ledgerEntry();
+        offers[key.ledgerKey()] = mapEntry.ptr->ledgerEntry();
     }
     return offers;
 }
@@ -921,14 +956,14 @@ LedgerTxn::Impl::getBestOfferSlow(Asset const& buying, Asset const& selling,
                                   std::unordered_set<int64_t>& exclude)
 {
     std::shared_ptr<InternalLedgerEntry const> selfBest;
-    for (auto const& kv : mEntry)
+    for (auto const& [internalKey, mapEntry] : mEntry)
     {
-        if (kv.first.type() != InternalLedgerEntryType::LEDGER_ENTRY)
+        if (internalKey.type() != InternalLedgerEntryType::LEDGER_ENTRY)
         {
             continue;
         }
 
-        auto const& key = kv.first.ledgerKey();
+        auto const& key = internalKey.ledgerKey();
         if (key.type() != OFFER)
         {
             continue;
@@ -939,9 +974,9 @@ LedgerTxn::Impl::getBestOfferSlow(Asset const& buying, Asset const& selling,
             continue;
         }
 
-        if (!kv.second.isDeleted())
+        if (!mapEntry.ptr.isDeleted())
         {
-            auto const& le = kv.second->ledgerEntry();
+            auto const& le = mapEntry.ptr->ledgerEntry();
             if (!(le.data.offer().buying == buying &&
                   le.data.offer().selling == selling))
             {
@@ -955,7 +990,7 @@ LedgerTxn::Impl::getBestOfferSlow(Asset const& buying, Asset const& selling,
 
             if (!selfBest || isBetterOffer(le, selfBest->ledgerEntry()))
             {
-                selfBest = kv.second.get();
+                selfBest = mapEntry.ptr.get();
             }
         }
     }
@@ -1026,12 +1061,12 @@ LedgerTxn::Impl::getBestOffer(Asset const& buying, Asset const& selling)
         if (!offers.empty())
         {
             auto entryIter = mEntry.find(offers.begin()->second);
-            if (entryIter == mEntry.end() || entryIter->second.isDeleted())
+            if (entryIter == mEntry.end() || entryIter->second.ptr.isDeleted())
             {
                 throw std::runtime_error("invalid order book state");
             }
             selfBest = std::make_shared<LedgerEntry const>(
-                entryIter->second->ledgerEntry());
+                entryIter->second.ptr->ledgerEntry());
         }
     }
 
@@ -1137,12 +1172,12 @@ LedgerTxn::Impl::getBestOffer(Asset const& buying, Asset const& selling,
         if (iter != offers.end())
         {
             auto entryIter = mEntry.find(iter->second);
-            if (entryIter == mEntry.end() || entryIter->second.isDeleted())
+            if (entryIter == mEntry.end() || entryIter->second.ptr.isDeleted())
             {
                 throw std::runtime_error("invalid order book state");
             }
             selfBest = std::make_shared<LedgerEntry const>(
-                entryIter->second->ledgerEntry());
+                entryIter->second.ptr->ledgerEntry());
         }
     }
 
@@ -1189,23 +1224,26 @@ LedgerTxn::Impl::getBestOffer(Asset const& buying, Asset const& selling,
 }
 
 LedgerEntryChanges
-LedgerTxn::getChanges()
+LedgerTxn::getChanges(EntryChangeType type)
 {
-    return getImpl()->getChanges();
+    return getImpl()->getChanges(type);
 }
 
 LedgerEntryChanges
-LedgerTxn::Impl::getChanges()
+LedgerTxn::Impl::getChanges(EntryChangeType type)
 {
     throwIfNotExactConsistency();
     LedgerEntryChanges changes;
     changes.reserve(mEntry.size() * 2);
     maybeUpdateLastModifiedThenInvokeThenSeal([&](EntryMap const& entries) {
-        for (auto const& kv : entries)
+        for (auto const& [key, mapEntry] : entries)
         {
-            auto const& key = kv.first;
-            auto const& entry = kv.second;
+            if (mapEntry.type != type)
+            {
+                continue;
+            }
 
+            auto const& entry = mapEntry.ptr;
             if (key.type() != InternalLedgerEntryType::LEDGER_ENTRY)
             {
                 continue;
@@ -1256,9 +1294,8 @@ LedgerTxn::Impl::getDelta()
     LedgerTxnDelta delta;
     delta.entry.reserve(mEntry.size());
     maybeUpdateLastModifiedThenInvokeThenSeal([&](EntryMap const& entries) {
-        for (auto const& kv : entries)
+        for (auto const& [key, mapEntry] : entries)
         {
-            auto const& key = kv.first;
             if (key.type() != InternalLedgerEntryType::LEDGER_ENTRY)
             {
                 continue;
@@ -1270,7 +1307,7 @@ LedgerTxn::Impl::getDelta()
             // Deep copy is not required here because getDelta causes
             // LedgerTxn to enter the sealed state, meaning subsequent
             // modifications are impossible.
-            delta.entry[key] = {kv.second.get(), previous};
+            delta.entry[key] = {mapEntry.ptr.get(), previous};
         }
         delta.header = {*mHeader, mParent.getHeader()};
     });
@@ -1308,19 +1345,17 @@ LedgerTxn::Impl::getDeltaVotes() const
 {
     int64_t const MIN_VOTES_TO_INCLUDE = 1000000000;
     std::map<AccountID, int64_t> deltaVotes;
-    for (auto const& kv : mEntry)
+    for (auto const& [key, mapEntry] : mEntry)
     {
-        auto const& key = kv.first;
-        auto const& entry = kv.second;
         if (key.type() != InternalLedgerEntryType::LEDGER_ENTRY ||
             key.ledgerKey().type() != ACCOUNT)
         {
             continue;
         }
 
-        if (!entry.isDeleted())
+        if (!mapEntry.ptr.isDeleted())
         {
-            auto const& acc = entry->ledgerEntry().data.account();
+            auto const& acc = mapEntry.ptr->ledgerEntry().data.account();
             if (acc.inflationDest && acc.balance >= MIN_VOTES_TO_INCLUDE)
             {
                 deltaVotes[*acc.inflationDest] += acc.balance;
@@ -1473,25 +1508,22 @@ LedgerTxn::Impl::getAllEntries(std::vector<LedgerEntry>& initEntries,
     resLive.reserve(mEntry.size());
     resDead.reserve(mEntry.size());
     maybeUpdateLastModifiedThenInvokeThenSeal([&](EntryMap const& entries) {
-        for (auto const& kv : entries)
+        for (auto const& [key, mapEntry] : entries)
         {
-            auto const& key = kv.first;
-            auto const& entry = kv.second;
-
             if (key.type() != InternalLedgerEntryType::LEDGER_ENTRY)
             {
                 continue;
             }
 
-            if (entry.get())
+            if (mapEntry.ptr.get())
             {
-                if (entry.isInit())
+                if (mapEntry.ptr.isInit())
                 {
-                    resInit.emplace_back(entry->ledgerEntry());
+                    resInit.emplace_back(mapEntry.ptr->ledgerEntry());
                 }
                 else
                 {
-                    resLive.emplace_back(entry->ledgerEntry());
+                    resLive.emplace_back(mapEntry.ptr->ledgerEntry());
                 }
             }
             else
@@ -1519,7 +1551,7 @@ LedgerTxn::Impl::getNewestVersion(InternalLedgerKey const& key,
     auto iter = mEntry.find(key);
     if (iter != mEntry.end())
     {
-        return iter->second.get();
+        return iter->second.ptr.get();
     }
     return mParent.getNewestVersion(key, loadExpiredEntry);
 }
@@ -1531,7 +1563,7 @@ LedgerTxn::Impl::getNewestVersionEntryMap(InternalLedgerKey const& key)
     auto iter = mEntry.find(key);
     if (iter != mEntry.end())
     {
-        return std::make_pair(iter->second.get(), iter);
+        return std::make_pair(iter->second.ptr.get(), iter);
     }
     return std::make_pair(
         mParent.getNewestVersion(key, /*loadExpiredEntry=*/false), iter);
@@ -1549,26 +1581,24 @@ LedgerTxn::Impl::getOffersByAccountAndAsset(AccountID const& account,
                                             Asset const& asset)
 {
     auto offers = mParent.getOffersByAccountAndAsset(account, asset);
-    for (auto const& kv : mEntry)
+    for (auto const& [key, mapEntry] : mEntry)
     {
-        auto const& key = kv.first;
-        auto const& entry = kv.second;
         if (key.type() != InternalLedgerEntryType::LEDGER_ENTRY ||
             key.ledgerKey().type() != OFFER)
         {
             continue;
         }
-        if (entry.isDeleted())
+        if (mapEntry.ptr.isDeleted())
         {
             offers.erase(key.ledgerKey());
             continue;
         }
 
-        auto const& oe = entry->ledgerEntry().data.offer();
+        auto const& oe = mapEntry.ptr->ledgerEntry().data.offer();
         if (oe.sellerID == account &&
             (oe.selling == asset || oe.buying == asset))
         {
-            offers[key.ledgerKey()] = entry->ledgerEntry();
+            offers[key.ledgerKey()] = mapEntry.ptr->ledgerEntry();
         }
         else
         {
@@ -1591,18 +1621,18 @@ LedgerTxn::Impl::getPoolShareTrustLinesByAccountAndAsset(
 {
     auto trustLines =
         mParent.getPoolShareTrustLinesByAccountAndAsset(account, asset);
-    for (auto const& kv : mEntry)
+    for (auto const& [internalKey, mapEntry] : mEntry)
     {
-        if (kv.first.type() != InternalLedgerEntryType::LEDGER_ENTRY)
+        if (internalKey.type() != InternalLedgerEntryType::LEDGER_ENTRY)
         {
             continue;
         }
 
-        auto const& key = kv.first.ledgerKey();
+        auto const& key = internalKey.ledgerKey();
         if (key.type() == TRUSTLINE && key.trustLine().accountID == account &&
             key.trustLine().asset.type() == ASSET_TYPE_POOL_SHARE)
         {
-            if (kv.second.isDeleted())
+            if (mapEntry.ptr.isDeleted())
             {
                 // The trust line was in our result set from a parent, but was
                 // deleted in self
@@ -1615,7 +1645,7 @@ LedgerTxn::Impl::getPoolShareTrustLinesByAccountAndAsset(
                 {
                     // The trust line was in our result set from a parent, and
                     // was updated in self
-                    iter->second = kv.second->ledgerEntry();
+                    iter->second = mapEntry.ptr->ledgerEntry();
                 }
                 else
                 {
@@ -1635,7 +1665,7 @@ LedgerTxn::Impl::getPoolShareTrustLinesByAccountAndAsset(
                     auto const& cp = lp.body.constantProduct();
                     if (cp.params.assetA == asset || cp.params.assetB == asset)
                     {
-                        trustLines.emplace(key, kv.second->ledgerEntry());
+                        trustLines.emplace(key, mapEntry.ptr->ledgerEntry());
                     }
                 }
             }
@@ -1669,7 +1699,8 @@ LedgerTxn::Impl::load(LedgerTxn& self, InternalLedgerKey const& key)
     std::optional<LedgerEntryPtr> currentEntryPtr;
     if (newest.second != mEntry.end())
     {
-        currentEntryPtr = std::optional<LedgerEntryPtr>(newest.second->second);
+        currentEntryPtr =
+            std::optional<LedgerEntryPtr>(newest.second->second.ptr);
     }
     else
     {
@@ -1691,7 +1722,7 @@ LedgerTxn::Impl::load(LedgerTxn& self, InternalLedgerKey const& key)
     // exception safety guarantee. Furthermore, ltxe will be destructed leading
     // to key being deactivated. This will leave LedgerTxn unmodified.
     updateEntry(key, &newest.second, *currentEntryPtr,
-                /* effectiveActive */ true);
+                /* effectiveActive */ true, EntryChangeType::TRANSACTION);
     return ltxe;
 }
 
@@ -2134,15 +2165,15 @@ LedgerTxn::Impl::maybeUpdateLastModified() noexcept
     throwIfSealed();
     throwIfChild();
 
-    for (auto& kv : mEntry)
+    for (auto& [key, mapEntry] : mEntry)
     {
-        auto& entry = kv.second;
-        if (!kv.second.isDeleted())
+        if (!mapEntry.ptr.isDeleted())
         {
             if (mShouldUpdateLastModified &&
-                entry->type() == InternalLedgerEntryType::LEDGER_ENTRY)
+                mapEntry.ptr->type() == InternalLedgerEntryType::LEDGER_ENTRY)
             {
-                entry->ledgerEntry().lastModifiedLedgerSeq = mHeader->ledgerSeq;
+                mapEntry.ptr->ledgerEntry().lastModifiedLedgerSeq =
+                    mHeader->ledgerSeq;
             }
         }
     }
@@ -2239,15 +2270,16 @@ LedgerTxn::Impl::updateEntryIfRecorded(InternalLedgerKey const& key,
     // book. Therefore we only updateEntry if key is in mEntry.
     if (entryIter != mEntry.end())
     {
-        updateEntry(key, &entryIter, entryIter->second, effectiveActive);
+        updateEntry(key, &entryIter, entryIter->second.ptr, effectiveActive,
+                    entryIter->second.type);
     }
 }
 
 void
 LedgerTxn::Impl::updateEntry(InternalLedgerKey const& key,
                              EntryMap::iterator const* keyHint,
-                             LedgerEntryPtr lePtr,
-                             bool effectiveActive) noexcept
+                             LedgerEntryPtr lePtr, bool effectiveActive,
+                             EntryChangeType type) noexcept
 {
     auto recordEntry = [&]() {
         // First, try to insert the entry. If the entry doesn't already exist,
@@ -2259,7 +2291,8 @@ LedgerTxn::Impl::updateEntry(InternalLedgerKey const& key,
         EntryMap::iterator localIterDoNotUse;
         if (!keyHint || *keyHint == mEntry.end())
         {
-            std::tie(localIterDoNotUse, inserted) = mEntry.emplace(key, lePtr);
+            std::tie(localIterDoNotUse, inserted) =
+                mEntry.emplace(key, EntryMapEntry{lePtr, type});
             keyHint = &localIterDoNotUse;
         }
 
@@ -2272,13 +2305,13 @@ LedgerTxn::Impl::updateEntry(InternalLedgerKey const& key,
 
             // An init entry is being deleted, so annihilate the init instead of
             // updating it.
-            if (lePtr.isDeleted() && (*keyHint)->second.isInit())
+            if (lePtr.isDeleted() && (*keyHint)->second.ptr.isInit())
             {
                 mEntry.erase(*keyHint);
             }
             else
             {
-                (*keyHint)->second.mergeFrom(lePtr);
+                (*keyHint)->second.ptr.mergeFrom(lePtr);
             }
         }
     };
@@ -2299,11 +2332,11 @@ LedgerTxn::Impl::updateEntry(InternalLedgerKey const& key,
         localIterDoNotUse = mEntry.find(key);
         keyHint = &localIterDoNotUse;
     }
-    if (*keyHint != mEntry.end() && !(*keyHint)->second.isDeleted())
+    if (*keyHint != mEntry.end() && !(*keyHint)->second.ptr.isDeleted())
     {
         // The offer is always removed from mMultiOrderBook even if this is a
         // modification because the assets on the existing offer can be modified
-        auto const& le = (*keyHint)->second->ledgerEntry();
+        auto const& le = (*keyHint)->second.ptr->ledgerEntry();
         removeFromOrderBookIfExists(le);
     }
 
@@ -2371,9 +2404,8 @@ LedgerTxn::Impl::hasSponsorshipEntry() const
     throwIfNotExactConsistency();
     throwIfChild();
 
-    for (auto const& kv : mEntry)
+    for (auto const& [glk, mapEntry] : mEntry)
     {
-        auto glk = kv.first;
         switch (glk.type())
         {
         case InternalLedgerEntryType::SPONSORSHIP:
@@ -2461,19 +2493,25 @@ LedgerTxn::Impl::EntryIteratorImpl::atEnd() const
 InternalLedgerEntry const&
 LedgerTxn::Impl::EntryIteratorImpl::entry() const
 {
-    return *(mIter->second);
+    return *(mIter->second.ptr);
 }
 
 LedgerEntryPtr const&
 LedgerTxn::Impl::EntryIteratorImpl::entryPtr() const
 {
-    return mIter->second;
+    return mIter->second.ptr;
+}
+
+EntryChangeType
+LedgerTxn::Impl::EntryIteratorImpl::type() const
+{
+    return mIter->second.type;
 }
 
 bool
 LedgerTxn::Impl::EntryIteratorImpl::entryExists() const
 {
-    return !mIter->second.isDeleted();
+    return !mIter->second.ptr.isDeleted();
 }
 
 InternalLedgerKey const&

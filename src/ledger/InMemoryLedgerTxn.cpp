@@ -54,6 +54,12 @@ InMemoryLedgerTxn::FilteredEntryIteratorImpl::entryPtr() const
     return mIter.entryPtr();
 }
 
+EntryChangeType
+InMemoryLedgerTxn::FilteredEntryIteratorImpl::type() const
+{
+    return mIter.type();
+}
+
 bool
 InMemoryLedgerTxn::FilteredEntryIteratorImpl::entryExists() const
 {
@@ -238,6 +244,12 @@ LedgerTxnEntry
 InMemoryLedgerTxn::restore(InternalLedgerEntry const& entry)
 {
     throw std::runtime_error("called restore on InMemoryLedgerTxn");
+}
+
+void
+InMemoryLedgerTxn::maybeEvict(InternalLedgerEntry const& entry)
+{
+    throw std::runtime_error("called evict on InMemoryLedgerTxn");
 }
 #endif
 
