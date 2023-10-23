@@ -302,12 +302,12 @@ ContractInvocationTest::deployContractWithSourceAccountWithResources(
     mContractID = mContractKeys[0].contractData().contract;
 }
 
-TransactionFrameBasePtr
-ContractInvocationTest::getCreateTx(TestAccount& acc)
+TransactionFramePtr
+ContractInvocationTest::getDeployTxForMetaTest(TestAccount& acc)
 {
     if (mContractKeys.empty())
     {
-        throw "Must deploy test contract before calling getCreateTx";
+        throw "Must deploy test contract before calling getDeployTxForMetaTest";
     }
 
     SorobanResources createResources{};
@@ -321,9 +321,8 @@ ContractInvocationTest::getCreateTx(TestAccount& acc)
     auto createResourceFee =
         sorobanResourceFee(*mApp, createResources, 1000, 40) + 40'000;
 
-    return sorobanTransactionFrameFromOps(mApp->getNetworkID(), acc, {createOp},
-                                          {}, createResources, 1000,
-                                          createResourceFee);
+    return acc.sorobanTx({createOp}, {}, createResources, 1000,
+                         createResourceFee, std::nullopt);
 }
 
 ContractInvocationTest::ContractInvocationTest(
@@ -549,6 +548,11 @@ TransactionFrameBasePtr
 ContractInvocationTest::createUploadWasmTx(TestAccount& source,
                                            uint32_t resourceFee)
 {
+    if (!mContractKeys.empty())
+    {
+        throw "WASM already uploaded";
+    }
+
     SorobanResources uploadResources{};
     uploadResources.instructions = 200'000 + (mWasm.data.size() * 6000);
     uploadResources.readBytes = 1000;
@@ -576,8 +580,7 @@ ContractInvocationTest::createInvokeTx(SorobanResources const& resources,
                                        SCSymbol const& functionName,
                                        std::vector<SCVal> const& args,
                                        uint32_t inclusionFee,
-                                       uint32_t resourceFee,
-                                       std::shared_ptr<TestAccount> source)
+                                       uint32_t resourceFee)
 {
     Operation op;
     op.body.type(INVOKE_HOST_FUNCTION);
@@ -586,36 +589,77 @@ ContractInvocationTest::createInvokeTx(SorobanResources const& resources,
     ihf.invokeContract().contractAddress = mContractID;
     ihf.invokeContract().functionName = functionName;
     ihf.invokeContract().args.assign(args.begin(), args.end());
-    auto& acc = source ? *source : getRoot();
 
-    return sorobanTransactionFrameFromOps(mApp->getNetworkID(), acc, {op}, {},
-                                          resources, inclusionFee, resourceFee);
+    return sorobanTransactionFrameFromOps(mApp->getNetworkID(), getRoot(), {op},
+                                          {}, resources, inclusionFee,
+                                          resourceFee);
+}
+
+TransactionFramePtr
+ContractInvocationTest::createInvokeTxForMetaTest(
+    TestAccount& source, SorobanResources const& resources,
+    SCSymbol const& functionName, std::vector<SCVal> const& args,
+    uint32_t inclusionFee, uint32_t resourceFee)
+{
+    Operation op;
+    op.body.type(INVOKE_HOST_FUNCTION);
+    auto& ihf = op.body.invokeHostFunctionOp().hostFunction;
+    ihf.type(HOST_FUNCTION_TYPE_INVOKE_CONTRACT);
+    ihf.invokeContract().contractAddress = mContractID;
+    ihf.invokeContract().functionName = functionName;
+    ihf.invokeContract().args.assign(args.begin(), args.end());
+
+    return source.sorobanTx({op}, {}, resources, inclusionFee, resourceFee,
+                            std::nullopt);
 }
 
 TransactionFrameBasePtr
 ContractInvocationTest::createExtendOpTx(SorobanResources const& resources,
                                          uint32_t extendTo, uint32_t fee,
-                                         uint32_t refundableFee,
-                                         std::shared_ptr<TestAccount> source)
+                                         uint32_t refundableFee)
 {
     Operation op;
     op.body.type(EXTEND_FOOTPRINT_TTL);
     op.body.extendFootprintTTLOp().extendTo = extendTo;
-    auto& acc = source ? *source : getRoot();
-    return sorobanTransactionFrameFromOps(mApp->getNetworkID(), acc, {op}, {},
-                                          resources, fee, refundableFee);
+
+    return sorobanTransactionFrameFromOps(mApp->getNetworkID(), getRoot(), {op},
+                                          {}, resources, fee, refundableFee);
+}
+
+TransactionFramePtr
+ContractInvocationTest::createExtendOpTxForMetaTest(
+    TestAccount& source, SorobanResources const& resources, uint32_t extendTo,
+    uint32_t fee, uint32_t refundableFee)
+{
+    Operation op;
+    op.body.type(EXTEND_FOOTPRINT_TTL);
+    op.body.extendFootprintTTLOp().extendTo = extendTo;
+
+    return source.sorobanTx({op}, {}, resources, 1'000, refundableFee,
+                            std::nullopt);
 }
 
 TransactionFrameBasePtr
 ContractInvocationTest::createRestoreTx(SorobanResources const& resources,
-                                        uint32_t fee, uint32_t refundableFee,
-                                        std::shared_ptr<TestAccount> source)
+                                        uint32_t fee, uint32_t refundableFee)
 {
     Operation op;
     op.body.type(RESTORE_FOOTPRINT);
-    auto& acc = source ? *source : getRoot();
-    return sorobanTransactionFrameFromOps(mApp->getNetworkID(), acc, {op}, {},
-                                          resources, fee, refundableFee);
+
+    return sorobanTransactionFrameFromOps(mApp->getNetworkID(), getRoot(), {op},
+                                          {}, resources, fee, refundableFee);
+}
+
+TransactionFramePtr
+ContractInvocationTest::createRestoreTxForMetaTest(
+    TestAccount& source, SorobanResources const& resources, uint32_t fee,
+    uint32_t refundableFee)
+{
+    Operation op;
+    op.body.type(RESTORE_FOOTPRINT);
+
+    return source.sorobanTx({op}, {}, resources, 1'000, refundableFee,
+                            std::nullopt);
 }
 
 void
@@ -623,6 +667,7 @@ ContractInvocationTest::txCheckValid(TransactionFrameBasePtr tx)
 {
     LedgerTxn ltx(mApp->getLedgerTxnRoot());
     REQUIRE(tx->checkValid(*mApp, ltx, 0, 0, 0));
+    ltx.commit();
 }
 
 bool
