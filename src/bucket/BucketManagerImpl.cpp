@@ -897,13 +897,14 @@ void
 BucketManagerImpl::scanForEviction(AbstractLedgerTxn& ltx, uint32_t ledgerSeq)
 {
     ZoneScoped;
-    if (protocolVersionStartsFrom(ltx.getHeader().ledgerVersion,
-                                  ProtocolVersion::V_20))
-    {
-        mBucketList->scanForEviction(mApp, ltx, ledgerSeq, mEntriesEvicted,
-                                     mBytesScannedForEviction,
-                                     mIncompleteBucketScans);
-    }
+    //     if (protocolVersionStartsFrom(ltx.getHeader().ledgerVersion,
+    //                                   ProtocolVersion::V_20))
+    //     {
+    //         mBucketList->scanForEviction(mApp, ltx, ledgerSeq,
+    //         mEntriesEvicted,
+    //                                      mBytesScannedForEviction,
+    //                                      mIncompleteBucketScans);
+    //     }
 }
 
 medida::Timer&
