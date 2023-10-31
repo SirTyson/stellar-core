@@ -3658,23 +3658,19 @@ TEST_CASE("soroban txs each parameter surge priced", "[soroban][herder]")
                                           .header;
                     auto txSet = nodes[0]->getHerder().getTxSet(
                         lclHeader.scpValue.txSetHash);
-                    GeneralizedTransactionSet xdrTxSet;
-                    txSet->toXDR(xdrTxSet);
-                    auto const& components =
-                        xdrTxSet.v1TxSet()
-                            .phases
-                            .at(static_cast<size_t>(TxSetFrame::Phase::SOROBAN))
-                            .v0Components();
-                    if (!components.empty())
+                    auto const& sorobanTxs =
+                        txSet->getTxsForPhase(TxSetFrame::Phase::SOROBAN);
+                    if (!sorobanTxs.empty())
                     {
-                        auto baseFee =
-                            components.at(0).txsMaybeDiscountedFee().baseFee;
-                        hadSorobanSurgePricing = hadSorobanSurgePricing ||
-                                                 (baseFee && *baseFee > 100);
+                        hadSorobanSurgePricing =
+                            hadSorobanSurgePricing ||
+                            txSet->getTxBaseFee(sorobanTxs[0], lclHeader) > 100;
                     }
 
-                    return loadGenDone.count() > currLoadGenCount &&
-                           secondLoadGenDone.count() > secondLoadGenCount;
+                    return (loadGenDone.count() > currLoadGenCount &&
+                            secondLoadGenDone.count() > secondLoadGenCount) ||
+                           loadGenFailed.count() > 0 ||
+                           secondLoadGenFailed.count() > 0;
                 },
                 200 * Herder::EXP_LEDGER_TIMESPAN_SECONDS, false);
 
