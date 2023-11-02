@@ -1442,6 +1442,42 @@ TEST_CASE("complex contract", "[tx][soroban]")
     }
 }
 
+TEST_CASE("multiple instances with same code entry")
+{
+    // First, deploy the contract from root account
+    ContractInvocationTest test(rust_bridge::get_test_wasm_add_i32(),
+                                /*deployContact=*/true);
+
+    const int64_t startingBalance =
+        test.getApp()->getLedgerManager().getLastMinBalance(50);
+    auto a1 = test.getRoot().create("A", startingBalance);
+
+    // Re-deploy the contract from a1 account
+    SorobanResources createResources{};
+    createResources.instructions = 200'000;
+    createResources.readBytes = 5000;
+    createResources.writeBytes = 5000;
+
+    auto const& contractCodeLedgerKey = test.getContractKeys()[1];
+    SCVal scContractSourceRefKey(SCValType::SCV_LEDGER_KEY_CONTRACT_INSTANCE);
+    auto [createOp, contractID] =
+        createOpCommon(*test.getApp(), createResources, contractCodeLedgerKey,
+                       a1, scContractSourceRefKey, sha256("A"));
+
+    auto createResourceFee =
+        sorobanResourceFee(*test.getApp(), createResources, 1000, 40) + 40'000;
+    submitTxToCreateContract(*test.getApp(), createOp, createResources,
+                             contractID, scContractSourceRefKey,
+                             contractCodeLedgerKey.contractCode().hash, 1000,
+                             createResourceFee);
+
+    // Check TTLs for contract instance
+    auto const& ses = test.getNetworkCfg().stateArchivalSettings();
+    auto expectedLiveUntilLedger =
+        ses.minPersistentTTL + test.getLedgerSeq() - 1;
+    test.checkTTL(contractCodeLedgerKey, expectedLiveUntilLedger);
+}
+
 TEST_CASE("contract storage", "[tx][soroban]")
 {
     ContractStorageInvocationTest test{};

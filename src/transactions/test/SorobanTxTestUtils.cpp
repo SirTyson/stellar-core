@@ -200,17 +200,17 @@ ContractInvocationTest::invokeArchivalOp(TransactionFrameBasePtr tx,
 }
 
 // Returns createOp, contractID pair
-static std::pair<Operation, Hash>
+std::pair<Operation, Hash>
 createOpCommon(Application& app, SorobanResources& createResources,
                LedgerKey const& contractCodeLedgerKey, TestAccount& source,
-               SCVal& scContractSourceRefKey)
+               SCVal& scContractSourceRefKey, uint256 salt)
 {
     // Deploy the contract instance
     ContractIDPreimage idPreimage(CONTRACT_ID_PREIMAGE_FROM_ADDRESS);
     idPreimage.fromAddress().address.type(SC_ADDRESS_TYPE_ACCOUNT);
     idPreimage.fromAddress().address.accountId().ed25519() =
         source.getPublicKey().ed25519();
-    idPreimage.fromAddress().salt = sha256("salt");
+    idPreimage.fromAddress().salt = salt;
     HashIDPreimage fullPreImage;
     fullPreImage.type(ENVELOPE_TYPE_CONTRACT_ID);
     fullPreImage.contractID().contractIDPreimage = idPreimage;

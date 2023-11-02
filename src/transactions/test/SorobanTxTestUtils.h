@@ -39,6 +39,11 @@ void submitTxToCreateContract(Application& app, Operation const& op,
                               Hash const& expectedWasmHash,
                               uint32_t inclusionFee, uint32_t resourceFee);
 
+std::pair<Operation, Hash>
+createOpCommon(Application& app, SorobanResources& createResources,
+               LedgerKey const& contractCodeLedgerKey, TestAccount& source,
+               SCVal& scContractSourceRefKey, uint256 salt = sha256("salt"));
+
 class ContractInvocationTest
 {
     // Fee constants from rs-soroban-env/soroban-env-host/src/fees.rs
