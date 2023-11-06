@@ -200,17 +200,17 @@ ContractInvocationTest::invokeArchivalOp(TransactionFrameBasePtr tx,
 }
 
 // Returns createOp, contractID pair
-static std::pair<Operation, Hash>
-createOpCommon(Application& app, SorobanResources& createResources,
-               LedgerKey const& contractCodeLedgerKey, TestAccount& source,
-               SCVal& scContractSourceRefKey)
+std::pair<Operation, Hash>
+getSorobanCreateOp(Application& app, SorobanResources& createResources,
+                   LedgerKey const& contractCodeLedgerKey, TestAccount& source,
+                   SCVal& scContractSourceRefKey, uint256 salt)
 {
     // Deploy the contract instance
     ContractIDPreimage idPreimage(CONTRACT_ID_PREIMAGE_FROM_ADDRESS);
     idPreimage.fromAddress().address.type(SC_ADDRESS_TYPE_ACCOUNT);
     idPreimage.fromAddress().address.accountId().ed25519() =
         source.getPublicKey().ed25519();
-    idPreimage.fromAddress().salt = sha256("salt");
+    idPreimage.fromAddress().salt = salt;
     HashIDPreimage fullPreImage;
     fullPreImage.type(ENVELOPE_TYPE_CONTRACT_ID);
     fullPreImage.contractID().contractIDPreimage = idPreimage;
@@ -284,8 +284,8 @@ ContractInvocationTest::deployContractWithSourceAccountWithResources(
     // Deploy the contract instance
     SCVal scContractSourceRefKey(SCValType::SCV_LEDGER_KEY_CONTRACT_INSTANCE);
     auto [createOp, contractID] =
-        createOpCommon(*mApp, createResources, contractCodeLedgerKey, mRoot,
-                       scContractSourceRefKey);
+        getSorobanCreateOp(*mApp, createResources, contractCodeLedgerKey, mRoot,
+                           scContractSourceRefKey);
 
     auto createResourceFee =
         sorobanResourceFee(*mApp, createResources, 1000, 40) + 40'000;
@@ -316,7 +316,7 @@ ContractInvocationTest::getDeployTxForMetaTest(TestAccount& acc)
     createResources.writeBytes = 5000;
 
     SCVal scContractSourceRefKey(SCValType::SCV_LEDGER_KEY_CONTRACT_INSTANCE);
-    auto [createOp, contractID] = createOpCommon(
+    auto [createOp, contractID] = getSorobanCreateOp(
         *mApp, createResources, mContractKeys[1], acc, scContractSourceRefKey);
     auto createResourceFee =
         sorobanResourceFee(*mApp, createResources, 1000, 40) + 40'000;
