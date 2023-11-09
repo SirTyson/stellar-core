@@ -1358,6 +1358,46 @@ TEST_CASE("settings upgrade", "[tx][soroban][upgrades]")
     }
 }
 
+TEST_CASE("yeet", "[soroban]")
+{
+    auto cfg = getTestConfig();
+    // cfg.ENABLE_SOROBAN_DIAGNOSTIC_EVENTS = true;
+    ContractInvocationTest test(rust_bridge::get_test_wasm_loadgen(), true,
+                                cfg);
+
+    auto scFunc = makeSymbol("write");
+    auto u320 = makeU32(0);
+    auto u321 = makeU32(1);
+    auto u322 = makeU32(2);
+    SorobanResources resources;
+    resources.footprint.readOnly = test.getContractKeys();
+    resources.instructions = 5'000'000;
+    resources.readBytes = 10'000;
+    resources.writeBytes = 10'000;
+
+    auto lk = contractDataKey(test.getContractID(), makeU32(0),
+                              ContractDataDurability::PERSISTENT);
+    auto lk2 = contractDataKey(test.getContractID(), makeU32(1),
+                               ContractDataDurability::PERSISTENT);
+    resources.footprint.readWrite = {lk, lk2};
+
+    auto tx = test.createInvokeTx(resources, scFunc, {u320, u322, u322}, 1'000,
+                                  3'000'000);
+    test.txCheckValid(tx);
+    test.invokeTx(tx, true);
+
+    {
+        LedgerTxn ltx(test.getApp()->getLedgerTxnRoot());
+        auto ltxe = ltx.load(lk);
+        REQUIRE(ltxe);
+        CLOG_FATAL(Bucket, "size: {}", xdr::xdr_size(ltxe.current()));
+
+        auto ltxe2 = ltx.load(lk2);
+        REQUIRE(ltxe2);
+        CLOG_FATAL(Bucket, "size: {}", xdr::xdr_size(ltxe2.current()));
+    }
+}
+
 TEST_CASE("complex contract", "[tx][soroban]")
 {
     auto complexTest = [&](bool enableDiagnostics) {
