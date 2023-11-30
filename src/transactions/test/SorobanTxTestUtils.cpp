@@ -587,7 +587,7 @@ WasmContractInvocationTest::WasmContractInvocationTest(
         uploadResources.writeBytes = 5000;
 
         SorobanResources createResources{};
-        createResources.instructions = 200'000;
+        createResources.instructions = 600'000;
         createResources.readBytes = 5000;
         createResources.writeBytes = 5000;
 
