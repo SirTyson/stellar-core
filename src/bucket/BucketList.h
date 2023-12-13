@@ -476,6 +476,10 @@ class BucketList
                                              Asset const& asset,
                                              Config const& cfg) const;
 
+    std::vector<LedgerEntry>
+    loadOffersByAccountAndAsset(AccountID const& accountID,
+                                Asset const& asset) const;
+
     std::vector<InflationWinner> loadInflationWinners(size_t maxWinners,
                                                       int64_t minBalance) const;
 

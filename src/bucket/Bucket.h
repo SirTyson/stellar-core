@@ -116,8 +116,15 @@ class Bucket : public std::enable_shared_from_this<Bucket>,
         UnorderedMap<LedgerKey, LedgerEntry>& liquidityPoolKeyToTrustline,
         LedgerKeySet& liquidityPoolKeys);
 
-    // At version 11, we added support for INITENTRY and METAENTRY. Before this
-    // we were only supporting LIVEENTRY and DEADENTRY.
+    // Loads all offers where sellerID == accountID and asset is either the
+    // selling or buying asset.
+    void loadOffersByAccountAndAsset(AccountID const& accountID,
+                                     Asset const& asset,
+                                     UnorderedSet<LedgerKey>& shadowedOffers,
+                                     std::vector<LedgerEntry>& loadedOffers);
+
+    // At version 11, we added support for INITENTRY and METAENTRY. Before
+    // this we were only supporting LIVEENTRY and DEADENTRY.
     static constexpr ProtocolVersion
         FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY =
             ProtocolVersion::V_11;

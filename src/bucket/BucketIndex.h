@@ -113,6 +113,12 @@ class BucketIndex : public NonMovableOrCopyable
     virtual std::pair<std::streamoff, std::streamoff>
     getPoolshareTrustlineRange(AccountID const& accountID) const = 0;
 
+    // Returns lower bound and upper bound for offer entry
+    // positions associated with the given sellerID. If no offers are found,
+    // returns std::pair<0, 0>
+    virtual std::pair<std::streamoff, std::streamoff>
+    getOfferRange(AccountID const& sellerID) const = 0;
+
     // Returns page size for index. InidividualIndex returns 0 for page size
     virtual std::streamoff getPageSize() const = 0;
 

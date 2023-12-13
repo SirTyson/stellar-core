@@ -961,8 +961,19 @@ BucketManagerImpl::loadPoolShareTrustLinesByAccountAndAsset(
 {
     releaseAssertOrThrow(getConfig().isUsingBucketListDB());
     auto timer = getBulkLoadTimer("poolshareTrustlines").TimeScope();
+    // TODO: Remove cfg
     return mBucketList->loadPoolShareTrustLinesByAccountAndAsset(
         accountID, asset, getConfig());
+}
+
+std::vector<LedgerEntry>
+BucketManagerImpl::loadOffersByAccountAndAsset(AccountID const& accountID,
+                                               Asset const& asset) const
+{
+    ZoneScoped;
+    releaseAssertOrThrow(getConfig().isUsingBucketListDB());
+    auto timer = getBulkLoadTimer("loadOfferByAccountAsset").TimeScope();
+    return mBucketList->loadOffersByAccountAndAsset(accountID, asset);
 }
 
 std::vector<InflationWinner>

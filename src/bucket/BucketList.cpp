@@ -486,6 +486,27 @@ BucketList::loadPoolShareTrustLinesByAccountAndAsset(AccountID const& accountID,
     return result;
 }
 
+std::vector<LedgerEntry>
+BucketList::loadOffersByAccountAndAsset(AccountID const& accountID,
+                                        Asset const& asset) const
+{
+    if (asset.type() == ASSET_TYPE_NATIVE)
+    {
+        throw std::runtime_error("Invalid asset type");
+    }
+
+    UnorderedSet<LedgerKey> shadowedOffers;
+    std::vector<LedgerEntry> result;
+
+    auto f = [&](std::shared_ptr<Bucket> b) {
+        b->loadOffersByAccountAndAsset(accountID, asset, shadowedOffers,
+                                       result);
+        return false; // continue
+    };
+    loopAllBuckets(f);
+    return result;
+}
+
 std::vector<InflationWinner>
 BucketList::loadInflationWinners(size_t maxWinners, int64_t minBalance) const
 {

@@ -40,6 +40,16 @@ getDummyPoolShareTrustlineKey(AccountID const& accountID, uint8_t fill)
     return key;
 }
 
+// Returns an offer key with the given sellerID and and offerID
+static LedgerKey
+getDummyOfferKey(AccountID const& sellerID, int64_t offerID)
+{
+    LedgerKey key(OFFER);
+    key.offer().sellerID = sellerID;
+    key.offer().offerID = offerID;
+    return key;
+}
+
 // Returns pagesize for given index based on config parameters and bucket size,
 // in bytes
 static inline std::streamoff
@@ -411,16 +421,9 @@ BucketIndexImpl<IndexT>::scan(Iterator start, LedgerKey const& k) const
 
 template <class IndexT>
 std::pair<std::streamoff, std::streamoff>
-BucketIndexImpl<IndexT>::getPoolshareTrustlineRange(
-    AccountID const& accountID) const
+BucketIndexImpl<IndexT>::getOffsetBounds(LedgerKey const& lowerBound,
+                                         LedgerKey const& upperBound) const
 {
-    // Get the smallest and largest possible trustline keys for the given
-    // accountID
-    auto upperBound = getDummyPoolShareTrustlineKey(
-        accountID, std::numeric_limits<uint8_t>::max());
-    auto lowerBound = getDummyPoolShareTrustlineKey(
-        accountID, std::numeric_limits<uint8_t>::min());
-
     // Get the index iterators for the bounds
     auto startIter = std::lower_bound(
         mData.keysToOffset.begin(), mData.keysToOffset.end(), lowerBound,
@@ -430,9 +433,15 @@ BucketIndexImpl<IndexT>::getPoolshareTrustlineRange(
         return {};
     }
 
-    auto endIter =
-        std::upper_bound(startIter, mData.keysToOffset.end(), upperBound,
-                         upper_bound_pred<typename IndexT::value_type>);
+    auto endIter = std::upper_bound(
+        std::next(startIter), mData.keysToOffset.end(), upperBound,
+        upper_bound_pred<typename IndexT::value_type>);
+
+    if (endIter != mData.keysToOffset.end() &&
+        !keyNotInIndexEntry(upperBound, endIter->first))
+    {
+        endIter = std::next(endIter);
+    }
 
     // Get file offsets based on lower and upper bound iterators
     std::streamoff startOff = startIter->second;
@@ -445,6 +454,35 @@ BucketIndexImpl<IndexT>::getPoolshareTrustlineRange(
     }
 
     return std::make_pair(startOff, endOff);
+}
+
+template <class IndexT>
+std::pair<std::streamoff, std::streamoff>
+BucketIndexImpl<IndexT>::getPoolshareTrustlineRange(
+    AccountID const& accountID) const
+{
+    // Get the smallest and largest possible trustline keys for the given
+    // accountID
+    auto upperBound = getDummyPoolShareTrustlineKey(
+        accountID, std::numeric_limits<uint8_t>::max());
+    auto lowerBound = getDummyPoolShareTrustlineKey(
+        accountID, std::numeric_limits<uint8_t>::min());
+
+    return getOffsetBounds(lowerBound, upperBound);
+}
+
+template <class IndexT>
+std::pair<std::streamoff, std::streamoff>
+BucketIndexImpl<IndexT>::getOfferRange(AccountID const& sellerID) const
+{
+    // Get the smallest and largest possible offer keys for the given
+    // sellerID
+    auto upperBound =
+        getDummyOfferKey(sellerID, std::numeric_limits<int64_t>::max());
+    auto lowerBound =
+        getDummyOfferKey(sellerID, std::numeric_limits<int64_t>::min());
+
+    return getOffsetBounds(lowerBound, upperBound);
 }
 
 #ifdef BUILD_TESTS

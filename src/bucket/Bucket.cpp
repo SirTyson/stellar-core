@@ -219,6 +219,7 @@ Bucket::loadKeys(std::set<LedgerKey, LedgerEntryIdCmp>& keys,
     }
 }
 
+// TODO: Fix shadowed trustlines if multiple live version exists
 void
 Bucket::loadPoolShareTrustLinessByAccount(
     AccountID const& accountID, UnorderedSet<LedgerKey>& deadTrustlines,
@@ -238,6 +239,8 @@ Bucket::loadPoolShareTrustLinessByAccount(
     // Get upper and lower bound for poolshare trustline range associated
     // with this account
     auto searchRange = getIndex().getPoolshareTrustlineRange(accountID);
+
+    // TODO: Fix bug where there's only trustlines
     if (searchRange.first == 0)
     {
         // No poolshare trustlines, exit
@@ -288,6 +291,69 @@ Bucket::loadPoolShareTrustLinessByAccount(
 
             liquidityPoolKeyToTrustline.emplace(key, entry);
             liquidityPoolKeys.emplace(key);
+        }
+    }
+}
+
+void
+Bucket::loadOffersByAccountAndAsset(AccountID const& accountID,
+                                    Asset const& asset,
+                                    UnorderedSet<LedgerKey>& shadowedOffers,
+                                    std::vector<LedgerEntry>& loadedOffers)
+{
+    ZoneScoped;
+    auto offerCheck = [&accountID, &asset](auto const& entry) {
+        return entry.type() == OFFER && entry.offer().sellerID == accountID;
+    };
+
+    auto const [lowOffset, highOffset] = getIndex().getOfferRange(accountID);
+    if (lowOffset == 0 && highOffset == 0)
+    {
+        return;
+    }
+
+    BucketEntry be;
+    auto& stream = getStream();
+    stream.seek(lowOffset);
+    while (stream && stream.pos() < highOffset && stream.readOne(be))
+    {
+        LedgerEntry entry;
+        switch (be.type())
+        {
+        case LIVEENTRY:
+        case INITENTRY:
+            entry = be.liveEntry();
+            break;
+        case DEADENTRY:
+        {
+            auto key = be.deadEntry();
+
+            // If we find a valid offer key and we have not seen the
+            // key yet, mark it as dead so we do not load a shadowed version
+            // later
+            if (offerCheck(key))
+            {
+                shadowedOffers.emplace(key);
+            }
+            continue;
+        }
+        case METAENTRY:
+        default:
+            throw std::invalid_argument("Indexed METAENTRY");
+        }
+
+        // If this is an offer that matches the accountID and is not shadowed,
+        // check the asset
+        if (offerCheck(entry.data) &&
+            shadowedOffers.find(LedgerEntryKey(entry)) == shadowedOffers.end())
+        {
+            shadowedOffers.emplace(LedgerEntryKey(entry));
+
+            if (entry.data.offer().selling == asset ||
+                entry.data.offer().buying == asset)
+            {
+                loadedOffers.emplace_back(entry);
+            }
         }
     }
 }

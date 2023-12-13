@@ -225,6 +225,10 @@ class BucketManager : NonMovableOrCopyable
     loadPoolShareTrustLinesByAccountAndAsset(AccountID const& accountID,
                                              Asset const& asset) const = 0;
 
+    virtual std::vector<LedgerEntry>
+    loadOffersByAccountAndAsset(AccountID const& accountID,
+                                Asset const& asset) const = 0;
+
     virtual std::vector<InflationWinner>
     loadInflationWinners(size_t maxWinners, int64_t minBalance) const = 0;
 

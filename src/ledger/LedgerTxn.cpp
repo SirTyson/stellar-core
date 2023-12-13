@@ -3446,20 +3446,29 @@ LedgerTxnRoot::Impl::getOffersByAccountAndAsset(AccountID const& account,
 {
     ZoneScoped;
     std::vector<LedgerEntry> offers;
-    try
+    if (mApp.getConfig().isUsingBucketListDB())
     {
-        offers = loadOffersByAccountAndAsset(account, asset);
+        offers =
+            mApp.getBucketManager().loadOffersByAccountAndAsset(account, asset);
     }
-    catch (std::exception& e)
+    else
     {
-        printErrorAndAbort("fatal error when getting offers by account and "
-                           "asset from LedgerTxnRoot: ",
-                           e.what());
-    }
-    catch (...)
-    {
-        printErrorAndAbort("unknown fatal error when getting offers by account "
-                           "and asset from LedgerTxnRoot");
+        try
+        {
+            offers = loadOffersByAccountAndAsset(account, asset);
+        }
+        catch (std::exception& e)
+        {
+            printErrorAndAbort("fatal error when getting offers by account and "
+                               "asset from LedgerTxnRoot: ",
+                               e.what());
+        }
+        catch (...)
+        {
+            printErrorAndAbort(
+                "unknown fatal error when getting offers by account "
+                "and asset from LedgerTxnRoot");
+        }
     }
 
     UnorderedSet<LedgerKey> toPrefetch;

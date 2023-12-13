@@ -144,6 +144,9 @@ class BucketManagerImpl : public BucketManager
     std::vector<LedgerEntry>
     loadPoolShareTrustLinesByAccountAndAsset(AccountID const& accountID,
                                              Asset const& asset) const override;
+    virtual std::vector<LedgerEntry>
+    loadOffersByAccountAndAsset(AccountID const& accountID,
+                                Asset const& asset) const override;
     std::vector<InflationWinner>
     loadInflationWinners(size_t maxWinners, int64_t minBalance) const override;
     medida::Meter& getBloomMissMeter() const override;
