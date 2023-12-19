@@ -53,6 +53,12 @@ Bucket::isIndexed() const
     return static_cast<bool>(mIndex);
 }
 
+std::pair<std::streamoff, std::streamoff>
+Bucket::getOfferRange() const
+{
+    return getIndex().getOfferRange();
+}
+
 void
 Bucket::setIndex(std::unique_ptr<BucketIndex const>&& index)
 {
@@ -304,7 +310,7 @@ Bucket::apply(Application& app) const
         0 /*set to a level that's not the bottom so we don't treat live entries
              as init*/
         ,
-        shared_from_this(), [](LedgerEntryType) { return true; });
+        shared_from_this(), [](LedgerEntryType) { return true; }, false);
     BucketApplicator::Counters counters(app.getClock().now());
     while (applicator)
     {

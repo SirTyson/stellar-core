@@ -21,7 +21,8 @@ BucketApplicator::BucketApplicator(Application& app,
                                    uint32_t minProtocolVersionSeen,
                                    uint32_t level,
                                    std::shared_ptr<Bucket const> bucket,
-                                   std::function<bool(LedgerEntryType)> filter)
+                                   std::function<bool(LedgerEntryType)> filter,
+                                   bool seek)
     : mApp(app)
     , mMaxProtocolVersion(maxProtocolVersion)
     , mMinProtocolVersionSeen(minProtocolVersionSeen)
@@ -37,11 +38,23 @@ BucketApplicator::BucketApplicator(Application& app,
                 "bucket protocol version {:d} exceeds maxProtocolVersion {:d}"),
             protocolVersion, mMaxProtocolVersion));
     }
+
+    if (mApp.getConfig().isUsingBucketListDB() && seek && !bucket->isEmpty())
+    {
+        releaseAssert(bucket->isIndexed());
+        auto [lower, upper] = bucket->getOfferRange();
+        if (lower != 0 && upper != 0)
+        {
+            mBucketIter.seek(lower);
+            mUpperBoundOffset = upper;
+        }
+    }
 }
 
-BucketApplicator::operator bool() const
+BucketApplicator::operator bool()
 {
-    return (bool)mBucketIter;
+    return (bool)mBucketIter &&
+           (!mUpperBoundOffset || mBucketIter.pos() < *mUpperBoundOffset);
 }
 
 size_t
@@ -171,6 +184,11 @@ BucketApplicator::advance(BucketApplicator::Counters& counters)
                 ++mBucketIter;
                 break;
             }
+        }
+
+        if (mUpperBoundOffset && mBucketIter.pos() >= *mUpperBoundOffset)
+        {
+            break;
         }
     }
     if (innerLtx)

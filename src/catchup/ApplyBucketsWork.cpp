@@ -98,6 +98,7 @@ ApplyBucketsWork::doReset()
 {
     ZoneScoped;
     CLOG_INFO(History, "Applying buckets");
+    mStart = mApp.getClock().now();
 
     mTotalBuckets = 0;
     mAppliedBuckets = 0;
@@ -184,7 +185,7 @@ ApplyBucketsWork::startLevel()
             mMinProtocolVersionSeen, Bucket::getBucketVersion(mSnapBucket));
         mSnapApplicator = std::make_unique<BucketApplicator>(
             mApp, mMaxProtocolVersion, mMinProtocolVersionSeen, mLevel,
-            mSnapBucket, mEntryTypeFilter);
+            mSnapBucket, mEntryTypeFilter, true);
         CLOG_DEBUG(History, "ApplyBuckets : starting level[{}].snap = {}",
                    mLevel, i.snap);
         mApplying = true;
@@ -196,7 +197,7 @@ ApplyBucketsWork::startLevel()
             mMinProtocolVersionSeen, Bucket::getBucketVersion(mCurrBucket));
         mCurrApplicator = std::make_unique<BucketApplicator>(
             mApp, mMaxProtocolVersion, mMinProtocolVersionSeen, mLevel,
-            mCurrBucket, mEntryTypeFilter);
+            mCurrBucket, mEntryTypeFilter, true);
         CLOG_DEBUG(History, "ApplyBuckets : starting level[{}].curr = {}",
                    mLevel, i.curr);
         mApplying = true;
@@ -277,6 +278,9 @@ ApplyBucketsWork::doWork()
         }
 
         CLOG_INFO(History, "ApplyBuckets : done, assuming state");
+        auto dur = std::chrono::duration_cast<std::chrono::seconds>(
+            mApp.getClock().now() - mStart);
+        CLOG_FATAL(History, "YEET TIME: {}", dur.count());
 
         // After all buckets applied, spawn assumeState work
         addWork<AssumeStateWork>(mApplyState, mMaxProtocolVersion);

@@ -29,6 +29,8 @@
 #include "util/xdrquery/XDRQuery.h"
 #include "work/WorkScheduler.h"
 
+#include "catchup/IndexBucketsWork.h"
+
 #include <charconv>
 #include <filesystem>
 #include <lib/http/HttpClient.h>
@@ -321,6 +323,14 @@ applyBucketsForLCL(Application& app,
     }
 
     std::map<std::string, std::shared_ptr<Bucket>> buckets;
+
+    if (app.getConfig().isUsingBucketListDB())
+    {
+        auto work = app.getWorkScheduler().scheduleWork<IndexBucketsWork>(has);
+        while (app.getClock().crank(true) && !work->isDone())
+            ;
+    }
+
     auto work = app.getWorkScheduler().scheduleWork<ApplyBucketsWork>(
         buckets, has, maxProtocolVersion, onlyApply);
 

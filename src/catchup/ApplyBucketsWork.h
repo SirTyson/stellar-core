@@ -38,6 +38,7 @@ class ApplyBucketsWork : public Work
     std::shared_ptr<Bucket const> mCurrBucket;
     std::unique_ptr<BucketApplicator> mSnapApplicator;
     std::unique_ptr<BucketApplicator> mCurrApplicator;
+    VirtualClock::time_point mStart;
 
     BucketApplicator::Counters mCounters;
 
