@@ -280,6 +280,7 @@ ApplyBucketsWork::doWork()
             return State::WORK_RUNNING;
         }
 
+        CLOG_FATAL(History, "YEET: KEY SIZE {}", mSeen.size());
         CLOG_INFO(History, "ApplyBuckets : done, assuming state");
         auto dur = std::chrono::duration_cast<std::chrono::seconds>(
             mApp.getClock().now() - mStart);
