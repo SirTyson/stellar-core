@@ -61,7 +61,7 @@ ApplyBucketsWork::ApplyBucketsWork(
     , mEntryTypeFilter(onlyApply)
     , mApplying(false)
     , mTotalSize(0)
-    , mLevel(BucketList::kNumLevels - 1)
+    , mLevel(0)
     , mMaxProtocolVersion(maxProtocolVersion)
     , mCounters(app.getClock().now())
 {
@@ -99,6 +99,8 @@ ApplyBucketsWork::doReset()
     ZoneScoped;
     CLOG_INFO(History, "Applying buckets");
     mStart = mApp.getClock().now();
+    mSeen.clear();
+    mSeen.reserve(300'000);
 
     mTotalBuckets = 0;
     mAppliedBuckets = 0;
@@ -154,7 +156,7 @@ ApplyBucketsWork::doReset()
         mApp.getLedgerTxnRoot().prepareNewObjects(totalLECount);
     }
 
-    mLevel = BucketList::kNumLevels - 1;
+    mLevel = 0;
     mApplying = false;
     mDelayChecked = false;
     mSpawnedAssumeStateWork = false;
@@ -178,18 +180,6 @@ ApplyBucketsWork::startLevel()
     bool applySnap = (i.snap != binToHex(level.getSnap()->getHash()));
     bool applyCurr = (i.curr != binToHex(level.getCurr()->getHash()));
 
-    if (mApplying || applySnap)
-    {
-        mSnapBucket = getBucket(i.snap);
-        mMinProtocolVersionSeen = std::min(
-            mMinProtocolVersionSeen, Bucket::getBucketVersion(mSnapBucket));
-        mSnapApplicator = std::make_unique<BucketApplicator>(
-            mApp, mMaxProtocolVersion, mMinProtocolVersionSeen, mLevel,
-            mSnapBucket, mEntryTypeFilter, true);
-        CLOG_DEBUG(History, "ApplyBuckets : starting level[{}].snap = {}",
-                   mLevel, i.snap);
-        mApplying = true;
-    }
     if (mApplying || applyCurr)
     {
         mCurrBucket = getBucket(i.curr);
@@ -197,9 +187,22 @@ ApplyBucketsWork::startLevel()
             mMinProtocolVersionSeen, Bucket::getBucketVersion(mCurrBucket));
         mCurrApplicator = std::make_unique<BucketApplicator>(
             mApp, mMaxProtocolVersion, mMinProtocolVersionSeen, mLevel,
-            mCurrBucket, mEntryTypeFilter, true);
+            mCurrBucket, mEntryTypeFilter, true, mSeen);
         CLOG_DEBUG(History, "ApplyBuckets : starting level[{}].curr = {}",
                    mLevel, i.curr);
+        mApplying = true;
+    }
+
+    if (mApplying || applySnap)
+    {
+        mSnapBucket = getBucket(i.snap);
+        mMinProtocolVersionSeen = std::min(
+            mMinProtocolVersionSeen, Bucket::getBucketVersion(mSnapBucket));
+        mSnapApplicator = std::make_unique<BucketApplicator>(
+            mApp, mMaxProtocolVersion, mMinProtocolVersionSeen, mLevel,
+            mSnapBucket, mEntryTypeFilter, true, mSeen);
+        CLOG_DEBUG(History, "ApplyBuckets : starting level[{}].snap = {}",
+                   mLevel, i.snap);
         mApplying = true;
     }
 }
@@ -238,21 +241,6 @@ ApplyBucketsWork::doWork()
         //    database when the invariants for snap are checked.
         // 2. There is no reason to advance mSnapApplicator or mCurrApplicator
         //    if there is nothing to be applied.
-        if (mSnapApplicator)
-        {
-            TempLedgerVersionSetter tlvs(mApp, mMaxProtocolVersion);
-            if (*mSnapApplicator)
-            {
-                advance("snap", *mSnapApplicator);
-                return State::WORK_RUNNING;
-            }
-            mApp.getInvariantManager().checkOnBucketApply(
-                mSnapBucket, mApplyState.currentLedger, mLevel, false,
-                mEntryTypeFilter);
-            mSnapApplicator.reset();
-            mSnapBucket.reset();
-            mApp.getCatchupManager().bucketsApplied();
-        }
         if (mCurrApplicator)
         {
             TempLedgerVersionSetter tlvs(mApp, mMaxProtocolVersion);
@@ -268,10 +256,25 @@ ApplyBucketsWork::doWork()
             mCurrBucket.reset();
             mApp.getCatchupManager().bucketsApplied();
         }
-
-        if (mLevel != 0)
+        if (mSnapApplicator)
         {
-            --mLevel;
+            TempLedgerVersionSetter tlvs(mApp, mMaxProtocolVersion);
+            if (*mSnapApplicator)
+            {
+                advance("snap", *mSnapApplicator);
+                return State::WORK_RUNNING;
+            }
+            mApp.getInvariantManager().checkOnBucketApply(
+                mSnapBucket, mApplyState.currentLedger, mLevel, false,
+                mEntryTypeFilter);
+            mSnapApplicator.reset();
+            mSnapBucket.reset();
+            mApp.getCatchupManager().bucketsApplied();
+        }
+
+        if (mLevel != BucketList::kNumLevels - 1)
+        {
+            ++mLevel;
             CLOG_DEBUG(History, "ApplyBuckets : starting next level: {}",
                        mLevel);
             return State::WORK_RUNNING;

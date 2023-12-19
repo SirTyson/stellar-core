@@ -22,13 +22,14 @@ BucketApplicator::BucketApplicator(Application& app,
                                    uint32_t level,
                                    std::shared_ptr<Bucket const> bucket,
                                    std::function<bool(LedgerEntryType)> filter,
-                                   bool seek)
+                                   bool seek, UnorderedSet<LedgerKey>& seen)
     : mApp(app)
     , mMaxProtocolVersion(maxProtocolVersion)
     , mMinProtocolVersionSeen(minProtocolVersionSeen)
     , mLevel(level)
     , mBucketIter(bucket)
     , mEntryTypeFilter(filter)
+    , mSeen(seen)
 {
     auto protocolVersion = mBucketIter.getMetadata().ledgerVersion;
     if (protocolVersion > mMaxProtocolVersion)
@@ -117,6 +118,24 @@ BucketApplicator::advance(BucketApplicator::Counters& counters)
 
         if (shouldApplyEntry(mEntryTypeFilter, e))
         {
+            if (mUpperBoundOffset)
+            {
+                LedgerKey key;
+                if (e.type() == LIVEENTRY || e.type() == INITENTRY)
+                {
+                    key = LedgerEntryKey(e.liveEntry());
+                }
+                else
+                {
+                    key = e.deadEntry();
+                }
+
+                auto [_, inserted] = mSeen.emplace(key);
+                if (e.type() == DEADENTRY || !inserted)
+                {
+                    continue;
+                }
+            }
             counters.mark(e);
 
             if (e.type() == LIVEENTRY || e.type() == INITENTRY)

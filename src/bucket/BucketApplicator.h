@@ -29,6 +29,7 @@ class BucketApplicator
     size_t mCount{0};
     std::function<bool(LedgerEntryType)> mEntryTypeFilter;
     std::optional<std::streamoff> mUpperBoundOffset;
+    UnorderedSet<LedgerKey>& mSeen;
 
   public:
     class Counters
@@ -79,7 +80,8 @@ class BucketApplicator
     BucketApplicator(Application& app, uint32_t maxProtocolVersion,
                      uint32_t minProtocolVersionSeen, uint32_t level,
                      std::shared_ptr<Bucket const> bucket,
-                     std::function<bool(LedgerEntryType)> filter, bool seek);
+                     std::function<bool(LedgerEntryType)> filter, bool seek,
+                     UnorderedSet<LedgerKey>& seen);
     operator bool();
     size_t advance(Counters& counters);
 
