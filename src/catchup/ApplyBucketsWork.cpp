@@ -99,6 +99,8 @@ ApplyBucketsWork::doReset()
     ZoneScoped;
     CLOG_INFO(History, "Applying buckets");
     mStart = mApp.getClock().now();
+    mSeenKeys.clear();
+    mSeenKeys.reserve(300'000);
 
     mTotalBuckets = 0;
     mAppliedBuckets = 0;
@@ -185,7 +187,7 @@ ApplyBucketsWork::startLevel()
             mMinProtocolVersionSeen, Bucket::getBucketVersion(mSnapBucket));
         mSnapApplicator = std::make_unique<BucketApplicator>(
             mApp, mMaxProtocolVersion, mMinProtocolVersionSeen, mLevel,
-            mSnapBucket, mEntryTypeFilter);
+            mSnapBucket, mEntryTypeFilter, mSeenKeys);
         CLOG_DEBUG(History, "ApplyBuckets : starting level[{}].snap = {}",
                    mLevel, i.snap);
         mApplying = true;
@@ -197,7 +199,7 @@ ApplyBucketsWork::startLevel()
             mMinProtocolVersionSeen, Bucket::getBucketVersion(mCurrBucket));
         mCurrApplicator = std::make_unique<BucketApplicator>(
             mApp, mMaxProtocolVersion, mMinProtocolVersionSeen, mLevel,
-            mCurrBucket, mEntryTypeFilter);
+            mCurrBucket, mEntryTypeFilter, mSeenKeys);
         CLOG_DEBUG(History, "ApplyBuckets : starting level[{}].curr = {}",
                    mLevel, i.curr);
         mApplying = true;

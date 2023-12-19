@@ -39,6 +39,7 @@ class ApplyBucketsWork : public Work
     std::unique_ptr<BucketApplicator> mSnapApplicator;
     std::unique_ptr<BucketApplicator> mCurrApplicator;
     VirtualClock::time_point mStart;
+    UnorderedSet<LedgerKey> mSeenKeys;
 
     BucketApplicator::Counters mCounters;
 

@@ -21,13 +21,15 @@ BucketApplicator::BucketApplicator(Application& app,
                                    uint32_t minProtocolVersionSeen,
                                    uint32_t level,
                                    std::shared_ptr<Bucket const> bucket,
-                                   std::function<bool(LedgerEntryType)> filter)
+                                   std::function<bool(LedgerEntryType)> filter,
+                                   UnorderedSet<LedgerKey>& seenKeys)
     : mApp(app)
     , mMaxProtocolVersion(maxProtocolVersion)
     , mMinProtocolVersionSeen(minProtocolVersionSeen)
     , mLevel(level)
     , mBucketIter(bucket)
     , mEntryTypeFilter(filter)
+    , mSeenKeys(seenKeys)
 {
     auto protocolVersion = mBucketIter.getMetadata().ledgerVersion;
     if (protocolVersion > mMaxProtocolVersion)
@@ -50,9 +52,10 @@ BucketApplicator::BucketApplicator(Application& app,
     }
 }
 
-BucketApplicator::operator bool() const
+BucketApplicator::operator bool()
 {
-    return (bool)mBucketIter;
+    return (bool)mBucketIter &&
+           (!mUpperBoundOffset || mBucketIter.pos() < *mUpperBoundOffset);
 }
 
 size_t
@@ -69,19 +72,22 @@ BucketApplicator::size() const
 
 static bool
 shouldApplyEntry(std::function<bool(LedgerEntryType)> const& filter,
-                 BucketEntry const& e)
+                 BucketEntry const& e, UnorderedSet<LedgerKey> const& seen)
 {
     if (e.type() == LIVEENTRY || e.type() == INITENTRY)
     {
-        return filter(e.liveEntry().data.type());
+        return filter(e.liveEntry().data.type()) &&
+               seen.find(LedgerEntryKey(e.liveEntry())) == seen.end();
     }
 
-    if (e.type() != DEADENTRY)
-    {
-        throw std::runtime_error(
-            "Malformed bucket: unexpected non-INIT/LIVE/DEAD entry.");
-    }
-    return filter(e.deadEntry().type());
+    return false;
+
+    // if (e.type() != DEADENTRY)
+    // {
+    //     throw std::runtime_error(
+    //         "Malformed bucket: unexpected non-INIT/LIVE/DEAD entry.");
+    // }
+    // return filter(e.deadEntry().type());
 }
 
 size_t
@@ -113,12 +119,13 @@ BucketApplicator::advance(BucketApplicator::Counters& counters)
         BucketEntry const& e = *mBucketIter;
         Bucket::checkProtocolLegality(e, mMaxProtocolVersion);
 
-        if (shouldApplyEntry(mEntryTypeFilter, e))
+        if (shouldApplyEntry(mEntryTypeFilter, e, mSeenKeys))
         {
             counters.mark(e);
 
             if (e.type() == LIVEENTRY || e.type() == INITENTRY)
             {
+                mSeenKeys.insert(LedgerEntryKey(e.liveEntry()));
                 // The last level can have live entries, but at that point we
                 // know that they are actually init entries because the earliest
                 // state of all entries is init, so we mark them as such here
@@ -159,6 +166,7 @@ BucketApplicator::advance(BucketApplicator::Counters& counters)
             }
             else
             {
+                releaseAssert(false);
                 if (protocolVersionIsBefore(
                         mMinProtocolVersionSeen,
                         Bucket::
