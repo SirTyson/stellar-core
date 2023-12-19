@@ -61,7 +61,7 @@ ApplyBucketsWork::ApplyBucketsWork(
     , mEntryTypeFilter(onlyApply)
     , mApplying(false)
     , mTotalSize(0)
-    , mLevel(BucketList::kNumLevels - 1)
+    , mLevel(0)
     , mMaxProtocolVersion(maxProtocolVersion)
     , mCounters(app.getClock().now())
 {
@@ -156,7 +156,7 @@ ApplyBucketsWork::doReset()
         mApp.getLedgerTxnRoot().prepareNewObjects(totalLECount);
     }
 
-    mLevel = BucketList::kNumLevels - 1;
+    mLevel = 0;
     mApplying = false;
     mDelayChecked = false;
     mSpawnedAssumeStateWork = false;
@@ -187,7 +187,7 @@ ApplyBucketsWork::startLevel()
             mMinProtocolVersionSeen, Bucket::getBucketVersion(mSnapBucket));
         mSnapApplicator = std::make_unique<BucketApplicator>(
             mApp, mMaxProtocolVersion, mMinProtocolVersionSeen, mLevel,
-            mSnapBucket, mEntryTypeFilter, mSeenKeys);
+            mSnapBucket, mEntryTypeFilter, mSeenKeys, true);
         CLOG_DEBUG(History, "ApplyBuckets : starting level[{}].snap = {}",
                    mLevel, i.snap);
         mApplying = true;
@@ -199,7 +199,7 @@ ApplyBucketsWork::startLevel()
             mMinProtocolVersionSeen, Bucket::getBucketVersion(mCurrBucket));
         mCurrApplicator = std::make_unique<BucketApplicator>(
             mApp, mMaxProtocolVersion, mMinProtocolVersionSeen, mLevel,
-            mCurrBucket, mEntryTypeFilter, mSeenKeys);
+            mCurrBucket, mEntryTypeFilter, mSeenKeys, true);
         CLOG_DEBUG(History, "ApplyBuckets : starting level[{}].curr = {}",
                    mLevel, i.curr);
         mApplying = true;
@@ -271,9 +271,9 @@ ApplyBucketsWork::doWork()
             mApp.getCatchupManager().bucketsApplied();
         }
 
-        if (mLevel != 0)
+        if (mLevel != BucketList::kNumLevels - 1)
         {
-            --mLevel;
+            ++mLevel;
             CLOG_DEBUG(History, "ApplyBuckets : starting next level: {}",
                        mLevel);
             return State::WORK_RUNNING;

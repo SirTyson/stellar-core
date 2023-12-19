@@ -81,7 +81,7 @@ class BucketApplicator
                      uint32_t minProtocolVersionSeen, uint32_t level,
                      std::shared_ptr<Bucket const> bucket,
                      std::function<bool(LedgerEntryType)> filter,
-                     UnorderedSet<LedgerKey>& seenKeys);
+                     UnorderedSet<LedgerKey>& seenKeys, bool seek);
     operator bool();
     size_t advance(Counters& counters);
 

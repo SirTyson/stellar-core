@@ -311,7 +311,7 @@ Bucket::apply(Application& app) const
         0 /*set to a level that's not the bottom so we don't treat live entries
              as init*/
         ,
-        shared_from_this(), [](LedgerEntryType) { return true; }, key);
+        shared_from_this(), [](LedgerEntryType) { return true; }, key, false);
     BucketApplicator::Counters counters(app.getClock().now());
     while (applicator)
     {
