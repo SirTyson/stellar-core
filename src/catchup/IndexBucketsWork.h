@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "history/HistoryArchive.h"
 #include "work/Work.h"
 #include <memory>
 
@@ -32,7 +33,8 @@ class IndexBucketsWork : public Work
         bool onAbort() override;
     };
 
-    std::vector<std::shared_ptr<Bucket>> const& mBuckets;
+    std::vector<std::shared_ptr<Bucket>> mBuckets;
+    HistoryArchiveState mHAS;
 
     bool mWorkSpawned{false};
     void spawnWork();
@@ -40,6 +42,8 @@ class IndexBucketsWork : public Work
   public:
     IndexBucketsWork(Application& app,
                      std::vector<std::shared_ptr<Bucket>> const& buckets);
+
+    IndexBucketsWork(Application& app, HistoryArchiveState const& applyState);
 
   protected:
     State doWork() override;

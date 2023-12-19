@@ -37,6 +37,17 @@ BucketApplicator::BucketApplicator(Application& app,
                 "bucket protocol version {:d} exceeds maxProtocolVersion {:d}"),
             protocolVersion, mMaxProtocolVersion));
     }
+
+    if (mApp.getConfig().isUsingBucketListDB())
+    {
+        releaseAssert(bucket->isIndexed());
+        auto [lower, upper] = bucket->getOfferRange();
+        if (lower != 0 && upper != 0)
+        {
+            mBucketIter.seek(lower);
+            mUpperBoundOffset = upper;
+        }
+    }
 }
 
 BucketApplicator::operator bool() const
@@ -171,6 +182,11 @@ BucketApplicator::advance(BucketApplicator::Counters& counters)
                 ++mBucketIter;
                 break;
             }
+        }
+
+        if (mUpperBoundOffset && mBucketIter.pos() >= *mUpperBoundOffset)
+        {
+            break;
         }
     }
     if (innerLtx)

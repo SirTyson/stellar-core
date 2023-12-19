@@ -11,6 +11,7 @@
 #include "catchup/CatchupConfiguration.h"
 #include "catchup/CatchupRange.h"
 #include "catchup/DownloadApplyTxsWork.h"
+#include "catchup/IndexBucketsWork.h"
 #include "catchup/VerifyLedgerChainWork.h"
 #include "herder/Herder.h"
 #include "history/FileTransferInfo.h"
@@ -250,6 +251,12 @@ CatchupWork::downloadApplyBuckets()
     {
         // Only apply unsupported BucketListDB types to SQL DB when BucketList
         // lookup is enabled
+        if (mApp.getConfig().isUsingBucketListDB())
+        {
+            seq.push_back(
+                std::make_shared<IndexBucketsWork>(mApp, *mBucketHAS));
+        }
+
         applyBuckets = std::make_shared<ApplyBucketsWork>(
             mApp, mBuckets, *mBucketHAS, version,
             BucketIndex::typeNotSupported);

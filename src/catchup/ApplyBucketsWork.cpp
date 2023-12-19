@@ -98,6 +98,7 @@ ApplyBucketsWork::doReset()
 {
     ZoneScoped;
     CLOG_INFO(History, "Applying buckets");
+    mStart = mApp.getClock().now();
 
     mTotalBuckets = 0;
     mAppliedBuckets = 0;
@@ -277,6 +278,9 @@ ApplyBucketsWork::doWork()
         }
 
         CLOG_INFO(History, "ApplyBuckets : done, assuming state");
+        auto dur = std::chrono::duration_cast<std::chrono::seconds>(
+            mApp.getClock().now() - mStart);
+        CLOG_FATAL(History, "YEET TIME: {}", dur.count());
 
         // After all buckets applied, spawn assumeState work
         addWork<AssumeStateWork>(mApplyState, mMaxProtocolVersion);

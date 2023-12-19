@@ -28,6 +28,7 @@ class BucketApplicator
     BucketInputIterator mBucketIter;
     size_t mCount{0};
     std::function<bool(LedgerEntryType)> mEntryTypeFilter;
+    std::optional<std::streamoff> mUpperBoundOffset;
 
   public:
     class Counters
@@ -84,5 +85,6 @@ class BucketApplicator
 
     size_t pos();
     size_t size() const;
+    void seek(std::streamoff offset);
 };
 }

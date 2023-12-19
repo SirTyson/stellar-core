@@ -107,11 +107,28 @@ IndexBucketsWork::IndexBucketsWork(
 {
 }
 
+IndexBucketsWork::IndexBucketsWork(Application& app,
+                                   HistoryArchiveState const& applyState)
+    : Work(app, "index-bucketList", BasicWork::RETRY_NEVER), mHAS(applyState)
+{
+}
+
 BasicWork::State
 IndexBucketsWork::doWork()
 {
     if (!mWorkSpawned)
     {
+        auto getBucket = [&](auto const& hash) {
+            auto b = mApp.getBucketManager().getBucketByHash(hexToBin256(hash));
+            releaseAssert(b);
+            return b;
+        };
+
+        for (auto const& hsb : mHAS.currentBuckets)
+        {
+            mBuckets.emplace_back(getBucket(hsb.snap));
+            mBuckets.emplace_back(getBucket(hsb.curr));
+        }
         spawnWork();
     }
 
