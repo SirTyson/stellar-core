@@ -842,6 +842,8 @@ Bucket::scanForEviction(AbstractLedgerTxn& ltx, EvictionIterator& iter,
                         uint32_t ledgerSeq, medida::Meter& entriesEvictedMeter,
                         medida::Counter& bytesScannedForEvictionCounter)
 {
+    static uint64_t bytesEvicted = 0;
+    static uint64_t counter = 0;
     ZoneScoped;
     if (isEmpty())
     {
@@ -857,6 +859,11 @@ Bucket::scanForEviction(AbstractLedgerTxn& ltx, EvictionIterator& iter,
 
     auto& stream = getStream();
     stream.seek(iter.bucketFileOffset);
+
+    if (++counter % 1000 == 0)
+    {
+        CLOG_FATAL(Bucket, "BYTES EVICTED {}", bytesEvicted);
+    }
 
     BucketEntry be;
     while (stream.readOne(be))
@@ -894,6 +901,7 @@ Bucket::scanForEviction(AbstractLedgerTxn& ltx, EvictionIterator& iter,
                 if (shouldEvict())
                 {
                     ZoneNamedN(evict, "evict entry", true);
+                    bytesEvicted += xdr::xdr_size(le);
                     ltx.erase(ttlKey);
                     ltx.erase(LedgerEntryKey(le));
                     entriesEvictedMeter.Mark();

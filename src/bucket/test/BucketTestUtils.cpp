@@ -137,7 +137,7 @@ LedgerManagerForBucketTests::transferLedgerEntriesToBucketList(
         // Use the testing values.
         mApp.getBucketManager().addBatch(mApp, ledgerSeq, currLedgerVers,
                                          mTestInitEntries, mTestLiveEntries,
-                                         mTestDeadEntries);
+                                         dead);
         mUseTestEntries = false;
     }
     else

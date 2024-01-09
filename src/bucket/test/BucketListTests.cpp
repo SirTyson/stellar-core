@@ -672,7 +672,6 @@ TEST_CASE_VERSIONS("network config snapshots BucketList size", "[bucketlist]")
     auto app = createTestApplication<BucketTestApplication>(clock, cfg);
     for_versions_from(20, *app, [&] {
         LedgerManagerForBucketTests& lm = app->getLedgerManager();
-
         auto& networkConfig = app->getLedgerManager().getSorobanNetworkConfig();
 
         uint32_t windowSize = networkConfig.stateArchivalSettings()
@@ -746,6 +745,216 @@ TEST_CASE_VERSIONS("network config snapshots BucketList size", "[bucketlist]")
                 check();
             }
         }
+    });
+}
+
+TEST_CASE_VERSIONS("temp entry DOS", "[bucketlist]")
+{
+    VirtualClock clock;
+    Config cfg(getTestConfig(0, Config::TESTDB_IN_MEMORY_SQLITE));
+    cfg.USE_CONFIG_FOR_GENESIS = true;
+
+    // BucketTestApplication writes directly to BL and circumvents LedgerTxn
+    // interface, so we have to use BucketListDB for lookups
+    cfg.EXPERIMENTAL_BUCKETLIST_DB = true;
+
+    auto app = createTestApplication<BucketTestApplication>(clock, cfg);
+    for_versions_from(20, *app, [&] {
+        // modifySorobanNetworkConfig(*app, [](SorobanNetworkConfig& sorobanCfg)
+        // {
+        //     sorobanCfg.mStateArchivalSettings.startingEvictionScanLevel = 4;
+        //     sorobanCfg.mStateArchivalSettings.evictionScanSize = 10'000'000;
+        //     sorobanCfg.mStateArchivalSettings.maxEntriesToArchive = 10'000;
+        // });
+
+        LedgerManagerForBucketTests& lm = app->getLedgerManager();
+        auto& bm = app->getBucketManager();
+        auto& bl = bm.getBucketList();
+
+        uint32_t ledgerSeq = 1;
+        auto const targetSize = 12'025'908'428; // 11.2 GB in bytes
+        // auto const targetSize = 209'715'200; // 200 mb in bytes
+
+        auto& networkCfg = [&]() -> SorobanNetworkConfig& {
+            LedgerTxn ltx(app->getLedgerTxnRoot());
+            return app->getLedgerManager().getMutableSorobanNetworkConfig();
+        }();
+        auto& stateArchivalSettings = networkCfg.stateArchivalSettings();
+
+        // Because this test uses BucketTestApplication, we must manually add
+        // the Network Config LedgerEntries to the BucketList with
+        // setNextLedgerEntryBatchForBucketTesting whenever state archival
+        // settings or the eviction iterator is manually changed
+        auto getNetworkCfgLE = [&] {
+            std::vector<LedgerEntry> result;
+            LedgerEntry sesLE;
+            sesLE.data.type(CONFIG_SETTING);
+            sesLE.data.configSetting().configSettingID(
+                ConfigSettingID::CONFIG_SETTING_STATE_ARCHIVAL);
+            sesLE.data.configSetting().stateArchivalSettings() =
+                stateArchivalSettings;
+            result.emplace_back(sesLE);
+
+            // LedgerEntry iterLE;
+            // iterLE.data.type(CONFIG_SETTING);
+            // iterLE.data.configSetting().configSettingID(
+            //     ConfigSettingID::CONFIG_SETTING_EVICTION_ITERATOR);
+            // iterLE.data.configSetting().evictionIterator() = evictionIter;
+            // result.emplace_back(iterLE);
+
+            return result;
+        };
+
+        auto updateNetworkCfg = [&] {
+            lm.setNextLedgerEntryBatchForBucketTesting({}, getNetworkCfgLE(),
+                                                       {});
+            closeLedger(*app);
+            ++ledgerSeq;
+        };
+
+        // stateArchivalSettings.evictionScanSize = 10'000'000;
+        stateArchivalSettings.evictionScanSize = 1;
+        // stateArchivalSettings.maxEntriesToArchive = 10'000;
+        updateNetworkCfg();
+
+        UnorderedSet<LedgerKey> seen;
+        for (; bl.getSize() < targetSize; ++ledgerSeq)
+        {
+            LedgerEntry e;
+            {
+                ZoneNamedN(yeet, "Setup insert", true);
+                for (;;)
+                {
+                    // Generate 1 2.5 kb PERSISTENT entry per ledger. This will
+                    // enable us to fill the BucketList completely and hit our
+                    // target size (11.2 GB) with the least number of ledgers.
+                    // Use PERSISTENT ContractData entries as filler because
+                    // they are easy to resize to arbitrary sizes and don't
+                    // interfere in eviction scans
+                    e = LedgerTestUtils::generateValidLedgerEntryOfType(
+                        CONTRACT_DATA);
+                    e.data.contractData().durability = PERSISTENT;
+
+                    // Make sure we don't have any duplicate entries
+                    auto [_, isInserted] = seen.emplace(LedgerEntryKey(e));
+                    if (isInserted)
+                    {
+                        // Make all entries persistent so they don't interfere
+                        // with eviction scans
+                        e.data.contractData().val.type(SCValType::SCV_BYTES);
+                        e.data.contractData().val.bytes().resize(2560);
+                        break;
+                    }
+                }
+            }
+
+            lm.setNextLedgerEntryBatchForBucketTesting({e}, {}, {});
+            closeLedger(*app);
+
+            if (ledgerSeq % 1000 == 0)
+            {
+                CLOG_FATAL(
+                    Bucket,
+                    "LedgerSeq {}, bytes remaining {}, setup progress: {}%",
+                    ledgerSeq, targetSize - bl.getSize(),
+                    (static_cast<float>(bl.getSize()) / targetSize) * 100.f);
+            }
+        }
+
+        seen.clear();
+
+        stateArchivalSettings.evictionScanSize = 1'000'000;
+        updateNetworkCfg();
+
+        uint64_t maxSizeSeen = bl.getSize();
+        uint64_t maxSnapshotSize = 0;
+        uint64_t bytesWritten = 0;
+        auto const startLedger = ledgerSeq;
+        for (; ledgerSeq < startLedger + 5'000'000; ++ledgerSeq)
+        {
+            // To mimic worst case scenario for Phase 1 limits, write 64 1 KB
+            // temp entries every ledger, where each temp entry is unique
+            std::vector<LedgerEntry> tempEntries;
+            {
+                ZoneNamedN(generate, "Generate Temp", true);
+                tempEntries.reserve(64);
+                for (; tempEntries.size() < 64;)
+                {
+                    auto e = LedgerTestUtils::generateValidLedgerEntryOfType(
+                        CONTRACT_DATA);
+
+                    e.data.contractData().durability = TEMPORARY;
+
+                    // Make sure we don't have any duplicate entries
+                    auto [_, isInserted] = seen.emplace(LedgerEntryKey(e));
+                    if (isInserted)
+                    {
+                        // Make all entries persistent so they don't interfere
+                        // with eviction scans
+                        e.data.contractData().val.type(SCValType::SCV_BYTES);
+                        e.data.contractData().val.bytes().resize(1024);
+                        tempEntries.emplace_back(e);
+                    }
+                }
+            }
+
+            // Make sure we init TTL entries with the minimal phase 1 lifetime
+            // (16 ledgers)
+            std::vector<LedgerEntry> init;
+            for (auto const& e : tempEntries)
+            {
+                auto ttlKey = getTTLKey(e);
+                LedgerEntry ttl;
+                ttl.data.type(TTL);
+                ttl.data.ttl().keyHash = ttlKey.ttl().keyHash;
+                ttl.data.ttl().liveUntilLedgerSeq = ledgerSeq + 16;
+
+                init.push_back(ttl);
+                init.push_back(e);
+                bytesWritten += xdr::xdr_size(ttl) + xdr::xdr_size(e);
+            }
+
+            lm.setNextLedgerEntryBatchForBucketTesting(init, {}, {});
+            closeLedger(*app);
+            maxSizeSeen = std::max(bl.getSize(), maxSizeSeen);
+
+            if (ledgerSeq % 1000 == 0)
+            {
+                auto snapShot = app->getLedgerManager()
+                                    .getSorobanNetworkConfig()
+                                    .getAverageBucketListSize();
+                maxSnapshotSize = std::max(snapShot, maxSnapshotSize);
+                CLOG_FATAL(Bucket,
+                           "LedgerSeq {}, current size: {}, max size: {}, curr "
+                           "snapshot: {}, max snapshot {}",
+                           ledgerSeq, bl.getSize(), maxSizeSeen, snapShot,
+                           maxSnapshotSize);
+                CLOG_FATAL(Bucket, "Temp entry bytes written: {}",
+                           bytesWritten);
+            }
+        }
+
+        CLOG_FATAL(Bucket, "Done generating");
+
+        // for (; ledgerSeq < startLedger + 1'000'000; ++ledgerSeq)
+        // {
+        //     lm.setNextLedgerEntryBatchForBucketTesting({}, {}, {});
+        //     closeLedger(*app);
+        //     maxSizeSeen = std::max(bl.getSize(), maxSizeSeen);
+
+        //     if (ledgerSeq % 1000 == 0)
+        //     {
+        //         auto snapShot = app->getLedgerManager()
+        //                             .getSorobanNetworkConfig()
+        //                             .getAverageBucketListSize();
+        //         maxSnapshotSize = std::max(snapShot, maxSnapshotSize);
+        //         CLOG_FATAL(Bucket,
+        //                    "LedgerSeq {}, current size: {}, max size: {},
+        //                    curr " "snapshot: {}, max snapshot {}", ledgerSeq,
+        //                    bl.getSize(), maxSizeSeen, snapShot,
+        //                    maxSnapshotSize);
+        //     }
+        // }
     });
 }
 
