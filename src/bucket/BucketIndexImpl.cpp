@@ -23,6 +23,8 @@
 #include <fmt/chrono.h>
 #include <fmt/format.h>
 
+#include "util/LogSlowExecution.h"
+
 #include <thread>
 
 namespace stellar
@@ -220,7 +222,14 @@ BucketIndexImpl<IndexT>::saveToDisk(BucketManager& bm, Hash const& hash) const
 {
     ZoneScoped;
     releaseAssert(bm.getConfig().isPersistingBucketListDBIndexes());
-    auto timer = LogSlowExecution("Saving index");
+
+    if constexpr (std::is_same<IndexT, IndividualIndex>::value)
+    {
+        return;
+    }
+    auto timer =
+        LogSlowExecution("Saving index", LogSlowExecution::Mode::AUTOMATIC_RAII,
+                         "took", std::chrono::milliseconds(50));
 
     std::filesystem::path tmpFilename =
         Bucket::randomBucketIndexName(bm.getTmpDir());
