@@ -407,6 +407,48 @@ BucketIndexImpl<IndexT>::lookup(LedgerKey const& k) const
 }
 
 template <class IndexT>
+size_t
+BucketIndexImpl<IndexT>::getSize() const
+{
+
+    // assetToPoolID
+    size_t size = sizeof(std::map<Asset, std::vector<PoolID>>); // container
+    for (auto const& [asset, idVec] : mData.assetToPoolID)
+    {
+        size += sizeof(asset);
+        size += sizeof(std::vector<PoolID>);   // idVec container
+        size += sizeof(PoolID) * idVec.size(); // idVec elements
+    }
+
+    // Filter pointer only
+    size += sizeof(mData.filter);
+
+    size += sizeof(mData.pageSize);
+
+    if constexpr (std::is_same<IndexT, RangeIndex>::value)
+    {
+        // keysToOffset == std::vector<std::pair<RangeEntry, std::streamoff>>
+        size += sizeof(std::vector<std::pair<RangeEntry, std::streamoff>>);
+        size += mData.keysToOffset.size() &
+                sizeof(std::pair<RangeEntry, std::streamoff>);
+
+        // Bit table == std::vector<unsigned char>
+        size += sizeof(std::vector<unsigned char>);
+        size += sizeof(unsigned char) * mData.filter->bit_table_.size();
+    }
+    else
+    {
+        // keysToOffset == std::vector<std::pair<LedgerKey, std::streamoff>>
+        size += sizeof(
+            std::vector<std::pair<LedgerKey, std::streamoff>>); // container
+        size += mData.keysToOffset.size() *
+                sizeof(std::pair<LedgerKey, std::streamoff>);
+    }
+
+    return size;
+}
+
+template <class IndexT>
 std::pair<std::optional<std::streamoff>, BucketIndex::Iterator>
 BucketIndexImpl<IndexT>::scan(Iterator start, LedgerKey const& k) const
 {

@@ -82,6 +82,8 @@ class Bucket : public std::enable_shared_from_this<Bucket>,
     // Returns true if bucket is indexed, false otherwise
     bool isIndexed() const;
 
+    size_t getIndexSize() const;
+
     // Sets index, throws if index is already set
     void setIndex(std::unique_ptr<BucketIndex const>&& index);
 

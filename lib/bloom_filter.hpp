@@ -516,6 +516,7 @@ class bloom_filter
                                        std::numeric_limits<bloom_type>::max());
     }
 
+  public:
     std::vector<unsigned char> bit_table_;
     unsigned int hash_count_;
     unsigned long long int table_size_;

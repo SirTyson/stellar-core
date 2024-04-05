@@ -53,6 +53,16 @@ Bucket::isIndexed() const
     return static_cast<bool>(mIndex);
 }
 
+size_t
+Bucket::getIndexSize() const
+{
+    if (!mIndex)
+    {
+        return 0;
+    }
+    return mIndex->getSize();
+}
+
 void
 Bucket::setIndex(std::unique_ptr<BucketIndex const>&& index)
 {

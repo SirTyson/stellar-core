@@ -102,6 +102,8 @@ template <class IndexT> class BucketIndexImpl : public BucketIndex
     virtual void markBloomMiss() const override;
     virtual void markBloomLookup() const override;
 
+    virtual size_t getSize() const override;
+
 #ifdef BUILD_TESTS
     virtual bool operator==(BucketIndex const& inRaw) const override;
 #endif

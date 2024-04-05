@@ -759,6 +759,12 @@ BucketManagerImpl::forgetUnreferencedBuckets()
             j->second->freeIndex();
         }
 
+        if (j->second->isIndexed() &&
+            blReferenced.find(j->first) == blReferenced.end())
+        {
+            CLOG_FATAL(Bucket, "USE COUNT {}", j->second.use_count());
+        }
+
         // Only drop buckets if the bucketlist has forgotten them _and_
         // no other in-progress structures (worker threads, shadow lists)
         // have references to them, just us. It's ok to retain a few too
@@ -819,6 +825,14 @@ BucketManagerImpl::forgetUnreferencedBuckets()
         }
     }
     mSharedBucketsSize.set_count(mSharedBuckets.size());
+
+    auto size = 0;
+    for (auto const [_, b] : mSharedBuckets)
+    {
+        size += b->getIndexSize();
+    }
+
+    CLOG_FATAL(Bucket, "Total INDEX SIZE {}", size);
 }
 
 void

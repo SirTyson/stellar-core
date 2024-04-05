@@ -527,12 +527,18 @@ BucketList::addBatch(Application& app, uint32_t currLedger,
     ZoneScoped;
     releaseAssert(currLedger > 0);
 
+    auto size = 0;
     std::vector<std::shared_ptr<Bucket>> shadows;
     for (auto& level : mLevels)
     {
         shadows.push_back(level.getCurr());
         shadows.push_back(level.getSnap());
+        size += level.getCurr()->getIndexSize();
+        size += level.getSnap()->getIndexSize();
     }
+
+    CLOG_FATAL(Bucket, "YEET TOTAL POSSIBLE SIZE LCL {}, SIZE {}", currLedger,
+               size);
 
     // We will be counting-down from the highest-numbered level (the
     // oldest/largest level) to the lowest (youngest); each step we check for
@@ -636,6 +642,46 @@ BucketList::addBatch(Application& app, uint32_t currLedger,
     if (!app.getConfig().ARTIFICIALLY_PESSIMIZE_MERGES_FOR_TESTING)
     {
         resolveAnyReadyFutures();
+    }
+
+    auto getEstimate = [](auto filename) {
+        if (filename.empty())
+        {
+            return 0ul;
+        }
+        size_t const estimatedLedgerEntrySize =
+            xdr::xdr_traits<BucketEntry>::serial_size(BucketEntry{});
+        auto fileSize = fs::size(filename.string());
+        return fileSize / estimatedLedgerEntrySize;
+    };
+
+    if (currLedger == 696320 || currLedger == 895935)
+    {
+        auto total = 0;
+        CLOG_FATAL(Bucket, "Allocation estimates:");
+        std::string str = "";
+
+        for (auto& level : mLevels)
+        {
+            auto curr = getEstimate(level.getCurr()->getFilename());
+            str += std::to_string(curr) + ",";
+
+            auto snap = getEstimate(level.getSnap()->getFilename());
+            str += std::to_string(snap) + ",";
+            if (level.getNext().isLive())
+            {
+                auto b = level.getNext().resolve();
+
+                auto fut = getEstimate(b->getFilename());
+                total += fut;
+                str += std::to_string(fut) + ",";
+            }
+            total += curr + snap;
+        }
+
+        CLOG_FATAL(Bucket, "{}", str);
+        CLOG_FATAL(Bucket, "TOTAL {}", total);
+        releaseAssert(10 == 5);
     }
 }
 

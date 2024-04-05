@@ -479,6 +479,42 @@ testAllIndexTypes(std::function<void(Config&)> f)
     }
 }
 
+typedef std::vector<std::pair<LedgerKey, std::streamoff>> vec;
+
+static std::vector<std::shared_ptr<vec>>
+alloc(std::vector<size_t> toAlloc)
+{
+    std::vector<std::shared_ptr<vec>> res;
+    for (auto val : toAlloc)
+    {
+        auto ptr = std::make_shared<vec>();
+        ptr->reserve(val);
+        res.emplace_back(ptr);
+    }
+
+    return res;
+}
+
+TEST_CASE("yeet")
+{
+    std::vector<size_t> startVec = {
+        16,     5,      10,     14,     13,    140,   340,   637,
+        451,    1585,   1845,   6800,   10742, 45176, 93086, 100941,
+        198775, 296985, 389401, 266383, 0,     0};
+
+    std::vector<size_t> endVec = {
+        13,     12,    30,     35,     12,     234,   141,   35,
+        385,    788,   486,    4332,   2591,   788,   9497,  6978,
+        10475,  12900, 26268,  16576,  49442,  85648, 58940, 349373,
+        324674, 85648, 627519, 266383, 781141, 0,     0,     266383};
+
+    auto results = alloc(endVec);
+    for (auto p : results)
+    {
+        REQUIRE(p);
+    }
+}
+
 TEST_CASE("key-value lookup", "[bucket][bucketindex]")
 {
     auto f = [&](Config& cfg) {
