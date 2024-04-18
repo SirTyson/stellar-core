@@ -984,24 +984,27 @@ CommandHandler::tx(std::string const& params, std::string& retStr)
         if (transaction)
         {
             // Add it to our current set and make sure it is valid.
-            TransactionQueue::AddResult status =
+            TransactionQueue::AddPayload payload =
                 mApp.getHerder().recvTransaction(transaction, true);
 
-            root["status"] = TX_STATUS_STRING[static_cast<int>(status)];
-            if (status == TransactionQueue::AddResult::ADD_STATUS_ERROR)
+            root["status"] =
+                TX_STATUS_STRING[static_cast<int>(payload.statusCode)];
+            if (payload.statusCode ==
+                TransactionQueue::AddResult::ADD_STATUS_ERROR)
             {
+                releaseAssert(payload.txResult);
                 std::string resultBase64;
-                auto resultBin = xdr::xdr_to_opaque(transaction->getResult());
+                auto resultBin = xdr::xdr_to_opaque(*payload.txResult);
                 resultBase64.reserve(decoder::encoded_size64(resultBin.size()) +
                                      1);
                 resultBase64 = decoder::encode_b64(resultBin);
                 root["error"] = resultBase64;
                 if (mApp.getConfig().ENABLE_DIAGNOSTICS_FOR_TX_SUBMISSION &&
                     transaction->isSoroban() &&
-                    !transaction->getDiagnosticEvents().empty())
+                    !payload.sorobanDiagnostics.empty())
                 {
                     auto diagsBin =
-                        xdr::xdr_to_opaque(transaction->getDiagnosticEvents());
+                        xdr::xdr_to_opaque(payload.sorobanDiagnostics);
                     auto diagsBase64 = decoder::encode_b64(diagsBin);
                     root["diagnostic_events"] = diagsBase64;
                 }
@@ -1417,11 +1420,12 @@ CommandHandler::testTx(std::string const& params, std::string& retStr)
             txFrame = fromAccount.tx({payment(toAccount, paymentAmount)});
         }
 
-        auto status = mApp.getHerder().recvTransaction(txFrame, true);
-        root["status"] = TX_STATUS_STRING[static_cast<int>(status)];
-        if (status == TransactionQueue::AddResult::ADD_STATUS_ERROR)
+        auto payload = mApp.getHerder().recvTransaction(txFrame, true);
+        root["status"] = TX_STATUS_STRING[static_cast<int>(payload.statusCode)];
+        if (payload.statusCode == TransactionQueue::AddResult::ADD_STATUS_ERROR)
         {
-            root["detail"] = xdr_to_string(txFrame->getResult().result.code(),
+            releaseAssert(payload.txResult);
+            root["detail"] = xdr_to_string(payload.txResult->result.code(),
                                            "TransactionResultCode");
         }
     }

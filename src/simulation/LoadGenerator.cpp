@@ -2019,18 +2019,20 @@ LoadGenerator::execute(TransactionFramePtr& txf, LoadGenMode mode,
     StellarMessage msg(txf->toStellarMessage());
     txm.mTxnBytes.Mark(xdr::xdr_argpack_size(msg));
 
-    auto status = mApp.getHerder().recvTransaction(txf, true);
-    if (status != TransactionQueue::AddResult::ADD_STATUS_PENDING)
+    auto payload = mApp.getHerder().recvTransaction(txf, true);
+    if (payload.statusCode != TransactionQueue::AddResult::ADD_STATUS_PENDING)
     {
         CLOG_INFO(LoadGen, "tx rejected '{}': ===> {}, {}",
-                  TX_STATUS_STRING[static_cast<int>(status)],
+                  TX_STATUS_STRING[static_cast<int>(payload.statusCode)],
                   txf->isSoroban() ? "soroban"
                                    : xdr_to_string(txf->getEnvelope(),
                                                    "TransactionEnvelope"),
-                  xdr_to_string(txf->getResult(), "TransactionResult"));
-        if (status == TransactionQueue::AddResult::ADD_STATUS_ERROR)
+                  payload.txResult
+                      ? xdr_to_string(*payload.txResult, "TransactionResult")
+                      : "");
+        if (payload.statusCode == TransactionQueue::AddResult::ADD_STATUS_ERROR)
         {
-            code = txf->getResultCode();
+            code = payload.txResult->result.code();
         }
         txm.mTxnRejected.Mark();
     }
@@ -2039,7 +2041,7 @@ LoadGenerator::execute(TransactionFramePtr& txf, LoadGenMode mode,
         mApp.getOverlayManager().broadcastMessage(msg, txf->getFullHash());
     }
 
-    return status;
+    return payload.statusCode;
 }
 
 GeneratedLoadConfig

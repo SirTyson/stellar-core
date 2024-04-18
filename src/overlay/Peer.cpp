@@ -1126,7 +1126,8 @@ Peer::recvTransaction(StellarMessage const& msg)
 
         // add it to our current set
         // and make sure it is valid
-        auto recvRes = mApp.getHerder().recvTransaction(transaction, false);
+        auto recvRes =
+            mApp.getHerder().recvTransaction(transaction, false).statusCode;
         bool pulledRelevantTx = false;
         if (!(recvRes == TransactionQueue::AddResult::ADD_STATUS_PENDING ||
               recvRes == TransactionQueue::AddResult::ADD_STATUS_DUPLICATE))

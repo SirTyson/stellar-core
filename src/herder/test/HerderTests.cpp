@@ -88,8 +88,9 @@ TEST_CASE_VERSIONS("standalone", "[herder][acceptance]")
 
             auto feedTx = [&](TransactionFramePtr& tx,
                               TransactionQueue::AddResult expectedRes) {
-                REQUIRE(app->getHerder().recvTransaction(tx, false) ==
-                        expectedRes);
+                REQUIRE(
+                    app->getHerder().recvTransaction(tx, false).statusCode ==
+                    expectedRes);
             };
 
             auto waitForExternalize = [&]() {
@@ -3502,12 +3503,18 @@ TEST_CASE("tx queue source account limit", "[herder][transactionqueue]")
     auto [root, a1, b1, tx1, tx2] = makeTxs(app);
 
     // Submit txs for the same account, should be good
-    REQUIRE(app->getHerder().recvTransaction(tx1, true) ==
+    auto payload1 = app->getHerder().recvTransaction(tx1, true);
+    REQUIRE(payload1.statusCode ==
             TransactionQueue::AddResult::ADD_STATUS_PENDING);
+    REQUIRE(!payload1.txResult);
+    REQUIRE(payload1.sorobanDiagnostics.empty());
 
     // Second tx is rejected due to limit
-    REQUIRE(app->getHerder().recvTransaction(tx2, true) ==
+    auto payload2 = app->getHerder().recvTransaction(tx2, true);
+    REQUIRE(payload2.statusCode ==
             TransactionQueue::AddResult::ADD_STATUS_TRY_AGAIN_LATER);
+    REQUIRE(!payload2.txResult);
+    REQUIRE(payload2.sorobanDiagnostics.empty());
 
     uint32_t lcl = app->getLedgerManager().getLastClosedLedgerNum();
     simulation->crankUntil(
@@ -3533,7 +3540,7 @@ TEST_CASE("tx queue source account limit", "[herder][transactionqueue]")
 
     // Now submit the second tx (which was rejected earlier) and make sure
     // it ends up in the ledger
-    REQUIRE(app->getHerder().recvTransaction(tx2, true) ==
+    REQUIRE(app->getHerder().recvTransaction(tx2, true).statusCode ==
             TransactionQueue::AddResult::ADD_STATUS_PENDING);
 
     lcl = app->getLedgerManager().getLastClosedLedgerNum();
@@ -4170,8 +4177,12 @@ herderExternalizesValuesWithProtocol(uint32_t version)
                     SorobanResources resources;
                     auto sorobanTx = createUploadWasmTx(
                         *A, root, 100, DEFAULT_TEST_RESOURCE_FEE, resources);
-                    REQUIRE(herderA.recvTransaction(sorobanTx, true) ==
+                    auto payload = herderA.recvTransaction(sorobanTx, true);
+                    REQUIRE(payload.statusCode ==
                             TransactionQueue::AddResult::ADD_STATUS_PENDING);
+                    REQUIRE(!payload.txResult);
+                    REQUIRE(payload.sorobanDiagnostics.empty());
+
                     submitted = true;
                 }
                 return currentALedger() >= destinationLedger &&
@@ -4957,8 +4968,13 @@ TEST_CASE("do not flood too many soroban transactions",
 
         auto tx = createUploadWasmTx(*app, source, inclusionFee, 10'000'000,
                                      resources);
-        REQUIRE(herder.recvTransaction(tx, false) ==
+
+        auto payload = herder.recvTransaction(tx, false);
+        REQUIRE(payload.statusCode ==
                 TransactionQueue::AddResult::ADD_STATUS_PENDING);
+        REQUIRE(!payload.txResult);
+        REQUIRE(payload.sorobanDiagnostics.empty());
+
         return tx;
     };
 
@@ -5130,8 +5146,11 @@ TEST_CASE("do not flood too many transactions", "[herder][transactionqueue]")
                 curFeeOffset--;
             }
 
-            REQUIRE(herder.recvTransaction(tx, false) ==
+            auto payload = herder.recvTransaction(tx, false);
+            REQUIRE(payload.statusCode ==
                     TransactionQueue::AddResult::ADD_STATUS_PENDING);
+            REQUIRE(!payload.txResult);
+            REQUIRE(payload.sorobanDiagnostics.empty());
             return tx;
         };
 
@@ -5340,8 +5359,12 @@ TEST_CASE("do not flood too many transactions with DEX separation",
                 curFeeOffset--;
             }
 
-            REQUIRE(herder.recvTransaction(tx, false) ==
+            auto payload = herder.recvTransaction(tx, false);
+            REQUIRE(payload.statusCode ==
                     TransactionQueue::AddResult::ADD_STATUS_PENDING);
+            REQUIRE(!payload.txResult);
+            REQUIRE(payload.sorobanDiagnostics.empty());
+
             return tx;
         };
 
@@ -5768,8 +5791,11 @@ TEST_CASE("exclude transactions by operation type", "[herder]")
         auto acc = getAccount("acc");
         auto tx = root.tx({createAccount(acc.getPublicKey(), 1)});
 
-        REQUIRE(app->getHerder().recvTransaction(tx, false) ==
+        auto payload = app->getHerder().recvTransaction(tx, false);
+        REQUIRE(payload.statusCode ==
                 TransactionQueue::AddResult::ADD_STATUS_PENDING);
+        REQUIRE(!payload.txResult);
+        REQUIRE(payload.sorobanDiagnostics.empty());
     }
 
     SECTION("filter excludes transaction containing specified operation")
@@ -5783,8 +5809,11 @@ TEST_CASE("exclude transactions by operation type", "[herder]")
         auto acc = getAccount("acc");
         auto tx = root.tx({createAccount(acc.getPublicKey(), 1)});
 
-        REQUIRE(app->getHerder().recvTransaction(tx, false) ==
+        auto payload = app->getHerder().recvTransaction(tx, false);
+        REQUIRE(payload.statusCode ==
                 TransactionQueue::AddResult::ADD_STATUS_FILTERED);
+        REQUIRE(!payload.txResult);
+        REQUIRE(payload.sorobanDiagnostics.empty());
     }
 
     SECTION("filter does not exclude transaction containing non-specified "
@@ -5799,8 +5828,11 @@ TEST_CASE("exclude transactions by operation type", "[herder]")
         auto acc = getAccount("acc");
         auto tx = root.tx({createAccount(acc.getPublicKey(), 1)});
 
-        REQUIRE(app->getHerder().recvTransaction(tx, false) ==
+        auto payload = app->getHerder().recvTransaction(tx, false);
+        REQUIRE(payload.statusCode ==
                 TransactionQueue::AddResult::ADD_STATUS_PENDING);
+        REQUIRE(!payload.txResult);
+        REQUIRE(payload.sorobanDiagnostics.empty());
     }
 }
 

@@ -973,8 +973,11 @@ TEST_CASE_VERSIONS("TransactionQueue with PreconditionsV2",
             auto& herder = static_cast<HerderImpl&>(app->getHerder());
             auto& tq = herder.getTransactionQueue();
 
-            REQUIRE(herder.recvTransaction(tx, false) ==
+            auto payload = herder.recvTransaction(tx, false);
+            REQUIRE(payload.statusCode ==
                     TransactionQueue::AddResult::ADD_STATUS_PENDING);
+            REQUIRE(!payload.txResult);
+            REQUIRE(payload.sorobanDiagnostics.empty());
 
             REQUIRE(tq.getTransactions({}).size() == 1);
             closeLedger(*app);
@@ -1146,7 +1149,7 @@ TEST_CASE("Soroban TransactionQueue pre-protocol-20",
                                  DEFAULT_TEST_RESOURCE_FEE, resources);
 
     // Soroban tx is not supported
-    REQUIRE(app->getHerder().recvTransaction(tx, false) ==
+    REQUIRE(app->getHerder().recvTransaction(tx, false).statusCode ==
             TransactionQueue::AddResult::ADD_STATUS_ERROR);
     REQUIRE(app->getHerder().getTx(tx->getFullHash()) == nullptr);
 }
@@ -1188,7 +1191,7 @@ TEST_CASE("Soroban TransactionQueue limits",
     auto tx = createUploadWasmTx(*app, root, initialInclusionFee, resourceFee,
                                  resAdjusted);
 
-    REQUIRE(app->getHerder().recvTransaction(tx, false) ==
+    REQUIRE(app->getHerder().recvTransaction(tx, false).statusCode ==
             TransactionQueue::AddResult::ADD_STATUS_PENDING);
     REQUIRE(app->getHerder().getTx(tx->getFullHash()) != nullptr);
 
@@ -1248,9 +1251,10 @@ TEST_CASE("Soroban TransactionQueue limits",
             REQUIRE_THROWS_AS(badTx->getInclusionFee(), std::runtime_error);
         }
         // Gracefully handle malformed transaction
-        REQUIRE(app->getHerder().recvTransaction(badTx, false) ==
+        auto badPayload = app->getHerder().recvTransaction(badTx, false);
+        REQUIRE(badPayload.statusCode ==
                 TransactionQueue::AddResult::ADD_STATUS_ERROR);
-        REQUIRE(badTx->getResult().result.code() == txMALFORMED);
+        REQUIRE(badPayload.txResult->result.code() == txMALFORMED);
     }
     SECTION("source account limit, soroban and classic tx queue")
     {
@@ -1261,11 +1265,14 @@ TEST_CASE("Soroban TransactionQueue limits",
         auto checkLimitEnforced = [&](auto const& pendingTx,
                                       auto const& rejectedTx,
                                       TransactionQueue& txQueue) {
-            REQUIRE(app->getHerder().recvTransaction(pendingTx, false) ==
-                    TransactionQueue::AddResult::ADD_STATUS_PENDING);
+            REQUIRE(
+                app->getHerder().recvTransaction(pendingTx, false).statusCode ==
+                TransactionQueue::AddResult::ADD_STATUS_PENDING);
 
             // Can't submit tx due to source account limit
-            REQUIRE(app->getHerder().recvTransaction(rejectedTx, false) ==
+            REQUIRE(app->getHerder()
+                        .recvTransaction(rejectedTx, false)
+                        .statusCode ==
                     TransactionQueue::AddResult::ADD_STATUS_TRY_AGAIN_LATER);
 
             // ban existing tx
@@ -1275,7 +1282,9 @@ TEST_CASE("Soroban TransactionQueue limits",
             REQUIRE(app->getHerder().isBannedTx(pendingTx->getFullHash()));
 
             // Now can submit classic txs
-            REQUIRE(app->getHerder().recvTransaction(rejectedTx, false) ==
+            REQUIRE(app->getHerder()
+                        .recvTransaction(rejectedTx, false)
+                        .statusCode ==
                     TransactionQueue::AddResult::ADD_STATUS_PENDING);
         };
         SECTION("classic is rejected when soroban is pending")
@@ -1331,7 +1340,7 @@ TEST_CASE("Soroban TransactionQueue limits",
             auto txNew = createUploadWasmTx(*app, account1, initialInclusionFee,
                                             resourceFee, resources);
 
-            REQUIRE(app->getHerder().recvTransaction(txNew, false) ==
+            REQUIRE(app->getHerder().recvTransaction(txNew, false).statusCode ==
                     TransactionQueue::AddResult::ADD_STATUS_PENDING);
 
             SECTION("insufficient fee")
@@ -1355,12 +1364,13 @@ TEST_CASE("Soroban TransactionQueue limits",
                 }
 
                 // Same per-op fee, no eviction
-                REQUIRE(app->getHerder().recvTransaction(tx2, false) ==
+                auto payload2 = app->getHerder().recvTransaction(tx2, false);
+                REQUIRE(payload2.statusCode ==
                         TransactionQueue::AddResult::ADD_STATUS_ERROR);
                 REQUIRE(!app->getHerder().isBannedTx(tx->getFullHash()));
-                REQUIRE(tx2->getResultCode() ==
+                REQUIRE(payload2.txResult->result.code() ==
                         TransactionResultCode::txINSUFFICIENT_FEE);
-                REQUIRE(tx2->getResult().feeCharged == expectedFeeCharged);
+                REQUIRE(payload2.txResult->feeCharged == expectedFeeCharged);
             }
             SECTION("insufficient account balance")
             {
@@ -1369,10 +1379,11 @@ TEST_CASE("Soroban TransactionQueue limits",
                     createUploadWasmTx(*app, account2, initialInclusionFee,
                                        minBalance2, resources);
 
-                REQUIRE(app->getHerder().recvTransaction(tx2, false) ==
+                auto payload2 = app->getHerder().recvTransaction(tx2, false);
+                REQUIRE(payload2.statusCode ==
                         TransactionQueue::AddResult::ADD_STATUS_ERROR);
                 REQUIRE(!app->getHerder().isBannedTx(tx->getFullHash()));
-                REQUIRE(tx2->getResultCode() ==
+                REQUIRE(payload2.txResult->result.code() ==
                         TransactionResultCode::txINSUFFICIENT_BALANCE);
             }
             SECTION("invalid resources")
@@ -1396,10 +1407,11 @@ TEST_CASE("Soroban TransactionQueue limits",
                                            resourceFee, resources);
                 }
 
-                REQUIRE(app->getHerder().recvTransaction(tx2, false) ==
+                auto payload2 = app->getHerder().recvTransaction(tx2, false);
+                REQUIRE(payload2.statusCode ==
                         TransactionQueue::AddResult::ADD_STATUS_ERROR);
                 REQUIRE(!app->getHerder().isBannedTx(tx->getFullHash()));
-                REQUIRE(tx2->getResultCode() ==
+                REQUIRE(payload2.txResult->result.code() ==
                         TransactionResultCode::txSOROBAN_INVALID);
             }
             SECTION("too many ops")
@@ -1408,10 +1420,11 @@ TEST_CASE("Soroban TransactionQueue limits",
                     *app, account2, initialInclusionFee * 2, resourceFee,
                     resources, std::nullopt, /* addInvalidOps */ 1);
 
-                REQUIRE(app->getHerder().recvTransaction(tx2, false) ==
+                auto payload2 = app->getHerder().recvTransaction(tx2, false);
+                REQUIRE(payload2.statusCode ==
                         TransactionQueue::AddResult::ADD_STATUS_ERROR);
                 REQUIRE(!app->getHerder().isBannedTx(tx->getFullHash()));
-                REQUIRE(tx2->getResultCode() ==
+                REQUIRE(payload2.txResult->result.code() ==
                         TransactionResultCode::txMALFORMED);
             }
         }
@@ -1441,9 +1454,11 @@ TEST_CASE("Soroban TransactionQueue limits",
                               2 * (initialInclusionFee + 1));
             }
 
-            auto status = app->getHerder().recvTransaction(tx2, false);
+            auto status =
+                app->getHerder().recvTransaction(tx2, false).statusCode;
             REQUIRE(status == TransactionQueue::AddResult::ADD_STATUS_PENDING);
-            auto status2 = app->getHerder().recvTransaction(tx3, false);
+            auto status2 =
+                app->getHerder().recvTransaction(tx3, false).statusCode;
             REQUIRE(status2 == TransactionQueue::AddResult::ADD_STATUS_PENDING);
 
             // Evicted and banned the first tx
@@ -2612,7 +2627,7 @@ TEST_CASE("remove applied", "[herder][transactionqueue]")
     }
 
     REQUIRE(tq.getTransactions({}).size() == 1);
-    REQUIRE(herder.recvTransaction(tx4, false) ==
+    REQUIRE(herder.recvTransaction(tx4, false).statusCode ==
             TransactionQueue::AddResult::ADD_STATUS_PENDING);
     REQUIRE(tq.getTransactions({}).size() == 2);
 }

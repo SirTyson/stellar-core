@@ -72,6 +72,16 @@ class TransactionQueue
         ADD_STATUS_COUNT
     };
 
+    struct AddPayload
+    {
+        AddResult statusCode;
+
+        // If resultCode == ADD_STATUS_ERROR, txResult and sorobanDiagnostics
+        // will be populated
+        std::optional<TransactionResult> txResult{};
+        xdr::xvector<DiagnosticEvent> sorobanDiagnostics{};
+    };
+
     /**
      * AccountState stores the following information:
      * - mTotalFees: the sum of feeBid() over every transaction for which this

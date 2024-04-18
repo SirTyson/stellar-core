@@ -542,11 +542,11 @@ HerderImpl::emitEnvelope(SCPEnvelope const& envelope)
     broadcast(envelope);
 }
 
-TransactionQueue::AddResult
+TransactionQueue::AddPayload
 HerderImpl::recvTransaction(TransactionFrameBasePtr tx, bool submittedFromSelf)
 {
     ZoneScoped;
-    TransactionQueue::AddResult result;
+    TransactionQueue::AddPayload payload;
 
     // Allow txs of the same kind to reach the tx queue in case it can be
     // replaced by fee
@@ -564,30 +564,42 @@ HerderImpl::recvTransaction(TransactionFrameBasePtr tx, bool submittedFromSelf)
                    "account per ledger limit",
                    hexAbbrev(tx->getFullHash()),
                    KeyUtils::toShortString(tx->getSourceID()));
-        result = TransactionQueue::AddResult::ADD_STATUS_TRY_AGAIN_LATER;
+        payload.statusCode =
+            TransactionQueue::AddResult::ADD_STATUS_TRY_AGAIN_LATER;
     }
     else if (!tx->isSoroban())
     {
-        result = mTransactionQueue.tryAdd(tx, submittedFromSelf);
+        payload.statusCode = mTransactionQueue.tryAdd(tx, submittedFromSelf);
     }
     else if (mSorobanTransactionQueue)
     {
-        result = mSorobanTransactionQueue->tryAdd(tx, submittedFromSelf);
+        payload.statusCode =
+            mSorobanTransactionQueue->tryAdd(tx, submittedFromSelf);
     }
     else
     {
         // Received Soroban transaction before protocol 20; since this
         // transaction isn't supported yet, return ERROR
-        result = TransactionQueue::AddResult::ADD_STATUS_ERROR;
+        payload.statusCode = TransactionQueue::AddResult::ADD_STATUS_ERROR;
     }
 
-    if (result == TransactionQueue::AddResult::ADD_STATUS_PENDING)
+    if (payload.statusCode == TransactionQueue::AddResult::ADD_STATUS_PENDING)
     {
         CLOG_TRACE(Herder, "recv transaction {} for {}",
                    hexAbbrev(tx->getFullHash()),
                    KeyUtils::toShortString(tx->getSourceID()));
     }
-    return result;
+    else if (payload.statusCode ==
+             TransactionQueue::AddResult::ADD_STATUS_ERROR)
+    {
+        payload.txResult = tx->getResult();
+        if (tx->isSoroban())
+        {
+            payload.sorobanDiagnostics = tx->getDiagnosticEvents();
+        }
+    }
+
+    return payload;
 }
 
 bool
