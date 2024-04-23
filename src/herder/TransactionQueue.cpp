@@ -299,15 +299,17 @@ TransactionQueue::canAdd(TransactionFrameBasePtr tx,
             // appropriate error message
             if (tx->isSoroban())
             {
-                // TODO: Return txResult optional here
+                TransactionResult result;
                 if (!tx->checkSorobanResourceAndSetError(
-                        mApp, mApp.getLedgerManager()
-                                  .getLastClosedLedgerHeader()
-                                  .header.ledgerVersion))
+                        mApp,
+                        mApp.getLedgerManager()
+                            .getLastClosedLedgerHeader()
+                            .header.ledgerVersion,
+                        result))
                 {
                     auto ret = TransactionQueue::AddPayload(
                         AddResult::ADD_STATUS_ERROR);
-                    ret.txResult = tx->getResult();
+                    ret.txResult = result;
                     return ret;
                 }
             }
