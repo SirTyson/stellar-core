@@ -99,8 +99,12 @@ class TransactionQueueTest
     void
     add(TransactionFrameBasePtr const& tx, TransactionQueue::AddResult expected)
     {
-        auto res = mTransactionQueue.tryAdd(tx, false);
-        REQUIRE(res == expected);
+        auto addPayload = mTransactionQueue.tryAdd(tx, false);
+        REQUIRE(addPayload.statusCode == expected);
+        if (addPayload.txResult)
+        {
+            tx->getResult() = *addPayload.txResult;
+        }
     }
 
     TransactionQueue&
@@ -2043,8 +2047,9 @@ TEST_CASE("transaction queue starting sequence boundary",
         REQUIRE(acc1.loadSequenceNumber() == startingSeq - 1);
 
         ClassicTransactionQueue tq(*app, 4, 10, 4);
-        REQUIRE(tq.tryAdd(transaction(*app, acc1, 1, 1, 100), false) ==
-                TransactionQueue::AddResult::ADD_STATUS_PENDING);
+        REQUIRE(
+            tq.tryAdd(transaction(*app, acc1, 1, 1, 100), false).statusCode ==
+            TransactionQueue::AddResult::ADD_STATUS_PENDING);
 
         auto checkTxSet = [&](uint32_t ledgerSeq) {
             auto lcl = app->getLedgerManager().getLastClosedLedgerHeader();

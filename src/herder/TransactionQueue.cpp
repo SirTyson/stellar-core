@@ -47,6 +47,22 @@ std::array<const char*,
     TX_STATUS_STRING = std::array{"PENDING", "DUPLICATE", "ERROR",
                                   "TRY_AGAIN_LATER", "FILTERED"};
 
+TransactionQueue::AddPayload::AddPayload(AddResult code) : statusCode(code)
+{
+    if (statusCode == AddResult::ADD_STATUS_ERROR)
+    {
+        txResult = std::make_optional<TransactionResult>();
+    }
+}
+
+TransactionQueue::AddPayload
+TransactionQueue::AddPayload::txError(TransactionResultCode txCode)
+{
+    auto result = AddPayload(AddResult::ADD_STATUS_ERROR);
+    result.txResult->result.code(txCode);
+    return result;
+}
+
 TransactionQueue::TransactionQueue(Application& app, uint32 pendingDepth,
                                    uint32 banDepth, uint32 poolLedgerMultiplier,
                                    bool isSoroban)
@@ -231,7 +247,7 @@ TransactionQueue::sourceAccountPending(AccountID const& accountID) const
     return mAccountStates.find(accountID) != mAccountStates.end();
 }
 
-TransactionQueue::AddResult
+TransactionQueue::AddPayload
 TransactionQueue::canAdd(TransactionFrameBasePtr tx,
                          AccountStates::iterator& stateIter,
                          std::vector<std::pair<TxStackPtr, bool>>& txsToEvict)
@@ -239,18 +255,18 @@ TransactionQueue::canAdd(TransactionFrameBasePtr tx,
     ZoneScoped;
     if (isBanned(tx->getFullHash()))
     {
-        return TransactionQueue::AddResult::ADD_STATUS_TRY_AGAIN_LATER;
+        return AddPayload{
+            TransactionQueue::AddResult::ADD_STATUS_TRY_AGAIN_LATER};
     }
     if (isFiltered(tx))
     {
-        return TransactionQueue::AddResult::ADD_STATUS_FILTERED;
+        return AddPayload{TransactionQueue::AddResult::ADD_STATUS_FILTERED};
     }
 
     int64_t newFullFee = tx->getFullFee();
     if (newFullFee < 0 || tx->getInclusionFee() < 0)
     {
-        tx->getResult().result.code(txMALFORMED);
-        return TransactionQueue::AddResult::ADD_STATUS_ERROR;
+        return AddPayload::txError(txMALFORMED);
     }
 
     stateIter = mAccountStates.find(tx->getSourceID());
@@ -266,7 +282,8 @@ TransactionQueue::canAdd(TransactionFrameBasePtr tx,
             // Check if the tx is a duplicate
             if (isDuplicateTx(currentTx, tx))
             {
-                return TransactionQueue::AddResult::ADD_STATUS_DUPLICATE;
+                return AddPayload{
+                    TransactionQueue::AddResult::ADD_STATUS_DUPLICATE};
             }
 
             // Any transaction older than the current one is invalid
@@ -274,8 +291,7 @@ TransactionQueue::canAdd(TransactionFrameBasePtr tx,
             {
                 // If the transaction is older than the one in the queue, we
                 // reject it
-                tx->getResult().result.code(txBAD_SEQ);
-                return TransactionQueue::AddResult::ADD_STATUS_ERROR;
+                return AddPayload::txError(txBAD_SEQ);
             }
 
             // Before rejecting Soroban transactions due to source account
@@ -283,12 +299,16 @@ TransactionQueue::canAdd(TransactionFrameBasePtr tx,
             // appropriate error message
             if (tx->isSoroban())
             {
+                // TODO: Return txResult optional here
                 if (!tx->checkSorobanResourceAndSetError(
                         mApp, mApp.getLedgerManager()
                                   .getLastClosedLedgerHeader()
                                   .header.ledgerVersion))
                 {
-                    return TransactionQueue::AddResult::ADD_STATUS_ERROR;
+                    auto ret = TransactionQueue::AddPayload(
+                        AddResult::ADD_STATUS_ERROR);
+                    ret.txResult = tx->getResult();
+                    return ret;
                 }
             }
 
@@ -296,23 +316,24 @@ TransactionQueue::canAdd(TransactionFrameBasePtr tx,
             {
                 // If there's already a transaction in the queue, we reject
                 // any new transaction
-                return TransactionQueue::AddResult::ADD_STATUS_TRY_AGAIN_LATER;
+                return AddPayload{
+                    TransactionQueue::AddResult::ADD_STATUS_TRY_AGAIN_LATER};
             }
             else
             {
                 if (tx->getSeqNum() != currentTx->getSeqNum())
                 {
                     // New fee-bump transaction is rejected
-                    return TransactionQueue::AddResult::
-                        ADD_STATUS_TRY_AGAIN_LATER;
+                    return AddPayload{TransactionQueue::AddResult::
+                                          ADD_STATUS_TRY_AGAIN_LATER};
                 }
 
                 int64_t minFee;
                 if (!canReplaceByFee(tx, currentTx, minFee))
                 {
-                    tx->getResult().result.code(txINSUFFICIENT_FEE);
-                    tx->getResult().feeCharged = minFee;
-                    return TransactionQueue::AddResult::ADD_STATUS_ERROR;
+                    auto result = AddPayload::txError(txINSUFFICIENT_FEE);
+                    result.txResult->feeCharged = minFee;
+                    return result;
                 }
 
                 if (currentTx->getFeeSourceID() == tx->getFeeSourceID())
@@ -337,11 +358,12 @@ TransactionQueue::canAdd(TransactionFrameBasePtr tx,
         ban({tx});
         if (canAddRes.second != 0)
         {
-            tx->getResult().result.code(txINSUFFICIENT_FEE);
-            tx->getResult().feeCharged = canAddRes.second;
-            return TransactionQueue::AddResult::ADD_STATUS_ERROR;
+            auto result = AddPayload::txError(txINSUFFICIENT_FEE);
+            result.txResult->feeCharged = canAddRes.second;
+            return result;
         }
-        return TransactionQueue::AddResult::ADD_STATUS_TRY_AGAIN_LATER;
+        return AddPayload{
+            TransactionQueue::AddResult::ADD_STATUS_TRY_AGAIN_LATER};
     }
 
     auto closeTime = mApp.getLedgerManager()
@@ -355,10 +377,13 @@ TransactionQueue::canAdd(TransactionFrameBasePtr tx,
             mApp.getLedgerManager().getLastClosedLedgerNum() + 1;
     }
 
+    // TODO: Return optional from check valid
     if (!tx->checkValid(mApp, ltx, 0, 0,
                         getUpperBoundCloseTimeOffset(mApp, closeTime)))
     {
-        return TransactionQueue::AddResult::ADD_STATUS_ERROR;
+        auto ret = AddPayload{TransactionQueue::AddResult::ADD_STATUS_ERROR};
+        ret.txResult = tx->getResult();
+        return ret;
     }
 
     // Note: stateIter corresponds to getSourceID() which is not necessarily
@@ -371,11 +396,10 @@ TransactionQueue::canAdd(TransactionFrameBasePtr tx,
     if (getAvailableBalance(ltx.loadHeader(), feeSource) - newFullFee <
         totalFees)
     {
-        tx->getResult().result.code(txINSUFFICIENT_BALANCE);
-        return TransactionQueue::AddResult::ADD_STATUS_ERROR;
+        return AddPayload::txError(txINSUFFICIENT_BALANCE);
     }
 
-    return TransactionQueue::AddResult::ADD_STATUS_PENDING;
+    return AddPayload{TransactionQueue::AddResult::ADD_STATUS_PENDING};
 }
 
 void
@@ -514,7 +538,7 @@ TransactionQueue::findAllAssetPairsInvolvedInPaymentLoops(
     return ret;
 }
 
-TransactionQueue::AddResult
+TransactionQueue::AddPayload
 TransactionQueue::tryAdd(TransactionFrameBasePtr tx, bool submittedFromSelf)
 {
     ZoneScoped;
@@ -529,15 +553,14 @@ TransactionQueue::tryAdd(TransactionFrameBasePtr tx, bool submittedFromSelf)
     // fast fail when Soroban tx is malformed
     if ((tx->isSoroban() != (c1 || c2)) || !tx->XDRProvidesValidFee())
     {
-        tx->getResult().result.code(txMALFORMED);
-        return TransactionQueue::AddResult::ADD_STATUS_ERROR;
+        return AddPayload::txError(txMALFORMED);
     }
 
     AccountStates::iterator stateIter;
 
     std::vector<std::pair<TxStackPtr, bool>> txsToEvict;
     auto const res = canAdd(tx, stateIter, txsToEvict);
-    if (res != TransactionQueue::AddResult::ADD_STATUS_PENDING)
+    if (res.statusCode != TransactionQueue::AddResult::ADD_STATUS_PENDING)
     {
         return res;
     }

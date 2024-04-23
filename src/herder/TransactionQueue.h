@@ -80,6 +80,10 @@ class TransactionQueue
         // will be populated
         std::optional<TransactionResult> txResult{};
         xdr::xvector<DiagnosticEvent> sorobanDiagnostics{};
+
+        AddPayload(AddResult code = AddResult::ADD_STATUS_PENDING);
+
+        static AddPayload txError(TransactionResultCode txCode);
     };
 
     /**
@@ -117,7 +121,7 @@ class TransactionQueue
     static std::vector<AssetPair>
     findAllAssetPairsInvolvedInPaymentLoops(TransactionFrameBasePtr tx);
 
-    AddResult tryAdd(TransactionFrameBasePtr tx, bool submittedFromSelf);
+    AddPayload tryAdd(TransactionFrameBasePtr tx, bool submittedFromSelf);
     void removeApplied(Transactions const& txs);
     // Ban transactions that are no longer valid or have insufficient fee;
     // transaction per account limit applies here, so `txs` should have no
@@ -210,9 +214,9 @@ class TransactionQueue
         BROADCAST_STATUS_SKIPPED
     };
     BroadcastStatus broadcastTx(TimestampedTx& tx);
-    AddResult canAdd(TransactionFrameBasePtr tx,
-                     AccountStates::iterator& stateIter,
-                     std::vector<std::pair<TxStackPtr, bool>>& txsToEvict);
+    AddPayload canAdd(TransactionFrameBasePtr tx,
+                      AccountStates::iterator& stateIter,
+                      std::vector<std::pair<TxStackPtr, bool>>& txsToEvict);
 
     void releaseFeeMaybeEraseAccountState(TransactionFrameBasePtr tx);
 

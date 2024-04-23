@@ -569,18 +569,17 @@ HerderImpl::recvTransaction(TransactionFrameBasePtr tx, bool submittedFromSelf)
     }
     else if (!tx->isSoroban())
     {
-        payload.statusCode = mTransactionQueue.tryAdd(tx, submittedFromSelf);
+        payload = mTransactionQueue.tryAdd(tx, submittedFromSelf);
     }
     else if (mSorobanTransactionQueue)
     {
-        payload.statusCode =
-            mSorobanTransactionQueue->tryAdd(tx, submittedFromSelf);
+        payload = mSorobanTransactionQueue->tryAdd(tx, submittedFromSelf);
     }
     else
     {
         // Received Soroban transaction before protocol 20; since this
         // transaction isn't supported yet, return ERROR
-        payload.statusCode = TransactionQueue::AddResult::ADD_STATUS_ERROR;
+        payload = TransactionQueue::AddPayload::txError(txMALFORMED);
     }
 
     if (payload.statusCode == TransactionQueue::AddResult::ADD_STATUS_PENDING)
@@ -592,7 +591,6 @@ HerderImpl::recvTransaction(TransactionFrameBasePtr tx, bool submittedFromSelf)
     else if (payload.statusCode ==
              TransactionQueue::AddResult::ADD_STATUS_ERROR)
     {
-        payload.txResult = tx->getResult();
         if (tx->isSoroban())
         {
             payload.sorobanDiagnostics = tx->getDiagnosticEvents();
