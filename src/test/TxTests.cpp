@@ -1702,17 +1702,18 @@ sorobanEnvelopeFromOps(Hash const& networkID, TestAccount& source,
     return tx;
 }
 
-TransactionFrameBasePtr
+TransactionFrameForTestingPtr
 transactionFrameFromOps(Hash const& networkID, TestAccount& source,
                         std::vector<Operation> const& ops,
                         std::vector<SecretKey> const& opKeys,
                         std::optional<PreconditionsV2> cond)
 {
-    return TransactionFrameBase::makeTransactionFromWire(
+    auto tx = TransactionFrameBase::makeTransactionFromWire(
         networkID, envelopeFromOps(networkID, source, ops, opKeys, cond));
+    return TransactionFrameForTesting::fromTxFrame(tx);
 }
 
-TransactionFrameBasePtr
+TransactionFrameForTestingPtr
 sorobanTransactionFrameFromOps(Hash const& networkID, TestAccount& source,
                                std::vector<Operation> const& ops,
                                std::vector<SecretKey> const& opKeys,
@@ -1724,23 +1725,25 @@ sorobanTransactionFrameFromOps(Hash const& networkID, TestAccount& source,
     uint64 totalFee = inclusionFee;
     totalFee += resourceFee;
     releaseAssert(totalFee >= 0 && totalFee <= UINT32_MAX);
-    return TransactionFrameBase::makeTransactionFromWire(
+    auto tx = TransactionFrameBase::makeTransactionFromWire(
         networkID, sorobanEnvelopeFromOps(
                        networkID, source, ops, opKeys, resources,
                        static_cast<uint32>(totalFee), resourceFee, memo, seq));
+    return TransactionFrameForTesting::fromTxFrame(tx);
 }
 
-TransactionFrameBasePtr
+TransactionFrameForTestingPtr
 sorobanTransactionFrameFromOpsWithTotalFee(
     Hash const& networkID, TestAccount& source,
     std::vector<Operation> const& ops, std::vector<SecretKey> const& opKeys,
     SorobanResources const& resources, uint32_t totalFee, int64_t resourceFee,
     std::optional<std::string> memo)
 {
-    return TransactionFrameBase::makeTransactionFromWire(
+    auto tx = TransactionFrameBase::makeTransactionFromWire(
         networkID,
         sorobanEnvelopeFromOps(networkID, source, ops, opKeys, resources,
                                totalFee, resourceFee, memo, std::nullopt));
+    return TransactionFrameForTesting::fromTxFrame(tx);
 }
 
 LedgerUpgrade

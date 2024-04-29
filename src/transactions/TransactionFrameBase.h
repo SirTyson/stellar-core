@@ -22,6 +22,7 @@ class AbstractLedgerTxn;
 class Application;
 class Database;
 class OperationFrame;
+class TransactionResultPayload;
 
 class TransactionFrameBase;
 using TransactionFrameBasePtr = std::shared_ptr<TransactionFrameBase>;
@@ -37,6 +38,7 @@ class TransactionFrameBase
 
     virtual bool apply(Application& app, AbstractLedgerTxn& ltx,
                        TransactionMetaFrame& meta,
+                       TransactionResultPayload& resPayload,
                        Hash const& sorobanBasePrngSeed = Hash{}) = 0;
 
     virtual bool checkValid(Application& app, AbstractLedgerTxn& ltxOuter,

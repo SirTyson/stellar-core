@@ -125,30 +125,29 @@ bool doesAccountExist(Application& app, PublicKey const& k);
 xdr::xvector<Signer, 20> getAccountSigners(PublicKey const& k,
                                            Application& app);
 
-TransactionFramePtr transactionFromOperationsV0(
+TransactionFrameForTestingPtr transactionFromOperationsV0(
     Application& app, SecretKey const& from, SequenceNumber seq,
     std::vector<Operation> const& ops, uint32_t fee = 0);
-TransactionFramePtr
+TransactionFrameForTestingPtr
 transactionFromOperationsV1(Application& app, SecretKey const& from,
                             SequenceNumber seq,
                             std::vector<Operation> const& ops, uint32_t fee,
                             std::optional<PreconditionsV2> cond = std::nullopt);
-TransactionFramePtr transactionFromOperations(Application& app,
-                                              SecretKey const& from,
-                                              SequenceNumber seq,
-                                              std::vector<Operation> const& ops,
-                                              uint32_t fee = 0);
-TransactionFramePtr transactionWithV2Precondition(Application& app,
-                                                  TestAccount& account,
-                                                  int64_t sequenceDelta,
-                                                  uint32_t fee,
-                                                  PreconditionsV2 const& cond);
+TransactionFrameForTestingPtr
+transactionFromOperations(Application& app, SecretKey const& from,
+                          SequenceNumber seq, std::vector<Operation> const& ops,
+                          uint32_t fee = 0);
+TransactionFrameForTestingPtr
+transactionWithV2Precondition(Application& app, TestAccount& account,
+                              int64_t sequenceDelta, uint32_t fee,
+                              PreconditionsV2 const& cond);
 
 // If useInclusionAsFullFee is true, `inclusion` will be used as the full fee.
 // Otherwise, `tx` resource fee is added to full fee.
-TransactionFrameBasePtr feeBump(Application& app, TestAccount& feeSource,
-                                TransactionFrameBasePtr tx, int64_t inclusion,
-                                bool useInclusionAsFullFee = false);
+TransactionFrameForTestingPtr feeBump(Application& app, TestAccount& feeSource,
+                                      TransactionFrameBasePtr tx,
+                                      int64_t inclusion,
+                                      bool useInclusionAsFullFee = false);
 
 Operation changeTrust(Asset const& asset, int64_t limit);
 Operation changeTrust(ChangeTrustAsset const& asset, int64_t limit);
@@ -178,17 +177,18 @@ Operation createClaimableBalance(Asset const& asset, int64_t amount,
 
 Operation claimClaimableBalance(ClaimableBalanceID const& balanceID);
 
-TransactionFramePtr createPaymentTx(Application& app, SecretKey const& from,
-                                    PublicKey const& to, SequenceNumber seq,
-                                    int64_t amount);
+TransactionFrameForTestingPtr
+createPaymentTx(Application& app, SecretKey const& from, PublicKey const& to,
+                SequenceNumber seq, int64_t amount);
 
-TransactionFramePtr createCreditPaymentTx(Application& app,
-                                          SecretKey const& from,
-                                          PublicKey const& to, Asset const& ci,
-                                          SequenceNumber seq, int64_t amount);
+TransactionFrameForTestingPtr
+createCreditPaymentTx(Application& app, SecretKey const& from,
+                      PublicKey const& to, Asset const& ci, SequenceNumber seq,
+                      int64_t amount);
 
-TransactionFramePtr createSimpleDexTx(Application& app, TestAccount& account,
-                                      uint32 nbOps, uint32_t fee);
+TransactionFrameForTestingPtr createSimpleDexTx(Application& app,
+                                                TestAccount& account,
+                                                uint32 nbOps, uint32_t fee);
 
 // Generates `UPLOAD_CONTRACT_WASM` host function operation with
 // valid Wasm of *roughly* `generatedWasmSize` (within a few bytes).
@@ -196,7 +196,7 @@ TransactionFramePtr createSimpleDexTx(Application& app, TestAccount& account,
 // `generatedWasmSize`.
 Operation createUploadWasmOperation(uint32_t generatedWasmSize);
 
-TransactionFramePtr createUploadWasmTx(
+TransactionFrameForTestingPtr createUploadWasmTx(
     Application& app, TestAccount& account, uint32_t inclusionFee,
     int64_t resourceFee, SorobanResources resources,
     std::optional<std::string> memo = std::nullopt, int addInvalidOps = 0,
@@ -292,19 +292,19 @@ void checkTx(int index, TxSetResultMeta& r, TransactionResultCode expected);
 void checkTx(int index, TxSetResultMeta& r, TransactionResultCode expected,
              OperationResultCode code);
 
-TransactionFrameBasePtr
+TransactionFrameForTestingPtr
 transactionFrameFromOps(Hash const& networkID, TestAccount& source,
                         std::vector<Operation> const& ops,
                         std::vector<SecretKey> const& opKeys,
                         std::optional<PreconditionsV2> cond = std::nullopt);
 
-TransactionFrameBasePtr sorobanTransactionFrameFromOps(
+TransactionFrameForTestingPtr sorobanTransactionFrameFromOps(
     Hash const& networkID, TestAccount& source,
     std::vector<Operation> const& ops, std::vector<SecretKey> const& opKeys,
     SorobanResources const& resources, uint32_t inclusionFee,
     int64_t resourceFee, std::optional<std::string> memo = std::nullopt,
     std::optional<SequenceNumber> seq = std::nullopt);
-TransactionFrameBasePtr sorobanTransactionFrameFromOpsWithTotalFee(
+TransactionFrameForTestingPtr sorobanTransactionFrameFromOpsWithTotalFee(
     Hash const& networkID, TestAccount& source,
     std::vector<Operation> const& ops, std::vector<SecretKey> const& opKeys,
     SorobanResources const& resources, uint32_t totalFee, int64_t resourceFee,

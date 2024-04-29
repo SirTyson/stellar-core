@@ -103,7 +103,7 @@ TestAccount::exists() const
     return doesAccountExist(mApp, getPublicKey());
 }
 
-TransactionFramePtr
+TransactionFrameForTestingPtr
 TestAccount::tx(std::vector<Operation> const& ops, SequenceNumber sn)
 {
     if (sn == 0)
@@ -111,7 +111,8 @@ TestAccount::tx(std::vector<Operation> const& ops, SequenceNumber sn)
         sn = nextSequenceNumber();
     }
 
-    return transactionFromOperations(mApp, getSecretKey(), sn, ops);
+    return TransactionFrameForTesting::fromTxFrame(
+        transactionFromOperations(mApp, getSecretKey(), sn, ops));
 }
 
 Operation

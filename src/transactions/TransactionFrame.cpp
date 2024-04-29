@@ -121,14 +121,6 @@ TransactionFrame::getContentsHash() const
 }
 
 void
-TransactionFrame::clearCached()
-{
-    Hash zero;
-    mContentsHash = zero;
-    mFullHash = zero;
-}
-
-void
 TransactionFrame::pushContractEvents(xdr::xvector<ContractEvent>&& evts)
 {
     releaseAssertOrThrow(mSorobanExtension);
@@ -358,20 +350,6 @@ TransactionFrame::getFee(LedgerHeader const& header,
     {
         return getFullFee();
     }
-}
-
-void
-TransactionFrame::addSignature(SecretKey const& secretKey)
-{
-    auto sig = SignatureUtils::sign(secretKey, getContentsHash());
-    addSignature(sig);
-}
-
-void
-TransactionFrame::addSignature(DecoratedSignature const& signature)
-{
-    clearCached();
-    getSignatures(mEnvelope).push_back(signature);
 }
 
 bool
@@ -1654,10 +1632,11 @@ TransactionFrame::markResultFailed()
 
 bool
 TransactionFrame::apply(Application& app, AbstractLedgerTxn& ltx,
+                        TransactionResultPayload& resPayload,
                         Hash const& sorobanBasePrngSeed)
 {
     TransactionMetaFrame tm(ltx.loadHeader().current().ledgerVersion);
-    return apply(app, ltx, tm, sorobanBasePrngSeed);
+    return apply(app, ltx, tm, resPayload, sorobanBasePrngSeed);
 }
 
 bool
@@ -1882,7 +1861,8 @@ TransactionFrame::applyOperations(SignatureChecker& signatureChecker,
 
 bool
 TransactionFrame::apply(Application& app, AbstractLedgerTxn& ltx,
-                        TransactionMetaFrame& meta, bool chargeFee,
+                        TransactionMetaFrame& meta,
+                        TransactionResultPayload& resPayload, bool chargeFee,
                         Hash const& sorobanBasePrngSeed)
 {
     ZoneScoped;
@@ -1968,9 +1948,10 @@ TransactionFrame::apply(Application& app, AbstractLedgerTxn& ltx,
 bool
 TransactionFrame::apply(Application& app, AbstractLedgerTxn& ltx,
                         TransactionMetaFrame& meta,
+                        TransactionResultPayload& resPayload,
                         Hash const& sorobanBasePrngSeed)
 {
-    return apply(app, ltx, meta, true, sorobanBasePrngSeed);
+    return apply(app, ltx, meta, resPayload, true, sorobanBasePrngSeed);
 }
 
 void
@@ -2032,4 +2013,260 @@ TransactionFrame::getSize() const
     ZoneScoped;
     return static_cast<uint32_t>(xdr::xdr_size(mEnvelope));
 }
+
+#ifdef BUILD_TESTS
+TransactionFrameForTesting::TransactionFrameForTesting(TransactionFrameBase& tx)
+    : mTransactionFrame(tx)
+{
+    // TODO: Properly initialize mTransactionResultPayload
+}
+
+TransactionFrameForTestingPtr
+TransactionFrameForTesting::fromTxFrame(TransactionFrameBasePtr txFrame)
+{
+    releaseAssert(txFrame);
+    return std::shared_ptr<TransactionFrameForTesting>(
+        new TransactionFrameForTesting(*txFrame));
+}
+
+bool
+TransactionFrameForTesting::apply(Application& app, AbstractLedgerTxn& ltx,
+                                  TransactionMetaFrame& meta,
+                                  Hash const& sorobanBasePrngSeed)
+{
+    return mTransactionFrame.apply(app, ltx, meta, mTransactionResultPayload,
+                                   sorobanBasePrngSeed);
+}
+
+void
+TransactionFrameForTesting::clearCached()
+{
+    Hash zero;
+    auto& tx = dynamic_cast<TransactionFrame&>(mTransactionFrame);
+    tx.mContentsHash = zero;
+    tx.mFullHash = zero;
+}
+
+void
+TransactionFrameForTesting::addSignature(SecretKey const& secretKey)
+{
+    auto sig = SignatureUtils::sign(secretKey, getContentsHash());
+    addSignature(sig);
+}
+
+void
+TransactionFrameForTesting::addSignature(DecoratedSignature const& signature)
+{
+    clearCached();
+    getSignatures(dynamic_cast<TransactionFrame&>(mTransactionFrame).mEnvelope)
+        .push_back(signature);
+}
+
+bool
+TransactionFrameForTesting::apply(Application& app, AbstractLedgerTxn& ltx,
+                                  TransactionMetaFrame& meta,
+                                  TransactionResultPayload& resPayload,
+                                  Hash const& sorobanBasePrngSeed)
+{
+    return mTransactionFrame.apply(app, ltx, meta, resPayload,
+                                   sorobanBasePrngSeed);
+}
+
+bool
+TransactionFrameForTesting::checkValid(Application& app,
+                                       AbstractLedgerTxn& ltxOuter,
+                                       SequenceNumber current,
+                                       uint64_t lowerBoundCloseTimeOffset,
+                                       uint64_t upperBoundCloseTimeOffset)
+{
+    return mTransactionFrame.checkValid(app, ltxOuter, current,
+                                        lowerBoundCloseTimeOffset,
+                                        upperBoundCloseTimeOffset);
+}
+
+bool
+TransactionFrameForTesting::checkSorobanResourceAndSetError(
+    Application& app, uint32_t ledgerVersion, TransactionResult& txResult)
+{
+    return mTransactionFrame.checkSorobanResourceAndSetError(app, ledgerVersion,
+                                                             txResult);
+}
+
+TransactionEnvelope const&
+TransactionFrameForTesting::getEnvelope() const
+{
+    return mTransactionFrame.getEnvelope();
+}
+
+int64_t
+TransactionFrameForTesting::getFullFee() const
+{
+    return mTransactionFrame.getFullFee();
+}
+
+int64_t
+TransactionFrameForTesting::getInclusionFee() const
+{
+    return mTransactionFrame.getInclusionFee();
+}
+
+int64_t
+TransactionFrameForTesting::getFee(LedgerHeader const& header,
+                                   std::optional<int64_t> baseFee,
+                                   bool applying) const
+{
+    return mTransactionFrame.getFee(header, baseFee, applying);
+}
+
+Hash const&
+TransactionFrameForTesting::getContentsHash() const
+{
+    return mTransactionFrame.getContentsHash();
+}
+
+Hash const&
+TransactionFrameForTesting::getFullHash() const
+{
+    return mTransactionFrame.getFullHash();
+}
+
+uint32_t
+TransactionFrameForTesting::getNumOperations() const
+{
+    return mTransactionFrame.getNumOperations();
+}
+
+Resource
+TransactionFrameForTesting::getResources(bool useByteLimitInClassic) const
+{
+    return mTransactionFrame.getResources(useByteLimitInClassic);
+}
+
+std::vector<Operation> const&
+TransactionFrameForTesting::getRawOperations() const
+{
+    return mTransactionFrame.getRawOperations();
+}
+
+TransactionResult&
+TransactionFrameForTesting::getResult()
+{
+    return mTransactionFrame.getResult();
+}
+
+TransactionResultCode
+TransactionFrameForTesting::getResultCode() const
+{
+    return mTransactionFrame.getResultCode();
+}
+
+SequenceNumber
+TransactionFrameForTesting::getSeqNum() const
+{
+    return mTransactionFrame.getSeqNum();
+}
+
+AccountID
+TransactionFrameForTesting::getFeeSourceID() const
+{
+    return mTransactionFrame.getFeeSourceID();
+}
+
+AccountID
+TransactionFrameForTesting::getSourceID() const
+{
+    return mTransactionFrame.getSourceID();
+}
+
+std::optional<SequenceNumber const> const
+TransactionFrameForTesting::getMinSeqNum() const
+{
+    return mTransactionFrame.getMinSeqNum();
+}
+
+Duration
+TransactionFrameForTesting::getMinSeqAge() const
+{
+    return mTransactionFrame.getMinSeqAge();
+}
+
+uint32
+TransactionFrameForTesting::getMinSeqLedgerGap() const
+{
+    return mTransactionFrame.getMinSeqLedgerGap();
+}
+
+void
+TransactionFrameForTesting::insertKeysForFeeProcessing(
+    UnorderedSet<LedgerKey>& keys) const
+{
+    mTransactionFrame.insertKeysForFeeProcessing(keys);
+}
+
+void
+TransactionFrameForTesting::insertKeysForTxApply(
+    UnorderedSet<LedgerKey>& keys) const
+{
+    mTransactionFrame.insertKeysForTxApply(keys);
+}
+
+void
+TransactionFrameForTesting::processFeeSeqNum(AbstractLedgerTxn& ltx,
+                                             std::optional<int64_t> baseFee)
+{
+    mTransactionFrame.processFeeSeqNum(ltx, baseFee);
+}
+
+void
+TransactionFrameForTesting::processPostApply(Application& app,
+                                             AbstractLedgerTxn& ltx,
+                                             TransactionMetaFrame& meta)
+{
+    mTransactionFrame.processPostApply(app, ltx, meta);
+}
+
+StellarMessage
+TransactionFrameForTesting::toStellarMessage() const
+{
+    return mTransactionFrame.toStellarMessage();
+}
+
+bool
+TransactionFrameForTesting::hasDexOperations() const
+{
+    return mTransactionFrame.hasDexOperations();
+}
+
+bool
+TransactionFrameForTesting::isSoroban() const
+{
+    return mTransactionFrame.isSoroban();
+}
+
+SorobanResources const&
+TransactionFrameForTesting::sorobanResources() const
+{
+    return mTransactionFrame.sorobanResources();
+}
+
+xdr::xvector<DiagnosticEvent> const&
+TransactionFrameForTesting::getDiagnosticEvents() const
+{
+    return mTransactionFrame.getDiagnosticEvents();
+}
+
+int64
+TransactionFrameForTesting::declaredSorobanResourceFee() const
+{
+    return mTransactionFrame.declaredSorobanResourceFee();
+}
+
+bool
+TransactionFrameForTesting::XDRProvidesValidFee() const
+{
+    return mTransactionFrame.XDRProvidesValidFee();
+}
+
+#endif
+
 } // namespace stellar

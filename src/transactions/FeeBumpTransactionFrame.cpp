@@ -110,6 +110,7 @@ updateResult(TransactionResult& outerRes, TransactionFrameBasePtr innerTx)
 bool
 FeeBumpTransactionFrame::apply(Application& app, AbstractLedgerTxn& ltx,
                                TransactionMetaFrame& meta,
+                               TransactionResultPayload& resPayload,
                                Hash const& sorobanBasePrngSeed)
 {
     try
@@ -133,7 +134,8 @@ FeeBumpTransactionFrame::apply(Application& app, AbstractLedgerTxn& ltx,
 
     try
     {
-        bool res = mInnerTx->apply(app, ltx, meta, false, sorobanBasePrngSeed);
+        bool res = mInnerTx->apply(app, ltx, meta, resPayload, false,
+                                   sorobanBasePrngSeed);
         // If this throws, then we may not have the correct TransactionResult so
         // we must crash.
         // Note that even after updateResult is called here, feeCharged will not
