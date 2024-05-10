@@ -41,6 +41,8 @@
 #include <optional>
 #include <regex>
 
+#include "ledger/LedgerTxnImpl.h"
+
 namespace stellar
 {
 namespace
@@ -655,6 +657,9 @@ dumpStateArchivalStatistics(Config cfg)
     }
 
     UnorderedMap<LedgerKey, StateArchivalMetric> ledgerEntries;
+    UnorderedSet<std::string> keys;
+
+    size_t size = 0;
 
     // key -> (metric, liveUntilLedger)
     UnorderedMap<LedgerKey, std::pair<StateArchivalMetric, uint32_t>> ttls;
@@ -671,68 +676,127 @@ dumpStateArchivalStatistics(Config cfg)
             throw std::runtime_error(std::string("missing bucket: ") +
                                      binToHex(hash));
         }
-        processArchivalMetrics(b, ledgerEntries, ttls);
-        blSize += b->getSize();
+
+        for (BucketInputIterator in(b); in; ++in)
+        {
+            auto const& be = *in;
+            bool isDead = be.type() == DEADENTRY;
+            if (isDead)
+            {
+                continue;
+            }
+
+            auto const& le = be.liveEntry();
+            if (le.data.type() != CONTRACT_CODE &&
+                le.data.type() != CONTRACT_DATA)
+            {
+                continue;
+            }
+
+            LedgerKey k = LedgerEntryKey(le);
+            keys.emplace(toOpaqueBase64(k));
+
+            if (isSorobanEntry(le.data))
+            {
+                auto ttl = getTTLKey(k);
+                keys.emplace(toOpaqueBase64(ttl));
+                size += xdr::xdr_size(ttl);
+            }
+
+            size += xdr::xdr_size(be);
+        }
+
+        // processArchivalMetrics(b, ledgerEntries, ttls);
+        // blSize += b->getSize();
     }
 
     // *BytesNewest == bytes consumed only by newest version of BucketEntry
     // *BytesOutdated == bytes consumed only by outdated version of BucketEntry
     // live -> liveUntilLedger >= ledgerSeq
     // expired -> liveUntilLedger < ledgerSeq, but not yet evicted
-    uint64_t liveBytesNewest{};
-    uint64_t liveBytesOutdated{};
-    uint64_t expiredBytesNewest{};
-    uint64_t expiredBytesOutdated{};
-    uint64_t evictedBytes{}; // All evicted bytes considered "outdated"
+    // uint64_t liveBytesNewest{};
+    // uint64_t liveBytesOutdated{};
+    // uint64_t expiredBytesNewest{};
+    // uint64_t expiredBytesOutdated{};
+    // uint64_t evictedBytes{}; // All evicted bytes considered "outdated"
 
-    for (auto const& [k, leMetric] : ledgerEntries)
+    // for (auto const& [k, leMetric] : ledgerEntries)
+    // {
+    //     auto ttlIter = ttls.find(getTTLKey(k));
+    //     releaseAssertOrThrow(ttlIter != ttls.end());
+    //     auto const& [ttlMetric, liveUntilLedger] = ttlIter->second;
+
+    //     auto newestBytes = ttlMetric.newestBytes + leMetric.newestBytes;
+    //     auto outdatedBytes = ttlMetric.outdatedBytes +
+    //     leMetric.outdatedBytes;
+
+    //     if (ttlMetric.isDead)
+    //     {
+    //         releaseAssertOrThrow(leMetric.isDead);
+
+    //         // All bytes considered outdated for evicted entries
+    //         evictedBytes += newestBytes + outdatedBytes;
+    //     }
+    //     else
+    //     {
+    //         releaseAssertOrThrow(!leMetric.isDead);
+
+    //         // If entry is live
+    //         if (liveUntilLedger >=
+    //             app->getLedgerManager().getLastClosedLedgerNum())
+    //         {
+    //             liveBytesNewest += newestBytes;
+    //             liveBytesOutdated += outdatedBytes;
+    //         }
+    //         else
+    //         {
+    //             expiredBytesNewest += newestBytes;
+    //             expiredBytesOutdated += outdatedBytes;
+    //         }
+    //     }
+    // }
+
+    // CLOG_INFO(Bucket, "BucketList total bytes: {}", blSize);
+    // CLOG_INFO(Bucket,
+    //           "Live Temporary Entries: Newest bytes {} ({}%), Outdated bytes
+    //           "
+    //           "{} ({}%)",
+    //           liveBytesNewest, (liveBytesNewest / blSize) * 100,
+    //           liveBytesOutdated, (liveBytesOutdated / blSize) * 100);
+    // CLOG_INFO(Bucket,
+    //           "Expired but not evicted Temporary: Newest bytes {} ({}%), "
+    //           "Outdated bytes {} ({}%)",
+    //           expiredBytesNewest, (expiredBytesNewest / blSize) * 100,
+    //           expiredBytesOutdated, (expiredBytesOutdated / blSize) * 100);
+    // CLOG_INFO(Bucket, "Evicted Temporary Entries: Outdated bytes {} ({}%)",
+    //           evictedBytes, (evictedBytes / blSize) * 100);
+
+    CLOG_FATAL(Bucket, "Total size: {}", size);
+    CLOG_FATAL(Bucket, "Unique keys: {}", keys.size());
+    CLOG_FATAL(Bucket, "Size per key: {}", size / keys.size());
+
+    auto path = "/home/user/stellar-core-data/prod/"
+                "contract_ledger_keys_base64_str_mixed.txt";
+
+    CLOG_FATAL(Bucket, "Writing keys to {}", path);
+
+    if (fs::exists(path))
     {
-        auto ttlIter = ttls.find(getTTLKey(k));
-        releaseAssertOrThrow(ttlIter != ttls.end());
-        auto const& [ttlMetric, liveUntilLedger] = ttlIter->second;
-
-        auto newestBytes = ttlMetric.newestBytes + leMetric.newestBytes;
-        auto outdatedBytes = ttlMetric.outdatedBytes + leMetric.outdatedBytes;
-
-        if (ttlMetric.isDead)
-        {
-            releaseAssertOrThrow(leMetric.isDead);
-
-            // All bytes considered outdated for evicted entries
-            evictedBytes += newestBytes + outdatedBytes;
-        }
-        else
-        {
-            releaseAssertOrThrow(!leMetric.isDead);
-
-            // If entry is live
-            if (liveUntilLedger >=
-                app->getLedgerManager().getLastClosedLedgerNum())
-            {
-                liveBytesNewest += newestBytes;
-                liveBytesOutdated += outdatedBytes;
-            }
-            else
-            {
-                expiredBytesNewest += newestBytes;
-                expiredBytesOutdated += outdatedBytes;
-            }
-        }
+        std::remove(path);
     }
 
-    CLOG_INFO(Bucket, "BucketList total bytes: {}", blSize);
-    CLOG_INFO(Bucket,
-              "Live Temporary Entries: Newest bytes {} ({}%), Outdated bytes "
-              "{} ({}%)",
-              liveBytesNewest, (liveBytesNewest / blSize) * 100,
-              liveBytesOutdated, (liveBytesOutdated / blSize) * 100);
-    CLOG_INFO(Bucket,
-              "Expired but not evicted Temporary: Newest bytes {} ({}%), "
-              "Outdated bytes {} ({}%)",
-              expiredBytesNewest, (expiredBytesNewest / blSize) * 100,
-              expiredBytesOutdated, (expiredBytesOutdated / blSize) * 100);
-    CLOG_INFO(Bucket, "Evicted Temporary Entries: Outdated bytes {} ({}%)",
-              evictedBytes, (evictedBytes / blSize) * 100);
+    std::ofstream ofs(path);
+
+    size_t count = 0;
+    for (auto const& key : keys)
+    {
+        ofs << key << std::endl;
+
+        if (++count >= 10'000'000)
+        {
+            break;
+        }
+    }
 
     return 0;
 }
