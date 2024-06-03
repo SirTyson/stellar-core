@@ -2,39 +2,37 @@
 // server.cpp
 // ~~~~~~~~~~
 //
-// Copyright (c) 2003-2014 Christopher M. Kohlhoff (chris at kohlhoff dot com)
+// Copyright (c) 2003-2024 Christopher M. Kohlhoff (chris at kohlhoff dot com)
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 //
 #include "server.hpp"
 #include <signal.h>
-#include <utility>
 #include <sstream>
+#include <thread>
+#include <utility>
 
-namespace http
+namespace httpThreaded
 {
 namespace server
 {
 
-server::server(asio::io_service& io_service)
-    : io_service_(io_service)
-    , signals_(io_service_)
-    , acceptor_(io_service_)
-    , connection_manager_()
-    , socket_(io_service_)
+server::server(const std::string& address, unsigned short port, int maxClient,
+               std::size_t threadPoolSize)
+    : thread_pool_size_(threadPoolSize)
+    , signals_(io_context_)
+    , acceptor_(io_context_)
 {
+    // Register to handle the signals that indicate when the server should exit.
+    // It is safe to register for the same signal multiple times in a program,
+    // provided all registration for the specified signal is made through Asio.
+    signals_.add(SIGINT);
+    signals_.add(SIGTERM);
+#if defined(SIGQUIT)
+    signals_.add(SIGQUIT);
+#endif // defined(SIGQUIT)
 
-}
-
-server::server(asio::io_service& io_service, const std::string& address,
-               unsigned short port, int maxClient)
-    : io_service_(io_service)
-    , signals_(io_service_)
-    , acceptor_(io_service_)
-    , connection_manager_()
-    , socket_(io_service_)
-{
     asio::ip::tcp::endpoint endpoint(asio::ip::address::from_string(address),
                                      port);
     // Open the acceptor with the option to reuse the address (i.e.
@@ -44,10 +42,29 @@ server::server(asio::io_service& io_service, const std::string& address,
     acceptor_.bind(endpoint);
     acceptor_.listen(maxClient);
     do_accept();
-    // test
 }
 
-void server::add404(routeHandler callback)
+void
+server::start()
+{
+    event_thread_ = std::make_unique<std::thread>([this] {
+        // Create a pool of threads to run the io_context.
+        std::vector<std::thread> threads;
+        for (std::size_t i = 0; i < thread_pool_size_; ++i)
+        {
+            threads.emplace_back([this] { io_context_.run(); });
+        }
+
+        // Wait for all threads in the pool to exit.
+        for (std::size_t i = 0; i < threads.size(); ++i)
+        {
+            threads[i].join();
+        }
+    });
+}
+
+void
+server::add404(routeHandler callback)
 {
     addRoute("404", callback);
 }
@@ -61,29 +78,35 @@ server::addRoute(const std::string& routeName, routeHandler callback)
 void
 server::do_accept()
 {
-    acceptor_.async_accept(socket_, [this](asio::error_code ec)
-                           {
-        // Check whether the server was stopped by a signal before this
-        // completion handler had a chance to run.
-        if (!acceptor_.is_open())
-        {
-            return;
-        }
+    // The newly accepted socket is put into its own strand to ensure that all
+    // completion handlers associated with the connection do not run
+    // concurrently.
+    acceptor_.async_accept(
+        asio::make_strand(io_context_),
+        [this](std::error_code ec, asio::ip::tcp::socket socket) {
+            // Check whether the server was stopped by a signal before this
+            // completion handler had a chance to run.
+            if (!acceptor_.is_open())
+            {
+                return;
+            }
 
-        if (!ec)
-        {
-            connection_manager_.start(std::make_shared<connection>(
-                std::move(socket_), connection_manager_, *this));
-        }
+            if (!ec)
+            {
+                std::make_shared<connection>(std::move(socket), *this)->start();
+            }
 
-        do_accept();
-    });
+            do_accept();
+        });
 }
 
 server::~server()
 {
-    acceptor_.close();
-    connection_manager_.stop_all();
+    io_context_.stop();
+    if (event_thread_)
+    {
+        event_thread_->join();
+    }
 }
 
 void
@@ -136,7 +159,8 @@ server::handle_request(const request& req, reply& rep)
             rep.headers[0].value = std::to_string(rep.content.size());
             rep.headers[1].name = "Content-Type";
             rep.headers[1].value = "text/html";
-        } else
+        }
+        else
         {
             rep = reply::stock_reply(reply::not_found);
             return;
@@ -184,35 +208,41 @@ server::url_decode(const std::string& in, std::string& out)
     return true;
 }
 
-void server::parseParams(const std::string& params, std::map<std::string, std::string>& retMap)
+void
+server::parseParams(const std::string& params,
+                    std::map<std::string, std::string>& retMap)
 {
-    bool buildingName=true;
-    std::string name,value;
-    for(auto c : params)
+    bool buildingName = true;
+    std::string name, value;
+    for (auto c : params)
     {
-        if(c == '?')
+        if (c == '?')
         {
-
-        }else if(c == '=')
+        }
+        else if (c == '=')
         {
             buildingName = false;
-        }else if(c == '&')
+        }
+        else if (c == '&')
         {
             buildingName = true;
             retMap[name] = value;
             name = "";
             value = "";
-        } else
+        }
+        else
         {
-            if(buildingName) name += c;
-            else value += c;
+            if (buildingName)
+                name += c;
+            else
+                value += c;
         }
     }
-    if(name.size() && value.size())
+    if (name.size() && value.size())
     {
         retMap[name] = value;
     }
 }
 
 } // namespace server
-} // namespace http
+} // namespace httpThreaded

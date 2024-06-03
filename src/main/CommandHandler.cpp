@@ -12,7 +12,7 @@
 #include "ledger/LedgerTxn.h"
 #include "ledger/LedgerTxnEntry.h"
 #include "ledger/LedgerTxnImpl.h"
-#include "lib/http/server.hpp"
+#include "lib/httpthreaded/server.hpp"
 #include "lib/json/json.h"
 #include "main/Application.h"
 #include "main/Config.h"
@@ -38,6 +38,10 @@
 
 #include "ExternalQueue.h"
 
+#include "bucket/BucketListSnapshot.h"
+#include "bucket/BucketManager.h"
+#include "bucket/BucketSnapshotManager.h"
+
 #ifdef BUILD_TESTS
 #include "simulation/LoadGenerator.h"
 #include "test/TestAccount.h"
@@ -54,41 +58,44 @@ namespace stellar
 {
 CommandHandler::CommandHandler(Application& app) : mApp(app)
 {
+    auto port = 11626;
     if (mApp.getConfig().HTTP_PORT)
     {
-        std::string ipStr;
-        if (mApp.getConfig().PUBLIC_HTTP_PORT)
-        {
-            ipStr = "0.0.0.0";
-        }
+        port = mApp.getConfig().HTTP_PORT;
+    }
+
+    std::string ipStr;
+    if (mApp.getConfig().PUBLIC_HTTP_PORT)
+    {
+        ipStr = "0.0.0.0";
+    }
         else
         {
             ipStr = "127.0.0.1";
         }
         LOG_INFO(DEFAULT_LOG, "Listening on {}:{} for HTTP requests", ipStr,
-                 mApp.getConfig().HTTP_PORT);
+                 port);
 
         int httpMaxClient = mApp.getConfig().HTTP_MAX_CLIENT;
 
-        mServer = std::make_unique<http::server::server>(
-            app.getClock().getIOContext(), ipStr, mApp.getConfig().HTTP_PORT,
-            httpMaxClient);
-    }
-    else
-    {
-        mServer = std::make_unique<http::server::server>(
-            app.getClock().getIOContext());
-    }
+        mServer = std::make_unique<httpThreaded::server::server>(
+            ipStr, port, httpMaxClient, 4);
+        // else
+        // {
+        //     // mServer = std::make_unique<httpThreaded::server::server>(
+        //     //     app.getClock().getIOContext());
+        //     // releaseAssert(false);
+        // }
 
-    mServer->add404(std::bind(&CommandHandler::fileNotFound, this, _1, _2));
+        mServer->add404(std::bind(&CommandHandler::fileNotFound, this, _1, _2));
 
-    if (mApp.getConfig().modeStoresAnyHistory())
-    {
-        addRoute("dropcursor", &CommandHandler::dropcursor);
-        addRoute("getcursor", &CommandHandler::getcursor);
-        addRoute("setcursor", &CommandHandler::setcursor);
-        addRoute("maintenance", &CommandHandler::maintenance);
-    }
+        if (mApp.getConfig().modeStoresAnyHistory())
+        {
+            addRoute("dropcursor", &CommandHandler::dropcursor);
+            addRoute("getcursor", &CommandHandler::getcursor);
+            addRoute("setcursor", &CommandHandler::setcursor);
+            addRoute("maintenance", &CommandHandler::maintenance);
+        }
 
     if (!mApp.getConfig().RUN_STANDALONE)
     {
@@ -135,6 +142,8 @@ CommandHandler::CommandHandler(Application& app) : mApp(app)
     addRoute("surveytopologytimesliced",
              &CommandHandler::surveyTopologyTimeSliced);
 #endif
+
+    mServer->start();
 }
 
 void
@@ -193,8 +202,8 @@ CommandHandler::ensureProtocolVersion(std::string const& errString,
 std::string
 CommandHandler::manualCmd(std::string const& cmd)
 {
-    http::server::reply reply;
-    http::server::request request;
+    httpThreaded::server::reply reply;
+    httpThreaded::server::request request;
     request.uri = cmd;
     mServer->handle_request(request, reply);
     LOG_INFO(DEFAULT_LOG, "{} -> {}", cmd, reply.content);
@@ -293,7 +302,7 @@ CommandHandler::manualClose(std::string const& params, std::string& retStr)
 {
     ZoneScoped;
     std::map<std::string, std::string> retMap;
-    http::server::server::parseParams(params, retMap);
+    httpThreaded::server::server::parseParams(params, retMap);
 
     if (!retMap.empty() && !mApp.getConfig().RUN_STANDALONE)
     {
@@ -313,7 +322,7 @@ CommandHandler::peers(std::string const& params, std::string& retStr)
 {
     ZoneScoped;
     std::map<std::string, std::string> retMap;
-    http::server::server::parseParams(params, retMap);
+    httpThreaded::server::server::parseParams(params, retMap);
 
     bool fullKeys = retMap["fullkeys"] == "true";
     // compact should be true by default
@@ -363,7 +372,7 @@ CommandHandler::info(std::string const& params, std::string& retStr)
 {
     ZoneScoped;
     std::map<std::string, std::string> retMap;
-    http::server::server::parseParams(params, retMap);
+    httpThreaded::server::server::parseParams(params, retMap);
 
     retStr = mApp.getJsonInfo(retMap["compact"] == "false").toStyledString();
 }
@@ -387,7 +396,7 @@ CommandHandler::metrics(std::string const& params, std::string& retStr)
     ZoneScoped;
 
     std::map<std::string, std::string> retMap;
-    http::server::server::parseParams(params, retMap);
+    httpThreaded::server::server::parseParams(params, retMap);
     std::set<std::string> toEnable;
 
     // Filter which metrics to report based on the parameters
@@ -445,7 +454,7 @@ CommandHandler::connect(std::string const& params, std::string& retStr)
 {
     ZoneScoped;
     std::map<std::string, std::string> retMap;
-    http::server::server::parseParams(params, retMap);
+    httpThreaded::server::server::parseParams(params, retMap);
 
     auto peerP = retMap.find("peer");
     auto portP = retMap.find("port");
@@ -469,7 +478,7 @@ CommandHandler::dropPeer(std::string const& params, std::string& retStr)
 {
     ZoneScoped;
     std::map<std::string, std::string> retMap;
-    http::server::server::parseParams(params, retMap);
+    httpThreaded::server::server::parseParams(params, retMap);
 
     auto peerId = retMap.find("node");
     auto ban = retMap.find("ban");
@@ -533,7 +542,7 @@ CommandHandler::unban(std::string const& params, std::string& retStr)
 {
     ZoneScoped;
     std::map<std::string, std::string> retMap;
-    http::server::server::parseParams(params, retMap);
+    httpThreaded::server::server::parseParams(params, retMap);
 
     auto peerId = retMap.find("node");
     if (peerId != retMap.end())
@@ -563,7 +572,7 @@ CommandHandler::upgrades(std::string const& params, std::string& retStr)
 {
     ZoneScoped;
     std::map<std::string, std::string> retMap;
-    http::server::server::parseParams(params, retMap);
+    httpThreaded::server::server::parseParams(params, retMap);
     auto s = retMap["mode"];
     if (s.empty())
     {
@@ -647,7 +656,7 @@ CommandHandler::dumpProposedSettings(std::string const& params,
 {
     ZoneScoped;
     std::map<std::string, std::string> retMap;
-    http::server::server::parseParams(params, retMap);
+    httpThreaded::server::server::parseParams(params, retMap);
     auto blob = retMap["blob"];
     if (!blob.empty())
     {
@@ -698,7 +707,7 @@ CommandHandler::quorum(std::string const& params, std::string& retStr)
 {
     ZoneScoped;
     std::map<std::string, std::string> retMap;
-    http::server::server::parseParams(params, retMap);
+    httpThreaded::server::server::parseParams(params, retMap);
 
     NodeID n;
 
@@ -735,7 +744,7 @@ CommandHandler::scpInfo(std::string const& params, std::string& retStr)
 {
     ZoneScoped;
     std::map<std::string, std::string> retMap;
-    http::server::server::parseParams(params, retMap);
+    httpThreaded::server::server::parseParams(params, retMap);
     size_t lim = parseOptionalParamOrDefault<size_t>(retMap, "limit", 2);
 
     auto root = mApp.getHerder().getJsonInfo(lim, retMap["fullkeys"] == "true");
@@ -751,7 +760,7 @@ CommandHandler::sorobanInfo(std::string const& params, std::string& retStr)
     if (lm.hasSorobanNetworkConfig())
     {
         std::map<std::string, std::string> retMap;
-        http::server::server::parseParams(params, retMap);
+        httpThreaded::server::server::parseParams(params, retMap);
 
         // Format is the only acceptable param, but it is optional
         if (retMap.count("format") != retMap.size())
@@ -893,7 +902,7 @@ CommandHandler::ll(std::string const& params, std::string& retStr)
     Json::Value root;
 
     std::map<std::string, std::string> retMap;
-    http::server::server::parseParams(params, retMap);
+    httpThreaded::server::server::parseParams(params, retMap);
 
     std::string levelStr = retMap["level"];
     std::string partition = retMap["partition"];
@@ -930,22 +939,27 @@ CommandHandler::getLedgerEntry(std::string const& params, std::string& retStr)
     Json::Value root;
 
     std::map<std::string, std::string> paramMap;
-    http::server::server::parseParams(params, paramMap);
+    httpThreaded::server::server::parseParams(params, paramMap);
     std::string key = paramMap["key"];
     if (!key.empty())
     {
-        LedgerTxn ltx(mApp.getLedgerTxnRoot(),
-                      /* shouldUpdateLastModified */ false,
-                      TransactionMode::READ_ONLY_WITHOUT_SQL_TXN);
-        root["ledger"] = ltx.loadHeader().current().ledgerSeq;
+        // LedgerTxn ltx(mApp.getLedgerTxnRoot(),
+        //               /* shouldUpdateLastModified */ false,
+        //               TransactionMode::READ_ONLY_WITHOUT_SQL_TXN);
+        root["ledger"] = 1;
 
         LedgerKey k;
         fromOpaqueBase64(k, key);
-        auto le = ltx.loadWithoutRecord(k);
+
+        auto bl = mApp.getBucketManager()
+                      .getBucketSnapshotManager()
+                      .getSearchableBucketListSnapshot();
+
+        auto le = bl->getLedgerEntry(k);
         if (le)
         {
             root["state"] = "live";
-            root["entry"] = toOpaqueBase64(le.current());
+            root["entry"] = toOpaqueBase64(*le);
         }
         else
         {
@@ -968,7 +982,7 @@ CommandHandler::tx(std::string const& params, std::string& retStr)
     Json::Value root;
 
     std::map<std::string, std::string> paramMap;
-    http::server::server::parseParams(params, paramMap);
+    httpThreaded::server::server::parseParams(params, paramMap);
     std::string blob = paramMap["blob"];
 
     if (!blob.empty())
@@ -1030,7 +1044,7 @@ CommandHandler::dropcursor(std::string const& params, std::string& retStr)
 {
     ZoneScoped;
     std::map<std::string, std::string> map;
-    http::server::server::parseParams(params, map);
+    httpThreaded::server::server::parseParams(params, map);
     std::string const& id = map["id"];
 
     if (!ExternalQueue::validateResourceID(id))
@@ -1050,7 +1064,7 @@ CommandHandler::setcursor(std::string const& params, std::string& retStr)
 {
     ZoneScoped;
     std::map<std::string, std::string> map;
-    http::server::server::parseParams(params, map);
+    httpThreaded::server::server::parseParams(params, map);
     std::string const& id = map["id"];
 
     uint32 cursor = parseRequiredParam<uint32>(map, "cursor");
@@ -1073,7 +1087,7 @@ CommandHandler::getcursor(std::string const& params, std::string& retStr)
     ZoneScoped;
     Json::Value root;
     std::map<std::string, std::string> map;
-    http::server::server::parseParams(params, map);
+    httpThreaded::server::server::parseParams(params, map);
     std::string const& id = map["id"];
 
     // the decision was made not to check validity here
@@ -1101,7 +1115,7 @@ CommandHandler::maintenance(std::string const& params, std::string& retStr)
 {
     ZoneScoped;
     std::map<std::string, std::string> map;
-    http::server::server::parseParams(params, map);
+    httpThreaded::server::server::parseParams(params, map);
     if (map["queue"] == "true")
     {
         uint32_t count =
@@ -1121,7 +1135,7 @@ CommandHandler::clearMetrics(std::string const& params, std::string& retStr)
 {
     ZoneScoped;
     std::map<std::string, std::string> map;
-    http::server::server::parseParams(params, map);
+    httpThreaded::server::server::parseParams(params, map);
 
     std::string domain =
         parseOptionalParamOrDefault<std::string>(map, "domain", "");
@@ -1155,7 +1169,7 @@ CommandHandler::surveyTopology(std::string const& params, std::string& retStr)
     checkBooted();
 
     std::map<std::string, std::string> map;
-    http::server::server::parseParams(params, map);
+    httpThreaded::server::server::parseParams(params, map);
 
     auto duration =
         std::chrono::seconds(parseRequiredParam<uint32>(map, "duration"));
@@ -1203,7 +1217,7 @@ CommandHandler::startSurveyCollecting(std::string const& params,
     checkBooted();
 
     std::map<std::string, std::string> map;
-    http::server::server::parseParams(params, map);
+    httpThreaded::server::server::parseParams(params, map);
 
     uint32_t const nonce = parseRequiredParam<uint32_t>(map, "nonce");
 
@@ -1245,7 +1259,7 @@ CommandHandler::surveyTopologyTimeSliced(std::string const& params,
     checkBooted();
 
     std::map<std::string, std::string> map;
-    http::server::server::parseParams(params, map);
+    httpThreaded::server::server::parseParams(params, map);
 
     auto idString = parseRequiredParam<std::string>(map, "node");
     NodeID id = KeyUtils::fromStrKey<NodeID>(idString);
@@ -1276,7 +1290,7 @@ CommandHandler::generateLoad(std::string const& params, std::string& retStr)
     if (mApp.getConfig().ARTIFICIALLY_GENERATE_LOAD_FOR_TESTING)
     {
         std::map<std::string, std::string> map;
-        http::server::server::parseParams(params, map);
+        httpThreaded::server::server::parseParams(params, map);
         GeneratedLoadConfig cfg;
         cfg.mode = LoadGenerator::getMode(
             parseOptionalParamOrDefault<std::string>(map, "mode", "create"));
@@ -1431,7 +1445,7 @@ CommandHandler::testAcc(std::string const& params, std::string& retStr)
     using namespace txtest;
 
     std::map<std::string, std::string> retMap;
-    http::server::server::parseParams(params, retMap);
+    httpThreaded::server::server::parseParams(params, retMap);
     Json::Value root;
     auto accName = retMap.find("name");
     if (accName == retMap.end())
@@ -1475,7 +1489,7 @@ CommandHandler::testTx(std::string const& params, std::string& retStr)
     using namespace txtest;
 
     std::map<std::string, std::string> retMap;
-    http::server::server::parseParams(params, retMap);
+    httpThreaded::server::server::parseParams(params, retMap);
 
     auto to = retMap.find("to");
     auto from = retMap.find("from");

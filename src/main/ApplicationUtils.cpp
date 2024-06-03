@@ -380,16 +380,16 @@ httpCommand(std::string const& command, unsigned short port)
         }
     }
 
-    int code = http_request("127.0.0.1", path.str(), port, ret);
-    if (code == 200)
-    {
-        std::cout << ret << std::endl;
-    }
-    else
-    {
-        LOG_INFO(DEFAULT_LOG, "http failed({}) port: {} command: {}", code,
-                 port, command);
-    }
+    // int code = http_request("127.0.0.1", path.str(), port, ret);
+    // if (code == 200)
+    // {
+    //     std::cout << ret << std::endl;
+    // }
+    // else
+    // {
+    //     LOG_INFO(DEFAULT_LOG, "http failed({}) port: {} command: {}", code,
+    //              port, command);
+    // }
 }
 
 void

@@ -4,7 +4,7 @@
 // under the Apache License, Version 2.0. See the COPYING file at the root
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
-#include "lib/http/server.hpp"
+#include "lib/httpthreaded/server.hpp"
 #include "util/ProtocolVersion.h"
 #include <string>
 
@@ -23,7 +23,7 @@ class CommandHandler
         HandlerRoute;
 
     Application& mApp;
-    std::unique_ptr<http::server::server> mServer;
+    std::unique_ptr<httpThreaded::server::server> mServer;
 
     void addRoute(std::string const& name, HandlerRoute route);
     void safeRouter(HandlerRoute route, std::string const& params,
