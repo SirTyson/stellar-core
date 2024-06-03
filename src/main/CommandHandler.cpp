@@ -38,6 +38,10 @@
 
 #include "ExternalQueue.h"
 
+#include "bucket/BucketListSnapshot.h"
+#include "bucket/BucketManager.h"
+#include "bucket/BucketSnapshotManager.h"
+
 #ifdef BUILD_TESTS
 #include "simulation/LoadGenerator.h"
 #include "test/TestAccount.h"
@@ -934,18 +938,22 @@ CommandHandler::getLedgerEntry(std::string const& params, std::string& retStr)
     std::string key = paramMap["key"];
     if (!key.empty())
     {
-        LedgerTxn ltx(mApp.getLedgerTxnRoot(),
-                      /* shouldUpdateLastModified */ false,
-                      TransactionMode::READ_ONLY_WITHOUT_SQL_TXN);
-        root["ledger"] = ltx.loadHeader().current().ledgerSeq;
+        // LedgerTxn ltx(mApp.getLedgerTxnRoot(),
+        //               /* shouldUpdateLastModified */ false,
+        //               TransactionMode::READ_ONLY_WITHOUT_SQL_TXN);
+        root["ledger"] = 1;
 
         LedgerKey k;
         fromOpaqueBase64(k, key);
-        auto le = ltx.loadWithoutRecord(k);
+        // auto le = ltx.loadWithoutRecord(k);
+        auto bl = mApp.getBucketManager()
+                      .getBucketSnapshotManager()
+                      .getSearchableBucketListSnapshot();
+        auto le = bl->getLedgerEntry(k);
         if (le)
         {
             root["state"] = "live";
-            root["entry"] = toOpaqueBase64(le.current());
+            root["entry"] = toOpaqueBase64(*le);
         }
         else
         {
