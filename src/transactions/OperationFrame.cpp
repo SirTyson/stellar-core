@@ -45,9 +45,9 @@ namespace stellar
 using namespace std;
 
 static int32_t
-getNeededThreshold(LedgerTxnEntry const& account, ThresholdLevel const level)
+getNeededThreshold(LedgerEntry const& account, ThresholdLevel const level)
 {
-    auto const& acc = account.current().data.account();
+    auto const& acc = account.data.account();
     switch (level)
     {
     case ThresholdLevel::LOW:
@@ -142,8 +142,22 @@ OperationFrame::apply(Application& app, SignatureChecker& signatureChecker,
 {
     ZoneScoped;
     CLOG_TRACE(Tx, "{}", xdrToCerealString(mOperation, "Operation"));
-    bool applyRes =
-        checkValid(app, signatureChecker, ltx, true, res, sorobanData);
+    std::optional<SorobanNetworkConfig> sorobanCfg{};
+    if (protocolVersionStartsFrom(ltx.loadHeader().current().ledgerVersion,
+                                  SOROBAN_PROTOCOL_VERSION))
+    {
+        sorobanCfg = app.getLedgerManager().getSorobanNetworkConfig();
+    }
+
+    bool applyRes;
+    {
+        LedgerTxn checkValidLtx(ltx);
+        applyRes = checkValid<AbstractLedgerTxn>(
+            checkValidLtx, app.getConfig(), sorobanCfg,
+            checkValidLtx.loadHeader().current(), signatureChecker, true, res,
+            sorobanData);
+    }
+
     if (applyRes)
     {
         if (isSoroban())
@@ -185,19 +199,19 @@ OperationFrame::isOpSupported(LedgerHeader const&) const
     return true;
 }
 
+template <class T>
 bool
-OperationFrame::checkSignature(SignatureChecker& signatureChecker,
-                               AbstractLedgerTxn& ltx, OperationResult& res,
-                               bool forApply) const
+OperationFrame::checkSignature(T& dbLoader, LedgerHeader const& header,
+                               SignatureChecker& signatureChecker,
+                               OperationResult& res, bool forApply) const
 {
     ZoneScoped;
-    auto header = ltx.loadHeader();
-    auto sourceAccount = loadSourceAccount(ltx, header);
+    auto sourceAccount = loadReadOnlySourceAccount(dbLoader, header);
     if (sourceAccount)
     {
         auto neededThreshold =
-            getNeededThreshold(sourceAccount, getThresholdLevel());
-        if (!mParentTx.checkSignature(signatureChecker, sourceAccount.current(),
+            getNeededThreshold(*sourceAccount, getThresholdLevel());
+        if (!mParentTx.checkSignature(signatureChecker, *sourceAccount,
                                       neededThreshold))
         {
             res.code(opBAD_AUTH);
@@ -234,26 +248,28 @@ OperationFrame::getSourceID() const
 // called when determining if we should flood
 // make sure sig is correct
 // verifies that the operation is well formed (operation specific)
+template <class T>
 bool
-OperationFrame::checkValid(Application& app, SignatureChecker& signatureChecker,
-                           AbstractLedgerTxn& ltxOuter, bool forApply,
-                           OperationResult& res,
-                           std::shared_ptr<SorobanTxData> sorobanData) const
+OperationFrame::checkValid(
+    T& dbLoader, Config const& cfg,
+    std::optional<SorobanNetworkConfig const> const& sorobanCfg,
+    LedgerHeader const& header, SignatureChecker& signatureChecker,
+    bool forApply, OperationResult& res,
+    std::shared_ptr<SorobanTxData> sorobanData) const
 {
     ZoneScoped;
-    // Note: ltx is always rolled back so checkValid never modifies the ledger
-    LedgerTxn ltx(ltxOuter);
-    if (!isOpSupported(ltx.loadHeader().current()))
+    if (!isOpSupported(header))
     {
         res.code(opNOT_SUPPORTED);
         return false;
     }
 
-    auto ledgerVersion = ltx.loadHeader().current().ledgerVersion;
+    auto ledgerVersion = header.ledgerVersion;
     if (!forApply ||
         protocolVersionIsBefore(ledgerVersion, ProtocolVersion::V_10))
     {
-        if (!checkSignature(signatureChecker, ltx, res, forApply))
+        if (!checkSignature<T>(dbLoader, header, signatureChecker, res,
+                               forApply))
         {
             return false;
         }
@@ -262,7 +278,7 @@ OperationFrame::checkValid(Application& app, SignatureChecker& signatureChecker,
     {
         // for ledger versions >= 10 we need to load account here, as for
         // previous versions it is done in checkSignature call
-        if (!loadSourceAccount(ltx, ltx.loadHeader()))
+        if (!loadReadOnlySourceAccount(dbLoader, header))
         {
             res.code(opNO_ACCOUNT);
             return false;
@@ -275,17 +291,30 @@ OperationFrame::checkValid(Application& app, SignatureChecker& signatureChecker,
         isSoroban())
     {
         releaseAssertOrThrow(sorobanData);
-        auto const& sorobanConfig =
-            app.getLedgerManager().getSorobanNetworkConfig();
-
-        return doCheckValidForSoroban(sorobanConfig, app.getConfig(),
-                                      ledgerVersion, res, *sorobanData);
+        releaseAssertOrThrow(sorobanCfg);
+        return doCheckValidForSoroban(*sorobanCfg, cfg, ledgerVersion, res,
+                                      *sorobanData);
     }
     else
     {
         return doCheckValid(ledgerVersion, res);
     }
 }
+
+template bool OperationFrame::checkValid<AbstractLedgerTxn>(
+    AbstractLedgerTxn& dbLoader, Config const& cfg,
+    std::optional<SorobanNetworkConfig const> const& sorobanCfg,
+    LedgerHeader const& header, SignatureChecker& signatureChecker,
+    bool forApply, OperationResult& res,
+    std::shared_ptr<SorobanTxData> sorobanData) const;
+
+template bool
+OperationFrame::checkValid<std::shared_ptr<SearchableBucketListSnapshot>>(
+    std::shared_ptr<SearchableBucketListSnapshot>& dbLoader, Config const& cfg,
+    std::optional<SorobanNetworkConfig const> const& sorobanCfg,
+    LedgerHeader const& header, SignatureChecker& signatureChecker,
+    bool forApply, OperationResult& res,
+    std::shared_ptr<SorobanTxData> sorobanData) const;
 
 bool
 OperationFrame::doCheckValidForSoroban(SorobanNetworkConfig const& config,
@@ -302,7 +331,24 @@ OperationFrame::loadSourceAccount(AbstractLedgerTxn& ltx,
                                   LedgerTxnHeader const& header) const
 {
     ZoneScoped;
-    return mParentTx.loadAccount(ltx, header, getSourceID());
+    return mParentTx.loadAccount(ltx, header.current(), getSourceID());
+}
+
+std::shared_ptr<LedgerEntry>
+OperationFrame::loadReadOnlySourceAccount(
+    std::shared_ptr<SearchableBucketListSnapshot> bl,
+    LedgerHeader const& header) const
+{
+    ZoneScoped;
+    return mParentTx.loadReadOnlySourceAccount(bl, header);
+}
+
+std::shared_ptr<LedgerEntry>
+OperationFrame::loadReadOnlySourceAccount(AbstractLedgerTxn& ltx,
+                                          LedgerHeader const& header) const
+{
+    ZoneScoped;
+    return mParentTx.loadReadOnlySourceAccount(ltx, header);
 }
 
 void

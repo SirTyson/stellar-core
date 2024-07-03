@@ -67,6 +67,13 @@ class OperationFrame
     LedgerTxnEntry loadSourceAccount(AbstractLedgerTxn& ltx,
                                      LedgerTxnHeader const& header) const;
 
+    std::shared_ptr<LedgerEntry>
+    loadReadOnlySourceAccount(std::shared_ptr<SearchableBucketListSnapshot> bl,
+                              LedgerHeader const& header) const;
+    std::shared_ptr<LedgerEntry>
+    loadReadOnlySourceAccount(AbstractLedgerTxn& ltx,
+                              LedgerHeader const& header) const;
+
   public:
     static std::shared_ptr<OperationFrame>
     makeHelper(Operation const& op, TransactionFrame const& parentTx,
@@ -79,14 +86,18 @@ class OperationFrame
     // given an operation result, gives a default value representing "success"
     void resetResultSuccess(OperationResult& res) const;
 
-    bool checkSignature(SignatureChecker& signatureChecker,
-                        AbstractLedgerTxn& ltx, OperationResult& res,
-                        bool forApply) const;
+    template <class T>
+    bool checkSignature(T& dbLoader, LedgerHeader const& header,
+                        SignatureChecker& signatureChecker,
+                        OperationResult& res, bool forApply) const;
 
     AccountID getSourceID() const;
 
-    bool checkValid(Application& app, SignatureChecker& signatureChecker,
-                    AbstractLedgerTxn& ltxOuter, bool forApply,
+    template <class T>
+    bool checkValid(T& dbLoader, Config const& cfg,
+                    std::optional<SorobanNetworkConfig const> const& sorobanCfg,
+                    LedgerHeader const& header,
+                    SignatureChecker& signatureChecker, bool forApply,
                     OperationResult& res,
                     std::shared_ptr<SorobanTxData> sorobanData) const;
 

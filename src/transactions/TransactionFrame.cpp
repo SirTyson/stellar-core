@@ -321,15 +321,18 @@ TransactionFrame::checkExtraSigners(SignatureChecker& signatureChecker) const
 
 std::shared_ptr<LedgerEntry>
 TransactionFrame::loadReadOnlySourceAccount(
-    std::shared_ptr<SearchableBucketListSnapshot> bl) const
+    std::shared_ptr<SearchableBucketListSnapshot> bl,
+    LedgerHeader const& header) const
 {
+    releaseAssert(false);
     return bl->getLedgerEntry(accountKey(getSourceID()));
 }
 
 std::shared_ptr<LedgerEntry>
-TransactionFrame::loadReadOnlySourceAccount(AbstractLedgerTxn& ltx) const
+TransactionFrame::loadReadOnlySourceAccount(AbstractLedgerTxn& ltx,
+                                            LedgerHeader const& header) const
 {
-    auto ret = loadSourceAccount(ltx, ltx.loadHeader());
+    auto ret = loadSourceAccount(ltx, header);
     if (ret)
     {
         return std::make_shared<LedgerEntry>(ret.current());
@@ -340,12 +343,11 @@ TransactionFrame::loadReadOnlySourceAccount(AbstractLedgerTxn& ltx) const
 
 LedgerTxnEntry
 TransactionFrame::loadSourceAccount(AbstractLedgerTxn& ltx,
-                                    LedgerTxnHeader const& header) const
+                                    LedgerHeader const& header) const
 {
     ZoneScoped;
     auto res = loadAccount(ltx, header, getSourceID());
-    if (protocolVersionIsBefore(header.current().ledgerVersion,
-                                ProtocolVersion::V_8))
+    if (protocolVersionIsBefore(header.ledgerVersion, ProtocolVersion::V_8))
     {
         // this is buggy caching that existed in old versions of the protocol
         if (res)
@@ -363,12 +365,11 @@ TransactionFrame::loadSourceAccount(AbstractLedgerTxn& ltx,
 
 LedgerTxnEntry
 TransactionFrame::loadAccount(AbstractLedgerTxn& ltx,
-                              LedgerTxnHeader const& header,
+                              LedgerHeader const& header,
                               AccountID const& accountID) const
 {
     ZoneScoped;
-    if (protocolVersionIsBefore(header.current().ledgerVersion,
-                                ProtocolVersion::V_8) &&
+    if (protocolVersionIsBefore(header.ledgerVersion, ProtocolVersion::V_8) &&
         mCachedAccountPreProtocol8 &&
         mCachedAccountPreProtocol8->ledgerEntry().data.account().accountID ==
             accountID)
@@ -699,7 +700,7 @@ TransactionFrame::refundSorobanFee(AbstractLedgerTxn& ltxOuter,
     auto header = ltx.loadHeader();
     // The fee source could be from a Fee-bump, so it needs to be forwarded here
     // instead of using TransactionFrame's getFeeSource() method
-    auto feeSourceAccount = loadAccount(ltx, header, feeSource);
+    auto feeSourceAccount = loadAccount(ltx, header.current(), feeSource);
     if (!feeSourceAccount)
     {
         // Account was merged (shouldn't be possible)
@@ -1074,7 +1075,7 @@ TransactionFrame::commonValidPreSeqNum(
         return false;
     }
 
-    if (!loadReadOnlySourceAccount(dbLoader))
+    if (!loadReadOnlySourceAccount(dbLoader, header))
     {
         txResult->setInnermostResultCode(txNO_ACCOUNT);
         return false;
@@ -1091,7 +1092,7 @@ TransactionFrame::processSeqNum(AbstractLedgerTxn& ltx) const
     if (protocolVersionStartsFrom(header.current().ledgerVersion,
                                   ProtocolVersion::V_10))
     {
-        auto sourceAccount = loadSourceAccount(ltx, header);
+        auto sourceAccount = loadSourceAccount(ltx, header.current());
         if (sourceAccount.current().data.account().seqNum > getSeqNum())
         {
             throw std::runtime_error("unexpected sequence number");
@@ -1143,7 +1144,9 @@ TransactionFrame::processSignatures(
         {
             auto const& op = mOperations[i];
             auto& opResult = txResult.getOpResultAt(i);
-            if (!op->checkSignature(signatureChecker, ltx, opResult, false))
+            if (!op->checkSignature<AbstractLedgerTxn>(
+                    ltx, ltx.loadHeader().current(), signatureChecker, opResult,
+                    false))
             {
                 allOpsValid = false;
             }
@@ -1222,7 +1225,7 @@ TransactionFrame::commonValid(
         return res;
     }
 
-    auto sourceAccount = *loadReadOnlySourceAccount(dbLoader);
+    auto sourceAccount = *loadReadOnlySourceAccount(dbLoader, header);
 
     // in older versions, the account's sequence number is updated when taking
     // fees
@@ -1297,7 +1300,7 @@ TransactionFrame::processFeeSeqNum(AbstractLedgerTxn& ltx,
         createSuccessResultWithFeeCharged(header.current(), baseFee, true);
     releaseAssert(txResult);
 
-    auto sourceAccount = loadSourceAccount(ltx, header);
+    auto sourceAccount = loadSourceAccount(ltx, header.current());
     if (!sourceAccount)
     {
         throw std::runtime_error("Unexpected database state");
@@ -1450,15 +1453,16 @@ TransactionFrame::checkValidWithOptionallyChargedFee(
             auto const& op = mOperations[i];
             auto& opResult = txResult->getOpResultAt(i);
 
-            // if (!op->checkValid(app, signatureChecker, ltx, false, opResult,
-            //                     txResult->getSorobanData()))
-            // {
-            //     // it's OK to just fast fail here and not try to call
-            //     // checkValid on all operations as the resulting object
-            //     // is only used by applications
-            //     txResult->setInnermostResultCode(txFAILED);
-            //     return txResult;
-            // }
+            if (!op->checkValid<T>(dbLoader, cfg, sorobanCfg, header,
+                                   signatureChecker, false, opResult,
+                                   txResult->getSorobanData()))
+            {
+                // it's OK to just fast fail here and not try to call
+                // checkValid on all operations as the resulting object
+                // is only used by applications
+                txResult->setInnermostResultCode(txFAILED);
+                return txResult;
+            }
         }
 
         if (!signatureChecker.checkAllSignaturesUsed())
@@ -1470,6 +1474,15 @@ TransactionFrame::checkValidWithOptionallyChargedFee(
 
     return txResult;
 }
+
+template MutableTxResultPtr
+TransactionFrame::checkValidWithOptionallyChargedFee<
+    std::shared_ptr<SearchableBucketListSnapshot>>(
+    std::shared_ptr<SearchableBucketListSnapshot>& dbLoader, Config const& cfg,
+    std::optional<SorobanNetworkConfig const> const& sorobanCfg,
+    LedgerHeader const& header, SequenceNumber current, bool chargeFee,
+    uint64_t lowerBoundCloseTimeOffset,
+    uint64_t upperBoundCloseTimeOffset) const;
 
 MutableTxResultPtr
 TransactionFrame::checkValid(std::shared_ptr<SearchableBucketListSnapshot> bl,
@@ -1501,7 +1514,7 @@ TransactionFrame::checkValid(Application& app, AbstractLedgerTxn& ltxOuter,
         sorobanCfg = app.getLedgerManager().getSorobanNetworkConfig();
     }
 
-    return checkValidWithOptionallyChargedFee<LedgerTxn>(
+    return checkValidWithOptionallyChargedFee<AbstractLedgerTxn>(
         ltx, app.getConfig(), sorobanCfg, header, current, true,
         lowerBoundCloseTimeOffset, upperBoundCloseTimeOffset);
 }

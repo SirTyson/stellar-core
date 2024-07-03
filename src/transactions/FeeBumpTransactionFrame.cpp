@@ -208,7 +208,7 @@ FeeBumpTransactionFrame::checkValidInternal(
 
     SignatureChecker signatureChecker{header.ledgerVersion, getContentsHash(),
                                       mEnvelope.feeBump().signatures};
-    if (commonValid(signatureChecker, dbLoader, header, false, *txResult) !=
+    if (commonValid<T>(signatureChecker, dbLoader, header, false, *txResult) !=
         ValidationType::kFullyValid)
     {
         return txResult;

@@ -71,13 +71,8 @@ class TransactionFrame : public TransactionFrameBase
 
     std::vector<std::shared_ptr<OperationFrame const>> mOperations;
 
-    std::shared_ptr<LedgerEntry> loadReadOnlySourceAccount(
-        std::shared_ptr<SearchableBucketListSnapshot> bl) const;
-    std::shared_ptr<LedgerEntry>
-    loadReadOnlySourceAccount(AbstractLedgerTxn& ltx) const;
-
     LedgerTxnEntry loadSourceAccount(AbstractLedgerTxn& ltx,
-                                     LedgerTxnHeader const& header) const;
+                                     LedgerHeader const& header) const;
 
     enum ValidationType
     {
@@ -177,6 +172,13 @@ class TransactionFrame : public TransactionFrameBase
     {
         return mOperations;
     }
+
+    std::shared_ptr<LedgerEntry>
+    loadReadOnlySourceAccount(std::shared_ptr<SearchableBucketListSnapshot> bl,
+                              LedgerHeader const& header) const;
+    std::shared_ptr<LedgerEntry>
+    loadReadOnlySourceAccount(AbstractLedgerTxn& ltx,
+                              LedgerHeader const& header) const;
 
 #ifdef BUILD_TESTS
     TransactionEnvelope& getMutableEnvelope() const override;
@@ -287,7 +289,7 @@ class TransactionFrame : public TransactionFrameBase
     std::shared_ptr<StellarMessage const> toStellarMessage() const override;
 
     LedgerTxnEntry loadAccount(AbstractLedgerTxn& ltx,
-                               LedgerTxnHeader const& header,
+                               LedgerHeader const& header,
                                AccountID const& accountID) const;
 
     std::optional<SequenceNumber const> const getMinSeqNum() const override;

@@ -924,10 +924,24 @@ class FuzzTransactionFrame : public TransactionFrame
             ltx.loadHeader().current().ledgerVersion, getContentsHash(),
             mEnvelope.v1().signatures};
         // if any ill-formed Operations, do not attempt transaction application
-        auto isInvalidOperation = [&](auto const& op, auto& opResult) {
-            return !op->checkValid(app, signatureChecker, ltx, false, opResult,
-                                   mTxResult->getSorobanData());
-        };
+        auto isInvalidOperation =
+            [&](std::shared_ptr<OperationFrame const> const& op,
+                auto& opResult) {
+                std::optional<SorobanNetworkConfig> sorobanCfg{};
+                if (protocolVersionStartsFrom(
+                        ltx.loadHeader().current().ledgerVersion,
+                        SOROBAN_PROTOCOL_VERSION))
+                {
+                    sorobanCfg =
+                        app.getLedgerManager().getSorobanNetworkConfig();
+                }
+
+                auto ret = op->checkValid<AbstractLedgerTxn>(
+                    ltx, app.getConfig(), sorobanCfg,
+                    ltx.loadHeader().current(), signatureChecker, false,
+                    opResult, mTxResult->getSorobanData());
+                return !ret;
+            };
 
         auto const& ops = getOperations();
         for (size_t i = 0; i < ops.size(); ++i)
@@ -944,7 +958,7 @@ class FuzzTransactionFrame : public TransactionFrame
         // while the following method's result is not captured, regardless, for
         // protocols < 8, this triggered buggy caching, and potentially may do
         // so in the future
-        loadSourceAccount(ltx, ltx.loadHeader());
+        loadSourceAccount(ltx, ltx.loadHeader().current());
         processSeqNum(ltx);
         TransactionMetaFrame tm(2);
         applyOperations(signatureChecker, app, ltx, tm, *mTxResult, Hash{});
