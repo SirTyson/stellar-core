@@ -62,11 +62,19 @@ class TransactionTestFrame : public TransactionFrameBase
                Hash const& sorobanBasePrngSeed = Hash{}) const override;
 
     MutableTxResultPtr
+    checkValid(std::shared_ptr<SearchableBucketListSnapshot> bl,
+               Config const cfg, SorobanNetworkConfig const sorobanCfg,
+               LedgerHeader const header, SequenceNumber current,
+               uint64_t lowerBoundCloseTimeOffset,
+               uint64_t upperBoundCloseTimeOffset) const override;
+
+    MutableTxResultPtr
     checkValid(Application& app, AbstractLedgerTxn& ltxOuter,
                SequenceNumber current, uint64_t lowerBoundCloseTimeOffset,
                uint64_t upperBoundCloseTimeOffset) const override;
     bool
-    checkSorobanResourceAndSetError(Application& app, uint32_t ledgerVersion,
+    checkSorobanResourceAndSetError(SorobanNetworkConfig const& sorobanConfig,
+                                    Config const& cfg, uint32_t ledgerVersion,
                                     MutableTxResultPtr txResult) const override;
 
     MutableTxResultPtr createSuccessResult() const override;

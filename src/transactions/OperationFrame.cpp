@@ -197,7 +197,7 @@ OperationFrame::checkSignature(SignatureChecker& signatureChecker,
     {
         auto neededThreshold =
             getNeededThreshold(sourceAccount, getThresholdLevel());
-        if (!mParentTx.checkSignature(signatureChecker, sourceAccount,
+        if (!mParentTx.checkSignature(signatureChecker, sourceAccount.current(),
                                       neededThreshold))
         {
             res.code(opBAD_AUTH);

@@ -28,11 +28,7 @@ class FeeBumpTransactionFrame : public TransactionFrameBase
     mutable Hash mFullHash;
 
     bool checkSignature(SignatureChecker& signatureChecker,
-                        LedgerTxnEntry const& account,
-                        int32_t neededWeight) const;
-
-    bool commonValidPreSeqNum(AbstractLedgerTxn& ltx,
-                              MutableTransactionResultBase& txResult) const;
+                        LedgerEntry const& account, int32_t neededWeight) const;
 
     enum ValidationType
     {
@@ -42,11 +38,29 @@ class FeeBumpTransactionFrame : public TransactionFrameBase
         kFullyValid
     };
 
-    ValidationType commonValid(SignatureChecker& signatureChecker,
-                               AbstractLedgerTxn& ltxOuter, bool applying,
+    template <class T>
+    ValidationType commonValid(SignatureChecker& signatureChecker, T& dbLoader,
+                               LedgerHeader const& header, bool applying,
                                MutableTransactionResultBase& txResult) const;
+    template <class T>
+    bool commonValidPreSeqNum(T& dbLoader, LedgerHeader const& header,
+                              MutableTransactionResultBase& txResult) const;
+
+    std::optional<LedgerEntry> loadAccount(AbstractLedgerTxn& ltx,
+                                           AccountID const& accountID) const;
+    std::optional<LedgerEntry>
+    loadAccount(std::shared_ptr<SearchableBucketListSnapshot> bl,
+                AccountID const& accountID) const;
 
     void removeOneTimeSignerKeyFromFeeSource(AbstractLedgerTxn& ltx) const;
+
+    template <class T>
+    MutableTxResultPtr checkValidInternal(
+        T& dbLoader, Config const& cfg,
+        std::optional<SorobanNetworkConfig const> const& sorobanCfg,
+        LedgerHeader const& header, SequenceNumber current,
+        uint64_t lowerBoundCloseTimeOffset,
+        uint64_t upperBoundCloseTimeOffset) const;
 
   public:
     FeeBumpTransactionFrame(Hash const& networkID,
@@ -80,8 +94,17 @@ class FeeBumpTransactionFrame : public TransactionFrameBase
     checkValid(Application& app, AbstractLedgerTxn& ltxOuter,
                SequenceNumber current, uint64_t lowerBoundCloseTimeOffset,
                uint64_t upperBoundCloseTimeOffset) const override;
+
+    MutableTxResultPtr
+    checkValid(std::shared_ptr<SearchableBucketListSnapshot> bl,
+               Config const cfg, SorobanNetworkConfig const sorobanCfg,
+               LedgerHeader const header, SequenceNumber current,
+               uint64_t lowerBoundCloseTimeOffset,
+               uint64_t upperBoundCloseTimeOffset) const override;
+
     bool
-    checkSorobanResourceAndSetError(Application& app, uint32_t ledgerVersion,
+    checkSorobanResourceAndSetError(SorobanNetworkConfig const& sorobanConfig,
+                                    Config const& cfg, uint32_t ledgerVersion,
                                     MutableTxResultPtr txResult) const override;
 
     MutableTxResultPtr createSuccessResult() const override;

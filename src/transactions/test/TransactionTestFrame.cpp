@@ -100,6 +100,19 @@ TransactionTestFrame::checkValid(Application& app, AbstractLedgerTxn& ltxOuter,
     return mTransactionTxResult;
 }
 
+MutableTxResultPtr
+TransactionTestFrame::checkValid(
+    std::shared_ptr<SearchableBucketListSnapshot> bl, Config const cfg,
+    SorobanNetworkConfig const sorobanCfg, LedgerHeader const header,
+    SequenceNumber current, uint64_t lowerBoundCloseTimeOffset,
+    uint64_t upperBoundCloseTimeOffset) const
+{
+    mTransactionTxResult = mTransactionFrame->checkValid(
+        bl, cfg, sorobanCfg, header, current, lowerBoundCloseTimeOffset,
+        upperBoundCloseTimeOffset);
+    return mTransactionTxResult;
+}
+
 void
 TransactionTestFrame::processFeeSeqNum(AbstractLedgerTxn& ltx,
                                        std::optional<int64_t> baseFee)
@@ -129,10 +142,11 @@ TransactionTestFrame::checkValidForTesting(Application& app,
 
 bool
 TransactionTestFrame::checkSorobanResourceAndSetError(
-    Application& app, uint32_t ledgerVersion, MutableTxResultPtr txResult) const
+    SorobanNetworkConfig const& sorobanConfig, Config const& cfg,
+    uint32_t ledgerVersion, MutableTxResultPtr txResult) const
 {
     auto ret = mTransactionFrame->checkSorobanResourceAndSetError(
-        app, ledgerVersion, txResult);
+        sorobanConfig, cfg, ledgerVersion, txResult);
     mTransactionTxResult = txResult;
     return ret;
 }

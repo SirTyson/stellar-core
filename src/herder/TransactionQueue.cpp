@@ -326,7 +326,8 @@ TransactionQueue::canAdd(TransactionFrameBasePtr tx,
             {
                 auto txResult = tx->createSuccessResult();
                 if (!tx->checkSorobanResourceAndSetError(
-                        mApp,
+                        mApp.getLedgerManager().getSorobanNetworkConfig(),
+                        mApp.getConfig(),
                         mApp.getLedgerManager()
                             .getLastClosedLedgerHeader()
                             .header.ledgerVersion,

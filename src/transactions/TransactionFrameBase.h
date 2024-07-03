@@ -24,6 +24,7 @@ class Database;
 class OperationFrame;
 class TransactionFrame;
 class FeeBumpTransactionFrame;
+class SearchableBucketListSnapshot;
 
 class MutableTransactionResultBase;
 using MutableTxResultPtr = std::shared_ptr<MutableTransactionResultBase>;
@@ -44,12 +45,23 @@ class TransactionFrameBase
                        TransactionMetaFrame& meta, MutableTxResultPtr txResult,
                        Hash const& sorobanBasePrngSeed = Hash{}) const = 0;
 
+    // Thread safe, validates a transaction against a given snapshot
+    virtual MutableTxResultPtr
+    checkValid(std::shared_ptr<SearchableBucketListSnapshot> bl,
+               Config const cfg, SorobanNetworkConfig const sorobanCfg,
+               LedgerHeader const header, SequenceNumber current,
+               uint64_t lowerBoundCloseTimeOffset,
+               uint64_t upperBoundCloseTimeOffset) const = 0;
+
+    // Not thread safe, validates a transaction against the current state
     virtual MutableTxResultPtr
     checkValid(Application& app, AbstractLedgerTxn& ltxOuter,
                SequenceNumber current, uint64_t lowerBoundCloseTimeOffset,
                uint64_t upperBoundCloseTimeOffset) const = 0;
+
     virtual bool
-    checkSorobanResourceAndSetError(Application& app, uint32_t ledgerVersion,
+    checkSorobanResourceAndSetError(SorobanNetworkConfig const& sorobanConfig,
+                                    Config const& cfg, uint32_t ledgerVersion,
                                     MutableTxResultPtr txResult) const = 0;
 
     virtual MutableTxResultPtr createSuccessResult() const = 0;
