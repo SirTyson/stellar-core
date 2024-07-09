@@ -6,6 +6,7 @@
 
 #include "ledger/InternalLedgerEntry.h"
 #include "ledger/NetworkConfig.h"
+#include "ledger/ReadOnlyState.h"
 #include "main/Config.h"
 #include "overlay/StellarXDR.h"
 #include "rust/RustBridge.h"
@@ -73,6 +74,10 @@ class TransactionFrame : public TransactionFrameBase
     LedgerTxnEntry loadSourceAccount(AbstractLedgerTxn& ltx,
                                      LedgerHeader const& header) const;
 
+    ReadOnlyResultPtr
+    loadReadOnlySourceAccount(ReadOnlyState& roState,
+                              LedgerHeader const& header) const;
+
     enum ValidationType
     {
         kInvalid,             // transaction is not valid at all
@@ -92,7 +97,8 @@ class TransactionFrame : public TransactionFrameBase
                               LedgerEntry const& sourceAccount,
                               uint64_t lowerBoundCloseTimeOffset) const;
 
-    bool commonValidPreSeqNum(AbstractLedgerTxn& ltx, Config const& cfg,
+    bool commonValidPreSeqNum(ReadOnlyResultPtr sourceAccount,
+                              Config const& cfg,
                               SorobanNetworkConfig const* const sorobanCfg,
                               LedgerHeader const& header, bool chargeFee,
                               uint64_t lowerBoundCloseTimeOffset,
@@ -105,7 +111,7 @@ class TransactionFrame : public TransactionFrameBase
     ValidationType
     commonValid(Config const& cfg, SorobanNetworkConfig const* const sorobanCfg,
                 LedgerHeader const& header, SignatureChecker& signatureChecker,
-                AbstractLedgerTxn& ltxOuter, SequenceNumber current,
+                ReadOnlyResultPtr sourceAccount, SequenceNumber current,
                 bool applying, bool chargeFee,
                 uint64_t lowerBoundCloseTimeOffset,
                 uint64_t upperBoundCloseTimeOffset,
@@ -206,7 +212,7 @@ class TransactionFrame : public TransactionFrameBase
     bool checkExtraSigners(SignatureChecker& signatureChecker) const;
 
     MutableTxResultPtr checkValidWithOptionallyChargedFee(
-        AbstractLedgerTxn& ltxOuter, Config const& cfg,
+        ReadOnlyState& roState, Config const& cfg,
         SorobanNetworkConfig const* const sorobanCfg,
         LedgerHeader const& header, SequenceNumber current, bool chargeFee,
         uint64_t lowerBoundCloseTimeOffset,

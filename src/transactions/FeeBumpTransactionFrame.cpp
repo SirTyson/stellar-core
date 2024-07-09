@@ -191,10 +191,11 @@ FeeBumpTransactionFrame::checkValid(Application& app,
     auto header = ltx.loadHeader().current();
     auto sorobanCfg = app.getLedgerManager().maybeGetSorobanNetworkConfigPtr(
         header.ledgerVersion);
+    LtxReadOnlyState roState(ltx);
 
     auto innerTxResult = mInnerTx->checkValidWithOptionallyChargedFee(
-        ltx, cfg, sorobanCfg, header, current, false, lowerBoundCloseTimeOffset,
-        upperBoundCloseTimeOffset);
+        roState, cfg, sorobanCfg, header, current, false,
+        lowerBoundCloseTimeOffset, upperBoundCloseTimeOffset);
     auto finalTxResult = createSuccessResultWithNewInnerTx(
         std::move(txResult), std::move(innerTxResult), mInnerTx);
 
