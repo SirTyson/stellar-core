@@ -126,9 +126,12 @@ class LedgerManager
     virtual void updateNetworkConfig(AbstractLedgerTxn& ltx) = 0;
     // Return the network config for Soroban.
     // The config is automatically refreshed on protocol upgrades.
-    // Ledger txn here is needed for the sake of lazy load; it won't be
-    // used most of the time.
     virtual SorobanNetworkConfig const& getSorobanNetworkConfig() = 0;
+
+    // Returns a pointer the network config for Soroban, or nullptr if
+    // ledgerVersion < Protocol 20.
+    virtual SorobanNetworkConfig const*
+    maybeGetSorobanNetworkConfigPtr(uint32_t ledgerVersion) = 0;
     virtual bool hasSorobanNetworkConfig() const = 0;
 
 #ifdef BUILD_TESTS

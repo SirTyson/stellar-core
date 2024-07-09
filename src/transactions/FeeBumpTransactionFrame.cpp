@@ -132,8 +132,7 @@ FeeBumpTransactionFrame::processPostApply(Application& app,
     // Note that we are not calling TransactionFrame::processPostApply, so if
     // any logic is added there, we would have to reason through if that logic
     // should also be reflected here.
-    int64_t refund =
-        mInnerTx->processRefund(app, ltx, meta, getFeeSourceID(), *txResult);
+    mInnerTx->processRefund(app, ltx, meta, getFeeSourceID(), *txResult);
 }
 
 bool
@@ -187,8 +186,14 @@ FeeBumpTransactionFrame::checkValid(Application& app,
         return txResult;
     }
 
+    auto& cfg = app.getConfig();
+
+    auto header = ltx.loadHeader().current();
+    auto sorobanCfg = app.getLedgerManager().maybeGetSorobanNetworkConfigPtr(
+        header.ledgerVersion);
+
     auto innerTxResult = mInnerTx->checkValidWithOptionallyChargedFee(
-        app, ltx, current, false, lowerBoundCloseTimeOffset,
+        ltx, cfg, sorobanCfg, header, current, false, lowerBoundCloseTimeOffset,
         upperBoundCloseTimeOffset);
     auto finalTxResult = createSuccessResultWithNewInnerTx(
         std::move(txResult), std::move(innerTxResult), mInnerTx);
@@ -198,10 +203,11 @@ FeeBumpTransactionFrame::checkValid(Application& app,
 
 bool
 FeeBumpTransactionFrame::checkSorobanResourceAndSetError(
-    Application& app, uint32_t ledgerVersion, MutableTxResultPtr txResult) const
+    SorobanNetworkConfig const& sorobanConfig, Config const& cfg,
+    uint32_t ledgerVersion, MutableTxResultPtr txResult) const
 {
-    return mInnerTx->checkSorobanResourceAndSetError(app, ledgerVersion,
-                                                     txResult);
+    return mInnerTx->checkSorobanResourceAndSetError(sorobanConfig, cfg,
+                                                     ledgerVersion, txResult);
 }
 
 bool

@@ -142,8 +142,15 @@ OperationFrame::apply(Application& app, SignatureChecker& signatureChecker,
 {
     ZoneScoped;
     CLOG_TRACE(Tx, "{}", xdrToCerealString(mOperation, "Operation"));
-    bool applyRes =
-        checkValid(app, signatureChecker, ltx, true, res, sorobanData);
+
+    SorobanNetworkConfig const* sorobanCfg = nullptr;
+    if (isSoroban())
+    {
+        sorobanCfg = &app.getLedgerManager().getSorobanNetworkConfig();
+    }
+
+    bool applyRes = checkValid(sorobanCfg, app.getConfig(), signatureChecker,
+                               ltx, true, res, sorobanData);
     if (applyRes)
     {
         if (isSoroban())
@@ -197,7 +204,7 @@ OperationFrame::checkSignature(SignatureChecker& signatureChecker,
     {
         auto neededThreshold =
             getNeededThreshold(sourceAccount, getThresholdLevel());
-        if (!mParentTx.checkSignature(signatureChecker, sourceAccount,
+        if (!mParentTx.checkSignature(signatureChecker, sourceAccount.current(),
                                       neededThreshold))
         {
             res.code(opBAD_AUTH);
@@ -235,7 +242,9 @@ OperationFrame::getSourceID() const
 // make sure sig is correct
 // verifies that the operation is well formed (operation specific)
 bool
-OperationFrame::checkValid(Application& app, SignatureChecker& signatureChecker,
+OperationFrame::checkValid(SorobanNetworkConfig const* const sorobanCfg,
+                           Config const& cfg,
+                           SignatureChecker& signatureChecker,
                            AbstractLedgerTxn& ltxOuter, bool forApply,
                            OperationResult& res,
                            std::shared_ptr<SorobanTxData> sorobanData) const
@@ -274,12 +283,10 @@ OperationFrame::checkValid(Application& app, SignatureChecker& signatureChecker,
     if (protocolVersionStartsFrom(ledgerVersion, SOROBAN_PROTOCOL_VERSION) &&
         isSoroban())
     {
+        releaseAssertOrThrow(sorobanCfg);
         releaseAssertOrThrow(sorobanData);
-        auto const& sorobanConfig =
-            app.getLedgerManager().getSorobanNetworkConfig();
-
-        return doCheckValidForSoroban(sorobanConfig, app.getConfig(),
-                                      ledgerVersion, res, *sorobanData);
+        return doCheckValidForSoroban(*sorobanCfg, cfg, ledgerVersion, res,
+                                      *sorobanData);
     }
     else
     {
@@ -302,7 +309,7 @@ OperationFrame::loadSourceAccount(AbstractLedgerTxn& ltx,
                                   LedgerTxnHeader const& header) const
 {
     ZoneScoped;
-    return mParentTx.loadAccount(ltx, header, getSourceID());
+    return mParentTx.loadAccount(ltx, header.current(), getSourceID());
 }
 
 void

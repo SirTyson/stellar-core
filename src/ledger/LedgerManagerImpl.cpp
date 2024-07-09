@@ -561,6 +561,17 @@ LedgerManagerImpl::getSorobanNetworkConfig()
     return getSorobanNetworkConfigInternal();
 }
 
+SorobanNetworkConfig const*
+LedgerManagerImpl::maybeGetSorobanNetworkConfigPtr(uint32_t ledgerVersion)
+{
+    if (protocolVersionStartsFrom(ledgerVersion, SOROBAN_PROTOCOL_VERSION))
+    {
+        return &getSorobanNetworkConfigInternal();
+    }
+
+    return nullptr;
+}
+
 bool
 LedgerManagerImpl::hasSorobanNetworkConfig() const
 {

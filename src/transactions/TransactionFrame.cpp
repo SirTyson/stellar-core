@@ -265,11 +265,11 @@ TransactionFrame::getFee(LedgerHeader const& header,
 
 bool
 TransactionFrame::checkSignature(SignatureChecker& signatureChecker,
-                                 LedgerTxnEntry const& account,
+                                 LedgerEntry const& account,
                                  int32_t neededWeight) const
 {
     ZoneScoped;
-    auto& acc = account.current().data.account();
+    auto& acc = account.data.account();
     std::vector<Signer> signers;
     if (acc.thresholds[0])
     {
@@ -320,12 +320,11 @@ TransactionFrame::checkExtraSigners(SignatureChecker& signatureChecker) const
 
 LedgerTxnEntry
 TransactionFrame::loadSourceAccount(AbstractLedgerTxn& ltx,
-                                    LedgerTxnHeader const& header) const
+                                    LedgerHeader const& header) const
 {
     ZoneScoped;
     auto res = loadAccount(ltx, header, getSourceID());
-    if (protocolVersionIsBefore(header.current().ledgerVersion,
-                                ProtocolVersion::V_8))
+    if (protocolVersionIsBefore(header.ledgerVersion, ProtocolVersion::V_8))
     {
         // this is buggy caching that existed in old versions of the protocol
         if (res)
@@ -343,12 +342,11 @@ TransactionFrame::loadSourceAccount(AbstractLedgerTxn& ltx,
 
 LedgerTxnEntry
 TransactionFrame::loadAccount(AbstractLedgerTxn& ltx,
-                              LedgerTxnHeader const& header,
+                              LedgerHeader const& header,
                               AccountID const& accountID) const
 {
     ZoneScoped;
-    if (protocolVersionIsBefore(header.current().ledgerVersion,
-                                ProtocolVersion::V_8) &&
+    if (protocolVersionIsBefore(header.ledgerVersion, ProtocolVersion::V_8) &&
         mCachedAccountPreProtocol8 &&
         mCachedAccountPreProtocol8->ledgerEntry().data.account().accountID ==
             accountID)
@@ -679,7 +677,7 @@ TransactionFrame::refundSorobanFee(AbstractLedgerTxn& ltxOuter,
     auto header = ltx.loadHeader();
     // The fee source could be from a Fee-bump, so it needs to be forwarded here
     // instead of using TransactionFrame's getFeeSource() method
-    auto feeSourceAccount = loadAccount(ltx, header, feeSource);
+    auto feeSourceAccount = loadAccount(ltx, header.current(), feeSource);
     if (!feeSourceAccount)
     {
         // Account was merged (shouldn't be possible)
@@ -775,13 +773,13 @@ TransactionFrame::computePreApplySorobanResourceFee(
 }
 
 bool
-TransactionFrame::isTooEarly(LedgerTxnHeader const& header,
+TransactionFrame::isTooEarly(LedgerHeader const& header,
                              uint64_t lowerBoundCloseTimeOffset) const
 {
     auto const tb = getTimeBounds();
     if (tb)
     {
-        uint64 closeTime = header.current().scpValue.closeTime;
+        uint64 closeTime = header.scpValue.closeTime;
         if (tb->minTime &&
             (tb->minTime > (closeTime + lowerBoundCloseTimeOffset)))
         {
@@ -789,18 +787,17 @@ TransactionFrame::isTooEarly(LedgerTxnHeader const& header,
         }
     }
 
-    if (protocolVersionStartsFrom(header.current().ledgerVersion,
-                                  ProtocolVersion::V_19))
+    if (protocolVersionStartsFrom(header.ledgerVersion, ProtocolVersion::V_19))
     {
         auto const lb = getLedgerBounds();
-        return lb && lb->minLedger > header.current().ledgerSeq;
+        return lb && lb->minLedger > header.ledgerSeq;
     }
 
     return false;
 }
 
 bool
-TransactionFrame::isTooLate(LedgerTxnHeader const& header,
+TransactionFrame::isTooLate(LedgerHeader const& header,
                             uint64_t upperBoundCloseTimeOffset) const
 {
     auto const tb = getTimeBounds();
@@ -809,7 +806,7 @@ TransactionFrame::isTooLate(LedgerTxnHeader const& header,
         // Prior to consensus, we can pass in an upper bound estimate on when we
         // expect the ledger to close so we don't accept transactions that will
         // expire by the time they are applied
-        uint64 closeTime = header.current().scpValue.closeTime;
+        uint64 closeTime = header.scpValue.closeTime;
         if (tb->maxTime &&
             (tb->maxTime < (closeTime + upperBoundCloseTimeOffset)))
         {
@@ -817,29 +814,26 @@ TransactionFrame::isTooLate(LedgerTxnHeader const& header,
         }
     }
 
-    if (protocolVersionStartsFrom(header.current().ledgerVersion,
-                                  ProtocolVersion::V_19))
+    if (protocolVersionStartsFrom(header.ledgerVersion, ProtocolVersion::V_19))
     {
         auto const lb = getLedgerBounds();
-        return lb && lb->maxLedger != 0 &&
-               lb->maxLedger <= header.current().ledgerSeq;
+        return lb && lb->maxLedger != 0 && lb->maxLedger <= header.ledgerSeq;
     }
     return false;
 }
 
 bool
-TransactionFrame::isTooEarlyForAccount(LedgerTxnHeader const& header,
-                                       LedgerTxnEntry const& sourceAccount,
+TransactionFrame::isTooEarlyForAccount(LedgerHeader const& header,
+                                       LedgerEntry const& sourceAccount,
                                        uint64_t lowerBoundCloseTimeOffset) const
 {
-    if (protocolVersionIsBefore(header.current().ledgerVersion,
-                                ProtocolVersion::V_19))
+    if (protocolVersionIsBefore(header.ledgerVersion, ProtocolVersion::V_19))
     {
         return false;
     }
 
     auto accountEntry = [&]() -> AccountEntry const& {
-        return sourceAccount.current().data.account();
+        return sourceAccount.data.account();
     };
 
     auto accSeqTime = hasAccountEntryExtV3(accountEntry())
@@ -848,7 +842,7 @@ TransactionFrame::isTooEarlyForAccount(LedgerTxnHeader const& header,
     auto minSeqAge = getMinSeqAge();
 
     auto lowerBoundCloseTime =
-        header.current().scpValue.closeTime + lowerBoundCloseTimeOffset;
+        header.scpValue.closeTime + lowerBoundCloseTimeOffset;
     if (minSeqAge > lowerBoundCloseTime ||
         lowerBoundCloseTime - minSeqAge < accSeqTime)
     {
@@ -861,7 +855,7 @@ TransactionFrame::isTooEarlyForAccount(LedgerTxnHeader const& header,
             : 0;
     auto minSeqLedgerGap = getMinSeqLedgerGap();
 
-    auto ledgerSeq = header.current().ledgerSeq;
+    auto ledgerSeq = header.ledgerSeq;
     if (minSeqLedgerGap > ledgerSeq ||
         ledgerSeq - minSeqLedgerGap < accSeqLedger)
     {
@@ -873,8 +867,10 @@ TransactionFrame::isTooEarlyForAccount(LedgerTxnHeader const& header,
 
 bool
 TransactionFrame::commonValidPreSeqNum(
-    Application& app, AbstractLedgerTxn& ltx, bool chargeFee,
-    uint64_t lowerBoundCloseTimeOffset, uint64_t upperBoundCloseTimeOffset,
+    AbstractLedgerTxn& ltx, Config const& cfg,
+    SorobanNetworkConfig const* const sorobanCfg, LedgerHeader const& header,
+    bool chargeFee, uint64_t lowerBoundCloseTimeOffset,
+    uint64_t upperBoundCloseTimeOffset,
     std::optional<FeePair> sorobanResourceFee,
     MutableTxResultPtr txResult) const
 {
@@ -883,7 +879,7 @@ TransactionFrame::commonValidPreSeqNum(
     // this function does validations that are independent of the account state
     //    (stay true regardless of other side effects)
 
-    uint32_t ledgerVersion = ltx.loadHeader().current().ledgerVersion;
+    uint32_t ledgerVersion = header.ledgerVersion;
     if ((protocolVersionIsBefore(ledgerVersion, ProtocolVersion::V_13) &&
          (mEnvelope.type() == ENVELOPE_TYPE_TX ||
           hasMuxedAccount(mEnvelope))) ||
@@ -943,7 +939,9 @@ TransactionFrame::commonValidPreSeqNum(
             return false;
         }
 
-        if (!checkSorobanResourceAndSetError(app, ledgerVersion, txResult))
+        releaseAssertOrThrow(sorobanCfg);
+        if (!checkSorobanResourceAndSetError(*sorobanCfg, cfg, ledgerVersion,
+                                             txResult))
         {
             return false;
         }
@@ -953,7 +951,7 @@ TransactionFrame::commonValidPreSeqNum(
         if (sorobanData.resourceFee > getFullFee())
         {
             sorobanTxData.pushValidationTimeDiagnosticError(
-                app.getConfig(), SCE_STORAGE, SCEC_EXCEEDED_LIMIT,
+                cfg, SCE_STORAGE, SCEC_EXCEEDED_LIMIT,
                 "transaction `sorobanData.resourceFee` is higher than the "
                 "full transaction fee",
                 {makeU64SCVal(sorobanData.resourceFee),
@@ -967,7 +965,7 @@ TransactionFrame::commonValidPreSeqNum(
             INT64_MAX - sorobanResourceFee->non_refundable_fee)
         {
             sorobanTxData.pushValidationTimeDiagnosticError(
-                app.getConfig(), SCE_STORAGE, SCEC_INVALID_INPUT,
+                cfg, SCE_STORAGE, SCEC_INVALID_INPUT,
                 "transaction resource fees cannot be added",
                 {makeU64SCVal(sorobanResourceFee->refundable_fee),
                  makeU64SCVal(sorobanResourceFee->non_refundable_fee)});
@@ -980,7 +978,7 @@ TransactionFrame::commonValidPreSeqNum(
         if (sorobanData.resourceFee < resourceFees)
         {
             sorobanTxData.pushValidationTimeDiagnosticError(
-                app.getConfig(), SCE_STORAGE, SCEC_EXCEEDED_LIMIT,
+                cfg, SCE_STORAGE, SCEC_EXCEEDED_LIMIT,
                 "transaction `sorobanData.resourceFee` is lower than the "
                 "actual Soroban resource fee",
                 {makeU64SCVal(sorobanData.resourceFee),
@@ -999,7 +997,7 @@ TransactionFrame::commonValidPreSeqNum(
                 if (!set.emplace(lk).second)
                 {
                     sorobanTxData.pushValidationTimeDiagnosticError(
-                        app.getConfig(), SCE_STORAGE, SCEC_INVALID_INPUT,
+                        cfg, SCE_STORAGE, SCEC_INVALID_INPUT,
                         "Found duplicate key in the Soroban footprint; every "
                         "key across read-only and read-write footprints has to "
                         "be unique.",
@@ -1031,7 +1029,6 @@ TransactionFrame::commonValidPreSeqNum(
         }
     }
 
-    auto header = ltx.loadHeader();
     if (isTooEarly(header, lowerBoundCloseTimeOffset))
     {
         txResult->setInnermostResultCode(txTOO_EARLY);
@@ -1043,8 +1040,7 @@ TransactionFrame::commonValidPreSeqNum(
         return false;
     }
 
-    if (chargeFee &&
-        getInclusionFee() < getMinInclusionFee(*this, header.current()))
+    if (chargeFee && getInclusionFee() < getMinInclusionFee(*this, header))
     {
         txResult->setInnermostResultCode(txINSUFFICIENT_FEE);
         return false;
@@ -1072,7 +1068,7 @@ TransactionFrame::processSeqNum(AbstractLedgerTxn& ltx) const
     if (protocolVersionStartsFrom(header.current().ledgerVersion,
                                   ProtocolVersion::V_10))
     {
-        auto sourceAccount = loadSourceAccount(ltx, header);
+        auto sourceAccount = loadSourceAccount(ltx, header.current());
         if (sourceAccount.current().data.account().seqNum > getSeqNum())
         {
             throw std::runtime_error("unexpected sequence number");
@@ -1149,9 +1145,9 @@ TransactionFrame::processSignatures(
 }
 
 bool
-TransactionFrame::isBadSeq(LedgerTxnHeader const& header, int64_t seqNum) const
+TransactionFrame::isBadSeq(LedgerHeader const& header, int64_t seqNum) const
 {
-    if (getSeqNum() == getStartingSequenceNumber(header))
+    if (getSeqNum() == getStartingSequenceNumber(header.ledgerSeq))
     {
         return true;
     }
@@ -1159,8 +1155,7 @@ TransactionFrame::isBadSeq(LedgerTxnHeader const& header, int64_t seqNum) const
     // If seqNum == INT64_MAX, seqNum >= getSeqNum() is guaranteed to be true
     // because SequenceNumber is int64, so isBadSeq will always return true in
     // that case.
-    if (protocolVersionStartsFrom(header.current().ledgerVersion,
-                                  ProtocolVersion::V_19))
+    if (protocolVersionStartsFrom(header.ledgerVersion, ProtocolVersion::V_19))
     {
         // Check if we need to relax sequence number checking
         auto minSeqNum = getMinSeqNum();
@@ -1175,15 +1170,14 @@ TransactionFrame::isBadSeq(LedgerTxnHeader const& header, int64_t seqNum) const
 }
 
 TransactionFrame::ValidationType
-TransactionFrame::commonValid(Application& app,
-                              SignatureChecker& signatureChecker,
-                              AbstractLedgerTxn& ltxOuter,
-                              SequenceNumber current, bool applying,
-                              bool chargeFee,
-                              uint64_t lowerBoundCloseTimeOffset,
-                              uint64_t upperBoundCloseTimeOffset,
-                              std::optional<FeePair> sorobanResourceFee,
-                              MutableTxResultPtr txResult) const
+TransactionFrame::commonValid(
+    Config const& cfg, SorobanNetworkConfig const* const sorobanCfg,
+    LedgerHeader const& header, SignatureChecker& signatureChecker,
+    AbstractLedgerTxn& ltxOuter, SequenceNumber current, bool applying,
+    bool chargeFee, uint64_t lowerBoundCloseTimeOffset,
+    uint64_t upperBoundCloseTimeOffset,
+    std::optional<FeePair> sorobanResourceFee,
+    MutableTxResultPtr txResult) const
 {
     ZoneScoped;
     releaseAssertOrThrow(txResult);
@@ -1197,19 +1191,18 @@ TransactionFrame::commonValid(Application& app,
             "Applying transaction with non-current closeTime");
     }
 
-    if (!commonValidPreSeqNum(app, ltx, chargeFee, lowerBoundCloseTimeOffset,
-                              upperBoundCloseTimeOffset, sorobanResourceFee,
-                              txResult))
+    if (!commonValidPreSeqNum(
+            ltx, cfg, sorobanCfg, header, chargeFee, lowerBoundCloseTimeOffset,
+            upperBoundCloseTimeOffset, sorobanResourceFee, txResult))
     {
         return res;
     }
 
-    auto header = ltx.loadHeader();
     auto sourceAccount = loadSourceAccount(ltx, header);
 
     // in older versions, the account's sequence number is updated when taking
     // fees
-    if (protocolVersionStartsFrom(header.current().ledgerVersion,
+    if (protocolVersionStartsFrom(header.ledgerVersion,
                                   ProtocolVersion::V_10) ||
         !applying)
     {
@@ -1226,21 +1219,22 @@ TransactionFrame::commonValid(Application& app,
 
     res = ValidationType::kInvalidUpdateSeqNum;
 
-    if (isTooEarlyForAccount(header, sourceAccount, lowerBoundCloseTimeOffset))
+    if (isTooEarlyForAccount(header, sourceAccount.current(),
+                             lowerBoundCloseTimeOffset))
     {
         txResult->setInnermostResultCode(txBAD_MIN_SEQ_AGE_OR_GAP);
         return res;
     }
 
     if (!checkSignature(
-            signatureChecker, sourceAccount,
+            signatureChecker, sourceAccount.current(),
             sourceAccount.current().data.account().thresholds[THRESHOLD_LOW]))
     {
         txResult->setInnermostResultCode(txBAD_AUTH);
         return res;
     }
 
-    if (protocolVersionStartsFrom(header.current().ledgerVersion,
+    if (protocolVersionStartsFrom(header.ledgerVersion,
                                   ProtocolVersion::V_19) &&
         !checkExtraSigners(signatureChecker))
     {
@@ -1254,13 +1248,14 @@ TransactionFrame::commonValid(Application& app,
     // balance, if not, we need to check if after that deduction this account
     // will still have minimum balance
     uint32_t feeToPay =
-        (applying && protocolVersionStartsFrom(header.current().ledgerVersion,
-                                               ProtocolVersion::V_9))
+        (applying &&
+         protocolVersionStartsFrom(header.ledgerVersion, ProtocolVersion::V_9))
             ? 0
             : static_cast<uint32_t>(getFullFee());
     // don't let the account go below the reserve after accounting for
     // liabilities
-    if (chargeFee && getAvailableBalance(header, sourceAccount) < feeToPay)
+    if (chargeFee &&
+        getAvailableBalance(header, sourceAccount.current()) < feeToPay)
     {
         txResult->setInnermostResultCode(txINSUFFICIENT_BALANCE);
         return res;
@@ -1281,7 +1276,7 @@ TransactionFrame::processFeeSeqNum(AbstractLedgerTxn& ltx,
         createSuccessResultWithFeeCharged(header.current(), baseFee, true);
     releaseAssert(txResult);
 
-    auto sourceAccount = loadSourceAccount(ltx, header);
+    auto sourceAccount = loadSourceAccount(ltx, header.current());
     if (!sourceAccount)
     {
         throw std::runtime_error("Unexpected database state");
@@ -1384,8 +1379,9 @@ TransactionFrame::removeAccountSigner(AbstractLedgerTxn& ltxOuter,
 
 MutableTxResultPtr
 TransactionFrame::checkValidWithOptionallyChargedFee(
-    Application& app, AbstractLedgerTxn& ltxOuter, SequenceNumber current,
-    bool chargeFee, uint64_t lowerBoundCloseTimeOffset,
+    AbstractLedgerTxn& ltxOuter, Config const& cfg,
+    SorobanNetworkConfig const* const sorobanCfg, LedgerHeader const& header,
+    SequenceNumber current, bool chargeFee, uint64_t lowerBoundCloseTimeOffset,
     uint64_t upperBoundCloseTimeOffset) const
 {
     ZoneScoped;
@@ -1399,30 +1395,29 @@ TransactionFrame::checkValidWithOptionallyChargedFee(
     }
 
     LedgerTxn ltx(ltxOuter);
-    int64_t minBaseFee = ltx.loadHeader().current().baseFee;
+    int64_t minBaseFee = header.baseFee;
     if (!chargeFee)
     {
         minBaseFee = 0;
     }
 
-    auto txResult = createSuccessResultWithFeeCharged(
-        ltx.loadHeader().current(), minBaseFee, false);
+    auto txResult =
+        createSuccessResultWithFeeCharged(header, minBaseFee, false);
     releaseAssert(txResult);
 
-    SignatureChecker signatureChecker{ltx.loadHeader().current().ledgerVersion,
-                                      getContentsHash(),
+    SignatureChecker signatureChecker{header.ledgerVersion, getContentsHash(),
                                       getSignatures(mEnvelope)};
     std::optional<FeePair> sorobanResourceFee;
-    if (protocolVersionStartsFrom(ltx.loadHeader().current().ledgerVersion,
+    if (protocolVersionStartsFrom(header.ledgerVersion,
                                   SOROBAN_PROTOCOL_VERSION) &&
         isSoroban())
     {
+        releaseAssertOrThrow(sorobanCfg);
         sorobanResourceFee = computePreApplySorobanResourceFee(
-            ltx.loadHeader().current().ledgerVersion,
-            app.getLedgerManager().getSorobanNetworkConfig(), app.getConfig());
+            header.ledgerVersion, *sorobanCfg, cfg);
     }
-    bool res = commonValid(app, signatureChecker, ltx, current, false,
-                           chargeFee, lowerBoundCloseTimeOffset,
+    bool res = commonValid(cfg, sorobanCfg, header, signatureChecker, ltx,
+                           current, false, chargeFee, lowerBoundCloseTimeOffset,
                            upperBoundCloseTimeOffset, sorobanResourceFee,
                            txResult) == ValidationType::kMaybeValid;
     if (res)
@@ -1432,8 +1427,8 @@ TransactionFrame::checkValidWithOptionallyChargedFee(
             auto const& op = mOperations[i];
             auto& opResult = txResult->getOpResultAt(i);
 
-            if (!op->checkValid(app, signatureChecker, ltx, false, opResult,
-                                txResult->getSorobanData()))
+            if (!op->checkValid(sorobanCfg, cfg, signatureChecker, ltx, false,
+                                opResult, txResult->getSorobanData()))
             {
                 // it's OK to just fast fail here and not try to call
                 // checkValid on all operations as the resulting object
@@ -1459,18 +1454,21 @@ TransactionFrame::checkValid(Application& app, AbstractLedgerTxn& ltxOuter,
                              uint64_t lowerBoundCloseTimeOffset,
                              uint64_t upperBoundCloseTimeOffset) const
 {
-    return checkValidWithOptionallyChargedFee(app, ltxOuter, current, true,
-                                              lowerBoundCloseTimeOffset,
-                                              upperBoundCloseTimeOffset);
+    auto& header = ltxOuter.loadHeader().current();
+    auto sorobanCfg = app.getLedgerManager().maybeGetSorobanNetworkConfigPtr(
+        header.ledgerVersion);
+
+    return checkValidWithOptionallyChargedFee(
+        ltxOuter, app.getConfig(), sorobanCfg, header, current, true,
+        lowerBoundCloseTimeOffset, upperBoundCloseTimeOffset);
 }
 
 bool
 TransactionFrame::checkSorobanResourceAndSetError(
-    Application& app, uint32_t ledgerVersion, MutableTxResultPtr txResult) const
+    SorobanNetworkConfig const& sorobanConfig, Config const& cfg,
+    uint32_t ledgerVersion, MutableTxResultPtr txResult) const
 {
-    auto const& sorobanConfig =
-        app.getLedgerManager().getSorobanNetworkConfig();
-    if (!validateSorobanResources(sorobanConfig, app.getConfig(), ledgerVersion,
+    if (!validateSorobanResources(sorobanConfig, cfg, ledgerVersion,
                                   *txResult->getSorobanData()))
     {
         txResult->setInnermostResultCode(txSOROBAN_INVALID);
@@ -1726,7 +1724,8 @@ TransactionFrame::apply(Application& app, AbstractLedgerTxn& ltx,
     try
     {
         mCachedAccountPreProtocol8.reset();
-        uint32_t ledgerVersion = ltx.loadHeader().current().ledgerVersion;
+        auto& header = ltx.loadHeader().current();
+        uint32_t ledgerVersion = header.ledgerVersion;
         SignatureChecker signatureChecker{ledgerVersion, getContentsHash(),
                                           getSignatures(mEnvelope)};
 
@@ -1734,13 +1733,16 @@ TransactionFrame::apply(Application& app, AbstractLedgerTxn& ltx,
         //  we'll skip trying to apply operations but we'll still
         //  process the sequence number if needed
         std::optional<FeePair> sorobanResourceFee;
+        auto sorobanCfg =
+            app.getLedgerManager().maybeGetSorobanNetworkConfigPtr(
+                header.ledgerVersion);
+
         if (protocolVersionStartsFrom(ledgerVersion,
                                       SOROBAN_PROTOCOL_VERSION) &&
             isSoroban())
         {
             sorobanResourceFee = computePreApplySorobanResourceFee(
-                ledgerVersion, app.getLedgerManager().getSorobanNetworkConfig(),
-                app.getConfig());
+                ledgerVersion, *sorobanCfg, app.getConfig());
 
             auto& sorobanData = *txResult->getSorobanData();
             sorobanData.setSorobanConsumedNonRefundableFee(
@@ -1750,8 +1752,9 @@ TransactionFrame::apply(Application& app, AbstractLedgerTxn& ltx,
                 sorobanResourceFee->non_refundable_fee);
         }
         LedgerTxn ltxTx(ltx);
-        auto cv = commonValid(app, signatureChecker, ltxTx, 0, true, chargeFee,
-                              0, 0, sorobanResourceFee, txResult);
+        auto cv = commonValid(app.getConfig(), sorobanCfg, header,
+                              signatureChecker, ltxTx, 0, true, chargeFee, 0, 0,
+                              sorobanResourceFee, txResult);
         if (cv >= ValidationType::kInvalidUpdateSeqNum)
         {
             processSeqNum(ltxTx);

@@ -81,7 +81,8 @@ class FeeBumpTransactionFrame : public TransactionFrameBase
                SequenceNumber current, uint64_t lowerBoundCloseTimeOffset,
                uint64_t upperBoundCloseTimeOffset) const override;
     bool
-    checkSorobanResourceAndSetError(Application& app, uint32_t ledgerVersion,
+    checkSorobanResourceAndSetError(SorobanNetworkConfig const& sorobanConfig,
+                                    Config const& cfg, uint32_t ledgerVersion,
                                     MutableTxResultPtr txResult) const override;
 
     MutableTxResultPtr createSuccessResult() const override;

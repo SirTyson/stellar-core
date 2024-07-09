@@ -925,8 +925,10 @@ class FuzzTransactionFrame : public TransactionFrame
             mEnvelope.v1().signatures};
         // if any ill-formed Operations, do not attempt transaction application
         auto isInvalidOperation = [&](auto const& op, auto& opResult) {
-            return !op->checkValid(app, signatureChecker, ltx, false, opResult,
-                                   mTxResult->getSorobanData());
+            return !op->checkValid(
+                &app.getLedgerManager().getSorobanNetworkConfig(),
+                app.getConfig(), signatureChecker, ltx, false, opResult,
+                mTxResult->getSorobanData());
         };
 
         auto const& ops = getOperations();
@@ -944,7 +946,7 @@ class FuzzTransactionFrame : public TransactionFrame
         // while the following method's result is not captured, regardless, for
         // protocols < 8, this triggered buggy caching, and potentially may do
         // so in the future
-        loadSourceAccount(ltx, ltx.loadHeader());
+        loadSourceAccount(ltx, ltx.loadHeader().current());
         processSeqNum(ltx);
         TransactionMetaFrame tm(2);
         applyOperations(signatureChecker, app, ltx, tm, *mTxResult, Hash{});

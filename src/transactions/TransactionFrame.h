@@ -71,7 +71,7 @@ class TransactionFrame : public TransactionFrameBase
     std::vector<std::shared_ptr<OperationFrame const>> mOperations;
 
     LedgerTxnEntry loadSourceAccount(AbstractLedgerTxn& ltx,
-                                     LedgerTxnHeader const& header) const;
+                                     LedgerHeader const& header) const;
 
     enum ValidationType
     {
@@ -83,33 +83,34 @@ class TransactionFrame : public TransactionFrameBase
         kMaybeValid
     };
 
-    virtual bool isTooEarly(LedgerTxnHeader const& header,
+    virtual bool isTooEarly(LedgerHeader const& header,
                             uint64_t lowerBoundCloseTimeOffset) const;
-    virtual bool isTooLate(LedgerTxnHeader const& header,
+    virtual bool isTooLate(LedgerHeader const& header,
                            uint64_t upperBoundCloseTimeOffset) const;
 
-    bool isTooEarlyForAccount(LedgerTxnHeader const& header,
-                              LedgerTxnEntry const& sourceAccount,
+    bool isTooEarlyForAccount(LedgerHeader const& header,
+                              LedgerEntry const& sourceAccount,
                               uint64_t lowerBoundCloseTimeOffset) const;
 
-    bool commonValidPreSeqNum(Application& app, AbstractLedgerTxn& ltx,
-                              bool chargeFee,
+    bool commonValidPreSeqNum(AbstractLedgerTxn& ltx, Config const& cfg,
+                              SorobanNetworkConfig const* const sorobanCfg,
+                              LedgerHeader const& header, bool chargeFee,
                               uint64_t lowerBoundCloseTimeOffset,
                               uint64_t upperBoundCloseTimeOffset,
                               std::optional<FeePair> sorobanResourceFee,
                               MutableTxResultPtr txResult) const;
 
-    virtual bool isBadSeq(LedgerTxnHeader const& header, int64_t seqNum) const;
+    virtual bool isBadSeq(LedgerHeader const& header, int64_t seqNum) const;
 
-    ValidationType commonValid(Application& app,
-                               SignatureChecker& signatureChecker,
-                               AbstractLedgerTxn& ltxOuter,
-                               SequenceNumber current, bool applying,
-                               bool chargeFee,
-                               uint64_t lowerBoundCloseTimeOffset,
-                               uint64_t upperBoundCloseTimeOffset,
-                               std::optional<FeePair> sorobanResourceFee,
-                               MutableTxResultPtr txResult) const;
+    ValidationType
+    commonValid(Config const& cfg, SorobanNetworkConfig const* const sorobanCfg,
+                LedgerHeader const& header, SignatureChecker& signatureChecker,
+                AbstractLedgerTxn& ltxOuter, SequenceNumber current,
+                bool applying, bool chargeFee,
+                uint64_t lowerBoundCloseTimeOffset,
+                uint64_t upperBoundCloseTimeOffset,
+                std::optional<FeePair> sorobanResourceFee,
+                MutableTxResultPtr txResult) const;
 
     void removeOneTimeSignerFromAllSourceAccounts(AbstractLedgerTxn& ltx) const;
 
@@ -198,23 +199,26 @@ class TransactionFrame : public TransactionFrameBase
                            bool applying) const override;
 
     bool checkSignature(SignatureChecker& signatureChecker,
-                        LedgerTxnEntry const& account,
-                        int32_t neededWeight) const;
+                        LedgerEntry const& account, int32_t neededWeight) const;
 
     bool checkSignatureNoAccount(SignatureChecker& signatureChecker,
                                  AccountID const& accountID) const;
     bool checkExtraSigners(SignatureChecker& signatureChecker) const;
 
     MutableTxResultPtr checkValidWithOptionallyChargedFee(
-        Application& app, AbstractLedgerTxn& ltxOuter, SequenceNumber current,
-        bool chargeFee, uint64_t lowerBoundCloseTimeOffset,
+        AbstractLedgerTxn& ltxOuter, Config const& cfg,
+        SorobanNetworkConfig const* const sorobanCfg,
+        LedgerHeader const& header, SequenceNumber current, bool chargeFee,
+        uint64_t lowerBoundCloseTimeOffset,
         uint64_t upperBoundCloseTimeOffset) const;
     MutableTxResultPtr
     checkValid(Application& app, AbstractLedgerTxn& ltxOuter,
                SequenceNumber current, uint64_t lowerBoundCloseTimeOffset,
                uint64_t upperBoundCloseTimeOffset) const override;
+
     bool
-    checkSorobanResourceAndSetError(Application& app, uint32_t ledgerVersion,
+    checkSorobanResourceAndSetError(SorobanNetworkConfig const& sorobanConfig,
+                                    Config const& cfg, uint32_t ledgerVersion,
                                     MutableTxResultPtr txResult) const override;
 
     MutableTxResultPtr createSuccessResult() const override;
@@ -266,7 +270,7 @@ class TransactionFrame : public TransactionFrameBase
     std::shared_ptr<StellarMessage const> toStellarMessage() const override;
 
     LedgerTxnEntry loadAccount(AbstractLedgerTxn& ltx,
-                               LedgerTxnHeader const& header,
+                               LedgerHeader const& header,
                                AccountID const& accountID) const;
 
     std::optional<SequenceNumber const> const getMinSeqNum() const override;

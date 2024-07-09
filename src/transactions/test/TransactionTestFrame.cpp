@@ -129,10 +129,11 @@ TransactionTestFrame::checkValidForTesting(Application& app,
 
 bool
 TransactionTestFrame::checkSorobanResourceAndSetError(
-    Application& app, uint32_t ledgerVersion, MutableTxResultPtr txResult) const
+    SorobanNetworkConfig const& sorobanConfig, Config const& cfg,
+    uint32_t ledgerVersion, MutableTxResultPtr txResult) const
 {
     auto ret = mTransactionFrame->checkSorobanResourceAndSetError(
-        app, ledgerVersion, txResult);
+        sorobanConfig, cfg, ledgerVersion, txResult);
     mTransactionTxResult = txResult;
     return ret;
 }
