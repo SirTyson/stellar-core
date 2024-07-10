@@ -64,13 +64,15 @@ class OperationFrame
     // header flags
     virtual bool isOpSupported(LedgerHeader const& header) const;
 
-    LedgerTxnEntry loadSourceAccount(AbstractLedgerTxn& ltx,
-                                     LedgerTxnHeader const& header) const;
-
   public:
     static std::shared_ptr<OperationFrame>
     makeHelper(Operation const& op, TransactionFrame const& parentTx,
                uint32_t index);
+
+    LedgerTxnEntry loadSourceAccount(AbstractLedgerTxn& ltx,
+                                     LedgerTxnHeader const& header) const;
+    ReadOnlyResultPtr loadSourceAccount(ReadOnlyState& roState,
+                                        LedgerHeader const& header) const;
 
     OperationFrame(Operation const& op, TransactionFrame const& parentTx);
     OperationFrame(OperationFrame const&) = delete;
@@ -80,15 +82,16 @@ class OperationFrame
     void resetResultSuccess(OperationResult& res) const;
 
     bool checkSignature(SignatureChecker& signatureChecker,
-                        AbstractLedgerTxn& ltx, OperationResult& res,
+                        ReadOnlyResultPtr sourceAccount,
+                        LedgerHeader const& header, OperationResult& res,
                         bool forApply) const;
 
     AccountID getSourceID() const;
 
     bool checkValid(SorobanNetworkConfig const* const sorobanCfg,
                     Config const& cfg, SignatureChecker& signatureChecker,
-                    AbstractLedgerTxn& ltxOuter, bool forApply,
-                    OperationResult& res,
+                    ReadOnlyResultPtr sourceAccount, LedgerHeader const& header,
+                    bool forApply, OperationResult& res,
                     std::shared_ptr<SorobanTxData> sorobanData) const;
 
     bool apply(Application& app, SignatureChecker& signatureChecker,

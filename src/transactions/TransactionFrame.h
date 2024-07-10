@@ -279,6 +279,10 @@ class TransactionFrame : public TransactionFrameBase
                                LedgerHeader const& header,
                                AccountID const& accountID) const;
 
+    ReadOnlyResultPtr loadReadOnlyAccount(ReadOnlyState& roState,
+                                          LedgerHeader const& header,
+                                          AccountID const& accountID) const;
+
     std::optional<SequenceNumber const> const getMinSeqNum() const override;
     Duration getMinSeqAge() const override;
     uint32 getMinSeqLedgerGap() const override;

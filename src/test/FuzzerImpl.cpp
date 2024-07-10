@@ -918,17 +918,21 @@ class FuzzTransactionFrame : public TransactionFrame
         // reset results of operations
         mTxResult = createSuccessResultWithFeeCharged(ltx.getHeader(), 0, true);
 
+        auto header = ltx.loadHeader();
+
         // attempt application of transaction without processing the fee or
         // committing the LedgerTxn
-        SignatureChecker signatureChecker{
-            ltx.loadHeader().current().ledgerVersion, getContentsHash(),
-            mEnvelope.v1().signatures};
+        SignatureChecker signatureChecker{header.current().ledgerVersion,
+                                          getContentsHash(),
+                                          mEnvelope.v1().signatures};
         // if any ill-formed Operations, do not attempt transaction application
         auto isInvalidOperation = [&](auto const& op, auto& opResult) {
+            auto ltxe = op->loadSourceAccount(ltx, header);
+            auto sourceAccount = LtxReadOnlyResult::create(std::move(ltxe));
             return !op->checkValid(
                 &app.getLedgerManager().getSorobanNetworkConfig(),
-                app.getConfig(), signatureChecker, ltx, false, opResult,
-                mTxResult->getSorobanData());
+                app.getConfig(), signatureChecker, sourceAccount,
+                header.current(), false, opResult, mTxResult->getSorobanData());
         };
 
         auto const& ops = getOperations();

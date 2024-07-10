@@ -392,6 +392,27 @@ TransactionFrame::loadAccount(AbstractLedgerTxn& ltx,
     }
 }
 
+ReadOnlyResultPtr
+TransactionFrame::loadReadOnlyAccount(ReadOnlyState& roState,
+                                      LedgerHeader const& header,
+                                      AccountID const& accountID) const
+{
+    ZoneScoped;
+
+    // While this function should be truly read-only, we need to preserve a
+    // buggy cache from older versions of the protocol, resulting in this messy
+    // cast and potential write via loadSourceAccount.
+    if (protocolVersionIsBefore(header.ledgerVersion, ProtocolVersion::V_8))
+    {
+        releaseAssert(threadIsMain());
+        auto& ltx = static_cast<LtxReadOnlyState&>(roState).getLedgerTxn();
+        auto ltxe = loadAccount(ltx, header, accountID);
+        return LtxReadOnlyResult::create(std::move(ltxe));
+    }
+
+    return roState.loadEntry(accountKey(accountID));
+}
+
 bool
 TransactionFrame::hasDexOperations() const
 {
@@ -1136,11 +1157,17 @@ TransactionFrame::processSignatures(
     {
         // scope here to avoid potential side effects of loading source accounts
         LedgerTxn ltx(ltxOuter);
+        auto header = ltx.loadHeader();
+
         for (size_t i = 0; i < mOperations.size(); ++i)
         {
             auto const& op = mOperations[i];
             auto& opResult = txResult.getOpResultAt(i);
-            if (!op->checkSignature(signatureChecker, ltx, opResult, false))
+
+            auto sourceAccount =
+                LtxReadOnlyResult::create(op->loadSourceAccount(ltx, header));
+            if (!op->checkSignature(signatureChecker, sourceAccount,
+                                    header.current(), opResult, false))
             {
                 allOpsValid = false;
             }
@@ -1444,15 +1471,27 @@ TransactionFrame::checkValidWithOptionallyChargedFee(
                     txResult) == ValidationType::kMaybeValid;
     if (res)
     {
-        // TODO: Pipe sourceAccount directly to op
-        auto& ltx = static_cast<LtxReadOnlyState&>(roState).getLedgerTxn();
         for (size_t i = 0; i < mOperations.size(); ++i)
         {
             auto const& op = mOperations[i];
             auto& opResult = txResult->getOpResultAt(i);
 
-            if (!op->checkValid(sorobanCfg, cfg, signatureChecker, ltx, false,
-                                opResult, txResult->getSorobanData()))
+            bool cv;
+            if (getSourceID() == op->getSourceID())
+            {
+                cv = op->checkValid(sorobanCfg, cfg, signatureChecker,
+                                    sourceAccount, header, false, opResult,
+                                    txResult->getSorobanData());
+            }
+            else
+            {
+                auto opSourceAccount = op->loadSourceAccount(roState, header);
+                cv = op->checkValid(sorobanCfg, cfg, signatureChecker,
+                                    opSourceAccount, header, false, opResult,
+                                    txResult->getSorobanData());
+            }
+
+            if (!cv)
             {
                 // it's OK to just fast fail here and not try to call
                 // checkValid on all operations as the resulting object

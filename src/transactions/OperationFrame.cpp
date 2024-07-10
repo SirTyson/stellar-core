@@ -45,9 +45,9 @@ namespace stellar
 using namespace std;
 
 static int32_t
-getNeededThreshold(LedgerTxnEntry const& account, ThresholdLevel const level)
+getNeededThreshold(LedgerEntry const& account, ThresholdLevel const level)
 {
-    auto const& acc = account.current().data.account();
+    auto const& acc = account.data.account();
     switch (level)
     {
     case ThresholdLevel::LOW:
@@ -149,8 +149,16 @@ OperationFrame::apply(Application& app, SignatureChecker& signatureChecker,
         sorobanCfg = &app.getLedgerManager().getSorobanNetworkConfig();
     }
 
-    bool applyRes = checkValid(sorobanCfg, app.getConfig(), signatureChecker,
-                               ltx, true, res, sorobanData);
+    bool applyRes;
+    {
+        LedgerTxn cvLtx(ltx);
+        auto header = cvLtx.loadHeader();
+        auto sourceAccount =
+            LtxReadOnlyResult::create(loadSourceAccount(cvLtx, header));
+        applyRes =
+            checkValid(sorobanCfg, app.getConfig(), signatureChecker,
+                       sourceAccount, header.current(), true, res, sorobanData);
+    }
     if (applyRes)
     {
         if (isSoroban())
@@ -194,24 +202,12 @@ OperationFrame::isOpSupported(LedgerHeader const&) const
 
 bool
 OperationFrame::checkSignature(SignatureChecker& signatureChecker,
-                               AbstractLedgerTxn& ltx, OperationResult& res,
+                               ReadOnlyResultPtr sourceAccount,
+                               LedgerHeader const& header, OperationResult& res,
                                bool forApply) const
 {
     ZoneScoped;
-    auto header = ltx.loadHeader();
-    auto sourceAccount = loadSourceAccount(ltx, header);
-    if (sourceAccount)
-    {
-        auto neededThreshold =
-            getNeededThreshold(sourceAccount, getThresholdLevel());
-        if (!mParentTx.checkSignature(signatureChecker, sourceAccount.current(),
-                                      neededThreshold))
-        {
-            res.code(opBAD_AUTH);
-            return false;
-        }
-    }
-    else
+    if (sourceAccount->isDead())
     {
         if (forApply || !mOperation.sourceAccount)
         {
@@ -221,6 +217,17 @@ OperationFrame::checkSignature(SignatureChecker& signatureChecker,
 
         if (!mParentTx.checkSignatureNoAccount(
                 signatureChecker, toAccountID(*mOperation.sourceAccount)))
+        {
+            res.code(opBAD_AUTH);
+            return false;
+        }
+    }
+    else
+    {
+        auto neededThreshold =
+            getNeededThreshold(sourceAccount->entry(), getThresholdLevel());
+        if (!mParentTx.checkSignature(signatureChecker, sourceAccount->entry(),
+                                      neededThreshold))
         {
             res.code(opBAD_AUTH);
             return false;
@@ -245,24 +252,24 @@ bool
 OperationFrame::checkValid(SorobanNetworkConfig const* const sorobanCfg,
                            Config const& cfg,
                            SignatureChecker& signatureChecker,
-                           AbstractLedgerTxn& ltxOuter, bool forApply,
+                           ReadOnlyResultPtr sourceAccount,
+                           LedgerHeader const& header, bool forApply,
                            OperationResult& res,
                            std::shared_ptr<SorobanTxData> sorobanData) const
 {
     ZoneScoped;
-    // Note: ltx is always rolled back so checkValid never modifies the ledger
-    LedgerTxn ltx(ltxOuter);
-    if (!isOpSupported(ltx.loadHeader().current()))
+    if (!isOpSupported(header))
     {
         res.code(opNOT_SUPPORTED);
         return false;
     }
 
-    auto ledgerVersion = ltx.loadHeader().current().ledgerVersion;
+    auto ledgerVersion = header.ledgerVersion;
     if (!forApply ||
         protocolVersionIsBefore(ledgerVersion, ProtocolVersion::V_10))
     {
-        if (!checkSignature(signatureChecker, ltx, res, forApply))
+        if (!checkSignature(signatureChecker, sourceAccount, header, res,
+                            forApply))
         {
             return false;
         }
@@ -271,7 +278,7 @@ OperationFrame::checkValid(SorobanNetworkConfig const* const sorobanCfg,
     {
         // for ledger versions >= 10 we need to load account here, as for
         // previous versions it is done in checkSignature call
-        if (!loadSourceAccount(ltx, ltx.loadHeader()))
+        if (sourceAccount->isDead())
         {
             res.code(opNO_ACCOUNT);
             return false;
@@ -310,6 +317,14 @@ OperationFrame::loadSourceAccount(AbstractLedgerTxn& ltx,
 {
     ZoneScoped;
     return mParentTx.loadAccount(ltx, header.current(), getSourceID());
+}
+
+ReadOnlyResultPtr
+OperationFrame::loadSourceAccount(ReadOnlyState& roState,
+                                  LedgerHeader const& header) const
+{
+    ZoneScoped;
+    return mParentTx.loadReadOnlyAccount(roState, header, getSourceID());
 }
 
 void
