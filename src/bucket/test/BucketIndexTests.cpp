@@ -69,7 +69,7 @@ class BucketIndexTest
                     {CONFIG_SETTING}, 10);
             f(entries);
             closeLedger(*mApp);
-        } while (!BucketListBase::levelShouldSpill(ledger, mLevelsToBuild - 1));
+        } while (!LiveBucketList::levelShouldSpill(ledger, mLevelsToBuild - 1));
     }
 
   public:
@@ -566,7 +566,7 @@ TEST_CASE("serialize bucket indexes", "[bucket][bucketindex]")
         auto indexFilename = test.getBM().bucketIndexFilename(bucketHash);
         REQUIRE(fs::exists(indexFilename));
 
-        auto b = test.getBM().getBucketByHash(bucketHash);
+        auto b = test.getBM().getLiveBucketByHash(bucketHash);
         REQUIRE(b->isIndexed());
 
         auto onDiskIndex =
@@ -592,7 +592,7 @@ TEST_CASE("serialize bucket indexes", "[bucket][bucketindex]")
         }
 
         // Check if in-memory index has correct params
-        auto b = test.getBM().getBucketByHash(bucketHash);
+        auto b = test.getBM().getLiveBucketByHash(bucketHash);
         REQUIRE(!b->isEmpty());
         REQUIRE(b->isIndexed());
 
