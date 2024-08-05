@@ -1467,7 +1467,7 @@ LedgerManagerImpl::prefetchTransactionData(
             {
                 if (mApp.getConfig().isUsingBucketListDB())
                 {
-                    tx->insertKeysForTxApply(sorobanKeys, lkMeter.get());
+                    // tx->insertKeysForTxApply(sorobanKeys, lkMeter.get());
                 }
             }
             else
