@@ -301,7 +301,7 @@ getTestConfig(int instanceNumber, Config::TestDbMode mode)
         // disable self-check
         thisConfig.AUTOMATIC_SELF_CHECK_PERIOD = std::chrono::seconds(0);
         // only spin up a small number of worker threads
-        thisConfig.WORKER_THREADS = 2;
+        thisConfig.WORKER_THREADS = 3;
         thisConfig.QUORUM_INTERSECTION_CHECKER = false;
         thisConfig.METADATA_DEBUG_LEDGERS = 0;
 
