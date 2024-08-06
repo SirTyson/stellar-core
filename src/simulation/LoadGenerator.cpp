@@ -2192,6 +2192,10 @@ LoadGenerator::execute(TransactionTestFramePtr& txf, LoadGenMode mode,
                   resultStr);
         if (addResult.code == TransactionQueue::AddResultCode::ADD_STATUS_ERROR)
         {
+            if (!addResult.txResult)
+            {
+                CLOG_FATAL(LoadGen, "FAILED ASSERT 0");
+            }
             releaseAssert(addResult.txResult);
             code = addResult.txResult.value()->getResultCode();
         }

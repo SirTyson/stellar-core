@@ -1024,6 +1024,10 @@ CommandHandler::tx(std::string const& params, std::string& retStr)
                 TransactionQueue::AddResultCode::ADD_STATUS_ERROR)
             {
                 std::string resultBase64;
+                if (!addResult.txResult)
+                {
+                    CLOG_FATAL(Bucket, "FAILED ASSERT 1");
+                }
                 releaseAssertOrThrow(addResult.txResult);
 
                 auto const& payload = addResult.txResult.value();
@@ -1549,6 +1553,11 @@ CommandHandler::testTx(std::string const& params, std::string& retStr)
         root["status"] = TX_STATUS_STRING[static_cast<int>(addResult.code)];
         if (addResult.code == TransactionQueue::AddResultCode::ADD_STATUS_ERROR)
         {
+
+            if (!addResult.txResult)
+            {
+                CLOG_FATAL(Bucket, "FAILED ASSERT 2");
+            }
             releaseAssert(addResult.txResult);
             root["detail"] =
                 xdrToCerealString(addResult.txResult.value()->getResultCode(),
