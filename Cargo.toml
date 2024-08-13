@@ -3,7 +3,7 @@ members = ["src/rust", "lib/tracy-client-sys"]
 
 [patch.crates-io]
 tracy-client-sys = { path = "lib/tracy-client-sys" }
-stellar-xdr = { git = "https://github.com/stellar/rs-stellar-xdr", rev = "ae805d0f8c28ca86327a834eea9ce7d29b0a63bb" }
+stellar-xdr = { git = "https://github.com/stellar/rs-stellar-xdr", rev = "9a31b81412712ab2dfbe32cbeaba6bdb754c264b" }
 
 #[patch."https://github.com/stellar/rs-soroban-env"]
 #soroban-env-common = { path = "../rs-soroban-env/soroban-env-common" }
