@@ -1041,7 +1041,8 @@ LedgerManagerImpl::closeLedger(LedgerCloseData const& ledgerData)
                                   SOROBAN_PROTOCOL_VERSION) &&
         mApp.getConfig().isUsingBackgroundEviction())
     {
-        mApp.getBucketManager().startBackgroundEvictionScan(ledgerSeq + 1);
+        mApp.getBucketManager().startBackgroundEvictionScan(ledgerSeq + 1,
+                                                            initialLedgerVers);
     }
 
     // step 4
@@ -1677,20 +1678,36 @@ LedgerManagerImpl::transferLedgerEntriesToBucketList(
 
             if (mApp.getConfig().isUsingBackgroundEviction())
             {
-                mApp.getBucketManager().resolveBackgroundEvictionScan(
-                    ltxEvictions, ledgerSeq, keys);
+                auto evictedEntries =
+                    mApp.getBucketManager().resolveBackgroundEvictionScan(
+                        ltxEvictions, ledgerSeq, keys, initialLedgerVers);
+
+                if (protocolVersionStartsFrom(currLedgerVers,
+                                              ProtocolVersion::V_22))
+                {
+                    mApp.getBucketManager().addHotArchiveBatch(
+                        mApp, ledgerSeq, currLedgerVers, evictedEntries.second,
+                        {}, {});
+                }
+
+                if (ledgerCloseMeta)
+                {
+                    ledgerCloseMeta->populateEvictedEntries(evictedEntries);
+                }
             }
             else
             {
+                releaseAssertOrThrow(protocolVersionIsBefore(
+                    initialLedgerVers, ProtocolVersion::V_22));
                 mApp.getBucketManager().scanForEvictionLegacy(ltxEvictions,
                                                               ledgerSeq);
+                if (ledgerCloseMeta)
+                {
+                    ledgerCloseMeta->populateEvictedEntriesLegacy(
+                        ltxEvictions.getChanges());
+                }
             }
 
-            if (ledgerCloseMeta)
-            {
-                ledgerCloseMeta->populateEvictedEntries(
-                    ltxEvictions.getChanges());
-            }
             ltxEvictions.commit();
         }
 

@@ -2,7 +2,9 @@
 // under the Apache License, Version 2.0. See the COPYING file at the root
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
+#include "test/test.h"
 #include "util/Logging.h"
+#include "util/UnorderedSet.h"
 #include "xdr/Stellar-transaction.h"
 #include <iterator>
 #include <stdexcept>
@@ -2495,16 +2497,28 @@ TEST_CASE("state archival", "[tx][soroban]")
     }
 }
 
-TEST_CASE("temp entry eviction", "[tx][soroban]")
+// TODO: Add persistent eviction meta test
+TEST_CASE_VERSIONS("temp entry eviction", "[tx][soroban]")
 {
-    auto test = [](bool enableBucketListDB, bool backgroundEviction) {
+    auto test = [](bool enableBucketListDB, bool backgroundEviction,
+                   UnorderedSet<uint32_t> versionsToTest) {
         if (backgroundEviction && !enableBucketListDB)
         {
             throw "testing error: backgroundEviction requires "
                   "enableBucketListDB == true";
         }
 
+        // Currently, SorobanTest does not support for_versions, so we test all
+        // versions and return early if the version is not in versionsToTest. We
+        // should fix this at some point, but the refactor is non-trivial
         Config cfg = getTestConfig();
+
+        if (versionsToTest.find(cfg.TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION) ==
+            versionsToTest.end())
+        {
+            return;
+        }
+
         TmpDirManager tdm(std::string("soroban-storage-meta-") +
                           binToHex(randomBytes(8)));
         TmpDir td = tdm.tmpDir("soroban-meta-ok");
@@ -2646,19 +2660,27 @@ TEST_CASE("temp entry eviction", "[tx][soroban]")
 
     SECTION("sql")
     {
-        test(/*enableBucketListDB=*/false, /*backgroundEviction=*/false);
+        test(/*enableBucketListDB=*/false, /*backgroundEviction=*/false,
+             {20, 21});
     }
 
     SECTION("BucketListDB")
     {
         SECTION("legacy main thread scan")
         {
-            test(/*enableBucketListDB=*/true, /*backgroundEviction=*/false);
+            test(/*enableBucketListDB=*/true, /*backgroundEviction=*/false,
+                 {20, 21});
         }
 
         SECTION("background scan")
         {
-            test(/*enableBucketListDB=*/true, /*backgroundEviction=*/true);
+            test(/*enableBucketListDB=*/true, /*backgroundEviction=*/true,
+                 {20, 21
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+                  ,
+                  22
+#endif
+                 });
         }
     }
 }

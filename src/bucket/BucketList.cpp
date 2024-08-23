@@ -573,6 +573,8 @@ HotArchiveBucketList::addBatch(Application& app, uint32_t currLedger,
 {
     ZoneScoped;
     releaseAssert(currLedger > 0);
+    releaseAssertOrThrow(
+        protocolVersionStartsFrom(currLedgerProtocol, ProtocolVersion::V_22));
 
     for (uint32_t i = static_cast<uint32>(mLevels.size()) - 1; i != 0; --i)
     {

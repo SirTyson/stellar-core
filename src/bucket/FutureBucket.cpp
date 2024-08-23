@@ -62,7 +62,8 @@ FutureBucket<BucketT>::FutureBucket(
 
     if constexpr (!std::is_same_v<BucketT, LiveBucket>)
     {
-        if (protocolVersionIsBefore(snap->getBucketVersion(),
+        if (!snap->isEmpty() &&
+            protocolVersionIsBefore(snap->getBucketVersion(),
                                     ProtocolVersion::V_22))
         {
             throw std::runtime_error(

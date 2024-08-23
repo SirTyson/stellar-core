@@ -11,6 +11,7 @@
 #include "ledger/LedgerTxn.h"
 #include "main/Application.h"
 #include "test/test.h"
+#include "util/ProtocolVersion.h"
 #include "xdr/Stellar-ledger.h"
 
 namespace stellar
@@ -188,20 +189,34 @@ LedgerManagerForBucketTests::transferLedgerEntriesToBucketList(
                 LedgerTxn ltxEvictions(ltx);
                 if (mApp.getConfig().isUsingBackgroundEviction())
                 {
-                    mApp.getBucketManager().resolveBackgroundEvictionScan(
-                        ltxEvictions, ledgerSeq, keys);
+                    auto evictedEntries =
+                        mApp.getBucketManager().resolveBackgroundEvictionScan(
+                            ltxEvictions, ledgerSeq, keys, initialLedgerVers);
+
+                    if (protocolVersionStartsFrom(currLedgerVers,
+                                                  ProtocolVersion::V_22))
+                    {
+                        mApp.getBucketManager().addHotArchiveBatch(
+                            mApp, ledgerSeq, currLedgerVers,
+                            evictedEntries.second, {}, {});
+                    }
+                    if (ledgerCloseMeta)
+                    {
+                        ledgerCloseMeta->populateEvictedEntries(evictedEntries);
+                    }
                 }
                 else
                 {
                     mApp.getBucketManager().scanForEvictionLegacy(ltxEvictions,
                                                                   ledgerSeq);
+
+                    if (ledgerCloseMeta)
+                    {
+                        ledgerCloseMeta->populateEvictedEntriesLegacy(
+                            ltxEvictions.getChanges());
+                    }
                 }
 
-                if (ledgerCloseMeta)
-                {
-                    ledgerCloseMeta->populateEvictedEntries(
-                        ltxEvictions.getChanges());
-                }
                 ltxEvictions.commit();
             }
             mApp.getLedgerManager()
