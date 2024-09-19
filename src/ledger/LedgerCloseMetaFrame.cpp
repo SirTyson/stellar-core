@@ -144,7 +144,7 @@ LedgerCloseMetaFrame::populateTxSet(TxSetXDRFrame const& txSet)
 }
 
 void
-LedgerCloseMetaFrame::populateEvictedEntries(
+LedgerCloseMetaFrame::populateEvictedEntriesLegacy(
     LedgerEntryChanges const& evictionChanges)
 {
     releaseAssert(mVersion == 1);
@@ -167,6 +167,25 @@ LedgerCloseMetaFrame::populateEvictedEntries(
             mLedgerCloseMeta.v1().evictedTemporaryLedgerKeys.push_back(key);
             break;
         }
+    }
+}
+
+void
+LedgerCloseMetaFrame::populateEvictedEntries(
+    std::pair<std::vector<LedgerKey>, std::vector<LedgerEntry>> const&
+        evictedEntries)
+{
+    releaseAssert(mVersion == 1);
+    for (auto const& key : evictedEntries.first)
+    {
+        releaseAssertOrThrow(isTemporaryEntry(key) || key.type() == TTL);
+        mLedgerCloseMeta.v1().evictedTemporaryLedgerKeys.emplace_back(key);
+    }
+    for (auto const& entry : evictedEntries.second)
+    {
+        releaseAssertOrThrow(isPersistentEntry(entry.data));
+        mLedgerCloseMeta.v1().evictedPersistentLedgerEntries.emplace_back(
+            entry);
     }
 }
 

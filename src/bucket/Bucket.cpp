@@ -939,19 +939,17 @@ Bucket::merge(BucketManager& bucketManager, uint32_t maxProtocolVersion,
     BucketMetadata meta;
     meta.ledgerVersion = protocolVersion;
 
-    // If any inputs use the new extension of BucketMeta, the output should as
-    // well
-    if (ni.getMetadata().ext.v() == 1)
+    if (protocolVersionStartsFrom(maxProtocolVersion, ProtocolVersion::V_22))
     {
-        releaseAssertOrThrow(protocolVersionStartsFrom(maxProtocolVersion,
-                                                       ProtocolVersion::V_22));
-        meta.ext = oi.getMetadata().ext;
-    }
-    else if (oi.getMetadata().ext.v() == 1)
-    {
-        releaseAssertOrThrow(protocolVersionStartsFrom(maxProtocolVersion,
-                                                       ProtocolVersion::V_22));
-        meta.ext = oi.getMetadata().ext;
+        meta.ext.v(1);
+        if constexpr (std::is_same_v<BucketT, LiveBucket>)
+        {
+            meta.ext.bucketListType() = BucketListType::LIVE;
+        }
+        else
+        {
+            meta.ext.bucketListType() = BucketListType::HOT_ARCHIVE;
+        }
     }
 
     BucketOutputIterator<BucketT> out(bucketManager.getTmpDir(),

@@ -1143,7 +1143,8 @@ BucketManagerImpl::scanForEvictionLegacy(AbstractLedgerTxn& ltx,
 }
 
 void
-BucketManagerImpl::startBackgroundEvictionScan(uint32_t ledgerSeq)
+BucketManagerImpl::startBackgroundEvictionScan(uint32_t ledgerSeq,
+                                               uint32_t ledgerVers)
 {
     releaseAssert(mApp.getConfig().isUsingBucketListDB());
     releaseAssert(mSnapshotManager);
@@ -1157,9 +1158,10 @@ BucketManagerImpl::startBackgroundEvictionScan(uint32_t ledgerSeq)
     using task_t = std::packaged_task<EvictionResult()>;
     auto task = std::make_shared<task_t>(
         [bl = std::move(searchableBL), iter = cfg.evictionIterator(), ledgerSeq,
-         sas, &counters = mBucketListEvictionCounters,
+         ledgerVers, sas, &counters = mBucketListEvictionCounters,
          stats = mEvictionStatistics] {
-            return bl->scanForEviction(ledgerSeq, counters, iter, stats, sas);
+            return bl->scanForEviction(ledgerSeq, counters, iter, stats, sas,
+                                       ledgerVers);
         });
 
     mEvictionFuture = task->get_future();
@@ -1168,10 +1170,10 @@ BucketManagerImpl::startBackgroundEvictionScan(uint32_t ledgerSeq)
         "SearchableBucketListSnapshot: eviction scan");
 }
 
-void
+std::pair<std::vector<LedgerKey>, std::vector<LedgerEntry>>
 BucketManagerImpl::resolveBackgroundEvictionScan(
     AbstractLedgerTxn& ltx, uint32_t ledgerSeq,
-    LedgerKeySet const& modifiedKeys)
+    LedgerKeySet const& modifiedKeys, uint32_t ledgerVers)
 {
     ZoneScoped;
     releaseAssert(threadIsMain());
@@ -1179,7 +1181,7 @@ BucketManagerImpl::resolveBackgroundEvictionScan(
 
     if (!mEvictionFuture.valid())
     {
-        startBackgroundEvictionScan(ledgerSeq);
+        startBackgroundEvictionScan(ledgerSeq, ledgerVers);
     }
 
     auto evictionCandidates = mEvictionFuture.get();
@@ -1192,44 +1194,59 @@ BucketManagerImpl::resolveBackgroundEvictionScan(
     if (!evictionCandidates.isValid(ledgerSeq,
                                     networkConfig.stateArchivalSettings()))
     {
-        startBackgroundEvictionScan(ledgerSeq);
+        startBackgroundEvictionScan(ledgerSeq, ledgerVers);
         evictionCandidates = mEvictionFuture.get();
     }
 
-    auto& eligibleKeys = evictionCandidates.eligibleKeys;
+    auto& eligibleEntries = evictionCandidates.eligibleEntries;
 
-    for (auto iter = eligibleKeys.begin(); iter != eligibleKeys.end();)
+    for (auto iter = eligibleEntries.begin(); iter != eligibleEntries.end();)
     {
         // If the TTL has not been modified this ledger, we can evict the entry
-        if (modifiedKeys.find(getTTLKey(iter->key)) == modifiedKeys.end())
+        if (modifiedKeys.find(getTTLKey(iter->entry)) == modifiedKeys.end())
         {
             ++iter;
         }
         else
         {
-            iter = eligibleKeys.erase(iter);
+            iter = eligibleEntries.erase(iter);
         }
     }
 
     auto remainingEntriesToEvict =
         networkConfig.stateArchivalSettings().maxEntriesToArchive;
-    auto entryToEvictIter = eligibleKeys.begin();
+    auto entryToEvictIter = eligibleEntries.begin();
     auto newEvictionIterator = evictionCandidates.endOfRegionIterator;
+
+    // Return vectors include both evicted entry and associated TTL
+    std::vector<LedgerKey> deletedKeys;
+    std::vector<LedgerEntry> archivedEntries;
 
     // Only actually evict up to maxEntriesToArchive of the eligible entries
     while (remainingEntriesToEvict > 0 &&
-           entryToEvictIter != eligibleKeys.end())
+           entryToEvictIter != eligibleEntries.end())
     {
-        ltx.erase(entryToEvictIter->key);
-        ltx.erase(getTTLKey(entryToEvictIter->key));
+        ltx.erase(LedgerEntryKey(entryToEvictIter->entry));
+        ltx.erase(getTTLKey(entryToEvictIter->entry));
         --remainingEntriesToEvict;
+
+        if (isTemporaryEntry(entryToEvictIter->entry.data))
+        {
+            deletedKeys.emplace_back(LedgerEntryKey(entryToEvictIter->entry));
+            deletedKeys.emplace_back(getTTLKey(entryToEvictIter->entry));
+        }
+        else
+        {
+            archivedEntries.emplace_back(entryToEvictIter->entry);
+            deletedKeys.emplace_back(getTTLKey(entryToEvictIter->entry));
+        }
 
         auto age = ledgerSeq - entryToEvictIter->liveUntilLedger;
         mEvictionStatistics->recordEvictedEntry(age);
         mBucketListEvictionCounters.entriesEvicted.inc();
 
         newEvictionIterator = entryToEvictIter->iter;
-        entryToEvictIter = eligibleKeys.erase(entryToEvictIter);
+        entryToEvictIter = eligibleEntries.erase(entryToEvictIter);
     }
 
     // If remainingEntriesToEvict == 0, that means we could not evict the entire
@@ -1242,6 +1259,7 @@ BucketManagerImpl::resolveBackgroundEvictionScan(
     }
 
     networkConfig.updateEvictionIterator(ltx, newEvictionIterator);
+    return {deletedKeys, archivedEntries};
 }
 
 medida::Meter&

@@ -189,10 +189,12 @@ class BucketManagerImpl : public BucketManager
                        std::unique_ptr<BucketIndex const>&& index) override;
     void scanForEvictionLegacy(AbstractLedgerTxn& ltx,
                                uint32_t ledgerSeq) override;
-    void startBackgroundEvictionScan(uint32_t ledgerSeq) override;
-    void
+    void startBackgroundEvictionScan(uint32_t ledgerSeq,
+                                     uint32_t ledgerVers) override;
+    std::pair<std::vector<LedgerKey>, std::vector<LedgerEntry>>
     resolveBackgroundEvictionScan(AbstractLedgerTxn& ltx, uint32_t ledgerSeq,
-                                  LedgerKeySet const& modifiedKeys) override;
+                                  LedgerKeySet const& modifiedKeys,
+                                  uint32_t ledgerVers) override;
 
     medida::Meter& getBloomMissMeter() const override;
     medida::Meter& getBloomLookupMeter() const override;
