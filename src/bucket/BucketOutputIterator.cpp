@@ -3,7 +3,7 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "bucket/BucketOutputIterator.h"
-#include "bucket/BucketIndex.h"
+#include "bucket/BucketIndexBase.h"
 #include "bucket/BucketManager.h"
 #include "bucket/HotArchiveBucket.h"
 #include "bucket/LiveBucket.h"
@@ -192,7 +192,7 @@ BucketOutputIterator<BucketT>::getBucket(BucketManager& bucketManager,
     }
 
     auto hash = mHasher.finish();
-    std::unique_ptr<BucketIndex const> index{};
+    std::unique_ptr<typename BucketT::IndexT const> index{};
 
     // If this bucket needs to be indexed and is not already indexed
     if (shouldSynchronouslyIndex)
@@ -202,8 +202,7 @@ BucketOutputIterator<BucketT>::getBucket(BucketManager& bucketManager,
         if (auto b = bucketManager.getBucketIfExists<BucketT>(hash);
             !b || !b->isIndexed())
         {
-            index = BucketIndex::createIndex<BucketT>(bucketManager, mFilename,
-                                                      hash, mCtx);
+            index = createIndex<BucketT>(bucketManager, mFilename, hash, mCtx);
         }
     }
 

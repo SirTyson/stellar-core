@@ -3,7 +3,7 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "IndexBucketsWork.h"
-#include "bucket/BucketIndex.h"
+#include "bucket/BucketIndexBase.h"
 #include "bucket/BucketManager.h"
 #include "util/Fs.h"
 #include "util/Logging.h"
@@ -64,8 +64,8 @@ IndexBucketsWork::IndexWork::postWork()
             if (bm.getConfig().isPersistingBucketListDBIndexes() &&
                 fs::exists(indexFilename))
             {
-                self->mIndex = BucketIndex::load(bm, indexFilename,
-                                                 self->mBucket->getSize());
+                self->mIndex = loadIndex<LiveBucket>(bm, indexFilename,
+                                                     self->mBucket->getSize());
 
                 // If we could not load the index from the file, file is out of
                 // date. Delete and create a new index.
@@ -85,9 +85,9 @@ IndexBucketsWork::IndexWork::postWork()
             if (!self->mIndex)
             {
                 // TODO: Fix this when archive BucketLists assume state
-                self->mIndex = BucketIndex::createIndex<LiveBucket>(
-                    bm, self->mBucket->getFilename(), self->mBucket->getHash(),
-                    ctx);
+                self->mIndex =
+                    createIndex<LiveBucket>(bm, self->mBucket->getFilename(),
+                                            self->mBucket->getHash(), ctx);
             }
 
             app.postOnMainThread(

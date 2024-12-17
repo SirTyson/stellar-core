@@ -3,7 +3,6 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "bucket/BucketSnapshot.h"
-#include "bucket/BucketIndex.h"
 #include "bucket/HotArchiveBucket.h"
 #include "bucket/LiveBucket.h"
 #include "bucket/SearchableBucketList.h"
@@ -67,7 +66,7 @@ BucketSnapshotBase<BucketT>::getEntryAtOffset(LedgerKey const& k,
     }
 
     // Mark entry miss for metrics
-    mBucket->getIndex().markBloomMiss();
+    // mBucket->getIndex().markBloomMiss();
     return {nullptr, true};
 }
 

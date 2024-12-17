@@ -2622,7 +2622,7 @@ BulkLedgerEntryChangeAccumulator::accumulate(EntryIterator const& iter,
     // Don't accumulate entry types that are supported by BucketListDB when it
     // is enabled
     auto type = iter.key().ledgerKey().type();
-    if (bucketListDBEnabled && !BucketIndex::typeNotSupported(type))
+    if (bucketListDBEnabled && !LiveBucketIndex::typeNotSupported(type))
     {
         return false;
     }

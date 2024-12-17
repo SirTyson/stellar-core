@@ -767,8 +767,7 @@ ApplicationImpl::validateAndLogConfig()
 
     if (mConfig.DEPRECATED_SQL_LEDGER_STATE)
     {
-        if (mPersistentState->getState(PersistentState::kDBBackend) ==
-            BucketIndex::DB_BACKEND_STATE)
+        if (mPersistentState->getState(PersistentState::kDBBackend) == "bl")
         {
             throw std::invalid_argument(
                 "To downgrade to DEPRECATED_SQL_LEDGER_STATE, run "
@@ -784,8 +783,7 @@ ApplicationImpl::validateAndLogConfig()
     {
         if (mConfig.isUsingBucketListDB())
         {
-            mPersistentState->setState(PersistentState::kDBBackend,
-                                       BucketIndex::DB_BACKEND_STATE);
+            mPersistentState->setState(PersistentState::kDBBackend, "bl");
             auto pageSizeExp = mConfig.BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT;
             if (pageSizeExp != 0)
             {

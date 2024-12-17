@@ -250,7 +250,7 @@ CatchupWork::downloadApplyBuckets()
         // lookup is enabled
         applyBuckets = std::make_shared<ApplyBucketsWork>(
             mApp, mBuckets, *mBucketHAS, version,
-            BucketIndex::typeNotSupported);
+            LiveBucketIndex::typeNotSupported);
     }
     else
     {

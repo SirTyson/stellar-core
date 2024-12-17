@@ -197,7 +197,7 @@ BucketListIsConsistentWithDatabase::checkEntireBucketlist()
         {
             // Don't check entry types in BucketListDB when enabled
             if (mApp.getConfig().isUsingBucketListDB() &&
-                !BucketIndex::typeNotSupported(pair.first.type()))
+                !LiveBucketIndex::typeNotSupported(pair.first.type()))
             {
                 continue;
             }
@@ -235,7 +235,7 @@ BucketListIsConsistentWithDatabase::checkEntireBucketlist()
         std::function<bool(LedgerEntryType)> filter;
         if (mApp.getConfig().isUsingBucketListDB())
         {
-            filter = BucketIndex::typeNotSupported;
+            filter = LiveBucketIndex::typeNotSupported;
         }
         else
         {
@@ -250,8 +250,7 @@ BucketListIsConsistentWithDatabase::checkEntireBucketlist()
     }
 
     if (mApp.getConfig().isUsingBucketListDB() &&
-        mApp.getPersistentState().getState(PersistentState::kDBBackend) !=
-            BucketIndex::DB_BACKEND_STATE)
+        mApp.getPersistentState().getState(PersistentState::kDBBackend) != "bl")
     {
         throw std::runtime_error("BucketListDB enabled but BucketListDB flag "
                                  "not set in PersistentState.");
