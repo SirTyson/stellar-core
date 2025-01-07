@@ -18,13 +18,17 @@ namespace stellar
 
 DownloadBucketsWork::DownloadBucketsWork(
     Application& app,
-    std::map<std::string, std::shared_ptr<LiveBucket>>& buckets,
-    std::vector<std::string> hashes, TmpDir const& downloadDir,
-    std::shared_ptr<HistoryArchive> archive)
+    std::map<std::string, std::shared_ptr<LiveBucket>>& liveBuckets,
+    std::map<std::string, std::shared_ptr<HotArchiveBucket>>& hotBuckets,
+    std::vector<std::string> liveHashes, std::vector<std::string> hotHashes,
+    TmpDir const& downloadDir, std::shared_ptr<HistoryArchive> archive)
     : BatchWork{app, "download-verify-buckets"}
-    , mBuckets{buckets}
-    , mHashes{hashes}
-    , mNextBucketIter{mHashes.begin()}
+    , mLiveBuckets{liveBuckets}
+    , mHotBuckets{hotBuckets}
+    , mLiveHashes{liveHashes}
+    , mHotHashes{hotHashes}
+    , mNextLiveBucketIter{mLiveHashes.begin()}
+    , mNextHotBucketIter{mHotHashes.begin()}
     , mDownloadDir{downloadDir}
     , mArchive{archive}
 {
@@ -35,11 +39,14 @@ DownloadBucketsWork::getStatus() const
 {
     if (!isDone() && !isAborting())
     {
-        if (!mHashes.empty())
+        if (!mLiveHashes.empty())
         {
-            auto numStarted = std::distance(mHashes.begin(), mNextBucketIter);
+            auto numStarted =
+                std::distance(mLiveHashes.begin(), mNextLiveBucketIter) +
+                std::distance(mHotHashes.begin(), mNextHotBucketIter);
             auto numDone = numStarted - getNumWorksInBatch();
-            auto total = static_cast<uint32_t>(mHashes.size());
+            auto total =
+                static_cast<uint32_t>(mLiveHashes.size() + mHotHashes.size());
             auto pct = (100 * numDone) / total;
             return fmt::format(
                 FMT_STRING(
@@ -53,13 +60,15 @@ DownloadBucketsWork::getStatus() const
 bool
 DownloadBucketsWork::hasNext() const
 {
-    return mNextBucketIter != mHashes.end();
+    return mNextLiveBucketIter != mLiveHashes.end() ||
+           mNextHotBucketIter != mHotHashes.end();
 }
 
 void
 DownloadBucketsWork::resetIter()
 {
-    mNextBucketIter = mHashes.begin();
+    mNextLiveBucketIter = mLiveHashes.begin();
+    mNextHotBucketIter = mHotHashes.begin();
 }
 
 std::shared_ptr<BasicWork>
@@ -71,7 +80,10 @@ DownloadBucketsWork::yieldMoreWork()
         throw std::runtime_error("Nothing to iterate over!");
     }
 
-    auto hash = *mNextBucketIter;
+    // Iterate through live hashes then Hot Archive hashes
+    auto isHotHash = mNextLiveBucketIter == mLiveHashes.end();
+    auto hash = isHotHash ? *mNextHotBucketIter : *mNextLiveBucketIter;
+
     FileTransferInfo ft(mDownloadDir, FileType::HISTORY_FILE_TYPE_BUCKET, hash);
     auto w1 = std::make_shared<GetAndUnzipRemoteFileWork>(mApp, ft, mArchive);
 
@@ -90,16 +102,29 @@ DownloadBucketsWork::yieldMoreWork()
     };
     std::weak_ptr<DownloadBucketsWork> weak(
         std::static_pointer_cast<DownloadBucketsWork>(shared_from_this()));
-    auto successCb = [weak, ft, hash](Application& app) -> bool {
+    auto successCb = [weak, ft, hash, isHotHash](Application& app) -> bool {
         auto self = weak.lock();
         if (self)
         {
             auto bucketPath = ft.localPath_nogz();
-            auto b = app.getBucketManager().adoptFileAsBucket<LiveBucket>(
-                bucketPath, hexToBin256(hash),
-                /*mergeKey=*/nullptr,
-                /*index=*/nullptr);
-            self->mBuckets[hash] = b;
+
+            if (isHotHash)
+            {
+                auto b =
+                    app.getBucketManager().adoptFileAsBucket<HotArchiveBucket>(
+                        bucketPath, hexToBin256(hash),
+                        /*mergeKey=*/nullptr,
+                        /*index=*/nullptr);
+                self->mHotBuckets[hash] = b;
+            }
+            else
+            {
+                auto b = app.getBucketManager().adoptFileAsBucket<LiveBucket>(
+                    bucketPath, hexToBin256(hash),
+                    /*mergeKey=*/nullptr,
+                    /*index=*/nullptr);
+                self->mLiveBuckets[hash] = b;
+            }
         }
         return true;
     };
@@ -111,7 +136,14 @@ DownloadBucketsWork::yieldMoreWork()
     auto w4 = std::make_shared<WorkSequence>(
         mApp, "download-verify-sequence-" + hash, seq);
 
-    ++mNextBucketIter;
+    if (isHotHash)
+    {
+        ++mNextHotBucketIter;
+    }
+    else
+    {
+        ++mNextLiveBucketIter;
+    }
     return w4;
 }
 }
