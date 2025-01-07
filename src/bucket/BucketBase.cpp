@@ -385,7 +385,7 @@ BucketBase::merge(BucketManager& bucketManager, uint32_t maxProtocolVersion,
     }
     if (countMergeEvents)
     {
-        bucketManager.incrMergeCounters(mc);
+        bucketManager.incrMergeCounters<BucketT>(mc);
     }
 
     std::vector<Hash> shadowHashes;

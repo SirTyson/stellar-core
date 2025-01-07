@@ -74,6 +74,18 @@ struct HistoryArchiveState
     static inline unsigned const
         HISTORY_ARCHIVE_STATE_VERSION_POST_PROTOCOL_22 = 2;
 
+    struct BucketHashReturnT
+    {
+        std::vector<std::string> live;
+        std::vector<std::string> hot;
+
+        explicit BucketHashReturnT(std::vector<std::string>&& live,
+                                   std::vector<std::string>&& hot)
+            : live(live), hot(hot)
+        {
+        }
+    };
+
     unsigned version{HISTORY_ARCHIVE_STATE_VERSION_PRE_PROTOCOL_22};
     std::string server;
     std::string networkPassphrase;
@@ -106,9 +118,8 @@ struct HistoryArchiveState
     // Return vector of buckets to fetch/apply to turn 'other' into 'this'.
     // Vector is sorted from largest/highest-numbered bucket to smallest/lowest,
     // and with snap buckets occurring before curr buckets. Zero-buckets are
-    // omitted.
-    std::vector<std::string>
-    differingBuckets(HistoryArchiveState const& other) const;
+    // omitted. Hashes are distinguished by live and Hot Archive buckets.
+    BucketHashReturnT differingBuckets(HistoryArchiveState const& other) const;
 
     // Return vector of all buckets referenced by this state.
     std::vector<std::string> allBuckets() const;
