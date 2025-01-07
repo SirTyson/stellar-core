@@ -656,14 +656,12 @@ LedgerManagerImpl::valueExternalized(LedgerCloseData const& ledgerData,
 }
 
 void
-LedgerManagerImpl::startCatchup(
-    CatchupConfiguration configuration, std::shared_ptr<HistoryArchive> archive,
-    std::set<std::shared_ptr<LiveBucket>> bucketsToRetain)
+LedgerManagerImpl::startCatchup(CatchupConfiguration configuration,
+                                std::shared_ptr<HistoryArchive> archive)
 {
     ZoneScoped;
     setState(LM_CATCHING_UP_STATE);
-    mApp.getLedgerApplyManager().startCatchup(configuration, archive,
-                                              bucketsToRetain);
+    mApp.getLedgerApplyManager().startCatchup(configuration, archive);
 }
 
 uint64_t

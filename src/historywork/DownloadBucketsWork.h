@@ -17,17 +17,23 @@ class HistoryArchive;
 
 class DownloadBucketsWork : public BatchWork
 {
-    std::map<std::string, std::shared_ptr<LiveBucket>>& mBuckets;
-    std::vector<std::string> mHashes;
-    std::vector<std::string>::const_iterator mNextBucketIter;
+    std::map<std::string, std::shared_ptr<LiveBucket>>& mLiveBuckets;
+    std::map<std::string, std::shared_ptr<HotArchiveBucket>>& mHotBuckets;
+    std::vector<std::string> mLiveHashes;
+    std::vector<std::string> mHotHashes;
+    std::vector<std::string>::const_iterator mNextLiveBucketIter;
+    std::vector<std::string>::const_iterator mNextHotBucketIter;
     TmpDir const& mDownloadDir;
     std::shared_ptr<HistoryArchive> mArchive;
 
   public:
+    // Note: hashes must contain both live and hot archive bucket hashes
     DownloadBucketsWork(
         Application& app,
-        std::map<std::string, std::shared_ptr<LiveBucket>>& buckets,
-        std::vector<std::string> hashes, TmpDir const& downloadDir,
+        std::map<std::string, std::shared_ptr<LiveBucket>>& liveBuckets,
+        std::map<std::string, std::shared_ptr<HotArchiveBucket>>& hotBuckets,
+        std::vector<std::string> liveHashes, std::vector<std::string> hotHashes,
+        TmpDir const& downloadDir,
         std::shared_ptr<HistoryArchive> archive = nullptr);
     ~DownloadBucketsWork() = default;
     std::string getStatus() const override;

@@ -410,7 +410,7 @@ HistoryManagerImpl::queueCurrentHistory(uint32_t ledger)
     auto ledgerVers = mApp.getLedgerManager()
                           .getLastClosedLedgerHeader()
                           .header.ledgerVersion;
-    if (protocolVersionIsBefore(
+    if (protocolVersionStartsFrom(
             ledgerVers,
             BucketBase::FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION))
     {
