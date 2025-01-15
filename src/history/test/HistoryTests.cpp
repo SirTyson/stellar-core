@@ -1461,7 +1461,9 @@ TEST_CASE_VERSIONS(
 
     BucketTestUtils::for_versions_with_differing_bucket_logic(
         cfg, [&](Config const& cfg) {
-            Application::pointer app = createTestApplication(clock, cfg);
+            auto app =
+                createTestApplication<BucketTestUtils::BucketTestApplication>(
+                    clock, cfg);
             auto& hm = app->getHistoryManager();
             auto& lm = app->getLedgerManager();
             auto& bl = app->getBucketManager().getLiveBucketList();
@@ -1470,9 +1472,11 @@ TEST_CASE_VERSIONS(
             {
                 auto lcl = lm.getLastClosedLedgerHeader();
                 lcl.header.ledgerSeq += 1;
-                BucketTestUtils::addLiveBatchAndUpdateSnapshot(
-                    *app, lcl.header, {},
-                    LedgerTestUtils::generateValidUniqueLedgerEntries(8), {});
+                lm.setNextLedgerEntryBatchForBucketTesting(
+                    {},
+                    LedgerTestUtils::generateValidLedgerEntriesWithExclusions(
+                        {LedgerEntryType::CONFIG_SETTING}, 8),
+                    {});
                 clock.crank(true);
             }
 
