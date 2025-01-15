@@ -99,6 +99,13 @@ class BucketSnapshotManager : NonMovableOrCopyable
     void maybeCopySearchableHotArchiveBucketListSnapshot(
         SearchableHotArchiveSnapshotConstPtr& snapshot);
 
+    // This function is the same as snapshot refreshers above, but guarantees
+    // that both snapshots are consistent with the same lcl. This is required
+    // when querying both snapshot types as part of the same query.
+    void maybeCopyLiveAndHotArchiveSnapshots(
+        SearchableSnapshotConstPtr& liveSnapshot,
+        SearchableHotArchiveSnapshotConstPtr& hotArchiveSnapshot);
+
     // All metric recording functions must only be called by the main thread
     void startPointLoadTimer() const;
     void endPointLoadTimer(LedgerEntryType t, bool bloomMiss) const;
