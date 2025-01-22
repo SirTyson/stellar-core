@@ -31,7 +31,7 @@ SearchableLiveBucketListSnapshot::scanForEviction(
     LiveBucketList::updateStartingEvictionIterator(
         evictionIter, sas.startingEvictionScanLevel, ledgerSeq);
 
-    EvictionResultCandidates result(sas);
+    EvictionResultCandidates result(sas, ledgerSeq, ledgerVers);
     auto startIter = evictionIter;
     auto scanSize = sas.evictionScanSize;
 
@@ -59,7 +59,6 @@ SearchableLiveBucketListSnapshot::scanForEviction(
     }
 
     result.endOfRegionIterator = evictionIter;
-    result.initialLedger = ledgerSeq;
     return result;
 }
 

@@ -1054,9 +1054,15 @@ LedgerManagerImpl::closeLedger(LedgerCloseData const& ledgerData,
 
     // Step 1. Maybe queue the current checkpoint file for publishing; this
     // should not race with main, since publish on main begins strictly _after_
-    // this call.
+    // this call. There is a bug in the upgrade path where the initial
+    // ledgerVers is used in some places during ledgerClose, and the upgraded
+    // ledgerVers is used in other places (see comment in ledgerClosed).
+    // On the ledger when an upgrade occurs, the ledger header will contain the
+    // newly incremented ledgerVers. Because the history checkpoint must be
+    // consistent with the ledger header, we must base checkpoints off the new
+    // ledgerVers here and not the initial ledgerVers.
     auto& hm = mApp.getHistoryManager();
-    hm.maybeQueueHistoryCheckpoint(ledgerSeq);
+    hm.maybeQueueHistoryCheckpoint(ledgerSeq, maybeNewVersion);
 
     // step 2
     ltx.commit();
@@ -1856,12 +1862,10 @@ LedgerManagerImpl::ledgerClosed(
     // there are two different assumptions in different parts of the
     // ledger-close path:
     //   - In closeLedger we mostly treat the ledger as being on vN, eg.
-    //   during
-    //     tx apply and LCM construction.
+    //     during tx apply and LCM construction.
     //   - In the final stage, when we call ledgerClosed, we pass vN+1
-    //   because
-    //     the upgrade completed and modified the ltx header, and we fish
-    //     the protocol out of the ltx header
+    //     because the upgrade completed and modified the ltx header, and we
+    //     fish the protocol out of the ltx header
     // Before LedgerCloseMetaV1, this inconsistency was mostly harmless
     // since LedgerCloseMeta was not modified after the LTX header was
     // modified. However, starting with protocol 20, LedgerCloseMeta is
