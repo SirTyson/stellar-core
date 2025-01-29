@@ -120,7 +120,8 @@ template <class BucketT>
 DiskIndex<BucketT>::DiskIndex(BucketManager& bm,
                               std::filesystem::path const& filename,
                               std::streamoff pageSize, Hash const& hash,
-                              asio::io_context& ctx)
+                              asio::io_context& ctx,
+                              std::optional<SHA256>& hasher)
     : mBloomLookupMeter(bm.getBloomLookupMeter<BucketT>())
     , mBloomMissMeter(bm.getBloomMissMeter<BucketT>())
 {
@@ -147,8 +148,9 @@ DiskIndex<BucketT>::DiskIndex(BucketManager& bm,
 
     std::vector<uint64_t> keyHashes;
     auto seed = shortHash::getShortHashInitKey();
+    SHA256* hasherPtr = hasher.has_value() ? &hasher.value() : nullptr;
 
-    while (in && in.readOne(be))
+    while (in && in.readOne(be, hasherPtr))
     {
         // peridocially check if bucket manager is exiting to stop indexing
         // gracefully

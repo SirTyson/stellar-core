@@ -45,7 +45,7 @@ namespace stellar
  */
 
 class BucketManager;
-
+class SHA256;
 class LiveBucketIndex : public NonMovableOrCopyable
 {
   public:
@@ -74,7 +74,8 @@ class LiveBucketIndex : public NonMovableOrCopyable
 
     // Constructor for creating new index from Bucketfile
     LiveBucketIndex(BucketManager& bm, std::filesystem::path const& filename,
-                    Hash const& hash, asio::io_context& ctx);
+                    Hash const& hash, asio::io_context& ctx,
+                    std::optional<SHA256>& hasher);
 
     // Constructor for loading pre-existing index from disk
     template <class Archive>

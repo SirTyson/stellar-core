@@ -3,6 +3,7 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "historywork/VerifyBucketWork.h"
+#include "bucket/LiveBucketIndex.h"
 #include "crypto/Hex.h"
 #include "crypto/SHA.h"
 #include "main/Application.h"
@@ -20,13 +21,13 @@
 namespace stellar
 {
 
-VerifyBucketWork::VerifyBucketWork(Application& app,
-                                   std::string const& bucketFile,
-                                   uint256 const& hash,
-                                   OnFailureCallback failureCb)
+VerifyBucketWork::VerifyBucketWork(
+    Application& app, std::string const& bucketFile, uint256 const& hash,
+    std::unique_ptr<LiveBucketIndex const>& index, OnFailureCallback failureCb)
     : BasicWork(app, "verify-bucket-hash-" + bucketFile, BasicWork::RETRY_NEVER)
     , mBucketFile(bucketFile)
     , mHash(hash)
+    , mIndex(index)
     , mOnFailure(failureCb)
 {
 }
@@ -57,8 +58,8 @@ VerifyBucketWork::spawnVerifier()
     std::weak_ptr<VerifyBucketWork> weak(
         std::static_pointer_cast<VerifyBucketWork>(shared_from_this()));
     app.postOnBackgroundThread(
-        [&app, filename, weak, hash]() {
-            SHA256 hasher;
+        [&app, filename, weak, hash, &index = mIndex]() {
+            auto hasher = std::make_optional<SHA256>();
             asio::error_code ec;
 
             // No point in verifying buckets if things are shutting down
@@ -71,24 +72,15 @@ VerifyBucketWork::spawnVerifier()
             try
             {
                 ZoneNamedN(verifyZone, "bucket verify", true);
-                CLOG_INFO(History, "Verifying bucket {}", binToHex(hash));
+                CLOG_INFO(History, "Verifying and indexing bucket {}",
+                          binToHex(hash));
 
-                // ensure that the stream gets its own scope to avoid race with
-                // main thread
-                std::ifstream in(filename, std::ifstream::binary);
-                if (!in)
-                {
-                    throw std::runtime_error(fmt::format(
-                        FMT_STRING("Error opening file {}"), filename));
-                }
-                in.exceptions(std::ios::badbit);
-                char buf[4096];
-                while (in)
-                {
-                    in.read(buf, sizeof(buf));
-                    hasher.add(ByteSlice(buf, in.gcount()));
-                }
-                uint256 vHash = hasher.finish();
+                index = createIndex<LiveBucket>(
+                    app.getBucketManager(), filename, hash,
+                    app.getWorkerIOContext(), hasher);
+                releaseAssertOrThrow(index);
+
+                uint256 vHash = hasher->finish();
                 if (vHash == hash)
                 {
                     CLOG_DEBUG(History, "Verified hash ({}) for {}",

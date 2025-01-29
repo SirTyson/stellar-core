@@ -37,7 +37,8 @@ LiveBucketIndex::getPageSize(Config const& cfg, size_t bucketSize)
 
 LiveBucketIndex::LiveBucketIndex(BucketManager& bm,
                                  std::filesystem::path const& filename,
-                                 Hash const& hash, asio::io_context& ctx)
+                                 Hash const& hash, asio::io_context& ctx,
+                                 std::optional<SHA256>& hasher)
 {
     ZoneScoped;
     releaseAssert(!filename.empty());
@@ -50,7 +51,7 @@ LiveBucketIndex::LiveBucketIndex(BucketManager& bm,
                    "LiveBucketIndex::createIndex() using in-memory index for "
                    "bucket {}",
                    filename);
-        mInMemoryIndex = std::make_unique<InMemoryIndex>(bm, filename);
+        mInMemoryIndex = std::make_unique<InMemoryIndex>(bm, filename, hasher);
     }
     else
     {
@@ -59,7 +60,7 @@ LiveBucketIndex::LiveBucketIndex(BucketManager& bm,
                    "page size {} in bucket {}",
                    pageSize, filename);
         mDiskIndex = std::make_unique<DiskIndex<LiveBucket>>(
-            bm, filename, pageSize, hash, ctx);
+            bm, filename, pageSize, hash, ctx, hasher);
     }
 }
 

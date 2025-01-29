@@ -1592,8 +1592,9 @@ BucketManager::scheduleVerifyReferencedBucketsWork(
             throw std::runtime_error(fmt::format(
                 FMT_STRING("Missing referenced bucket {}"), binToHex(h)));
         }
+        std::unique_ptr<LiveBucketIndex const> index;
         seq.emplace_back(std::make_shared<VerifyBucketWork>(
-            mApp, b->getFilename().string(), b->getHash(), nullptr));
+            mApp, b->getFilename().string(), b->getHash(), index, nullptr));
     }
     return mApp.getWorkScheduler().scheduleWork<WorkSequence>(
         "verify-referenced-buckets", seq);
