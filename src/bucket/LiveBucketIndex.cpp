@@ -11,6 +11,7 @@
 #include "util/Logging.h"
 #include "xdr/Stellar-ledger-entries.h"
 #include <ios>
+#include <medida/meter.h>
 #include <shared_mutex>
 #include <vector>
 
@@ -39,6 +40,8 @@ LiveBucketIndex::getPageSize(Config const& cfg, size_t bucketSize)
 LiveBucketIndex::LiveBucketIndex(BucketManager& bm,
                                  std::filesystem::path const& filename,
                                  Hash const& hash, asio::io_context& ctx)
+    : mCacheHitMeter(bm.getCacheHitMeter())
+    , mCacheMissMeter(bm.getCacheMissMeter())
 {
     ZoneScoped;
     releaseAssert(!filename.empty());
@@ -80,6 +83,8 @@ LiveBucketIndex::LiveBucketIndex(BucketManager const& bm, Archive& ar,
                                  std::streamoff pageSize)
 
     : mDiskIndex(std::make_unique<DiskIndex<LiveBucket>>(ar, bm, pageSize))
+    , mCacheHitMeter(bm.getCacheHitMeter())
+    , mCacheMissMeter(bm.getCacheMissMeter())
 {
     // Only disk indexes are serialized
     releaseAssertOrThrow(pageSize != 0);
@@ -129,8 +134,15 @@ LiveBucketIndex::getCachedEntry(LedgerKey const& k) const
         auto cachePtr = mCache->maybeGet(k);
         if (cachePtr)
         {
+            mCacheHitMeter.Mark();
             return *cachePtr;
         }
+
+        // In the case of a bloom filter false positive, we might have a cache
+        // "miss" because we're searching for something that doesn't exist. We
+        // don't cache non-existent entries, so we don't meter misses here.
+        // Instead, we track misses when we insert a new entry, since we always
+        // insert a new entry into the cache after a miss.
     }
 
     return nullptr;
@@ -252,6 +264,10 @@ LiveBucketIndex::maybeAddToCache(std::shared_ptr<BucketEntry const> entry) const
     {
         releaseAssertOrThrow(entry);
         auto k = getBucketLedgerKey(*entry);
+
+        // If we are adding an entry to the cache, we must have missed it
+        // earlier.
+        mCacheMissMeter.Mark();
 
         std::unique_lock<std::shared_mutex> lock(mCacheMutex);
         mCache->put(k, entry);
