@@ -48,6 +48,8 @@
 #include "medida/meter.h"
 #include "medida/metrics_registry.h"
 
+#include "util/XDRStream.h"
+
 #include <algorithm>
 #include <numeric>
 #include <unordered_set>
@@ -1696,7 +1698,8 @@ TransactionFrame::applyOperations(SignatureChecker& signatureChecker,
 
     bool skipTx = false;
 
-    static int num_tx_skipped = 0;
+    static int num_tx_skipped_send = 0;
+    static int num_tx_skipped_receive = 0;
     auto const& result = txResult.getReplayTransactionResult();
     if (result && result->result.code() != txSUCCESS)
     {
@@ -1712,14 +1715,42 @@ TransactionFrame::applyOperations(SignatureChecker& signatureChecker,
                 // These are rare and the cache returns a different error,
                 // resulting in hash mismatch. Shouldn't impact perf values too
                 // much
-                if (opRes.code() == opINNER &&
-                    opRes.tr().type() == PATH_PAYMENT_STRICT_SEND &&
-                    opRes.tr().pathPaymentStrictSendResult().code() !=
-                        PATH_PAYMENT_STRICT_SEND_UNDER_DESTMIN)
+                static int over_max = 0;
+                static int few_offers = 0;
+                if (opRes.code() == opINNER)
                 {
-                    skipTx = true;
-                    CLOG_FATAL(Tx, "Skipping failed TX {}", num_tx_skipped++);
-                    break;
+                    if (opRes.tr().type() == PATH_PAYMENT_STRICT_SEND &&
+                        opRes.tr().pathPaymentStrictSendResult().code() !=
+                            PATH_PAYMENT_STRICT_SEND_UNDER_DESTMIN)
+                    {
+                        skipTx = true;
+                        CLOG_FATAL(Tx, "Skipping failed send TX {}",
+                                   num_tx_skipped_send++);
+                        break;
+                    }
+
+                    // if (opRes.tr().type() == PATH_PAYMENT_STRICT_RECEIVE &&
+                    //     opRes.tr().pathPaymentStrictReceiveResult().code() ==
+                    //         PATH_PAYMENT_STRICT_RECEIVE_TOO_FEW_OFFERS)
+                    // {
+                    //     skipTx = true;
+                    //     few_offers++;
+                    //     CLOG_FATAL(Tx, "Few offers: {}", few_offers);
+                    //     // CLOG_FATAL(Tx, "Skipping failed send TX {}",
+                    //     //            num_tx_skipped_receive++);
+                    //     // CLOG_FATAL(Tx, "{}", xdrToCerealString(opRes,
+                    //     // "res"));
+                    //     break;
+                    // }
+
+                    // if (opRes.tr().type() == PATH_PAYMENT_STRICT_RECEIVE &&
+                    //     opRes.tr().pathPaymentStrictReceiveResult().code() ==
+                    //         PATH_PAYMENT_STRICT_RECEIVE_OVER_SENDMAX)
+                    // {
+                    //     skipTx = false;
+                    //     over_max++;
+                    //     CLOG_FATAL(Tx, "Over max: {}", over_max);
+                    // }
                 }
             }
         }
@@ -1782,6 +1813,9 @@ TransactionFrame::applyOperations(SignatureChecker& signatureChecker,
                 subSeed = subSeedSha.finish();
             }
             ++opNum;
+
+            // CLOG_FATAL(Tx, "op: {}",
+            //            xdrToCerealString(op->getOperation(), "op"));
 
             bool txRes = op->apply(app, signatureChecker, ltxOp, subSeed,
                                    opResult, txResult.getSorobanData());
@@ -1887,6 +1921,16 @@ TransactionFrame::applyOperations(SignatureChecker& signatureChecker,
                     outerMeta, app.getConfig());
             }
         }
+
+        // if (result && !(result->result == txResult.getResult().result))
+        // {
+        //     CLOG_FATAL(Tx, "EXPECTED {}",
+        //                xdrToCerealString(result->result, "res"));
+        //     CLOG_FATAL(Tx, "GOT {}",
+        //                xdrToCerealString(txResult.getResult().result,
+        //                "res"));
+        // }
+
         return success;
     }
     catch (InvariantDoesNotHold& e)

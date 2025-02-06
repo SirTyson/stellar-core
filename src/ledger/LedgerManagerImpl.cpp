@@ -163,6 +163,8 @@ LedgerManagerImpl::LedgerManagerImpl(Application& app)
 
     mPathPaymentStrictSendFailureCache.reserve(1000);
     mAssetToPaths.reserve(1000);
+    mRecvAssetToPaths.reserve(1000);
+    mTooFewRecOffersCache.reserve(1000);
 }
 
 void
@@ -1889,6 +1891,8 @@ LedgerManagerImpl::clearPathPaymentStrictSendCache()
 {
     mPathPaymentStrictSendFailureCache.clear();
     mAssetToPaths.clear();
+    mRecvAssetToPaths.clear();
+    mTooFewRecOffersCache.clear();
 }
 
 void
@@ -1957,5 +1961,64 @@ LedgerManagerImpl::invalidatePathPaymentCachesForAssetPair(
         }
         mAssetToPaths.erase(it);
     }
+
+    invalidatePathPaymentRecvCache(pair);
+}
+
+void
+LedgerManagerImpl::invalidatePathPaymentRecvCache(AssetPair const& pair)
+{
+    ZoneScoped;
+
+    auto it = mRecvAssetToPaths.find(pair);
+    if (it != mRecvAssetToPaths.end())
+    {
+        for (auto const& pathHash : it->second)
+        {
+            mTooFewRecOffersCache.erase(pathHash);
+        }
+        mRecvAssetToPaths.erase(it);
+    }
+}
+
+void
+LedgerManagerImpl::cachePathPaymentStrictReceiveTooFewOffers(
+    Hash const& pathHash, Asset const& dest, std::vector<Asset> const& assets,
+    int64_t sendMax)
+{
+    ZoneScoped;
+    auto iter = mTooFewRecOffersCache.find(pathHash);
+    if (iter == mTooFewRecOffersCache.end())
+    {
+        mTooFewRecOffersCache.emplace(pathHash, sendMax);
+    }
+    else if (iter->second > sendMax)
+    {
+        iter->second = sendMax;
+    }
+
+    auto insert = [&](AssetPair const& pair) {
+        auto iter = mRecvAssetToPaths.find(pair);
+        if (iter == mRecvAssetToPaths.end())
+        {
+            mRecvAssetToPaths.emplace(pair, std::vector<Hash>{pathHash});
+        }
+        else
+        {
+            iter->second.push_back(pathHash);
+        }
+    };
+
+    insert(AssetPair{dest, assets[0]});
+    for (size_t i = 0; i < assets.size() - 1; i++)
+    {
+        insert(AssetPair{assets[i], assets[i + 1]});
+    }
+}
+
+UnorderedMap<Hash, int64_t> const&
+LedgerManagerImpl::getTooFewRecOffersCache() const
+{
+    return mTooFewRecOffersCache;
 }
 }

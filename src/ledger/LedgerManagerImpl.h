@@ -113,6 +113,10 @@ class LedgerManagerImpl : public LedgerManager
     // Maps assets to the paths that contain them
     AssetToPathsMap mAssetToPaths;
 
+    // Maps asset pairs to the paths that contain them
+    AssetToPathsMap mRecvAssetToPaths;
+    UnorderedMap<Hash, int64_t> mTooFewRecOffersCache;
+
     static std::vector<MutableTxResultPtr> processFeesSeqNums(
         ApplicableTxSetFrame const& txSet, AbstractLedgerTxn& ltxOuter,
         std::unique_ptr<LedgerCloseMetaFrame> const& ledgerCloseMeta,
@@ -271,5 +275,13 @@ class LedgerManagerImpl : public LedgerManager
 
     void
     invalidatePathPaymentCachesForAssetPair(AssetPair const& pair) override;
+
+    void invalidatePathPaymentRecvCache(AssetPair const& pair) override;
+
+    void cachePathPaymentStrictReceiveTooFewOffers(
+        Hash const& pathHash, Asset const& dest,
+        std::vector<Asset> const& assets, int64_t sendMax) override;
+
+    UnorderedMap<Hash, int64_t> const& getTooFewRecOffersCache() const override;
 };
 }

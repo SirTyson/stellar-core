@@ -72,6 +72,48 @@ PathPaymentStrictReceiveOpFrame::doApply(
                     mPathPayment.path.rend());
     fullPath.emplace_back(getSourceAsset());
 
+    // Calculate path hash like in PathPaymentStrictSendOpFrame
+    SHA256 hasher;
+    auto destHash = getAssetHash(getDestAsset());
+    hasher.add(ByteSlice(reinterpret_cast<unsigned char*>(&destHash),
+                         sizeof(destHash)));
+    for (auto const& asset : fullPath)
+    {
+        auto assetHash = getAssetHash(asset);
+        hasher.add(ByteSlice(reinterpret_cast<unsigned char*>(&assetHash),
+                             sizeof(assetHash)));
+    }
+    auto const pathHash = hasher.finish();
+
+    // Check if this path was already found to have too few offers
+    auto& tooFewCache = app.getLedgerManager().getTooFewRecOffersCache();
+    auto cacheIter = tooFewCache.find(pathHash);
+    if (cacheIter != tooFewCache.end())
+    {
+        // Only use the cache if the current sendMax is less than or equal to
+        // the cached sendMax that failed
+        if (mPathPayment.sendMax >= cacheIter->second)
+        {
+            // CLOG_FATAL(Bucket, "CACHE HIT: {}, hash {}", pathStr,
+            //            binToHex(pathHash));
+            // CLOG_FATAL(Bucket, "sendMax: {}, cached sendMax: {}",
+            //            mPathPayment.sendMax, cacheIter->second);
+            setResultTooFewOffers(res);
+            return false;
+        }
+
+        // CLOG_FATAL(Bucket, "CACHE MISS due to sendMax: {}, hash {}", pathStr,
+        //            binToHex(pathHash));
+
+        // CLOG_FATAL(Bucket, "sendMax: {}, cached sendMax: {}",
+        //            mPathPayment.sendMax, cacheIter->second);
+    }
+    // else
+    // {
+    //     CLOG_FATAL(Bucket, "CACHE MISS: {}, hash {}", pathStr,
+    //                binToHex(pathHash));
+    // }
+
     // Walk the path
     Asset recvAsset = getDestAsset();
     int64_t maxAmountRecv = mPathPayment.destAmount;
@@ -108,6 +150,18 @@ PathPaymentStrictReceiveOpFrame::doApply(
                      RoundingType::PATH_PAYMENT_STRICT_RECEIVE, offerTrail,
                      res))
         {
+            if (innerResult(res).code() ==
+                PATH_PAYMENT_STRICT_RECEIVE_TOO_FEW_OFFERS)
+            {
+                app.getLedgerManager()
+                    .cachePathPaymentStrictReceiveTooFewOffers(
+                        pathHash, getDestAsset(), fullPath,
+                        mPathPayment.sendMax);
+
+                // CLOG_FATAL(Bucket, "populating cache {}, hash {}, max {}",
+                //            pathStr, binToHex(pathHash),
+                //            mPathPayment.sendMax);
+            }
             return false;
         }
 

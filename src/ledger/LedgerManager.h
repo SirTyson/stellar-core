@@ -233,5 +233,14 @@ class LedgerManager
     // Invalidate paths containing the given asset pair (in that order)
     virtual void
     invalidatePathPaymentCachesForAssetPair(AssetPair const& pair) = 0;
+
+    virtual void invalidatePathPaymentRecvCache(AssetPair const& pPair) = 0;
+
+    virtual void cachePathPaymentStrictReceiveTooFewOffers(
+        Hash const& pathHash, Asset const& dest,
+        std::vector<Asset> const& assets, int64_t sendMax) = 0;
+
+    virtual UnorderedMap<Hash, int64_t> const&
+    getTooFewRecOffersCache() const = 0;
 };
 }
