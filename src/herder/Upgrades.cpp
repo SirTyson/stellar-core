@@ -559,6 +559,7 @@ Upgrades::isValidForApply(UpgradeType const& opaqueUpgrade,
     {
     case LEDGER_UPGRADE_VERSION:
     {
+        CLOG_FATAL(Bucket, "CRAP 0");
         uint32 newVersion = upgrade.newLedgerVersion();
         // only allow upgrades to a supported version of the protocol
         res = res && (newVersion <= app.getConfig().LEDGER_PROTOCOL_VERSION);
@@ -567,40 +568,49 @@ Upgrades::isValidForApply(UpgradeType const& opaqueUpgrade,
     }
     break;
     case LEDGER_UPGRADE_BASE_FEE:
+        CLOG_FATAL(Bucket, "CRAP 1");
         res = res && (upgrade.newBaseFee() != 0);
         break;
     case LEDGER_UPGRADE_MAX_TX_SET_SIZE:
+        CLOG_FATAL(Bucket, "CRAP 2");
         // any size is allowed
         break;
     case LEDGER_UPGRADE_BASE_RESERVE:
+        CLOG_FATAL(Bucket, "CRAP 3");
         res = res && (upgrade.newBaseReserve() != 0);
         break;
     case LEDGER_UPGRADE_FLAGS:
+        CLOG_FATAL(Bucket, "CRAP 4");
         res = res &&
               protocolVersionStartsFrom(version, ProtocolVersion::V_18) &&
               (upgrade.newFlags() & ~MASK_LEDGER_HEADER_FLAGS) == 0;
         break;
     case LEDGER_UPGRADE_CONFIG:
     {
+        CLOG_FATAL(Bucket, "CRAP 5");
         if (protocolVersionIsBefore(version, SOROBAN_PROTOCOL_VERSION))
         {
+            CLOG_FATAL(Bucket, "BRUH 0");
             return UpgradeValidity::INVALID;
         }
         auto cfgUpgrade =
             ConfigUpgradeSetFrame::makeFromKey(ls, upgrade.newConfig());
         if (!cfgUpgrade)
         {
+            CLOG_FATAL(Bucket, "BRUH 1");
             return UpgradeValidity::INVALID;
         }
         auto configUpgradeValid = cfgUpgrade->isValidForApply();
         if (configUpgradeValid == UpgradeValidity::XDR_INVALID)
         {
+            CLOG_FATAL(Bucket, "BRUH 2");
             return UpgradeValidity::XDR_INVALID;
         }
         res = res && (configUpgradeValid == UpgradeValidity::VALID);
         break;
     }
     case LEDGER_UPGRADE_MAX_SOROBAN_TX_SET_SIZE:
+        CLOG_FATAL(Bucket, "CRAP 6");
         if (protocolVersionIsBefore(version, SOROBAN_PROTOCOL_VERSION))
         {
             return UpgradeValidity::INVALID;
@@ -1249,6 +1259,7 @@ ConfigUpgradeSetFrame::makeFromKey(LedgerSnapshot const& ls,
     auto ltxe = ls.load(lk);
     if (!ltxe)
     {
+        CLOG_FATAL(Bucket, "PLZ 0");
         return nullptr;
     }
 
@@ -1256,6 +1267,7 @@ ConfigUpgradeSetFrame::makeFromKey(LedgerSnapshot const& ls,
     releaseAssert(ttlLtxe);
     if (!isLive(ttlLtxe.current(), ls.getLedgerHeader().current().ledgerSeq))
     {
+        CLOG_FATAL(Bucket, "PLZ 1");
         return nullptr;
     }
 
@@ -1263,6 +1275,7 @@ ConfigUpgradeSetFrame::makeFromKey(LedgerSnapshot const& ls,
     if (contractData.val.type() != SCV_BYTES ||
         contractData.durability != TEMPORARY)
     {
+        CLOG_FATAL(Bucket, "PLZ 2");
         return nullptr;
     }
     auto const& bytes = contractData.val.bytes();
@@ -1274,11 +1287,17 @@ ConfigUpgradeSetFrame::makeFromKey(LedgerSnapshot const& ls,
     }
     catch (xdr::xdr_runtime_error&)
     {
+        CLOG_FATAL(Bucket, "PLZ 3");
         return nullptr;
     }
 
-    return std::shared_ptr<ConfigUpgradeSetFrame>(new ConfigUpgradeSetFrame(
+    auto ret = std::shared_ptr<ConfigUpgradeSetFrame>(new ConfigUpgradeSetFrame(
         upgradeSet, key, ls.getLedgerHeader().current().ledgerVersion));
+    if (!ret)
+    {
+        CLOG_FATAL(Bucket, "PLZ 4");
+    }
+    return ret;
 }
 
 ConfigUpgradeSetFrame::ConfigUpgradeSetFrame(

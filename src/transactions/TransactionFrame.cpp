@@ -1321,6 +1321,7 @@ TransactionFrame::commonValid(AppConnector& app,
                 app, cfg, ls, chargeFee, lowerBoundCloseTimeOffset,
                 upperBoundCloseTimeOffset, sorobanResourceFee, txResult))
         {
+            CLOG_FATAL(Tx, "Wtf 4");
             return;
         }
 
@@ -1339,6 +1340,7 @@ TransactionFrame::commonValid(AppConnector& app,
             }
             if (isBadSeq(header, current))
             {
+                CLOG_FATAL(Tx, "Wtf 5");
                 txResult->setInnermostResultCode(txBAD_SEQ);
                 return;
             }
@@ -1349,6 +1351,7 @@ TransactionFrame::commonValid(AppConnector& app,
         if (isTooEarlyForAccount(header, sourceAccount,
                                  lowerBoundCloseTimeOffset))
         {
+            CLOG_FATAL(Tx, "Wtf 6");
             txResult->setInnermostResultCode(txBAD_MIN_SEQ_AGE_OR_GAP);
             return;
         }
@@ -1358,6 +1361,7 @@ TransactionFrame::commonValid(AppConnector& app,
                                 .data.account()
                                 .thresholds[THRESHOLD_LOW]))
         {
+            CLOG_FATAL(Tx, "Wtf 7");
             txResult->setInnermostResultCode(txBAD_AUTH);
             return;
         }
@@ -1366,6 +1370,7 @@ TransactionFrame::commonValid(AppConnector& app,
                                       ProtocolVersion::V_19) &&
             !checkExtraSigners(signatureChecker))
         {
+            CLOG_FATAL(Tx, "Wtf 8");
             txResult->setInnermostResultCode(txBAD_AUTH);
             return;
         }
@@ -1386,6 +1391,7 @@ TransactionFrame::commonValid(AppConnector& app,
             getAvailableBalance(header.current(), sourceAccount.current()) <
                 feeToPay)
         {
+            CLOG_FATAL(Tx, "Wtf 9");
             txResult->setInnermostResultCode(txINSUFFICIENT_BALANCE);
             return;
         }
@@ -1533,6 +1539,7 @@ TransactionFrame::checkValidWithOptionallyChargedFee(
 
     if (!XDRProvidesValidFee())
     {
+        CLOG_FATAL(Tx, "Wtf 0");
         auto txResult = createSuccessResult();
         txResult->setInnermostResultCode(txMALFORMED);
         return txResult;
@@ -1577,6 +1584,7 @@ TransactionFrame::checkValidWithOptionallyChargedFee(
             if (!op->checkValid(app, signatureChecker, sorobanConfig, ls, false,
                                 opResult, txResult->getSorobanData()))
             {
+                CLOG_FATAL(Tx, "Wtf 1");
                 // it's OK to just fast fail here and not try to call
                 // checkValid on all operations as the resulting object
                 // is only used by applications
@@ -1587,8 +1595,13 @@ TransactionFrame::checkValidWithOptionallyChargedFee(
 
         if (!signatureChecker.checkAllSignaturesUsed())
         {
+            CLOG_FATAL(Tx, "Wtf 2");
             txResult->setInnermostResultCode(txBAD_AUTH_EXTRA);
         }
+    }
+    else
+    {
+        CLOG_FATAL(Tx, "Wtf 3");
     }
 
     return txResult;

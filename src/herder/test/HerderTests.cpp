@@ -1076,16 +1076,17 @@ TEST_CASE("surge pricing", "[herder][txset][soroban]")
     SECTION("max 0 ops per ledger")
     {
         Config cfg(getTestConfig(0, Config::TESTDB_IN_MEMORY));
-        cfg.TESTING_UPGRADE_MAX_TX_SET_SIZE = 0;
-
-        VirtualClock clock;
-        Application::pointer app = createTestApplication(clock, cfg);
-        auto root = TestAccount::createRoot(*app);
-
-        auto destAccount = root.create("destAccount", 500000000);
 
         SECTION("classic")
         {
+            cfg.TESTING_UPGRADE_MAX_TX_SET_SIZE = 0;
+
+            VirtualClock clock;
+            Application::pointer app = createTestApplication(clock, cfg);
+            auto root = TestAccount::createRoot(*app);
+
+            auto destAccount = root.create("destAccount", 500000000);
+
             auto tx = makeMultiPayment(destAccount, root, 1, 100, 0, 1);
 
             TxFrameList invalidTxs;
@@ -1098,13 +1099,27 @@ TEST_CASE("surge pricing", "[herder][txset][soroban]")
         }
         SECTION("soroban")
         {
+            // Dont set TESTING_UPGRADE_MAX_TX_SET_SIZE for soroban test case
+            // because we need to submit a TX for the actual kill switch
+            // upgrade.
+            VirtualClock clock;
+            Application::pointer app = createTestApplication(clock, cfg);
+            auto root =
+                std::make_shared<TestAccount>(TestAccount::createRoot(*app));
+
+            auto destAccount = root->create("destAccount", 500000000);
+
             uint32_t const baseFee = 10'000'000;
-            modifySorobanNetworkConfig(*app, [](SorobanNetworkConfig& cfg) {
-                cfg.mLedgerMaxTxCount = 0;
-            });
+            modifySorobanNetworkConfig(
+                *app,
+                [](SorobanNetworkConfig& cfg) { cfg.mLedgerMaxTxCount = 0; },
+                root);
             SorobanResources resources;
+
+            // TODO: Figure out what this is
+            // root.loadSequenceNumber();
             auto sorobanTx = createUploadWasmTx(
-                *app, root, baseFee, DEFAULT_TEST_RESOURCE_FEE, resources);
+                *app, *root, baseFee, DEFAULT_TEST_RESOURCE_FEE, resources);
 
             PerPhaseTransactionList invalidTxs;
             invalidTxs.resize(static_cast<size_t>(TxSetPhase::PHASE_COUNT));

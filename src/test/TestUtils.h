@@ -9,7 +9,9 @@
 #include "invariant/InvariantDoesNotHold.h"
 #include "invariant/InvariantManagerImpl.h"
 #include "ledger/LedgerManagerImpl.h"
+#include "main/Application.h"
 #include "main/ApplicationImpl.h"
+#include "test/TestAccount.h"
 #include "util/ProtocolVersion.h"
 #include <type_traits>
 
@@ -126,7 +128,8 @@ upgradeSorobanNetworkConfig(std::function<void(SorobanNetworkConfig&)> modifyFn,
                             bool applyUpgrade = true);
 void
 modifySorobanNetworkConfig(Application& app,
-                           std::function<void(SorobanNetworkConfig&)> modifyFn);
+                           std::function<void(SorobanNetworkConfig&)> modifyFn,
+                           std::shared_ptr<TestAccount> rootPtr = nullptr);
 
 bool appProtocolVersionStartsFrom(Application& app,
                                   ProtocolVersion fromVersion);
