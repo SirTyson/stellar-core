@@ -316,6 +316,11 @@ HerderSCPDriver::validateValueHelper(uint64_t slotIndex, StellarValue const& b,
 
     auto closeTimeOffset = b.closeTime - lastCloseTime;
 
+    // We already did signature check
+    // We're in nomination and we ourselves are the leader -- skip validation
+    bool isValid = nomination && b.ext.lcValueSignature().nodeID ==
+                                     mApp.getConfig().NODE_SEED.getPublicKey();
+
     if (!txSet)
     {
         CLOG_ERROR(Herder, "validateValue i:{} unknown txSet {}", slotIndex,
@@ -323,7 +328,7 @@ HerderSCPDriver::validateValueHelper(uint64_t slotIndex, StellarValue const& b,
 
         res = SCPDriver::kInvalidValue;
     }
-    else if (!checkAndCacheTxSetValid(*txSet, lcl, closeTimeOffset))
+    else if (!checkAndCacheTxSetValid(*txSet, lcl, closeTimeOffset, isValid))
     {
         CLOG_DEBUG(Herder,
                    "HerderSCPDriver::validateValue i: {} invalid txSet {}",
@@ -1230,7 +1235,8 @@ HerderSCPDriver::wrapStellarValue(StellarValue const& sv)
 bool
 HerderSCPDriver::checkAndCacheTxSetValid(TxSetXDRFrame const& txSet,
                                          LedgerHeaderHistoryEntry const& lcl,
-                                         uint64_t closeTimeOffset) const
+                                         uint64_t closeTimeOffset,
+                                         bool isValid) const
 {
     auto key = TxSetValidityKey{lcl.hash, txSet.getContentsHash(),
                                 closeTimeOffset, closeTimeOffset};
@@ -1260,7 +1266,7 @@ HerderSCPDriver::checkAndCacheTxSetValid(TxSetXDRFrame const& txSet,
         else
         {
             res = applicableTxSet->checkValid(mApp, closeTimeOffset,
-                                              closeTimeOffset);
+                                              closeTimeOffset, isValid);
         }
 
         mTxSetValidCache.put(key, res);

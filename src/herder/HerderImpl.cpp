@@ -1253,14 +1253,22 @@ HerderImpl::setupTriggerNextLedger()
     // even if ballot protocol started before triggering, we just use that
     // time as reference point for triggering again (this may trigger right
     // away if externalizing took a long time)
-    mTriggerTimer.expires_at(triggerTime);
 
-    if (!mApp.getConfig().MANUAL_CLOSE)
+    if (triggerTime == now)
     {
-        mTriggerTimer.async_wait(std::bind(&HerderImpl::triggerNextLedger, this,
-                                           static_cast<uint32_t>(nextIndex),
-                                           true),
-                                 &VirtualTimer::onFailureNoop);
+        triggerNextLedger(nextIndex, true, true);
+    }
+    else
+    {
+        mTriggerTimer.expires_at(triggerTime);
+
+        if (!mApp.getConfig().MANUAL_CLOSE)
+        {
+            mTriggerTimer.async_wait(
+                std::bind(&HerderImpl::triggerNextLedger, this,
+                          static_cast<uint32_t>(nextIndex), true, false),
+                &VirtualTimer::onFailureNoop);
+        }
     }
 
 #ifdef BUILD_TESTS
@@ -1369,14 +1377,14 @@ HerderImpl::setInSyncAndTriggerNextLedger()
 
     // Trigger next ledger, without requiring Herder to properly track SCP
     auto lcl = mLedgerManager.getLastClosedLedgerNum();
-    triggerNextLedger(lcl + 1, false);
+    triggerNextLedger(lcl + 1, false, false);
 }
 
 // called to take a position during the next round
 // uses the state in LedgerManager to derive a starting position
 void
 HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
-                              bool checkTrackingSCP)
+                              bool checkTrackingSCP, bool skipValidation)
 {
     ZoneScoped;
     ZoneValue(static_cast<int64_t>(ledgerSeqToTrigger));
@@ -1473,9 +1481,10 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
     PerPhaseTransactionList invalidTxPhases;
     invalidTxPhases.resize(txPhases.size());
 
-    auto [proposedSet, applicableProposedSet] =
-        makeTxSetFromTransactions(txPhases, mApp, lowerBoundCloseTimeOffset,
-                                  upperBoundCloseTimeOffset, invalidTxPhases);
+    // Pipe skipValidation flag
+    auto [proposedSet, applicableProposedSet] = makeTxSetFromTransactions(
+        txPhases, mApp, lowerBoundCloseTimeOffset, upperBoundCloseTimeOffset,
+        invalidTxPhases, skipValidation);
 
     if (protocolVersionStartsFrom(lcl.header.ledgerVersion,
                                   SOROBAN_PROTOCOL_VERSION))

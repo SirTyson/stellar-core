@@ -53,27 +53,21 @@ makeTxSetFromTransactions(
     PerPhaseTransactionList const& txPhases, Application& app,
     uint64_t lowerBoundCloseTimeOffset,
     uint64_t upperBoundCloseTimeOffset
-#ifdef BUILD_TESTS
     // Skips the tx set validation and preserves the pointers
     // to the passed-in transactions - use in conjunction with
     // `enforceTxsApplyOrder` argument in test-only overrides.
     ,
-    bool skipValidation = false
-#endif
-);
+    bool skipValidation = false);
 std::pair<TxSetXDRFrameConstPtr, ApplicableTxSetFrameConstPtr>
 makeTxSetFromTransactions(
     PerPhaseTransactionList const& txPhases, Application& app,
     uint64_t lowerBoundCloseTimeOffset, uint64_t upperBoundCloseTimeOffset,
     PerPhaseTransactionList& invalidTxsPerPhase
-#ifdef BUILD_TESTS
     // Skips the tx set validation and preserves the pointers
     // to the passed-in transactions - use in conjunction with
     // `enforceTxsApplyOrder` argument in test-only overrides.
     ,
-    bool skipValidation = false
-#endif
-);
+    bool skipValidation = false);
 
 #ifdef BUILD_TESTS
 std::pair<TxSetXDRFrameConstPtr, ApplicableTxSetFrameConstPtr>
@@ -303,12 +297,8 @@ class TxSetPhaseFrame
                               Application& app,
                               uint64_t lowerBoundCloseTimeOffset,
                               uint64_t upperBoundCloseTimeOffset,
-                              PerPhaseTransactionList& invalidTxsPerPhase
-#ifdef BUILD_TESTS
-                              ,
-                              bool skipValidation
-#endif
-    );
+                              PerPhaseTransactionList& invalidTxsPerPhase,
+                              bool skipValidation);
 #ifdef BUILD_TESTS
     friend std::pair<TxSetXDRFrameConstPtr, ApplicableTxSetFrameConstPtr>
     makeTxSetFromTransactions(TxFrameList txs, Application& app,
@@ -340,7 +330,8 @@ class TxSetPhaseFrame
     // Returns a copy of this phase with transactions sorted for apply.
     TxSetPhaseFrame sortedForApply(Hash const& txSetHash) const;
     bool checkValid(Application& app, uint64_t lowerBoundCloseTimeOffset,
-                    uint64_t upperBoundCloseTimeOffset) const;
+                    uint64_t upperBoundCloseTimeOffset,
+                    bool skipTxValidation = false) const;
     bool checkValidClassic(LedgerHeader const& lclHeader) const;
     bool checkValidSoroban(LedgerHeader const& lclHeader,
                            SorobanNetworkConfig const& sorobanConfig) const;
@@ -396,7 +387,8 @@ class ApplicableTxSetFrame
     // This can be called when LCL does not match `previousLedgerHash`, but
     // then validation will never pass.
     bool checkValid(Application& app, uint64_t lowerBoundCloseTimeOffset,
-                    uint64_t upperBoundCloseTimeOffset) const;
+                    uint64_t upperBoundCloseTimeOffset,
+                    bool skipValidation = false) const;
 
     // Returns the size of this whole transaction set, or the specified phase
     // in operations or transactions (for older protocol versions).
@@ -460,20 +452,14 @@ class ApplicableTxSetFrame
                               Application& app,
                               uint64_t lowerBoundCloseTimeOffset,
                               uint64_t upperBoundCloseTimeOffset,
-                              PerPhaseTransactionList& invalidTxsPerPhase
-#ifdef BUILD_TESTS
-                              ,
-                              bool skipValidation
-#endif
-    );
-#ifdef BUILD_TESTS
+                              PerPhaseTransactionList& invalidTxsPerPhase,
+                              bool skipValidation);
     friend std::pair<TxSetXDRFrameConstPtr, ApplicableTxSetFrameConstPtr>
     makeTxSetFromTransactions(TxFrameList txs, Application& app,
                               uint64_t lowerBoundCloseTimeOffset,
                               uint64_t upperBoundCloseTimeOffset,
                               TxFrameList& invalidTxs,
                               bool enforceTxsApplyOrder);
-#endif
 
     ApplicableTxSetFrame(Application& app,
                          LedgerHeaderHistoryEntry const& lclHeader,

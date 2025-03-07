@@ -193,7 +193,8 @@ class Herder
     virtual uint32_t getMostRecentCheckpointSeq() = 0;
 
     virtual void triggerNextLedger(uint32_t ledgerSeqToTrigger,
-                                   bool forceTrackingSCP) = 0;
+                                   bool forceTrackingSCP,
+                                   bool skipValidation) = 0;
     virtual void setInSyncAndTriggerNextLedger() = 0;
 
     // lookup a nodeID in config and in SCP messages

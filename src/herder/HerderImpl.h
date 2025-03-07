@@ -176,8 +176,8 @@ class HerderImpl : public Herder
 
     uint32_t getMostRecentCheckpointSeq() override;
 
-    void triggerNextLedger(uint32_t ledgerSeqToTrigger,
-                           bool checkTrackingSCP) override;
+    void triggerNextLedger(uint32_t ledgerSeqToTrigger, bool checkTrackingSCP,
+                           bool skipValidation) override;
 
     void setInSyncAndTriggerNextLedger() override;
 
