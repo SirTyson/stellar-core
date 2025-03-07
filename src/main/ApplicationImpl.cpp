@@ -934,7 +934,7 @@ ApplicationImpl::manualClose(std::optional<uint32_t> const& manualLedgerSeq,
             releaseAssert(!manualLedgerSeq);
         }
 
-        mHerder->triggerNextLedger(targetLedgerSeq, true);
+        mHerder->triggerNextLedger(targetLedgerSeq, true, false);
 
         if (mConfig.RUN_STANDALONE)
         {

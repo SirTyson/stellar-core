@@ -670,34 +670,22 @@ TxSetXDRFrame::makeFromStoredTxSet(StoredTransactionSet const& storedSet)
 std::pair<TxSetXDRFrameConstPtr, ApplicableTxSetFrameConstPtr>
 makeTxSetFromTransactions(PerPhaseTransactionList const& txPhases,
                           Application& app, uint64_t lowerBoundCloseTimeOffset,
-                          uint64_t upperBoundCloseTimeOffset
-#ifdef BUILD_TESTS
-                          ,
-                          bool skipValidation
-#endif
-)
+                          uint64_t upperBoundCloseTimeOffset,
+                          bool skipValidation)
 {
     PerPhaseTransactionList invalidTxs;
     invalidTxs.resize(txPhases.size());
     return makeTxSetFromTransactions(txPhases, app, lowerBoundCloseTimeOffset,
-                                     upperBoundCloseTimeOffset, invalidTxs
-#ifdef BUILD_TESTS
-                                     ,
-                                     skipValidation
-#endif
-    );
+                                     upperBoundCloseTimeOffset, invalidTxs,
+                                     skipValidation);
 }
 
 std::pair<TxSetXDRFrameConstPtr, ApplicableTxSetFrameConstPtr>
 makeTxSetFromTransactions(PerPhaseTransactionList const& txPhases,
                           Application& app, uint64_t lowerBoundCloseTimeOffset,
                           uint64_t upperBoundCloseTimeOffset,
-                          PerPhaseTransactionList& invalidTxs
-#ifdef BUILD_TESTS
-                          ,
-                          bool skipValidation
-#endif
-)
+                          PerPhaseTransactionList& invalidTxs,
+                          bool skipValidation)
 {
     releaseAssert(threadIsMain());
     releaseAssert(!app.getLedgerManager().isApplying());
@@ -720,20 +708,16 @@ makeTxSetFromTransactions(PerPhaseTransactionList const& txPhases,
 
         auto& invalid = invalidTxs[i];
         TxFrameList validatedTxs;
-#ifdef BUILD_TESTS
         if (skipValidation)
         {
             validatedTxs = phaseTxs;
         }
         else
         {
-#endif
             validatedTxs = TxSetUtils::trimInvalid(
                 phaseTxs, app, lowerBoundCloseTimeOffset,
                 upperBoundCloseTimeOffset, invalid);
-#ifdef BUILD_TESTS
         }
-#endif
         auto phaseType = static_cast<TxSetPhase>(i);
         auto [includedTxs, inclusionFeeMap] =
             applySurgePricing(phaseType, validatedTxs, app);
@@ -770,7 +754,6 @@ makeTxSetFromTransactions(PerPhaseTransactionList const& txPhases,
     // Do the roundtrip through XDR to ensure we never build an incorrect tx set
     // for nomination.
     auto outputTxSet = preliminaryApplicableTxSet->toWireTxSetFrame();
-#ifdef BUILD_TESTS
     if (skipValidation)
     {
         // Fill in the contents hash if we're skipping the normal roundtrip
@@ -780,7 +763,6 @@ makeTxSetFromTransactions(PerPhaseTransactionList const& txPhases,
         return std::make_pair(outputTxSet,
                               std::move(preliminaryApplicableTxSet));
     }
-#endif
 
     ApplicableTxSetFrameConstPtr outputApplicableTxSet =
         outputTxSet->prepareForApply(app, lclHeader.header);
@@ -806,9 +788,11 @@ makeTxSetFromTransactions(PerPhaseTransactionList const& txPhases,
         }
     }
 
+    // Either skipValidation is true, or we already trimmed invalid txs in
+    // trimInvalid
     valid = valid &&
             outputApplicableTxSet->checkValid(app, lowerBoundCloseTimeOffset,
-                                              upperBoundCloseTimeOffset);
+                                              upperBoundCloseTimeOffset, true);
     if (!valid)
     {
         throw std::runtime_error("Created invalid tx set frame");
@@ -1575,7 +1559,8 @@ TxSetPhaseFrame::sortedForApply(Hash const& txSetHash) const
 bool
 TxSetPhaseFrame::checkValid(Application& app,
                             uint64_t lowerBoundCloseTimeOffset,
-                            uint64_t upperBoundCloseTimeOffset) const
+                            uint64_t upperBoundCloseTimeOffset,
+                            bool skipTxValidation) const
 {
     auto const& lcl = app.getLedgerManager().getLastClosedLedgerHeader();
     // Verify the fee map for the phase. This check is independent of the phase
@@ -1612,6 +1597,11 @@ TxSetPhaseFrame::checkValid(Application& app,
     if (!checkPhaseSpecific)
     {
         return false;
+    }
+
+    if (skipTxValidation)
+    {
+        return true;
     }
 
     return txsAreValid(app, lowerBoundCloseTimeOffset,
@@ -1926,7 +1916,8 @@ ApplicableTxSetFrame::getPhasesInApplyOrder() const
 bool
 ApplicableTxSetFrame::checkValid(Application& app,
                                  uint64_t lowerBoundCloseTimeOffset,
-                                 uint64_t upperBoundCloseTimeOffset) const
+                                 uint64_t upperBoundCloseTimeOffset,
+                                 bool skipValidation) const
 {
     ZoneScoped;
     releaseAssert(threadIsMain());
@@ -1987,7 +1978,7 @@ ApplicableTxSetFrame::checkValid(Application& app,
     for (auto const& phase : mPhases)
     {
         if (!phase.checkValid(app, lowerBoundCloseTimeOffset,
-                              upperBoundCloseTimeOffset))
+                              upperBoundCloseTimeOffset, skipValidation))
         {
             return false;
         }
