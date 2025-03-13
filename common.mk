@@ -2,7 +2,7 @@
 
 AM_CPPFLAGS = -isystem "$(top_srcdir)" -I"$(top_srcdir)/src" -I"$(top_builddir)/src"
 AM_CPPFLAGS += $(libsodium_CFLAGS) $(xdrpp_CFLAGS) $(libmedida_CFLAGS)	\
-	$(soci_CFLAGS) $(sqlite3_CFLAGS) $(libasio_CFLAGS) $(libunwind_CFLAGS)
+	$(soci_CFLAGS) $(sqlite3_CFLAGS) $(libasio_CFLAGS) $(libunwind_CFLAGS) $(zstd_CFLAGS)
 AM_CPPFLAGS += -isystem "$(top_srcdir)/lib"             \
 	-isystem "$(top_srcdir)/lib/autocheck/include"      \
 	-isystem "$(top_srcdir)/lib/cereal/include"         \
@@ -11,6 +11,7 @@ AM_CPPFLAGS += -isystem "$(top_srcdir)/lib"             \
 	-isystem "$(top_srcdir)/lib/soci/src/core"          \
 	-isystem "$(top_srcdir)/lib/tracy/public/tracy"     \
 	-isystem "$(top_srcdir)/lib/spdlog/include"         \
+	-isystem "$(top_srcdir)/lib/zstd"                   \
 	-isystem "$(top_srcdir)/rust/src"
 
 if USE_POSTGRES
@@ -25,6 +26,7 @@ endif
 
 # Unconditionally add CEREAL_THREAD_SAFE, we always want it.
 AM_CPPFLAGS += -DCEREAL_THREAD_SAFE
+AM_CPPFLAGS += -DZSTD_MULTITHREAD
 
 # USE_TRACY and tracy_CFLAGS here represent the case of enabling
 # tracy at configure-time; but even when it is disabled we want

@@ -323,6 +323,11 @@ soci_LIBS='$(top_builddir)/lib/libsoci.a'
 AC_SUBST(soci_CFLAGS)
 AC_SUBST(soci_LIBS)
 
+zstd_CFLAGS='-isystem $(top_srcdir)/lib/zstd'
+zstd_LIBS='$(top_builddir)/lib/lib3rdparty.a'
+AC_SUBST(zstd_CFLAGS)
+AC_SUBST(zstd_LIBS)
+
 libasio_CFLAGS='-DASIO_SEPARATE_COMPILATION=1 -DASIO_STANDALONE -isystem $(top_srcdir)/lib/asio/asio/include'
 AC_SUBST(libasio_CFLAGS)
 
