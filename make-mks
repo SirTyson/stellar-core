@@ -58,6 +58,8 @@ listall() {
  echo SOCI_FILES = $(listall soci/src/backends/sqlite3 soci/src/core)
  echo SOCI_PG_FILES = $(listall soci/src/backends/postgresql)
 
+ echo ZSTD_FILES = $(listall zstd/common zstd/compress zstd/decompress zstd/dictBuilder zstd/deprecated zstd/legacy) zstd/zstd.h zstd/zstd_errors.h zstd/zdict.h
+
  echo SQLITE3_FILES = $(listall sqlite)
  echo UTIL_FILES = $(listall util http httpthreaded)
  echo ASIO_H_FILES = $(listall asio/asio/include)
