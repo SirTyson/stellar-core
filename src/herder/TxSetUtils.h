@@ -13,6 +13,9 @@
 namespace stellar
 {
 
+class ZstdCompressor;
+class ZstdDecompressor;
+
 class AccountTransactionQueue
 {
   public:
@@ -54,5 +57,13 @@ class TxSetUtils
                                    uint64_t lowerBoundCloseTimeOffset,
                                    uint64_t upperBoundCloseTimeOffset,
                                    TxFrameList& invalidTxs);
+
+    // Compress/decompress generalized tx set via zstd
+    static std::vector<uint8_t>
+    compressTxSet(GeneralizedTransactionSet const& txSet,
+                  ZstdCompressor const& compressor);
+    static GeneralizedTransactionSet
+    decompressTxSet(std::vector<uint8_t> const& compressedTxSet,
+                    ZstdDecompressor const& decompressor);
 }; // class TxSetUtils
 } // namespace stellar

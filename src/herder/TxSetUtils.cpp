@@ -22,6 +22,7 @@
 #include "util/UnorderedSet.h"
 #include "util/XDRCereal.h"
 #include "util/XDROperators.h"
+#include "util/zstd.h"
 #include "xdrpp/marshal.h"
 
 #include <Tracy.hpp>
@@ -199,6 +200,42 @@ TxSetUtils::trimInvalid(TxFrameList const& txs, Application& app,
     invalidTxs = getInvalidTxList(txs, app, lowerBoundCloseTimeOffset,
                                   upperBoundCloseTimeOffset);
     return removeTxs(txs, invalidTxs);
+}
+
+std::vector<uint8_t>
+TxSetUtils::compressTxSet(GeneralizedTransactionSet const& txSet,
+                          ZstdCompressor const& compressor)
+{
+    ZoneScoped;
+
+    // Serialize the GeneralizedTransactionSet to binary format
+    auto serialized = xdr::xdr_to_opaque(txSet);
+    return compressor.compress(serialized.data(), serialized.size());
+}
+
+GeneralizedTransactionSet
+TxSetUtils::decompressTxSet(std::vector<uint8_t> const& compressedTxSet,
+                            ZstdDecompressor const& decompressor)
+{
+    ZoneScoped;
+
+    auto decompressedData =
+        decompressor.decompress(compressedTxSet.data(), compressedTxSet.size());
+
+    // Convert the decompressed data back to a GeneralizedTransactionSet
+    GeneralizedTransactionSet result;
+    try
+    {
+        xdr::xdr_from_opaque(decompressedData, result);
+    }
+    catch (const xdr::xdr_runtime_error& e)
+    {
+        throw std::runtime_error(
+            std::string("Failed to deserialize decompressed data: ") +
+            e.what());
+    }
+
+    return result;
 }
 
 } // namespace stellar
