@@ -18,6 +18,7 @@
 #include "transactions/test/SorobanTxTestUtils.h"
 #include "util/ProtocolVersion.h"
 #include "util/XDRCereal.h"
+#include "util/zstd.h"
 
 namespace stellar
 {
@@ -2055,6 +2056,152 @@ TEST_CASE("txset nomination", "[txset]")
         runTest(Config::CURRENT_LEDGER_PROTOCOL_VERSION, "v_next.csv");
     }
 #endif
+}
+
+TEST_CASE("txset compression/decompression", "[txset][compression]")
+{
+    Config cfg(getTestConfig());
+    cfg.LEDGER_PROTOCOL_VERSION = Config::CURRENT_LEDGER_PROTOCOL_VERSION;
+    cfg.TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION =
+        Config::CURRENT_LEDGER_PROTOCOL_VERSION;
+    VirtualClock clock;
+    Application::pointer app = createTestApplication(clock, cfg);
+    auto compressor = ZstdCompressor(3, 6);
+    auto decompressor = ZstdDecompressor(3);
+
+    SECTION("empty tx set")
+    {
+        // Create an empty transaction set
+        GeneralizedTransactionSet txSet(1);
+        txSet.v1TxSet().previousLedgerHash =
+            app->getLedgerManager().getLastClosedLedgerHeader().hash;
+
+        // Compress the transaction set
+        auto compressed = TxSetUtils::compressTxSet(txSet, compressor);
+        REQUIRE(!compressed.empty());
+
+        // Decompress the transaction set
+        auto decompressed =
+            TxSetUtils::decompressTxSet(compressed, decompressor);
+
+        // Verify that the decompressed set matches the original
+        REQUIRE(txSet.v1TxSet().previousLedgerHash ==
+                decompressed.v1TxSet().previousLedgerHash);
+        REQUIRE(txSet.v1TxSet().phases.size() ==
+                decompressed.v1TxSet().phases.size());
+    }
+
+    SECTION("tx set with transactions")
+    {
+        // Create a transaction set with some transactions
+        auto txSet =
+            testtxset::makeNonValidatedGeneralizedTxSet(
+                {}, *app,
+                app->getLedgerManager().getLastClosedLedgerHeader().hash)
+                .first;
+
+        // Create a GeneralizedTransactionSet to pass to compression
+        GeneralizedTransactionSet generalizedTxSet;
+        txSet->toXDR(generalizedTxSet);
+
+        // Compress the transaction set
+        auto compressed =
+            TxSetUtils::compressTxSet(generalizedTxSet, compressor);
+        REQUIRE(!compressed.empty());
+
+        // Verify compression actually reduces size
+        auto originalSize = xdr::xdr_to_opaque(generalizedTxSet).size();
+        REQUIRE(compressed.size() < originalSize);
+
+        // Decompress the transaction set
+        auto decompressed =
+            TxSetUtils::decompressTxSet(compressed, decompressor);
+
+        // Verify that the decompressed set matches the original
+        REQUIRE(generalizedTxSet.v1TxSet().previousLedgerHash ==
+                decompressed.v1TxSet().previousLedgerHash);
+        REQUIRE(generalizedTxSet.v1TxSet().phases.size() ==
+                decompressed.v1TxSet().phases.size());
+
+        // Create TxSetFrame from both to compare
+        auto originalTxSetFrame = TxSetXDRFrame::makeFromWire(generalizedTxSet);
+        auto decompressedTxSetFrame = TxSetXDRFrame::makeFromWire(decompressed);
+
+        // Verify that the hash of both transaction sets match
+        REQUIRE(originalTxSetFrame->getContentsHash() ==
+                decompressedTxSetFrame->getContentsHash());
+    }
+
+    SECTION("compression error handling")
+    {
+        // Test with invalid data for decompression
+        std::vector<uint8_t> invalidData = {0x1, 0x2, 0x3, 0x4};
+        REQUIRE_THROWS_AS(
+            TxSetUtils::decompressTxSet(invalidData, decompressor),
+            std::runtime_error);
+    }
+
+    SECTION("round trip with large transaction set")
+    {
+        // Create a larger transaction set with multiple phases and components
+        GeneralizedTransactionSet txSet(1);
+        txSet.v1TxSet().previousLedgerHash =
+            app->getLedgerManager().getLastClosedLedgerHeader().hash;
+
+        // Add some phases
+        txSet.v1TxSet().phases.emplace_back();
+        txSet.v1TxSet().phases.emplace_back();
+
+        // Add components to phases
+        for (auto& phase : txSet.v1TxSet().phases)
+        {
+            phase.v0Components().emplace_back(
+                TXSET_COMP_TXS_MAYBE_DISCOUNTED_FEE);
+            phase.v0Components()
+                .back()
+                .txsMaybeDiscountedFee()
+                .baseFee.activate() = 1000;
+
+            // Add some transactions
+            for (int i = 0; i < 50; i++)
+            {
+                auto& txEnv = phase.v0Components()
+                                  .back()
+                                  .txsMaybeDiscountedFee()
+                                  .txs.emplace_back(ENVELOPE_TYPE_TX);
+
+                // Set up a basic transaction
+                txEnv.v1().tx.operations.emplace_back();
+                txEnv.v1().tx.fee = 100 + i;
+                txEnv.v1().tx.operations.back().body.type(
+                    OperationType::PAYMENT);
+            }
+        }
+
+        // Compress the transaction set
+        auto compressed = TxSetUtils::compressTxSet(txSet, compressor);
+        REQUIRE(!compressed.empty());
+
+        // Calculate compression ratio
+        auto originalSize = xdr::xdr_to_opaque(txSet).size();
+        double compressionRatio =
+            static_cast<double>(compressed.size()) / originalSize;
+        CLOG_INFO(Herder, "Compression ratio: {}", compressionRatio);
+        CLOG_INFO(Herder, "Original size: {}", originalSize);
+        CLOG_INFO(Herder, "Compressed size: {}", compressed.size());
+
+        // Make sure we actually compressed something
+        REQUIRE(compressionRatio < 0.7);
+
+        // Decompress and verify
+        auto decompressed =
+            TxSetUtils::decompressTxSet(compressed, decompressor);
+        REQUIRE(txSet.v1TxSet().previousLedgerHash ==
+                decompressed.v1TxSet().previousLedgerHash);
+        REQUIRE(txSet.v1TxSet().phases.size() ==
+                decompressed.v1TxSet().phases.size());
+        REQUIRE(xdr::xdr_to_opaque(txSet) == xdr::xdr_to_opaque(decompressed));
+    }
 }
 
 } // namespace
