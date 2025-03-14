@@ -210,6 +210,7 @@ void
 LoadGenerator::cleanupAccounts()
 {
     ZoneScoped;
+    auto lcl = mApp.getLedgerManager().getLastClosedLedgerNum();
 
     // Check if creation source accounts have been created
     for (auto it = mCreationSourceAccounts.begin();
@@ -230,12 +231,15 @@ LoadGenerator::cleanupAccounts()
     for (auto it = mAccountsInUse.begin(); it != mAccountsInUse.end();)
     {
         auto const& accounts = mTxGenerator.getAccounts();
-        auto accIt = accounts.find(*it);
+        auto accIt = accounts.find(it->first);
         releaseAssert(accIt != accounts.end());
+        // Only if account in use is not pending in tx queue anymore, AND we
+        // waited a small number of ledgers for everyone to finish applying it.
         if (!mApp.getHerder().sourceAccountPending(
-                accIt->second->getPublicKey()))
+                accIt->second->getPublicKey()) &&
+            lcl >= it->second)
         {
-            mAccountsAvailable.insert(*it);
+            mAccountsAvailable.insert(it->first);
             it = mAccountsInUse.erase(it);
         }
         else
@@ -917,6 +921,8 @@ uint64_t
 LoadGenerator::getNextAvailableAccount(uint32_t ledgerNum)
 {
     uint64_t sourceAccountId;
+    auto cooldownLedger =
+        ledgerNum + mApp.getConfig().LOADGEN_ACCOUNT_REUSE_DELAY;
     do
     {
         releaseAssert(!mAccountsAvailable.empty());
@@ -927,7 +933,8 @@ LoadGenerator::getNextAvailableAccount(uint32_t ledgerNum)
         std::advance(it, sourceAccountIdx);
         sourceAccountId = *it;
         mAccountsAvailable.erase(it);
-        releaseAssert(mAccountsInUse.insert(sourceAccountId).second);
+        releaseAssert(
+            mAccountsInUse.emplace(sourceAccountId, cooldownLedger).second);
 
         // Although mAccountsAvailable shouldn't contain pending accounts, it is
         // possible when the network is overloaded. Consider the following
