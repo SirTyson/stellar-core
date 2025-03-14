@@ -324,6 +324,10 @@ class Config : public std::enable_shared_from_this<Config>
     std::vector<uint32_t> LOADGEN_TX_SIZE_BYTES_FOR_TESTING;
     std::vector<uint32_t> LOADGEN_TX_SIZE_BYTES_DISTRIBUTION_FOR_TESTING;
 
+    // Number of ledgers to wait before reusing an account for load generation.
+    // This prevents account reuse until the transaction is fully applied.
+    uint32_t LOADGEN_ACCOUNT_REUSE_DELAY;
+
     // Instructions per transaction for SOROBAN_INVOKE and MIX_CLASSIC_SOROBAN
     // loadgen modes
     // Also used for configuring apply-load command.

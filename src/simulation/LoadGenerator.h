@@ -266,7 +266,7 @@ class LoadGenerator
 
     // Track account IDs that are currently being referenced by the transaction
     // queue (to avoid source account collisions during tx submission)
-    std::unordered_set<uint64_t> mAccountsInUse;
+    std::unordered_map<uint64_t, uint32_t> mAccountsInUse;
     std::unordered_set<uint64_t> mAccountsAvailable;
 
     std::optional<XDRInputFileStream> mPreloadedTransactionsFile;

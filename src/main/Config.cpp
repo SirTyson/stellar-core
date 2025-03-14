@@ -63,6 +63,7 @@ static const std::unordered_set<std::string> TESTING_ONLY_OPTIONS = {
     "LOADGEN_TX_SIZE_BYTES_DISTRIBUTION_FOR_TESTING"
     "LOADGEN_INSTRUCTIONS_FOR_TESTING",
     "LOADGEN_INSTRUCTIONS_DISTRIBUTION_FOR_TESTING"
+    "LOADGEN_ACCOUNT_REUSE_DELAY",
     "CATCHUP_WAIT_MERGES_TX_APPLY_FOR_TESTING",
     "ARTIFICIALLY_SET_SURVEY_PHASE_DURATION_FOR_TESTING",
     "ARTIFICIALLY_DELAY_BUCKET_APPLICATION_FOR_TESTING",
@@ -306,6 +307,9 @@ Config::Config() : NODE_SEED(SecretKey::random())
         InitialSorobanNetworkConfig::MAX_ENTRIES_TO_ARCHIVE;
     TESTING_STARTING_EVICTION_SCAN_LEVEL =
         InitialSorobanNetworkConfig::STARTING_EVICTION_SCAN_LEVEL;
+
+    // Default to 1 ledger before allowing account reuse in load generation
+    LOADGEN_ACCOUNT_REUSE_DELAY = 2;
 
     EMIT_SOROBAN_TRANSACTION_META_EXT_V1 = false;
     EMIT_LEDGER_CLOSE_META_EXT_V1 = false;
@@ -1120,6 +1124,11 @@ Config::processConfig(std::shared_ptr<cpptoml::table> t)
                          "EXPERIMENTAL_BUCKETLIST_DB flag is deprecated. "
                          "please remove from config");
                  }},
+                {"LOADGEN_ACCOUNT_REUSE_DELAY",
+                    [&]() {
+                        LOADGEN_ACCOUNT_REUSE_DELAY =
+                            readInt<uint32_t>(item, 0, UINT32_MAX - 1);
+                }},
                 {"EXPERIMENTAL_BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT",
                  [&]() {
                      BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT =
