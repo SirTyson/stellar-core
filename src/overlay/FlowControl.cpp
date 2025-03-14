@@ -15,8 +15,9 @@
 namespace stellar
 {
 
+// ~2 ledgers worth of data, aggressive timeout
 constexpr std::chrono::seconds const OUTBOUND_QUEUE_TIMEOUT =
-    std::chrono::seconds(30);
+    std::chrono::seconds(10);
 
 size_t
 FlowControl::getOutboundQueueByteLimit(
@@ -403,8 +404,11 @@ FlowControl::addMsgAndMaybeTrimQueue(std::shared_ptr<StellarMessage const> msg)
 
     size_t dropped = 0;
 
-    uint32_t const limit =
-        mAppConnector.getLedgerManager().getLastMaxTxSetSizeOps();
+    // Roughly 1 second worth of consensus, up to
+    // MAX_OUTBOUND_QUEUE_SIZE
+    uint32_t const limit = std::min<uint32_t>(
+        mAppConnector.getConfig().MAX_OUTBOUND_QUEUE_SIZE,
+        mAppConnector.getLedgerManager().getLastMaxTxSetSizeOps() / 5);
     auto& om = mOverlayMetrics;
     if (type == TRANSACTION)
     {
