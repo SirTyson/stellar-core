@@ -21,6 +21,7 @@
 #include "overlay/SurveyDataManager.h"
 #include "overlay/TCPPeer.h"
 #include "overlay/TxDemandsManager.h"
+#include "transactions/MutableTransactionResult.h"
 #include "util/GlobalChecks.h"
 #include "util/Logging.h"
 #include "util/Math.h"
@@ -1202,6 +1203,76 @@ OverlayManagerImpl::recvTransaction(StellarMessage const& msg,
         // add it to our current set
         // and make sure it is valid
         auto addResult = mApp.getHerder().recvTransaction(transaction, false);
+
+        {
+            // Based on AddResult, add a new Meter metric for each result type
+            auto& m = mApp.getMetrics();
+            switch (addResult.code)
+            {
+            case TransactionQueue::AddResultCode::ADD_STATUS_PENDING:
+                m.NewMeter({"overlay", "transaction", "pending"}, "transaction")
+                    .Mark();
+                break;
+            case TransactionQueue::AddResultCode::ADD_STATUS_DUPLICATE:
+                m.NewMeter({"overlay", "transaction", "duplicate"},
+                           "transaction")
+                    .Mark();
+                break;
+            case TransactionQueue::AddResultCode::ADD_STATUS_ERROR:
+                switch (addResult.txResult->getResult().result.code())
+                {
+                case txBAD_SEQ:
+                    m.NewMeter({"overlay", "transaction", "error_bad_seq"},
+                               "transaction")
+                        .Mark();
+                    break;
+                case txBAD_AUTH:
+                    m.NewMeter({"overlay", "transaction", "error_bad_auth"},
+                               "transaction")
+                        .Mark();
+                    break;
+                case txNO_ACCOUNT:
+                    m.NewMeter({"overlay", "transaction", "error_no_account"},
+                               "transaction")
+                        .Mark();
+                    break;
+                case txNOT_SUPPORTED:
+                    m.NewMeter(
+                         {"overlay", "transaction", "error_not_supported"},
+                         "transaction")
+                        .Mark();
+                    break;
+                case txBAD_AUTH_EXTRA:
+                    m.NewMeter(
+                         {"overlay", "transaction", "error_bad_auth_extra"},
+                         "transaction")
+                        .Mark();
+                    break;
+                case txINTERNAL_ERROR:
+                    m.NewMeter(
+                         {"overlay", "transaction", "error_internal_error"},
+                         "transaction")
+                        .Mark();
+                    break;
+                default:
+                    m.NewMeter({"overlay", "transaction", "error_unknown"},
+                               "transaction")
+                        .Mark();
+                    break;
+                }
+                break;
+            case TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER:
+                m.NewMeter({"overlay", "transaction", "try_again_later"},
+                           "transaction")
+                    .Mark();
+                break;
+            default:
+                m.NewMeter({"overlay", "transaction", "unknown"}, "transaction")
+                    .Mark();
+                break;
+            }
+        }
+
         bool pulledRelevantTx = false;
         if (!(addResult.code ==
                   TransactionQueue::AddResultCode::ADD_STATUS_PENDING ||
