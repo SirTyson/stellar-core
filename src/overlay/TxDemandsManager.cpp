@@ -132,24 +132,28 @@ TxDemandsManager::demand()
 
     // We determine that demands are obsolete after maxRetention.
     auto maxRetention = MAX_DELAY_DEMAND * MAX_RETRY_COUNT * 2;
-    while (!mPendingDemands.empty())
     {
-        auto const& it = mDemandHistoryMap.find(mPendingDemands.front());
-        if ((now - it->second.firstDemanded) >= maxRetention)
+        ZoneNamedN(pendingDem, "cleanupPendingDemands", true);
+
+        while (!mPendingDemands.empty())
         {
-            if (!it->second.latencyRecorded)
+            auto const& it = mDemandHistoryMap.find(mPendingDemands.front());
+            if ((now - it->second.firstDemanded) >= maxRetention)
             {
-                // We never received the txn.
-                om.mAbandonedDemandMeter.Mark();
+                if (!it->second.latencyRecorded)
+                {
+                    // We never received the txn.
+                    om.mAbandonedDemandMeter.Mark();
+                }
+                mPendingDemands.pop();
+                mDemandHistoryMap.erase(it);
             }
-            mPendingDemands.pop();
-            mDemandHistoryMap.erase(it);
-        }
-        else
-        {
-            // The oldest demand in mPendingDemands isn't old enough
-            // to be deleted from our record.
-            break;
+            else
+            {
+                // The oldest demand in mPendingDemands isn't old enough
+                // to be deleted from our record.
+                break;
+            }
         }
     }
 
@@ -160,9 +164,13 @@ TxDemandsManager::demand()
     bool anyNewDemand = false;
     do
     {
+        ZoneNamedN(first, "populateDemIteration", true);
+
         anyNewDemand = false;
         for (auto const& peer : peers)
         {
+            ZoneNamedN(second, "forPeerIteration", true);
+
             auto& demPair = demandMap[peer];
             auto& demand = demPair.first;
             auto& retry = demPair.second;
