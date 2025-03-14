@@ -38,6 +38,7 @@ test "${CXXFLAGS+set}" || CXXFLAGS="$CFLAGS"
 AC_PROG_CC([clang gcc cc])
 AC_PROG_CXX([clang++ g++ c++])
 AM_PROG_AR
+AM_PROG_AS
 AM_PROG_CC_C_O
 
 LT_INIT([disable-shared])
@@ -323,10 +324,8 @@ soci_LIBS='$(top_builddir)/lib/libsoci.a'
 AC_SUBST(soci_CFLAGS)
 AC_SUBST(soci_LIBS)
 
-zstd_CFLAGS='-isystem $(top_srcdir)/lib/zstd'
-zstd_LIBS='$(top_builddir)/lib/lib3rdparty.a'
+zstd_CFLAGS='-DZSTD_MULTITHREAD -isystem $(top_srcdir)/lib/zstd/lib'
 AC_SUBST(zstd_CFLAGS)
-AC_SUBST(zstd_LIBS)
 
 libasio_CFLAGS='-DASIO_SEPARATE_COMPILATION=1 -DASIO_STANDALONE -isystem $(top_srcdir)/lib/asio/asio/include'
 AC_SUBST(libasio_CFLAGS)
