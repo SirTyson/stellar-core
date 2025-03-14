@@ -44,6 +44,8 @@ class BanManager;
 class StatusManager;
 class AbstractLedgerTxnParent;
 class BasicWork;
+class ZstdCompressor;
+class ZstdDecompressor;
 enum class LoadGenMode;
 struct GeneratedLoadConfig;
 class AppConnector;
@@ -320,6 +322,11 @@ class Application
     virtual Hash const& getNetworkID() const = 0;
 
     virtual AbstractLedgerTxnParent& getLedgerTxnRoot() = 0;
+
+    virtual ZstdCompressor const& getZstdCompressor() const = 0;
+    virtual ZstdDecompressor const& getZstdDecompressor() const = 0;
+    virtual std::mutex& getZstdCompressorMutex() = 0;
+    virtual std::mutex& getZstdDecompressorMutex() = 0;
 
     virtual void validateAndLogConfig() = 0;
 

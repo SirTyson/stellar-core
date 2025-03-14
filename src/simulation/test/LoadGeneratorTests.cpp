@@ -202,6 +202,126 @@ TEST_CASE("modify soroban network config", "[loadgen][soroban]")
             bucketListSizeWindowSampleSize);
 }
 
+TEST_CASE("generate soroban load -- stress test", "[loadgen][soroban]")
+{
+    auto nAccounts = 500;
+    auto nTPS = 15;
+    auto nTxs = 10000;
+
+    Hash networkID = sha256(getTestConfig().NETWORK_PASSPHRASE);
+    Simulation::pointer simulation =
+        Topologies::pair(Simulation::OVER_LOOPBACK, networkID, [&](int i) {
+            auto cfg = getTestConfig(i);
+
+            cfg.ZSTD_COMPRESSION_LEVEL = 4;
+            cfg.ZSTD_NUM_CORES = 16;
+
+            cfg.USE_CONFIG_FOR_GENESIS = false;
+            cfg.ARTIFICIALLY_GENERATE_LOAD_FOR_TESTING = true;
+            cfg.UPDATE_SOROBAN_COSTS_DURING_PROTOCOL_UPGRADE_FOR_TESTING = true;
+            //  Use tight bounds to we can verify storage works properly
+            cfg.LOADGEN_NUM_DATA_ENTRIES_FOR_TESTING = {5};
+            cfg.LOADGEN_NUM_DATA_ENTRIES_DISTRIBUTION_FOR_TESTING = {1};
+            cfg.LOADGEN_IO_KILOBYTES_FOR_TESTING = {15};
+            cfg.LOADGEN_IO_KILOBYTES_DISTRIBUTION_FOR_TESTING = {1};
+
+            cfg.LOADGEN_TX_SIZE_BYTES_FOR_TESTING = {2'000'000, 5'000'000,
+                                                     8'000'000};
+            cfg.LOADGEN_TX_SIZE_BYTES_DISTRIBUTION_FOR_TESTING = {1, 2, 1};
+            cfg.LOADGEN_INSTRUCTIONS_FOR_TESTING = {1'000'000, 5'000'000,
+                                                    10'000'000};
+            cfg.LOADGEN_INSTRUCTIONS_DISTRIBUTION_FOR_TESTING = {1, 2, 3};
+
+            cfg.TESTING_UPGRADE_MAX_TX_SET_SIZE = 100'000'000;
+
+            return cfg;
+        });
+
+    simulation->startAllNodes();
+    simulation->crankUntil(
+        [&]() { return simulation->haveAllExternalized(3, 1); },
+        2 * Herder::EXP_LEDGER_TIMESPAN_SECONDS, false);
+
+    auto nodes = simulation->getNodes();
+
+    auto& app = *nodes[0]; // pick a node to generate load
+    Upgrades::UpgradeParameters scheduledUpgrades;
+    auto lclCloseTime =
+        VirtualClock::from_time_t(app.getLedgerManager()
+                                      .getLastClosedLedgerHeader()
+                                      .header.scpValue.closeTime);
+    scheduledUpgrades.mUpgradeTime = lclCloseTime;
+    scheduledUpgrades.mProtocolVersion =
+        Config::CURRENT_LEDGER_PROTOCOL_VERSION;
+    for (auto const& node : nodes)
+    {
+        node->getHerder().setUpgrades(scheduledUpgrades);
+    }
+    simulation->crankForAtLeast(std::chrono::seconds(20), false);
+
+    auto& loadGen = app.getLoadGenerator();
+    loadGen.generateLoad(GeneratedLoadConfig::createAccountsLoad(
+        /* nAccounts */ nAccounts,
+        /* txRate */ nTPS));
+    auto& complete =
+        app.getMetrics().NewMeter({"loadgen", "run", "complete"}, "run");
+    auto& failed =
+        app.getMetrics().NewMeter({"loadgen", "run", "failed"}, "run");
+    auto completeCount = complete.count();
+    simulation->crankUntil(
+        [&]() { return complete.count() == completeCount + 1; },
+        100 * Herder::EXP_LEDGER_TIMESPAN_SECONDS, false);
+
+    upgradeSorobanNetworkConfig(
+        [&](SorobanNetworkConfig& cfg) {
+            setSorobanNetworkConfigForTest(cfg);
+
+            cfg.mLedgerMaxTxCount = 100;
+            cfg.mTxMaxSizeBytes = 10'000'000;
+            cfg.mTxMaxInstructions = 1'000'000'000;
+
+            cfg.mTxMaxReadBytes = cfg.mTxMaxSizeBytes;
+
+            // Entries should never expire
+            cfg.mStateArchivalSettings.maxEntryTTL = 2'000'000;
+            cfg.mStateArchivalSettings.minPersistentTTL = 20;
+
+            // Set write limits so that we can write all keys in a single TX
+            // during setup
+            cfg.mTxMaxWriteLedgerEntries = cfg.mTxMaxReadLedgerEntries;
+            cfg.mTxMaxWriteBytes = cfg.mTxMaxReadBytes;
+
+            // Allow every TX to have the maximum TX resources
+            cfg.mLedgerMaxInstructions =
+                cfg.mTxMaxInstructions * cfg.mLedgerMaxTxCount;
+            cfg.mLedgerMaxReadLedgerEntries =
+                cfg.mTxMaxReadLedgerEntries * cfg.mLedgerMaxTxCount;
+            cfg.mLedgerMaxReadBytes =
+                cfg.mTxMaxReadBytes * cfg.mLedgerMaxTxCount;
+            cfg.mLedgerMaxWriteLedgerEntries =
+                cfg.mTxMaxWriteLedgerEntries * cfg.mLedgerMaxTxCount;
+            cfg.mLedgerMaxWriteBytes =
+                cfg.mTxMaxWriteBytes * cfg.mLedgerMaxTxCount;
+            cfg.mLedgerMaxTransactionsSizeBytes =
+                cfg.mTxMaxSizeBytes * cfg.mLedgerMaxTxCount;
+        },
+        simulation);
+
+    auto invokeLoadCfg = GeneratedLoadConfig::txLoad(
+        LoadGenMode::SOROBAN_UPLOAD, nAccounts, nTxs, nTPS);
+    loadGen.generateLoad(invokeLoadCfg);
+
+    completeCount = complete.count();
+    REQUIRE(failed.count() == 0);
+
+    simulation->crankUntil(
+        [&]() {
+            return complete.count() == completeCount + 1 || failed.count() > 0;
+        },
+        10'000 * Herder::EXP_LEDGER_TIMESPAN_SECONDS, false);
+    REQUIRE(failed.count() == 0);
+}
+
 TEST_CASE("generate soroban load", "[loadgen][soroban]")
 {
     uint32_t const numDataEntries = 5;

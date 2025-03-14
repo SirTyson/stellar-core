@@ -14,6 +14,7 @@
 #include "database/Database.h"
 #include "herder/Herder.h"
 #include "herder/TxSetFrame.h"
+#include "herder/TxSetUtils.h"
 #include "ledger/LedgerManager.h"
 #include "main/Application.h"
 #include "main/Config.h"
@@ -38,6 +39,7 @@
 #include <Tracy.hpp>
 #include <soci.h>
 #include <time.h>
+#include <xdrpp/types.h>
 
 // LATER: need to add some way of docking peers that are misbehaving by sending
 // you bad data
@@ -637,6 +639,8 @@ Peer::msgSummary(StellarMessage const& msg)
     case TX_SET:
     case GENERALIZED_TX_SET:
         return "TXSET";
+    case COMPRESSED_GENERALIZED_TX_SET:
+        return "COMPRESSED_TXSET";
 
     case TRANSACTION:
         return "TRANSACTION";
@@ -721,6 +725,7 @@ Peer::sendMessage(std::shared_ptr<StellarMessage const> msg, bool log)
         break;
     case TX_SET:
     case GENERALIZED_TX_SET:
+    case COMPRESSED_GENERALIZED_TX_SET:
         mOverlayMetrics.mSendTxSetMeter.Mark();
         break;
     case TRANSACTION:
@@ -951,6 +956,7 @@ Peer::recvAuthenticatedMessage(AuthenticatedMessage&& msg)
     case DONT_HAVE:
     case TX_SET:
     case GENERALIZED_TX_SET:
+    case COMPRESSED_GENERALIZED_TX_SET:
     case SCP_QUORUMSET:
     case SCP_MESSAGE:
         cat = "SCP";
@@ -1183,8 +1189,16 @@ Peer::recvRawMessage(std::shared_ptr<CapacityTrackedMessage> msgTracker)
 
     case GENERALIZED_TX_SET:
     {
+        releaseAssertOrThrow(false);
         auto t = mOverlayMetrics.mRecvTxSetTimer.TimeScope();
         recvGeneralizedTxSet(stellarMsg);
+    }
+    break;
+
+    case COMPRESSED_GENERALIZED_TX_SET:
+    {
+        auto t = mOverlayMetrics.mRecvTxSetTimer.TimeScope();
+        recvCompressedGeneralizedTxSet(stellarMsg);
     }
     break;
 
@@ -1325,8 +1339,29 @@ Peer::recvGetTxSet(StellarMessage const& msg)
         auto newMsg = std::make_shared<StellarMessage>();
         if (txSet->isGeneralizedTxSet())
         {
-            newMsg->type(GENERALIZED_TX_SET);
-            txSet->toXDR(newMsg->generalizedTxSet());
+            newMsg->type(COMPRESSED_GENERALIZED_TX_SET);
+            auto compressedPtr =
+                mAppConnector.getHerder().getTxSetCompressed(msg.txSetHash());
+            if (!compressedPtr)
+            {
+                GeneralizedTransactionSet txSetXDR;
+                txSet->toXDR(txSetXDR);
+                compressedPtr = TxSetUtils::compressTxSet(
+                    txSetXDR, mAppConnector.getZstdCompressor());
+                mAppConnector.getHerder().addTxSetCompressed(msg.txSetHash(),
+                                                             compressedPtr);
+
+                CLOG_INFO(Tx,
+                          "Compressed txset {}, size {}, decompressed {}, "
+                          "ratio {}",
+                          hexAbbrev(msg.txSetHash()), compressedPtr->size(),
+                          xdr::xdr_size(txSetXDR),
+                          static_cast<double>(compressedPtr->size()) /
+                              xdr::xdr_size(txSetXDR));
+            }
+
+            std::copy(compressedPtr->begin(), compressedPtr->end(),
+                      std::back_inserter(newMsg->compressedBytes()));
         }
         else
         {
@@ -1373,6 +1408,27 @@ Peer::recvGeneralizedTxSet(StellarMessage const& msg)
     mAppConnector.getHerder().recvTxSet(frame->getContentsHash(), frame);
 }
 
+void
+Peer::recvCompressedGeneralizedTxSet(StellarMessage const& msg)
+{
+    ZoneScoped;
+    releaseAssert(threadIsMain());
+    auto& decompressor = mAppConnector.getZstdDecompressor();
+    auto compressed =
+        std::make_shared<std::vector<uint8_t>>(msg.compressedBytes());
+    auto txSet = TxSetUtils::decompressTxSet(*compressed, decompressor);
+    auto frame = TxSetXDRFrame::makeFromWire(txSet);
+
+    auto hash = frame->getContentsHash();
+    mAppConnector.getHerder().addTxSetCompressed(hash, compressed);
+
+    CLOG_INFO(
+        Tx, "Received compressed txset {}, size {}, decomrpessed {}, ratio {}",
+        hexAbbrev(hash), compressed->size(), xdr::xdr_size(txSet),
+        static_cast<double>(compressed->size()) / xdr::xdr_size(txSet));
+
+    mAppConnector.getHerder().recvTxSet(hash, frame);
+}
 void
 Peer::recvTransaction(CapacityTrackedMessage const& msg)
 {

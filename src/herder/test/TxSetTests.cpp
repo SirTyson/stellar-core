@@ -2078,11 +2078,12 @@ TEST_CASE("txset compression/decompression", "[txset][compression]")
 
         // Compress the transaction set
         auto compressed = TxSetUtils::compressTxSet(txSet, compressor);
-        REQUIRE(!compressed.empty());
+        REQUIRE(compressed);
+        REQUIRE(!compressed->empty());
 
         // Decompress the transaction set
         auto decompressed =
-            TxSetUtils::decompressTxSet(compressed, decompressor);
+            TxSetUtils::decompressTxSet(*compressed, decompressor);
 
         // Verify that the decompressed set matches the original
         REQUIRE(txSet.v1TxSet().previousLedgerHash ==
@@ -2107,15 +2108,16 @@ TEST_CASE("txset compression/decompression", "[txset][compression]")
         // Compress the transaction set
         auto compressed =
             TxSetUtils::compressTxSet(generalizedTxSet, compressor);
-        REQUIRE(!compressed.empty());
+        REQUIRE(compressed);
+        REQUIRE(!compressed->empty());
 
         // Verify compression actually reduces size
         auto originalSize = xdr::xdr_to_opaque(generalizedTxSet).size();
-        REQUIRE(compressed.size() < originalSize);
+        REQUIRE(compressed->size() < originalSize);
 
         // Decompress the transaction set
         auto decompressed =
-            TxSetUtils::decompressTxSet(compressed, decompressor);
+            TxSetUtils::decompressTxSet(*compressed, decompressor);
 
         // Verify that the decompressed set matches the original
         REQUIRE(generalizedTxSet.v1TxSet().previousLedgerHash ==
@@ -2180,22 +2182,23 @@ TEST_CASE("txset compression/decompression", "[txset][compression]")
 
         // Compress the transaction set
         auto compressed = TxSetUtils::compressTxSet(txSet, compressor);
-        REQUIRE(!compressed.empty());
+        REQUIRE(compressed);
+        REQUIRE(!compressed->empty());
 
         // Calculate compression ratio
         auto originalSize = xdr::xdr_to_opaque(txSet).size();
         double compressionRatio =
-            static_cast<double>(compressed.size()) / originalSize;
+            static_cast<double>(compressed->size()) / originalSize;
         CLOG_INFO(Herder, "Compression ratio: {}", compressionRatio);
         CLOG_INFO(Herder, "Original size: {}", originalSize);
-        CLOG_INFO(Herder, "Compressed size: {}", compressed.size());
+        CLOG_INFO(Herder, "Compressed size: {}", compressed->size());
 
         // Make sure we actually compressed something
         REQUIRE(compressionRatio < 0.7);
 
         // Decompress and verify
         auto decompressed =
-            TxSetUtils::decompressTxSet(compressed, decompressor);
+            TxSetUtils::decompressTxSet(*compressed, decompressor);
         REQUIRE(txSet.v1TxSet().previousLedgerHash ==
                 decompressed.v1TxSet().previousLedgerHash);
         REQUIRE(txSet.v1TxSet().phases.size() ==

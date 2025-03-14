@@ -165,6 +165,10 @@ Config::Config() : NODE_SEED(SecretKey::random())
     BUCKETLIST_DB_INDEX_CUTOFF = 20;             // 20 mb
     BUCKETLIST_DB_MEMORY_FOR_CACHING = 0;
     BUCKETLIST_DB_PERSIST_INDEX = true;
+
+    ZSTD_COMPRESSION_LEVEL = 4;
+    ZSTD_NUM_CORES = 4;
+
     PUBLISH_TO_ARCHIVE_DELAY = std::chrono::seconds{0};
     // automatic maintenance settings:
     // short and prime with 1 hour which will cause automatic maintenance to
@@ -1144,6 +1148,12 @@ Config::processConfig(std::shared_ptr<cpptoml::table> t)
                                   "deprecated, "
                                   "use BUCKETLIST_DB_INDEX_CUTOFF instead.");
                  }},
+                {"ZSTD_COMPRESSION_LEVEL",
+                 [&]() {
+                     ZSTD_COMPRESSION_LEVEL = readInt<uint32_t>(item, 1, 22);
+                 }},
+                {"ZSTD_NUM_CORES",
+                 [&]() { ZSTD_NUM_CORES = readInt<uint32_t>(item, 0, 32); }},
                 {"EXPERIMENTAL_BUCKETLIST_DB_PERSIST_INDEX",
                  [&]() {
                      BUCKETLIST_DB_PERSIST_INDEX = readBool(item);

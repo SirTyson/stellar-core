@@ -1585,6 +1585,18 @@ HerderImpl::forceSCPStateIntoSyncWithLastClosedLedger()
                         /* isTrackingNetwork */ true);
 }
 
+void
+HerderImpl::addTxSetCompressed(Hash const& hash, CompressedTxSetPtr compressed)
+{
+    mPendingEnvelopes.addTxSetCompressed(hash, compressed);
+}
+
+CompressedTxSetPtr
+HerderImpl::getTxSetCompressed(Hash const& hash) const
+{
+    return mPendingEnvelopes.getTxSetCompressed(hash);
+}
+
 bool
 HerderImpl::resolveNodeID(std::string const& s, PublicKey& retKey)
 {

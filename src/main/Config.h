@@ -481,6 +481,9 @@ class Config : public std::enable_shared_from_this<Config>
     // index.
     size_t BUCKETLIST_DB_INDEX_CUTOFF;
 
+    uint32_t ZSTD_COMPRESSION_LEVEL;
+    uint32_t ZSTD_NUM_CORES;
+
     // Enable parallel processing of overlay operations (experimental)
     bool BACKGROUND_OVERLAY_PROCESSING;
 

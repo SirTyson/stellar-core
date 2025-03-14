@@ -91,6 +91,10 @@ class HerderImpl : public Herder
         return mState == State::HERDER_TRACKING_NETWORK_STATE;
     }
 
+    void addTxSetCompressed(Hash const& hash,
+                            CompressedTxSetPtr compressed) override;
+    CompressedTxSetPtr getTxSetCompressed(Hash const& hash) const override;
+
     void processExternalized(uint64 slotIndex, StellarValue const& value,
                              bool isLatestSlot);
     void valueExternalized(uint64 slotIndex, StellarValue const& value,

@@ -133,6 +133,30 @@ AppConnector::getOverlayMetrics()
     return mApp.getOverlayManager().getOverlayMetrics();
 }
 
+ZstdCompressor const&
+AppConnector::getZstdCompressor() const
+{
+    return mApp.getZstdCompressor();
+}
+
+ZstdDecompressor const&
+AppConnector::getZstdDecompressor() const
+{
+    return mApp.getZstdDecompressor();
+}
+
+std::mutex&
+AppConnector::getZstdCompressorMutex() const
+{
+    return mApp.getZstdCompressorMutex();
+}
+
+std::mutex&
+AppConnector::getZstdDecompressorMutex() const
+{
+    return mApp.getZstdDecompressorMutex();
+}
+
 bool
 AppConnector::checkScheduledAndCache(
     std::shared_ptr<CapacityTrackedMessage> msgTracker)

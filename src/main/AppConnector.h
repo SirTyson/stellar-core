@@ -17,6 +17,8 @@ class SorobanMetrics;
 class SearchableHotArchiveBucketListSnapshot;
 struct LedgerTxnDelta;
 class CapacityTrackedMessage;
+class ZstdCompressor;
+class ZstdDecompressor;
 
 // Helper class to isolate access to Application; all function helpers must
 // either be called from main or be thread-sade
@@ -62,5 +64,11 @@ class AppConnector
     medida::MetricsRegistry& getMetrics() const;
     SearchableHotArchiveSnapshotConstPtr
     copySearchableHotArchiveBucketListSnapshot();
+
+    // Not thread-safe, must acquire lock first
+    ZstdCompressor const& getZstdCompressor() const;
+    ZstdDecompressor const& getZstdDecompressor() const;
+    std::mutex& getZstdCompressorMutex() const;
+    std::mutex& getZstdDecompressorMutex() const;
 };
 }
