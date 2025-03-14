@@ -59,7 +59,7 @@ class TxSetUtils
                                    TxFrameList& invalidTxs);
 
     // Compress/decompress generalized tx set via zstd
-    static std::vector<uint8_t>
+    static CompressedTxSetPtr
     compressTxSet(GeneralizedTransactionSet const& txSet,
                   ZstdCompressor const& compressor);
     static GeneralizedTransactionSet

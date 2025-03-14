@@ -35,8 +35,7 @@ ZstdCompressor::compress(void const* data, size_t size) const
 
     if (ZSTD_isError(compressedSize))
     {
-        throw std::runtime_error(std::string("ZSTD compression error: ") +
-                                 ZSTD_getErrorName(compressedSize));
+        throw std::runtime_error("ZSTD compression error");
     }
 
     compressedData.resize(compressedSize);
@@ -80,8 +79,7 @@ ZstdDecompressor::decompress(void const* data, size_t size) const
 
     if (ZSTD_isError(decompressedSize))
     {
-        throw std::runtime_error(std::string("ZSTD decompression error: ") +
-                                 ZSTD_getErrorName(decompressedSize));
+        throw std::runtime_error("ZSTD decompression error");
     }
 
     decompressedData.resize(decompressedSize);

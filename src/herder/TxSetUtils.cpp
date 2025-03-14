@@ -202,7 +202,7 @@ TxSetUtils::trimInvalid(TxFrameList const& txs, Application& app,
     return removeTxs(txs, invalidTxs);
 }
 
-std::vector<uint8_t>
+CompressedTxSetPtr
 TxSetUtils::compressTxSet(GeneralizedTransactionSet const& txSet,
                           ZstdCompressor const& compressor)
 {
@@ -210,7 +210,8 @@ TxSetUtils::compressTxSet(GeneralizedTransactionSet const& txSet,
 
     // Serialize the GeneralizedTransactionSet to binary format
     auto serialized = xdr::xdr_to_opaque(txSet);
-    return compressor.compress(serialized.data(), serialized.size());
+    auto compressed = compressor.compress(serialized.data(), serialized.size());
+    return std::make_shared<std::vector<uint8_t>>(compressed);
 }
 
 GeneralizedTransactionSet

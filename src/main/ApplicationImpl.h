@@ -140,6 +140,11 @@ class ApplicationImpl : public Application
 
     virtual AbstractLedgerTxnParent& getLedgerTxnRoot() override;
 
+    virtual ZstdCompressor const& getZstdCompressor() const override;
+    virtual ZstdDecompressor const& getZstdDecompressor() const override;
+    virtual std::mutex& getZstdCompressorMutex() override;
+    virtual std::mutex& getZstdDecompressorMutex() override;
+
   private:
     VirtualClock& mVirtualClock;
     Config mConfig;
@@ -249,6 +254,11 @@ class ApplicationImpl : public Application
     // A handle to any running self-check, to avoid scheduling
     // more than one concurrently.
     std::weak_ptr<BasicWork> mRunningSelfCheck;
+
+    mutable std::mutex mZstdCompressorMutex;
+    std::unique_ptr<ZstdCompressor> mZstdCompressor;
+    mutable std::mutex mZstdDecompressorMutex;
+    std::unique_ptr<ZstdDecompressor> mZstdDecompressor;
 
     void newDB();
 

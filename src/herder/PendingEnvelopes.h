@@ -2,6 +2,7 @@
 #include "crypto/SecretKey.h"
 #include "herder/Herder.h"
 #include "herder/QuorumTracker.h"
+#include "herder/TxSetFrame.h"
 #include "lib/json/json.h"
 #include "overlay/ItemFetcher.h"
 #include "util/RandomEvictionCache.h"
@@ -69,6 +70,7 @@ class PendingEnvelopes
     RandomEvictionCache<Hash, TxSetFramCacheItem> mTxSetCache;
     // weak references to all known txsets
     UnorderedMap<Hash, std::weak_ptr<TxSetXDRFrame const>> mKnownTxSets;
+    UnorderedMap<Hash, CompressedTxSetPtr> mKnownCompressedTxSets;
 
     // keep track of txset/qset hash -> size pairs for quick access
     RandomEvictionCache<Hash, size_t> mValueSizeCache;
@@ -177,6 +179,9 @@ class PendingEnvelopes
      * Return true if TxSet useful (was asked for).
      */
     bool recvTxSet(Hash const& hash, TxSetXDRFrameConstPtr txset);
+
+    void addTxSetCompressed(Hash const& hash, CompressedTxSetPtr compressed);
+    CompressedTxSetPtr getTxSetCompressed(Hash const& hash) const;
 
     void peerDoesntHave(MessageType type, Hash const& itemID,
                         Peer::pointer peer);

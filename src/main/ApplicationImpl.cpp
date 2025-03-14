@@ -55,6 +55,7 @@
 #include "util/StatusManager.h"
 #include "util/Thread.h"
 #include "util/TmpDir.h"
+#include "util/zstd.h"
 #include "work/BasicWork.h"
 #include "work/WorkScheduler.h"
 
@@ -193,6 +194,16 @@ ApplicationImpl::ApplicationImpl(VirtualClock& clock, Config const& cfg)
         mLedgerCloseThread =
             std::thread{[this]() { mLedgerCloseIOContext->run(); }};
         mThreadTypes[mLedgerCloseThread->get_id()] = ThreadType::APPLY;
+    }
+
+    if (mConfig.ZSTD_NUM_CORES > 0)
+    {
+        releaseAssert(mConfig.ZSTD_COMPRESSION_LEVEL >= 1 &&
+                      mConfig.ZSTD_COMPRESSION_LEVEL <= 22);
+        mZstdCompressor = std::make_unique<ZstdCompressor>(
+            mConfig.ZSTD_COMPRESSION_LEVEL, mConfig.ZSTD_NUM_CORES);
+        mZstdDecompressor =
+            std::make_unique<ZstdDecompressor>(mConfig.ZSTD_COMPRESSION_LEVEL);
     }
 }
 
@@ -1523,6 +1534,32 @@ ApplicationImpl::getLedgerTxnRoot()
 #endif
 
     return *mLedgerTxnRoot;
+}
+
+ZstdCompressor const&
+ApplicationImpl::getZstdCompressor() const
+{
+    releaseAssertOrThrow(mZstdCompressor);
+    return *mZstdCompressor;
+}
+
+ZstdDecompressor const&
+ApplicationImpl::getZstdDecompressor() const
+{
+    releaseAssertOrThrow(mZstdDecompressor);
+    return *mZstdDecompressor;
+}
+
+std::mutex&
+ApplicationImpl::getZstdCompressorMutex()
+{
+    return mZstdCompressorMutex;
+}
+
+std::mutex&
+ApplicationImpl::getZstdDecompressorMutex()
+{
+    return mZstdDecompressorMutex;
 }
 
 AppConnector&

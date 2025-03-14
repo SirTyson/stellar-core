@@ -137,6 +137,10 @@ class Herder
 
     virtual bool isTracking() const = 0;
 
+    virtual void addTxSetCompressed(Hash const& hash,
+                                    CompressedTxSetPtr compressed) = 0;
+    virtual CompressedTxSetPtr getTxSetCompressed(Hash const& hash) const = 0;
+
 #ifdef BUILD_TESTS
     // We are learning about a new fully-fetched envelope.
     virtual EnvelopeStatus recvSCPEnvelope(SCPEnvelope const& envelope,

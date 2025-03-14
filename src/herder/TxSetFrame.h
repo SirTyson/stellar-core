@@ -37,6 +37,8 @@ enum class TxSetPhase
 using TxFrameList = std::vector<TransactionFrameBasePtr>;
 using PerPhaseTransactionList = std::vector<TxFrameList>;
 
+using CompressedTxSetPtr = std::shared_ptr<std::vector<uint8_t> const>;
+
 // Creates a valid ApplicableTxSetFrame and corresponding TxSetXDRFrame
 // from the provided transactions.
 //

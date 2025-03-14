@@ -253,6 +253,26 @@ PendingEnvelopes::recvTxSet(Hash const& hash, TxSetXDRFrameConstPtr txset)
     return true;
 }
 
+void
+PendingEnvelopes::addTxSetCompressed(Hash const& hash,
+                                     CompressedTxSetPtr compressed)
+{
+    ZoneScoped;
+    CLOG_TRACE(Herder, "Add Compressed TxSet {}", hexAbbrev(hash));
+    mKnownCompressedTxSets[hash] = compressed;
+}
+
+CompressedTxSetPtr
+PendingEnvelopes::getTxSetCompressed(Hash const& hash) const
+{
+    auto it = mKnownCompressedTxSets.find(hash);
+    if (it != mKnownCompressedTxSets.end())
+    {
+        return it->second;
+    }
+    return nullptr;
+}
+
 bool
 PendingEnvelopes::isNodeDefinitelyInQuorum(NodeID const& node)
 {
@@ -442,6 +462,7 @@ PendingEnvelopes::cleanKnownData()
     {
         if (it2->second.expired())
         {
+            mKnownCompressedTxSets.erase(it2->first);
             it2 = mKnownTxSets.erase(it2);
         }
         else
