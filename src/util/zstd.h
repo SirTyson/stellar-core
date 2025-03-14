@@ -5,10 +5,9 @@
 #pragma once
 
 #include "NonCopyable.h"
-#include "lib/tracy/zstd/zstd.h"
-//#include "lib/zstd/zstd.h"
 #include <cstddef>
 #include <vector>
+#include <zstd.h>
 
 namespace stellar
 {
