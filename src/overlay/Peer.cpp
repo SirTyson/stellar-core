@@ -1197,6 +1197,13 @@ Peer::recvRawMessage(std::shared_ptr<CapacityTrackedMessage> msgTracker)
     }
     break;
 
+    case TX_BATCH:
+    {
+        auto t = mOverlayMetrics.mRecvTxBatchTimer.TimeScope();
+        recvTxBatch(stellarMsg);
+    }
+    break;
+
     case GET_SCP_QUORUMSET:
     {
         auto t = mOverlayMetrics.mRecvGetSCPQuorumSetTimer.TimeScope();
@@ -1279,6 +1286,29 @@ Peer::process(QueryInfo& queryInfo)
         queryInfo.mNumQueries = 0;
     }
     return queryInfo.mNumQueries < QUERIES_PER_WINDOW;
+}
+
+void
+Peer::recvTxBatch(StellarMessage const& msg)
+{
+    ZoneScoped;
+    releaseAssert(threadIsMain());
+    releaseAssert(msg.type() == TX_BATCH);
+
+    // Pre-create single StellarMessage instance to reuse
+    StellarMessage txMsg;
+    txMsg.type(TRANSACTION);
+
+    for (auto const& tx : msg.txBatch().transactions)
+    {
+        auto t = mOverlayMetrics.mRecvTransactionTimer.TimeScope();
+
+        // Reuse the message object instead of creating a new one each time
+        txMsg.transaction() = tx;
+        auto hash = xdrBlake2(txMsg);
+        mAppConnector.getOverlayManager().recvTransaction(
+            txMsg, shared_from_this(), hash);
+    }
 }
 
 void
@@ -1984,6 +2014,7 @@ Peer::handleMaxTxSizeIncrease(uint32_t increase)
 bool
 Peer::sendAdvert(Hash const& hash)
 {
+    ZoneScoped;
     releaseAssert(threadIsMain());
     if (!mTxAdverts)
     {

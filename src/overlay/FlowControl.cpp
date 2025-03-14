@@ -141,6 +141,7 @@ FlowControl::getNextBatchToSend()
             switch (front.mMessage->type())
             {
             case TRANSACTION:
+            case TX_BATCH:
             {
                 size_t s = mFlowControlBytesCapacity.getMsgResourceCount(msg);
                 releaseAssert(mTxQueueByteCount >= s);
@@ -195,6 +196,7 @@ FlowControl::updateMsgMetrics(std::shared_ptr<StellarMessage const> msg,
     switch (msg->type())
     {
     case TRANSACTION:
+    case TX_BATCH:
         updateQueueDelay(om.mOutboundQueueDelayTxs,
                          mMetrics.mOutboundQueueDelayTxs);
         break;
@@ -369,6 +371,7 @@ FlowControl::addMsgAndMaybeTrimQueue(std::shared_ptr<StellarMessage const> msg)
     }
     break;
     case TRANSACTION:
+    case TX_BATCH:
     {
         msgQInd = 1;
         auto bytes = mFlowControlBytesCapacity.getMsgResourceCount(*msg);

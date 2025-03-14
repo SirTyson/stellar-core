@@ -277,6 +277,9 @@ TxDemandsManager::recvTxDemand(FloodDemand const& dmd, Peer::pointer peer)
     ZoneScoped;
     auto& herder = mApp.getHerder();
     auto& om = mApp.getOverlayManager().getOverlayMetrics();
+    auto msg = std::make_shared<StellarMessage>();
+    msg->type(TX_BATCH);
+    size_t batchSize = 0;
 
     for (auto const& h : dmd.txHashes)
     {
@@ -287,9 +290,21 @@ TxDemandsManager::recvTxDemand(FloodDemand const& dmd, Peer::pointer peer)
             CLOG_TRACE(Overlay, "fulfilled demand for {} demanded by {}",
                        hexAbbrev(h),
                        KeyUtils::toShortString(peer->getPeerID()));
-            peer->getPeerMetrics().mMessagesFulfilled++;
+            msg->txBatch().transactions.emplace_back(
+                tx->toStellarMessage()->transaction());
             om.mMessagesFulfilledMeter.Mark();
-            peer->sendMessage(tx->toStellarMessage());
+            batchSize++;
+
+            if (msg->txBatch().transactions.size() ==
+                mApp.getConfig().TX_BATCH_MAX_SIZE)
+            {
+                // Record the batch size before sending
+                om.mTxBatchSizeHistogram.Update(batchSize);
+                peer->sendMessage(std::move(msg));
+                msg = std::make_shared<StellarMessage>();
+                msg->type(TX_BATCH);
+                batchSize = 0;
+            }
         }
         else
         {
@@ -309,6 +324,17 @@ TxDemandsManager::recvTxDemand(FloodDemand const& dmd, Peer::pointer peer)
                 peer->getPeerMetrics().mUnknownMessageUnfulfilled++;
             }
         }
+    }
+
+    // Send any remaining transactions in the batch and record the size
+    if (!msg->txBatch().transactions.empty())
+    {
+        // Only update metrics if we actually have transactions to send
+        if (batchSize > 0)
+        {
+            om.mTxBatchSizeHistogram.Update(batchSize);
+        }
+        peer->sendMessage(std::move(msg));
     }
 }
 }
