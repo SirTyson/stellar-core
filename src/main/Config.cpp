@@ -1121,10 +1121,10 @@ Config::processConfig(std::shared_ptr<cpptoml::table> t)
                          "please remove from config");
                  }},
                 {"LOADGEN_ACCOUNT_REUSE_DELAY",
-                    [&]() {
-                        LOADGEN_ACCOUNT_REUSE_DELAY =
-                            readInt<uint32_t>(item, 0, UINT32_MAX - 1);
-                }},
+                 [&]() {
+                     LOADGEN_ACCOUNT_REUSE_DELAY =
+                         readInt<uint32_t>(item, 0, UINT32_MAX - 1);
+                 }},
                 {"EXPERIMENTAL_BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT",
                  [&]() {
                      BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT =
