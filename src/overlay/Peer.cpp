@@ -930,6 +930,7 @@ Peer::recvAuthenticatedMessage(AuthenticatedMessage&& msg)
     case TRANSACTION:
     case FLOOD_ADVERT:
     case FLOOD_DEMAND:
+    case TX_BATCH:
     {
         cat = "TX";
         type = Scheduler::ActionType::DROPPABLE_ACTION;
