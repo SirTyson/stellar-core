@@ -63,6 +63,7 @@ SearchableBucketListSnapshotBase<BucketT>::loopAllBuckets(
     std::function<Loop(BucketSnapshotT const&)> f,
     BucketListSnapshot<BucketT> const& snapshot) const
 {
+    ZoneScoped;
     for (auto const& lev : snapshot.getLevels())
     {
         auto processBucket = [f](BucketSnapshotT const& b) {
@@ -98,6 +99,7 @@ SearchableBucketListSnapshotBase<BucketT>::load(LedgerKey const& k) const
         auto [be, bloomMiss] = b.getBucketEntry(k);
         if (bloomMiss)
         {
+            ZoneNamedN(bloomMissZone, "bloomMiss", true);
             // Reset timer on bloom miss to avoid outlier metrics, since we
             // really only want to measure disk performance
             timer.Reset();
