@@ -63,6 +63,7 @@ SearchableBucketListSnapshotBase<BucketT>::loopAllBuckets(
     std::function<Loop(BucketSnapshotT const&)> f,
     BucketListSnapshot<BucketT> const& snapshot) const
 {
+    ZoneScoped;
     for (auto const& lev : snapshot.getLevels())
     {
         auto processBucket = [f](BucketSnapshotT const& b) {
@@ -89,9 +90,9 @@ SearchableBucketListSnapshotBase<BucketT>::load(LedgerKey const& k) const
     ZoneScoped;
 
     std::shared_ptr<typename BucketT::LoadT const> result{};
-    auto timerIter = mPointTimers.find(k.type());
-    releaseAssert(timerIter != mPointTimers.end());
-    auto timer = timerIter->second.TimeScope();
+    // auto timerIter = mPointTimers.find(k.type());
+    // releaseAssert(timerIter != mPointTimers.end());
+    // auto timer = timerIter->second.TimeScope();
 
     // Search function called on each Bucket in BucketList until we find the key
     auto loadKeyBucketLoop = [&](auto const& b) {
@@ -100,7 +101,7 @@ SearchableBucketListSnapshotBase<BucketT>::load(LedgerKey const& k) const
         {
             // Reset timer on bloom miss to avoid outlier metrics, since we
             // really only want to measure disk performance
-            timer.Reset();
+            // timer.Reset();
         }
 
         if (be)

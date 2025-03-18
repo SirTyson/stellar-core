@@ -466,6 +466,7 @@ LiveBucket::isTombstoneEntry(BucketEntry const& e)
 std::shared_ptr<LiveBucket::LoadT const>
 LiveBucket::bucketEntryToLoadResult(std::shared_ptr<EntryT const> const& be)
 {
+    ZoneScoped;
     return isTombstoneEntry(*be)
                ? nullptr
                : std::make_shared<LedgerEntry>(be->liveEntry());
