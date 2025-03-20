@@ -131,7 +131,7 @@ class Peer : public std::enable_shared_from_this<Peer>,
 
         medida::Timer mMessageDelayInWriteQueueTimer;
         medida::Timer mMessageDelayInAsyncWriteTimer;
-        medida::Timer mAdvertQueueDelay;
+        medida::Counter mAdvertQueueDelayAccumulator;
         medida::Timer mPullLatency;
 
         std::atomic<uint64_t> mDemandTimeouts;

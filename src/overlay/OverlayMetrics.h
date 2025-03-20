@@ -48,7 +48,9 @@ struct OverlayMetrics
     medida::Timer& mRecvPeersTimer;
     medida::Timer& mRecvGetTxSetTimer;
     medida::Timer& mRecvTxSetTimer;
-    medida::Timer& mRecvTransactionTimer;
+
+    // Sum of total delay, in microseconds
+    medida::Counter& mRecvTransactionAccumulator;
     medida::Timer& mRecvGetSCPQuorumSetTimer;
     medida::Timer& mRecvSCPQuorumSetTimer;
     medida::Timer& mRecvSCPMessageTimer;
@@ -108,7 +110,9 @@ struct OverlayMetrics
     medida::Meter& mUnknownMessageUnfulfilledMeter;
     medida::Timer& mTxPullLatency;
     medida::Timer& mPeerTxPullLatency;
-    medida::Timer& mAdvertQueueDelay;
+
+    // Sum of total delay, in microseconds
+    medida::Counter& mAdvertQueueDelayAccumulator;
 
     medida::Meter& mDemandTimeouts;
     medida::Meter& mPulledRelevantTxs;

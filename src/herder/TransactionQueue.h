@@ -181,18 +181,21 @@ class TransactionQueue
     {
         QueueMetrics(std::vector<medida::Counter*> sizeByAge,
                      medida::Counter& bannedTransactionsCounter,
-                     medida::Timer& transactionsDelay,
-                     medida::Timer& transactionsSelfDelay)
+                     medida::Counter& transactionsDelayAccumulator,
+                     medida::Counter& transactionsSelfDelayAccumulator)
             : mSizeByAge(std::move(sizeByAge))
             , mBannedTransactionsCounter(bannedTransactionsCounter)
-            , mTransactionsDelay(transactionsDelay)
-            , mTransactionsSelfDelay(transactionsSelfDelay)
+            , mTransactionsDelayAccumulator(transactionsDelayAccumulator)
+            , mTransactionsSelfDelayAccumulator(
+                  transactionsSelfDelayAccumulator)
         {
         }
         std::vector<medida::Counter*> mSizeByAge;
         medida::Counter& mBannedTransactionsCounter;
-        medida::Timer& mTransactionsDelay;
-        medida::Timer& mTransactionsSelfDelay;
+
+        // Sum of total delay, in microseconds
+        medida::Counter& mTransactionsDelayAccumulator;
+        medida::Counter& mTransactionsSelfDelayAccumulator;
     };
 
     std::unique_ptr<QueueMetrics> mQueueMetrics;

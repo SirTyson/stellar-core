@@ -111,8 +111,8 @@ ClassicTransactionQueue::ClassicTransactionQueue(Application& app,
     mQueueMetrics = std::make_unique<QueueMetrics>(
         sizeByAge,
         app.getMetrics().NewCounter({"herder", "pending-txs", "banned"}),
-        app.getMetrics().NewTimer({"herder", "pending-txs", "delay"}),
-        app.getMetrics().NewTimer({"herder", "pending-txs", "self-delay"}));
+        app.getMetrics().NewCounter({"herder", "pending-txs", "delay"}),
+        app.getMetrics().NewCounter({"herder", "pending-txs", "self-delay"}));
     mBroadcastOpCarryover.resize(1,
                                  Resource::makeEmpty(NUM_CLASSIC_TX_RESOURCES));
 }
@@ -771,12 +771,15 @@ TransactionQueue::removeApplied(Transactions const& appliedTxs)
                     if (transaction->mTx->getFullHash() ==
                         appliedTx->getFullHash())
                     {
-                        auto elapsed = now - transaction->mInsertionTime;
-                        mQueueMetrics->mTransactionsDelay.Update(elapsed);
+                        auto elapsed = std::chrono::duration_cast<
+                            std::chrono::microseconds>(
+                            now - transaction->mInsertionTime);
+                        mQueueMetrics->mTransactionsDelayAccumulator.inc(
+                            elapsed.count());
                         if (transaction->mSubmittedFromSelf)
                         {
-                            mQueueMetrics->mTransactionsSelfDelay.Update(
-                                elapsed);
+                            mQueueMetrics->mTransactionsSelfDelayAccumulator
+                                .inc(elapsed.count());
                         }
                     }
 
@@ -1075,8 +1078,8 @@ SorobanTransactionQueue::SorobanTransactionQueue(Application& app,
         sizeByAge,
         app.getMetrics().NewCounter(
             {"herder", "pending-soroban-txs", "banned"}),
-        app.getMetrics().NewTimer({"herder", "pending-soroban-txs", "delay"}),
-        app.getMetrics().NewTimer(
+        app.getMetrics().NewCounter({"herder", "pending-soroban-txs", "delay"}),
+        app.getMetrics().NewCounter(
             {"herder", "pending-soroban-txs", "self-delay"}));
     mBroadcastOpCarryover.resize(1, Resource::makeEmptySoroban());
 }

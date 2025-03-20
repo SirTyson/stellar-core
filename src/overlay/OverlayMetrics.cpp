@@ -47,8 +47,8 @@ OverlayMetrics::OverlayMetrics(Application& app)
     , mRecvGetTxSetTimer(
           app.getMetrics().NewTimer({"overlay", "recv", "get-txset"}))
     , mRecvTxSetTimer(app.getMetrics().NewTimer({"overlay", "recv", "txset"}))
-    , mRecvTransactionTimer(
-          app.getMetrics().NewTimer({"overlay", "recv", "transaction"}))
+    , mRecvTransactionAccumulator(
+          app.getMetrics().NewCounter({"overlay", "recv", "transaction"}))
     , mRecvGetSCPQuorumSetTimer(
           app.getMetrics().NewTimer({"overlay", "recv", "get-scp-qset"}))
     , mRecvSCPQuorumSetTimer(
@@ -156,8 +156,8 @@ OverlayMetrics::OverlayMetrics(Application& app)
           app.getMetrics().NewTimer({"overlay", "flood", "tx-pull-latency"}))
     , mPeerTxPullLatency(app.getMetrics().NewTimer(
           {"overlay", "flood", "peer-tx-pull-latency"}))
-    , mAdvertQueueDelay(
-          app.getMetrics().NewTimer({"overlay", "flood", "advert-delay"}))
+    , mAdvertQueueDelayAccumulator(
+          app.getMetrics().NewCounter({"overlay", "flood", "advert-delay"}))
     , mDemandTimeouts(app.getMetrics().NewMeter(
           {"overlay", "demand", "timeout"}, "timeout"))
     , mPulledRelevantTxs(app.getMetrics().NewMeter(
