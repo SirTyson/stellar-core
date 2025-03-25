@@ -1248,6 +1248,8 @@ HerderImpl::setupTriggerNextLedger()
     // time as reference point for triggering again (this may trigger right
     // away if externalizing took a long time)
 
+    triggerTime = now;
+
     if (triggerTime == now)
     {
         triggerNextLedger(nextIndex, true, true);
