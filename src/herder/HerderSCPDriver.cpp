@@ -504,6 +504,16 @@ HerderSCPDriver::timerCallbackWrapper(uint64_t slotIndex, int timerID,
                 {
                     // Timeout happened between nominate and first prepare
                     ++SCPTiming.mNominationTimeoutCount;
+
+                    if (SCPTimingIt->second.mNominationAccept)
+                    {
+                        CLOG_WARNING(
+                            Herder,
+                            "Nomination timeout following accept for slot {}",
+                            slotIndex);
+                    }
+
+                    SCPTimingIt->second.mNominationAccept = std::nullopt;
                 }
             }
         }
@@ -931,6 +941,22 @@ HerderSCPDriver::acceptedBallotPrepared(uint64_t slotIndex,
 }
 
 void
+HerderSCPDriver::acceptedNomination(uint64_t slotIndex)
+{
+    auto it = mSCPExecutionTimes.find(slotIndex);
+    if (it != mSCPExecutionTimes.end())
+    {
+        // Only track first acceptance
+        if (!it->second.mNominationAccept)
+        {
+            it->second.mNominationAccept =
+                std::make_optional<VirtualClock::time_point>(
+                    mApp.getClock().now());
+        }
+    }
+}
+
+void
 HerderSCPDriver::confirmedBallotPrepared(uint64_t slotIndex,
                                          SCPBallot const& ballot)
 {
@@ -949,6 +975,18 @@ HerderSCPDriver::getPrepareStart(uint64_t slotIndex)
     if (it != mSCPExecutionTimes.end())
     {
         res = it->second.mPrepareStart;
+    }
+    return res;
+}
+
+std::optional<VirtualClock::time_point>
+HerderSCPDriver::getNominationAccept(uint64_t slotIndex)
+{
+    std::optional<VirtualClock::time_point> res;
+    auto it = mSCPExecutionTimes.find(slotIndex);
+    if (it != mSCPExecutionTimes.end())
+    {
+        res = it->second.mNominationAccept;
     }
     return res;
 }
@@ -1011,6 +1049,7 @@ HerderSCPDriver::recordSCPEvent(uint64_t slotIndex, bool isNomination)
     {
         timing.mNominationStart =
             std::make_optional<VirtualClock::time_point>(start);
+        timing.mNominationAccept = std::nullopt;
     }
     else
     {
