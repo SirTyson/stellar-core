@@ -1223,7 +1223,7 @@ HerderImpl::setupTriggerNextLedger()
     // the ballot protocol started last
     auto now = mApp.getClock().now();
     auto lastBallotStart = now - seconds;
-    auto lastStart = mHerderSCPDriver.getPrepareStart(lastIndex);
+    auto lastStart = mHerderSCPDriver.getNominationAccept(lastIndex);
     if (lastStart)
     {
         lastBallotStart = *lastStart;
