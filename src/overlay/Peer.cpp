@@ -1302,8 +1302,6 @@ Peer::recvTxBatch(StellarMessage const& msg)
 
     for (auto const& tx : msg.txBatch().transactions)
     {
-        auto t = mOverlayMetrics.mRecvTransactionTimer.TimeScope();
-
         // Reuse the message object instead of creating a new one each time
         txMsg.transaction() = tx;
         auto hash = xdrBlake2(txMsg);
