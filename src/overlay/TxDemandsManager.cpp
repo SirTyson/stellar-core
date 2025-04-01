@@ -171,7 +171,14 @@ TxDemandsManager::demand()
             while (demand.size() < getMaxDemandSize() && peer->hasAdvert() &&
                    !addedNewDemand)
             {
-                auto txHash = peer->popAdvert();
+                auto hashPair = peer->popAdvert();
+                auto txHash = hashPair.first;
+                if (hashPair.second)
+                {
+                    auto delta = now - *(hashPair.second);
+                    om.mAdvertQueueDelay.Update(delta);
+                    peer->getPeerMetrics().mAdvertQueueDelay.Update(delta);
+                }
                 switch (demandStatus(txHash, peer))
                 {
                 case DemandStatus::DEMAND:

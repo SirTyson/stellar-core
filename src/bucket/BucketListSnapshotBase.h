@@ -15,7 +15,6 @@
 namespace medida
 {
 class Timer;
-class Counter;
 }
 
 namespace stellar
@@ -92,14 +91,8 @@ class SearchableBucketListSnapshotBase : public NonMovableOrCopyable
     std::map<uint32_t, SnapshotPtrT<BucketT>> mHistoricalSnapshots;
     AppConnector const& mAppConnector;
 
-    // Tracks the sum of point load times for each LedgerEntryType, in
-    // microseconds. For point loads, Timers are too expensive to maintain, so
-    // we use a Counter to keep track of the total trend instead.
-    UnorderedMap<LedgerEntryType, medida::Counter&> mPointAccumulators{};
-    UnorderedMap<LedgerEntryType, medida::Counter&> mPointCounters{};
-
-    // Bulk load timers take significantly longer, so the timer overhead is
-    // comparatively negligible.
+    // Metrics
+    UnorderedMap<LedgerEntryType, medida::Timer&> mPointTimers{};
     mutable UnorderedMap<std::string, medida::Timer&> mBulkTimers{};
 
     medida::Meter& mBulkLoadMeter;

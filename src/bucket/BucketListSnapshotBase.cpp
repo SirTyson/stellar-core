@@ -89,7 +89,9 @@ SearchableBucketListSnapshotBase<BucketT>::load(LedgerKey const& k) const
     ZoneScoped;
 
     std::shared_ptr<typename BucketT::LoadT const> result{};
-    auto startTime = mAppConnector.now();
+    auto timerIter = mPointTimers.find(k.type());
+    releaseAssert(timerIter != mPointTimers.end());
+    auto timer = timerIter->second.TimeScope();
 
     // Search function called on each Bucket in BucketList until we find the key
     auto loadKeyBucketLoop = [&](auto const& b) {
@@ -98,7 +100,7 @@ SearchableBucketListSnapshotBase<BucketT>::load(LedgerKey const& k) const
         {
             // Reset timer on bloom miss to avoid outlier metrics, since we
             // really only want to measure disk performance
-            startTime = mAppConnector.now();
+            timer.Reset();
         }
 
         if (be)
@@ -113,18 +115,6 @@ SearchableBucketListSnapshotBase<BucketT>::load(LedgerKey const& k) const
     };
 
     loopAllBuckets(loadKeyBucketLoop, *mSnapshot);
-    auto endTime = mAppConnector.now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(
-        endTime - startTime);
-
-    auto accumulatorIter = mPointAccumulators.find(k.type());
-    releaseAssert(accumulatorIter != mPointAccumulators.end());
-    accumulatorIter->second.inc(duration.count());
-
-    auto counterIter = mPointCounters.find(k.type());
-    releaseAssert(counterIter != mPointCounters.end());
-    counterIter->second.inc();
-
     return result;
 }
 
@@ -201,11 +191,8 @@ SearchableBucketListSnapshotBase<BucketT>::SearchableBucketListSnapshotBase(
         auto const& label = xdr::xdr_traits<LedgerEntryType>::enum_name(
             static_cast<LedgerEntryType>(t));
         auto& metric =
-            app.getMetrics().NewCounter({BucketT::METRIC_STRING, label, "sum"});
-        mPointAccumulators.emplace(static_cast<LedgerEntryType>(t), metric);
-        auto& counter = app.getMetrics().NewCounter(
-            {BucketT::METRIC_STRING, label, "count"});
-        mPointCounters.emplace(static_cast<LedgerEntryType>(t), counter);
+            app.getMetrics().NewTimer({BucketT::METRIC_STRING, "point", label});
+        mPointTimers.emplace(static_cast<LedgerEntryType>(t), metric);
     }
 }
 

@@ -14,7 +14,6 @@
 #include "util/NonCopyable.h"
 #include "util/Timer.h"
 #include "xdrpp/message.h"
-#include <medida/counter.h>
 
 namespace stellar
 {
@@ -134,7 +133,7 @@ class Peer : public std::enable_shared_from_this<Peer>,
 
         medida::Timer mMessageDelayInWriteQueueTimer;
         medida::Timer mMessageDelayInAsyncWriteTimer;
-
+        medida::Timer mAdvertQueueDelay;
         medida::Timer mPullLatency;
 
         std::atomic<uint64_t> mDemandTimeouts;
@@ -411,7 +410,7 @@ class Peer : public std::enable_shared_from_this<Peer>,
     // Does this peer have any transaction hashes to process?
     bool hasAdvert();
     // Pop the next transaction hash to process
-    Hash popAdvert();
+    std::pair<Hash, std::optional<VirtualClock::time_point>> popAdvert();
     // Clear pull mode state below `ledgerSeq`
     void clearBelow(uint32_t ledgerSeq);
 
