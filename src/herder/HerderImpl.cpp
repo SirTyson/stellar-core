@@ -1223,10 +1223,18 @@ HerderImpl::setupTriggerNextLedger()
     // the ballot protocol started last
     auto now = mApp.getClock().now();
     auto lastBallotStart = now - seconds;
-    auto lastStart = mHerderSCPDriver.getPrepareStart(lastIndex);
+    auto lastStart = mHerderSCPDriver.getNominationAccept(lastIndex);
+
     if (lastStart)
     {
         lastBallotStart = *lastStart;
+    }
+    else
+    {
+        CLOG_WARNING(Herder,
+                     "No acceptance timer found for slot {}, starting now",
+                     lastIndex);
+        lastBallotStart = now - seconds - seconds;
     }
 
     // Adjust trigger time in case node's clock has drifted.
