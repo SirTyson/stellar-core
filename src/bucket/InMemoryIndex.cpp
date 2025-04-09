@@ -36,10 +36,81 @@ InMemoryBucketState::scan(IterT start, LedgerKey const& searchKey) const
     return {IndexReturnT(), mEntries.begin()};
 }
 
+InMemoryIndex::InMemoryIndex(BucketManager& bm,
+                             std::vector<BucketEntry> const& inMemoryState)
+{
+    ZoneScoped;
+    releaseAssertOrThrow(inMemoryState.size() > 0);
+
+    // TODO: Fix offset
+    std::streamoff lastOffset = 16; // sizeof meta entry
+    std::optional<std::streamoff> firstOffer;
+    std::optional<std::streamoff> lastOffer;
+
+    for (auto const& be : inMemoryState)
+    {
+        releaseAssertOrThrow(be.type() != METAENTRY);
+        mCounters.template count<LiveBucket>(be);
+
+        // Populate assetPoolIDMap
+        LedgerKey lk = getBucketLedgerKey(be);
+        if (be.type() == INITENTRY)
+        {
+            if (lk.type() == LIQUIDITY_POOL)
+            {
+                auto const& poolParams = be.liveEntry()
+                                             .data.liquidityPool()
+                                             .body.constantProduct()
+                                             .params;
+                mAssetPoolIDMap[poolParams.assetA].emplace_back(
+                    lk.liquidityPool().liquidityPoolID);
+                mAssetPoolIDMap[poolParams.assetB].emplace_back(
+                    lk.liquidityPool().liquidityPoolID);
+            }
+        }
+
+        // Populate inMemoryState
+        mInMemoryState.insert(be);
+
+        // Populate offerRange
+        if (!firstOffer && lk.type() == OFFER)
+        {
+            firstOffer = lastOffset;
+        }
+        if (!lastOffer && lk.type() > OFFER)
+        {
+            lastOffer = lastOffset;
+        }
+
+        // TODO: Verify this
+        lastOffset += xdr::xdr_size(be);
+    }
+
+    if (firstOffer)
+    {
+        if (lastOffer)
+        {
+            mOfferRange = {*firstOffer, *lastOffer};
+        }
+        // If we didn't see any entries after offers, then the upper bound is
+        // EOF
+        else
+        {
+            mOfferRange = {*firstOffer,
+                           std::numeric_limits<std::streamoff>::max()};
+        }
+    }
+    else
+    {
+        mOfferRange = std::nullopt;
+    }
+}
+
 InMemoryIndex::InMemoryIndex(BucketManager const& bm,
                              std::filesystem::path const& filename,
                              SHA256* hasher)
 {
+    ZoneScoped;
     XDRInputFileStream in;
     in.open(filename.string());
     BucketEntry be;

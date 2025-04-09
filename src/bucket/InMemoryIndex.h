@@ -197,6 +197,9 @@ class InMemoryIndex
     InMemoryIndex(BucketManager const& bm,
                   std::filesystem::path const& filename, SHA256* hasher);
 
+    InMemoryIndex(BucketManager& bm,
+                  std::vector<BucketEntry> const& inMemoryState);
+
     IterT
     begin() const
     {

@@ -26,6 +26,7 @@ BucketLevel<BucketT>::BucketLevel(uint32_t i)
     : mLevel(i)
     , mCurr(std::make_shared<BucketT>())
     , mSnap(std::make_shared<BucketT>())
+    , mNextCurrInMemory(nullptr)
 {
 }
 
@@ -79,6 +80,7 @@ void
 BucketLevel<BucketT>::setCurr(std::shared_ptr<BucketT> b)
 {
     mNextCurr.clear();
+    mNextCurrInMemory.reset();
     mCurr = b;
 }
 
@@ -127,11 +129,70 @@ template <typename BucketT>
 void
 BucketLevel<BucketT>::commit()
 {
-    if (mNextCurr.isLive())
+    if (mNextCurrInMemory)
     {
+        // If we have an in-memory merged result, use that
+        setCurr(mNextCurrInMemory);
+    }
+    else if (mNextCurr.isLive())
+    {
+        // Otherwise use the async merge result
         setCurr(mNextCurr.resolve());
     }
     releaseAssert(!mNextCurr.isMerging());
+}
+
+template <>
+void
+BucketLevel<LiveBucket>::prepareFirstLevel(
+    Application& app, uint32_t currLedger, uint32_t currLedgerProtocol,
+    std::shared_ptr<LiveBucket> snap,
+    std::vector<std::shared_ptr<LiveBucket>> const& shadows,
+    bool countMergeEvents)
+{
+    ZoneScoped;
+
+    // This method should only be called on level 0
+    releaseAssert(mLevel == 0);
+
+    // We shouldn't have an in-progress merge
+    releaseAssert(!mNextCurr.isMerging());
+    releaseAssert(!mNextCurrInMemory);
+
+    // For level 0, we'll use the in-memory merge instead of FutureBucket
+    auto curr =
+        BucketListBase<LiveBucket>::shouldMergeWithEmptyCurr(currLedger, mLevel)
+            ? std::make_shared<LiveBucket>()
+            : mCurr;
+
+    // If we need to support shadows or all inputs are not in-memory, fallback
+    // to the regular prepare method
+    if (!curr->hasInMemoryEntries() || !snap->hasInMemoryEntries() ||
+        !shadows.empty())
+    {
+        prepare(app, currLedger, currLedgerProtocol, snap, shadows,
+                countMergeEvents);
+        return;
+    }
+
+    auto& bucketManager = app.getBucketManager();
+    auto& ctx = app.getClock().getIOContext();
+    bool doFsync = !app.getConfig().DISABLE_XDR_FSYNC;
+    mNextCurrInMemory =
+        LiveBucket::mergeInMemory(bucketManager, currLedgerProtocol, curr, snap,
+                                  countMergeEvents, ctx, doFsync);
+}
+
+template <>
+void
+BucketLevel<HotArchiveBucket>::prepareFirstLevel(
+    Application& app, uint32_t currLedger, uint32_t currLedgerProtocol,
+    std::shared_ptr<HotArchiveBucket> snap,
+    std::vector<std::shared_ptr<HotArchiveBucket>> const& shadows,
+    bool countMergeEvents)
+{
+    prepare(app, currLedger, currLedgerProtocol, snap, shadows,
+            countMergeEvents);
 }
 
 // prepare builds a FutureBucket for the _next state_ of the current level,
@@ -179,6 +240,8 @@ BucketLevel<BucketT>::prepare(
     // If more than one absorb is pending at the same time, we have a logic
     // error in our caller (and all hell will break loose).
     releaseAssert(!mNextCurr.isMerging());
+    releaseAssert(!mNextCurrInMemory);
+
     auto curr =
         BucketListBase<BucketT>::shouldMergeWithEmptyCurr(currLedger, mLevel)
             ? std::make_shared<BucketT>()
@@ -657,12 +720,28 @@ BucketListBase<BucketT>::addBatchInternal(Application& app, uint32_t currLedger,
         !app.getConfig().ARTIFICIALLY_REDUCE_MERGE_COUNTS_FOR_TESTING;
     bool doFsync = !app.getConfig().DISABLE_XDR_FSYNC;
     releaseAssert(shadows.size() == 0);
-    mLevels[0].prepare(app, currLedger, currLedgerProtocol,
-                       BucketT::fresh(app.getBucketManager(),
-                                      currLedgerProtocol, inputVectors...,
-                                      countMergeEvents,
-                                      app.getClock().getIOContext(), doFsync),
-                       shadows, countMergeEvents);
+
+    // For level 0, create a fresh bucket with in-memory entries when available
+    std::shared_ptr<BucketT> freshBucket;
+    if constexpr (std::is_same_v<BucketT, LiveBucket>)
+    {
+        // In memory merges only supported for LiveBucket
+        freshBucket = LiveBucket::fresh(
+            app.getBucketManager(), currLedgerProtocol, inputVectors...,
+            countMergeEvents, app.getClock().getIOContext(), doFsync,
+            /*storeInMemory=*/true, /*shouldIndex=*/false);
+    }
+    else
+    {
+        // For other bucket types, use the regular fresh method
+        freshBucket = BucketT::fresh(app.getBucketManager(), currLedgerProtocol,
+                                     inputVectors..., countMergeEvents,
+                                     app.getClock().getIOContext(), doFsync);
+    }
+
+    mLevels[0].prepareFirstLevel(app, currLedger, currLedgerProtocol,
+                                 freshBucket, shadows, countMergeEvents);
+
     mLevels[0].commit();
 
     // We almost always want to try to resolve completed merges to single
