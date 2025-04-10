@@ -186,6 +186,7 @@ Config::Config() : NODE_SEED(SecretKey::random())
     ARTIFICIALLY_GENERATE_LOAD_FOR_TESTING = false;
     SKIP_SCP_PERSISTENCE_FOR_TESTING = false;
     TRIGGER_OFFSET_FOR_TESTING = 0;
+    NOMINATION_LATENCY_AVG_SAMPLE = 0;
     LOADGEN_PREGENERATED_TRANSACTIONS_FILE = "stellar-load-transactions.xdr";
     UPDATE_SOROBAN_COSTS_DURING_PROTOCOL_UPGRADE_FOR_TESTING = false;
     ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING = false;
@@ -1203,6 +1204,10 @@ Config::processConfig(std::shared_ptr<cpptoml::table> t)
                 {"TRIGGER_OFFSET_FOR_TESTING",
                  [&]() {
                      TRIGGER_OFFSET_FOR_TESTING = readInt<uint32_t>(item);
+                 }},
+                {"NOMINATION_LATENCY_AVG_SAMPLE",
+                 [&]() {
+                     NOMINATION_LATENCY_AVG_SAMPLE = readInt<uint32_t>(item);
                  }},
                 {"LOADGEN_PREGENERATED_TRANSACTIONS_FILE",
                  [&]() {

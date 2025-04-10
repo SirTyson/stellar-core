@@ -118,6 +118,9 @@ class HerderSCPDriver : public SCPDriver
     std::optional<VirtualClock::time_point>
     getNominationAccept(uint64_t slotIndex);
 
+    std::optional<std::chrono::milliseconds>
+    getEstimatedNominationLatency(uint64_t slotIndex);
+
     // converts a Value into a StellarValue
     // returns false on error
     bool toStellarValue(Value const& v, StellarValue& sv);
@@ -190,6 +193,7 @@ class HerderSCPDriver : public SCPDriver
     struct SCPTiming
     {
         std::optional<VirtualClock::time_point> mNominationStart{};
+        std::optional<VirtualClock::time_point> mCurrentNominationRoundStart{};
         std::optional<VirtualClock::time_point> mNominationAccept{};
         std::optional<VirtualClock::time_point> mPrepareStart{};
 
@@ -207,6 +211,13 @@ class HerderSCPDriver : public SCPDriver
     // * nomination to first prepare
     // * first prepare to externalize
     std::map<uint64_t, SCPTiming> mSCPExecutionTimes;
+
+    // Moving window to keep track of time latency, earliest values at the front
+    using TimeMovingWindow = std::deque<std::chrono::milliseconds>;
+
+    // Maps number of timeouts -> latency for that nomination round, from start
+    // to first accept
+    std::map<uint64_t, TimeMovingWindow> mAverageNominationLatencyPerRound;
 
     uint32_t mLedgerSeqNominating;
     ValueWrapperPtr mCurrentValue;
