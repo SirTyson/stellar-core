@@ -225,8 +225,6 @@ class Config : public std::enable_shared_from_this<Config>
 
     uint32_t TRIGGER_OFFSET_FOR_TESTING;
 
-    uint32_t NOMINATION_LATENCY_AVG_SAMPLE;
-
     // Path to pre-generated transaction fiCle for LoadGenerator's
     // PAY_PREGENERATED mode
     std::string LOADGEN_PREGENERATED_TRANSACTIONS_FILE;

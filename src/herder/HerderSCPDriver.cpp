@@ -504,9 +504,6 @@ HerderSCPDriver::timerCallbackWrapper(uint64_t slotIndex, int timerID,
                 {
                     // Timeout happened between nominate and first prepare
                     ++SCPTiming.mNominationTimeoutCount;
-                    SCPTiming.mCurrentNominationRoundStart =
-                        std::make_optional<VirtualClock::time_point>(
-                            mApp.getClock().now());
                 }
             }
         }
@@ -942,29 +939,9 @@ HerderSCPDriver::acceptedNomination(uint64_t slotIndex)
         // Only track first acceptance
         if (!it->second.mNominationAccept)
         {
-            auto time = mApp.getClock().now();
             it->second.mNominationAccept =
-                std::make_optional<VirtualClock::time_point>(time);
-
-            if (mApp.getConfig().NOMINATION_LATENCY_AVG_SAMPLE > 0)
-            {
-                releaseAssertOrThrow(it->second.mCurrentNominationRoundStart);
-
-                // Latency for the last round of nomination that didn't time out
-                std::chrono::milliseconds latency =
-                    std::chrono::duration_cast<std::chrono::milliseconds>(
-                        time - *it->second.mCurrentNominationRoundStart);
-                auto& window = mAverageNominationLatencyPerRound
-                    [it->second.mNominationTimeoutCount];
-                window.push_back(latency);
-
-                // Evict older values if the timing window is full
-                if (window.size() >
-                    mApp.getConfig().NOMINATION_LATENCY_AVG_SAMPLE)
-                {
-                    window.pop_front();
-                }
-            }
+                std::make_optional<VirtualClock::time_point>(
+                    mApp.getClock().now());
         }
     }
 }
@@ -1002,43 +979,6 @@ HerderSCPDriver::getNominationAccept(uint64_t slotIndex)
         res = it->second.mNominationAccept;
     }
     return res;
-}
-
-std::optional<std::chrono::milliseconds>
-HerderSCPDriver::getEstimatedNominationLatency(uint64_t slotIndex)
-{
-    std::chrono::milliseconds totalLatency = std::chrono::milliseconds::zero();
-    auto it = mSCPExecutionTimes.find(slotIndex);
-    if (it != mSCPExecutionTimes.end())
-    {
-        // First determine time due to timeout
-        auto timeoutCount = it->second.mNominationTimeoutCount;
-        for (int64_t round = 1; round <= timeoutCount; ++round)
-        {
-            totalLatency += computeTimeout(round);
-        }
-
-        // Then add average measured latency for that round
-        auto const& window = mAverageNominationLatencyPerRound[timeoutCount];
-        if (window.empty())
-        {
-            return std::nullopt;
-        }
-
-        std::chrono::milliseconds windowTotal =
-            std::chrono::milliseconds::zero();
-        for (auto const& latency : window)
-        {
-            windowTotal += latency;
-        }
-        auto averageLatency = windowTotal / window.size();
-
-        totalLatency += averageLatency;
-
-        return totalLatency;
-    }
-
-    return std::nullopt;
 }
 
 Json::Value
@@ -1098,8 +1038,6 @@ HerderSCPDriver::recordSCPEvent(uint64_t slotIndex, bool isNomination)
     if (isNomination)
     {
         timing.mNominationStart =
-            std::make_optional<VirtualClock::time_point>(start);
-        timing.mCurrentNominationRoundStart =
             std::make_optional<VirtualClock::time_point>(start);
     }
     else

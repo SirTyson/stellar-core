@@ -1216,8 +1216,7 @@ HerderImpl::setupTriggerNextLedger()
     // if we're in sync, we setup mTriggerTimer
     // it may get cancelled if a more recent ledger externalizes
 
-    std::chrono::milliseconds seconds =
-        mApp.getConfig().getExpectedLedgerCloseTime();
+    auto seconds = mApp.getConfig().getExpectedLedgerCloseTime();
 
     // bootstrap with a pessimistic estimate of when
     // the ballot protocol started last
@@ -1227,8 +1226,6 @@ HerderImpl::setupTriggerNextLedger()
 
     if (mApp.getConfig().TRIGGER_OFFSET_FOR_TESTING > 0)
     {
-        releaseAssertOrThrow(mApp.getConfig().NOMINATION_LATENCY_AVG_SAMPLE ==
-                             0);
         lastStart = mHerderSCPDriver.getPrepareStart(lastIndex);
     }
 
@@ -1240,26 +1237,6 @@ HerderImpl::setupTriggerNextLedger()
         {
             lastBallotStart -= std::chrono::seconds(
                 mApp.getConfig().TRIGGER_OFFSET_FOR_TESTING);
-        }
-
-        if (mApp.getConfig().NOMINATION_LATENCY_AVG_SAMPLE > 0)
-        {
-            // Get estimated time to accept and subtract it from expected
-            // ledger time.
-            auto latency =
-                mHerderSCPDriver.getEstimatedNominationLatency(lastIndex);
-
-            if (latency)
-            {
-                if (*latency > seconds)
-                {
-                    seconds = std::chrono::seconds::zero();
-                }
-                else
-                {
-                    seconds -= *latency;
-                }
-            }
         }
     }
     else
