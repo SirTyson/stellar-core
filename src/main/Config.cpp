@@ -317,6 +317,8 @@ Config::Config() : NODE_SEED(SecretKey::random())
     EMIT_SOROBAN_TRANSACTION_META_EXT_V1 = false;
     EMIT_LEDGER_CLOSE_META_EXT_V1 = false;
 
+    ADDITIONAL_NOMINATION_TIMEOUT_MS = 0;
+
     FORCE_OLD_STYLE_LEADER_ELECTION = false;
 
 #ifdef BUILD_TESTS
@@ -1306,6 +1308,11 @@ Config::processConfig(std::shared_ptr<cpptoml::table> t)
                  [&]() {
                      PEER_STRAGGLER_TIMEOUT = readInt<unsigned short>(
                          item, 1, std::numeric_limits<unsigned short>::max());
+                 }},
+                {"ADDITIONAL_NOMINATION_TIMEOUT_MS",
+                 [&]() {
+                     ADDITIONAL_NOMINATION_TIMEOUT_MS =
+                         readInt<uint32_t>(item, 0);
                  }},
                 {"MAX_BATCH_WRITE_COUNT",
                  [&]() { MAX_BATCH_WRITE_COUNT = readInt<int>(item, 1); }},

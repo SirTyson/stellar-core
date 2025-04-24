@@ -643,6 +643,9 @@ class Config : public std::enable_shared_from_this<Config>
     int HTTP_MAX_CLIENT;   // maximum number of http clients, i.e backlog
     std::string NETWORK_PASSPHRASE; // identifier for the network
 
+    // SCP config parameters for timeout
+    uint32_t ADDITIONAL_NOMINATION_TIMEOUT_MS;
+
     // overlay config
     unsigned short PEER_PORT;
     unsigned short TARGET_PEER_CONNECTIONS;

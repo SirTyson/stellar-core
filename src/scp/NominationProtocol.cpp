@@ -521,7 +521,7 @@ NominationProtocol::getStatementValues(SCPStatement const& st)
 // attempts to nominate a value for consensus
 bool
 NominationProtocol::nominate(ValueWrapperPtr value, Value const& previousValue,
-                             bool timedout)
+                             bool timedout, uint32_t configTimeout)
 {
     ZoneScoped;
 
@@ -559,7 +559,7 @@ NominationProtocol::nominate(ValueWrapperPtr value, Value const& previousValue,
     updateRoundLeaders();
 
     std::chrono::milliseconds timeout =
-        mSlot.getSCPDriver().computeTimeout(mRoundNumber);
+        mSlot.getSCPDriver().computeTimeout(mRoundNumber, configTimeout);
 
     // add a few more values from other leaders
     for (auto const& leader : mRoundLeaders)
@@ -596,8 +596,8 @@ NominationProtocol::nominate(ValueWrapperPtr value, Value const& previousValue,
     std::shared_ptr<Slot> slot = mSlot.shared_from_this();
     mSlot.getSCPDriver().setupTimer(
         mSlot.getSlotIndex(), Slot::NOMINATION_TIMER, timeout,
-        [slot, value, previousValue]() {
-            slot->nominate(value, previousValue, true);
+        [slot, value, previousValue, configTimeout]() {
+            slot->nominate(value, previousValue, true, configTimeout);
         });
 
     if (updated)

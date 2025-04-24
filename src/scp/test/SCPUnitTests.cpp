@@ -20,7 +20,7 @@ class TestNominationSCP : public SCPDriver
   public:
     SCP mSCP;
     TestNominationSCP(NodeID const& nodeID, SCPQuorumSet const& qSetLocal)
-        : mSCP(*this, nodeID, true, qSetLocal)
+        : mSCP(*this, nodeID, true, qSetLocal, 0)
     {
         auto localQSet =
             std::make_shared<SCPQuorumSet>(mSCP.getLocalQuorumSet());

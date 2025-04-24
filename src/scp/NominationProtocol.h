@@ -93,7 +93,7 @@ class NominationProtocol
 
     // attempts to nominate a value for consensus
     bool nominate(ValueWrapperPtr value, Value const& previousValue,
-                  bool timedout);
+                  bool timedout, uint32_t configTimeout);
 
     // stops the nomination protocol
     void stopNomination();

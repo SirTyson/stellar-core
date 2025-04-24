@@ -26,7 +26,13 @@ class SCP
 
   public:
     SCP(SCPDriver& driver, NodeID const& nodeID, bool isValidator,
-        SCPQuorumSet const& qSetLocal);
+        SCPQuorumSet const& qSetLocal, uint32_t additionalNominationTimeout);
+
+    uint32_t
+    getAdditionalNominationTimeout() const
+    {
+        return mAdditionalNominationTimeout;
+    }
 
     SCPDriver&
     getDriver()
@@ -163,6 +169,7 @@ class SCP
   protected:
     std::shared_ptr<LocalNode> mLocalNode;
     std::map<uint64, std::shared_ptr<Slot>> mKnownSlots;
+    uint32_t const mAdditionalNominationTimeout;
 
     // Slot getter
     std::shared_ptr<Slot> getSlot(uint64 slotIndex, bool create);

@@ -146,7 +146,7 @@ SCPDriver::computeValueHash(uint64 slotIndex, Value const& prev,
 static const int MAX_TIMEOUT_SECONDS = (30 * 60);
 
 std::chrono::milliseconds
-SCPDriver::computeTimeout(uint32 roundNumber)
+SCPDriver::computeTimeout(uint32 roundNumber, uint32_t configTimeout)
 {
     // straight linear timeout
     // starting at 1 second and capping at MAX_TIMEOUT_SECONDS
@@ -160,7 +160,9 @@ SCPDriver::computeTimeout(uint32 roundNumber)
     {
         timeoutInSeconds = (int)roundNumber;
     }
-    return std::chrono::seconds(timeoutInSeconds);
+
+    return std::chrono::seconds(timeoutInSeconds) +
+           std::chrono::seconds(configTimeout);
 }
 
 // if a validator is repeated multiple times its weight is only the

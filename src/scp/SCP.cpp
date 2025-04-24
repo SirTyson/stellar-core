@@ -19,8 +19,8 @@ namespace stellar
 {
 
 SCP::SCP(SCPDriver& driver, NodeID const& nodeID, bool isValidator,
-         SCPQuorumSet const& qSetLocal)
-    : mDriver(driver)
+         SCPQuorumSet const& qSetLocal, uint32_t additionalNominationTimeout)
+    : mDriver(driver), mAdditionalNominationTimeout(additionalNominationTimeout)
 {
     mLocalNode =
         std::make_shared<LocalNode>(nodeID, isValidator, qSetLocal, driver);
@@ -38,7 +38,7 @@ SCP::nominate(uint64 slotIndex, ValueWrapperPtr value,
               Value const& previousValue)
 {
     dbgAssert(isValidator());
-    return getSlot(slotIndex, true)->nominate(value, previousValue, false);
+    return getSlot(slotIndex, true)->nominate(value, previousValue, false, mAdditionalNominationTimeout);
 }
 
 void

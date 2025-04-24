@@ -77,7 +77,8 @@ HerderSCPDriver::HerderSCPDriver(Application& app, HerderImpl& herder,
     , mUpgrades{upgrades}
     , mPendingEnvelopes{pendingEnvelopes}
     , mSCP{*this, mApp.getConfig().NODE_SEED.getPublicKey(),
-           mApp.getConfig().NODE_IS_VALIDATOR, mApp.getConfig().QUORUM_SET}
+           mApp.getConfig().NODE_IS_VALIDATOR, mApp.getConfig().QUORUM_SET,
+           mApp.getConfig().ADDITIONAL_NOMINATION_TIMEOUT_MS}
     , mSCPMetrics{mApp}
     , mNominateTimeout{mApp.getMetrics().NewHistogram(
           {"scp", "timeout", "nominate"})}

@@ -58,7 +58,7 @@ class TestSCP : public SCPDriver
 
     TestSCP(NodeID const& nodeID, SCPQuorumSet const& qSetLocal,
             bool isValidator = true)
-        : mSCP(*this, nodeID, isValidator, qSetLocal)
+        : mSCP(*this, nodeID, isValidator, qSetLocal, 0)
     {
         mPriorityLookup = [&](NodeID const& n) {
             return (n == mSCP.getLocalNodeID()) ? 1000 : 1;
@@ -134,7 +134,7 @@ class TestSCP : public SCPDriver
     nominate(uint64 slotIndex, Value const& value, bool timedout)
     {
         auto wv = wrapValue(value);
-        return mSCP.getSlot(slotIndex, true)->nominate(wv, value, timedout);
+        return mSCP.getSlot(slotIndex, true)->nominate(wv, value, timedout, 0);
     }
 
     // only used by nomination protocol

@@ -213,9 +213,9 @@ Slot::bumpState(Value const& value, bool force)
 }
 
 bool
-Slot::nominate(ValueWrapperPtr value, Value const& previousValue, bool timedout)
+Slot::nominate(ValueWrapperPtr value, Value const& previousValue, bool timedout, uint32_t configTimeout)
 {
-    return mNominationProtocol.nominate(value, previousValue, timedout);
+    return mNominationProtocol.nominate(value, previousValue, timedout, configTimeout);
 }
 
 void
