@@ -1535,7 +1535,8 @@ LedgerManagerImpl::prefetchTxSourceIds(AbstractLedgerTxnParent& ltx,
                                        Config const& config)
 {
     ZoneScoped;
-    if (config.PREFETCH_BATCH_SIZE > 0)
+    if (config.PREFETCH_BATCH_SIZE > 0 &&
+        config.BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT > 0)
     {
         UnorderedSet<LedgerKey> keys;
         for (auto const& phase : txSet.getPhases())
@@ -1555,7 +1556,8 @@ LedgerManagerImpl::prefetchTransactionData(AbstractLedgerTxnParent& ltx,
                                            Config const& config)
 {
     ZoneScoped;
-    if (config.PREFETCH_BATCH_SIZE > 0)
+    if (config.PREFETCH_BATCH_SIZE > 0 &&
+        config.BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT > 0)
     {
         UnorderedSet<LedgerKey> sorobanKeys;
         auto lkMeter = make_unique<LedgerKeyMeter>();

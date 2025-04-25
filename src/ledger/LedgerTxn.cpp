@@ -2913,6 +2913,12 @@ LedgerTxnRoot::Impl::prefetchInternal(UnorderedSet<LedgerKey> const& keys,
     }
 #endif
 
+    // Skip prefetching when everything is stored in-memory
+    if (mApp.getConfig().BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT == 0)
+    {
+        return 0;
+    }
+
     ZoneScoped;
     uint32_t total = 0;
 
@@ -3455,55 +3461,84 @@ LedgerTxnRoot::Impl::getNewestVersion(InternalLedgerKey const& gkey) const
     }
     auto const& key = gkey.ledgerKey();
 
-    if (mEntryCache.exists(key))
+    // If everything is cached in-memory, don't check or populate the cache
+    if (mApp.getConfig().BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT == 0)
     {
-        std::string zoneTxt("hit");
-        ZoneText(zoneTxt.c_str(), zoneTxt.size());
-        return getFromEntryCache(key);
-    }
-    else
-    {
-        std::string zoneTxt("miss");
-        ZoneText(zoneTxt.c_str(), zoneTxt.size());
-        ++mPrefetchMisses;
-    }
-
-    std::shared_ptr<LedgerEntry const> entry;
-    try
-    {
-        if (key.type() != OFFER)
+        std::shared_ptr<LedgerEntry const> entry;
+        try
         {
             entry = getSearchableLiveBucketListSnapshot().load(key);
         }
+        catch (std::exception& e)
+        {
+            printErrorAndAbort(
+                "fatal error when loading ledger entry from LedgerTxnRoot: ",
+                e.what());
+        }
+
+        if (entry)
+        {
+            return std::make_shared<InternalLedgerEntry const>(*entry);
+        }
         else
         {
-            entry = loadOffer(key);
+            return nullptr;
         }
-    }
-    catch (NonSociRelatedException&)
-    {
-        throw;
-    }
-    catch (std::exception& e)
-    {
-        printErrorAndAbort(
-            "fatal error when loading ledger entry from LedgerTxnRoot: ",
-            e.what());
-    }
-    catch (...)
-    {
-        printErrorAndAbort("unknown fatal error when loading ledger entry from "
-                           "LedgerTxnRoot");
-    }
-
-    putInEntryCache(key, entry, LoadType::IMMEDIATE);
-    if (entry)
-    {
-        return std::make_shared<InternalLedgerEntry const>(*entry);
     }
     else
     {
-        return nullptr;
+        // Use normal cache-based path
+        if (mEntryCache.exists(key))
+        {
+            std::string zoneTxt("hit");
+            ZoneText(zoneTxt.c_str(), zoneTxt.size());
+            return getFromEntryCache(key);
+        }
+        else
+        {
+            std::string zoneTxt("miss");
+            ZoneText(zoneTxt.c_str(), zoneTxt.size());
+            ++mPrefetchMisses;
+        }
+
+        std::shared_ptr<LedgerEntry const> entry;
+        try
+        {
+            if (key.type() != OFFER)
+            {
+                entry = getSearchableLiveBucketListSnapshot().load(key);
+            }
+            else
+            {
+                entry = loadOffer(key);
+            }
+        }
+        catch (NonSociRelatedException&)
+        {
+            throw;
+        }
+        catch (std::exception& e)
+        {
+            printErrorAndAbort(
+                "fatal error when loading ledger entry from LedgerTxnRoot: ",
+                e.what());
+        }
+        catch (...)
+        {
+            printErrorAndAbort(
+                "unknown fatal error when loading ledger entry from "
+                "LedgerTxnRoot");
+        }
+
+        putInEntryCache(key, entry, LoadType::IMMEDIATE);
+        if (entry)
+        {
+            return std::make_shared<InternalLedgerEntry const>(*entry);
+        }
+        else
+        {
+            return nullptr;
+        }
     }
 }
 
