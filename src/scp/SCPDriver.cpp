@@ -162,7 +162,7 @@ SCPDriver::computeTimeout(uint32 roundNumber, uint32_t configTimeout)
     }
 
     return std::chrono::seconds(timeoutInSeconds) +
-           std::chrono::seconds(configTimeout);
+           std::chrono::milliseconds(configTimeout);
 }
 
 // if a validator is repeated multiple times its weight is only the
