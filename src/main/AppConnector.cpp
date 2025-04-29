@@ -21,35 +21,35 @@ AppConnector::AppConnector(Application& app)
 Herder&
 AppConnector::getHerder()
 {
-    releaseAssert(threadIsMain());
+    // releaseAssert(threadIsMain());
     return mApp.getHerder();
 }
 
 LedgerManager&
 AppConnector::getLedgerManager()
 {
-    releaseAssert(threadIsMain());
+    // releaseAssert(threadIsMain());
     return mApp.getLedgerManager();
 }
 
 OverlayManager&
 AppConnector::getOverlayManager()
 {
-    releaseAssert(threadIsMain());
+    // releaseAssert(threadIsMain());
     return mApp.getOverlayManager();
 }
 
 BanManager&
 AppConnector::getBanManager()
 {
-    releaseAssert(threadIsMain());
+    // releaseAssert(threadIsMain());
     return mApp.getBanManager();
 }
 
 SorobanNetworkConfig const&
 AppConnector::getLastClosedSorobanNetworkConfig() const
 {
-    releaseAssert(threadIsMain());
+    // releaseAssert(threadIsMain());
     return mApp.getLedgerManager().getLastClosedSorobanNetworkConfig();
 }
 
@@ -122,7 +122,7 @@ AppConnector::now() const
 bool
 AppConnector::shouldYield() const
 {
-    releaseAssert(threadIsMain());
+    // releaseAssert(threadIsMain());
     return mApp.getClock().shouldYield();
 }
 

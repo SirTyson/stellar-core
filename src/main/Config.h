@@ -493,6 +493,10 @@ class Config : public std::enable_shared_from_this<Config>
     uint32_t ZSTD_COMPRESSION_LEVEL;
     uint32_t ZSTD_NUM_CORES;
 
+    // Number of threads to use for checking validity of transactions. Parallel
+    // validity checking disabled if set to 0
+    uint32_t CHECK_VALID_THREAD_POOL_SIZE;
+
     // Enable parallel processing of overlay operations (experimental)
     bool BACKGROUND_OVERLAY_PROCESSING;
 

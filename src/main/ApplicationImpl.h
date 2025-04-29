@@ -81,6 +81,7 @@ class ApplicationImpl : public Application
 
     virtual asio::io_context& getWorkerIOContext() override;
     virtual asio::io_context& getEvictionIOContext() override;
+    virtual asio::io_context& getCheckValidIOContext() override;
     virtual asio::io_context& getOverlayIOContext() override;
     virtual asio::io_context& getLedgerCloseIOContext() override;
 
@@ -95,6 +96,8 @@ class ApplicationImpl : public Application
                                      std::string jobName) override;
     virtual void postOnLedgerCloseThread(std::function<void()>&& f,
                                          std::string jobName) override;
+    virtual void postOnCheckValidThread(std::function<void()>&& f,
+                                        std::string jobName) override;
     virtual void start() override;
     void startServices();
 
@@ -173,6 +176,9 @@ class ApplicationImpl : public Application
     std::unique_ptr<asio::io_context> mLedgerCloseIOContext;
     std::unique_ptr<asio::io_context::work> mLedgerCloseWork;
 
+    std::unique_ptr<asio::io_context> mCheckValidIOContext;
+    std::unique_ptr<asio::io_context::work> mCheckValidWork;
+
     std::unique_ptr<BucketManager> mBucketManager;
     std::unique_ptr<Database> mDatabase;
     std::unique_ptr<OverlayManager> mOverlayManager;
@@ -229,6 +235,8 @@ class ApplicationImpl : public Application
     // higher-priority worker thread type, but for now we only need a single
     // thread for eviction scans.
     std::optional<std::thread> mEvictionThread;
+
+    std::vector<std::thread> mCheckValidThreads;
 
     // NOTE: It is important that this map not be updated outside of the
     // constructor. `unordered_map` is safe for multiple threads to read from,

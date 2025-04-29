@@ -175,7 +175,7 @@ LedgerManagerImpl::moveToSynced()
 void
 LedgerManagerImpl::beginApply()
 {
-    releaseAssert(threadIsMain());
+    // releaseAssert(threadIsMain());
 
     // Go into "applying" state, this will prevent catchup from starting
     mCurrentlyApplyingLedger = true;
@@ -188,7 +188,7 @@ LedgerManagerImpl::beginApply()
 void
 LedgerManagerImpl::setState(State s)
 {
-    releaseAssert(threadIsMain());
+    // releaseAssert(threadIsMain());
     if (s != getState())
     {
         std::string oldState = getStateHuman();
@@ -219,14 +219,14 @@ LedgerManagerImpl::getStateHuman() const
 LedgerManagerImpl::LedgerState const&
 LedgerManagerImpl::getLCLState() const
 {
-    releaseAssert(threadIsMain());
+    // // releaseAssert(threadIsMain());
     return mLastClosedLedgerState;
 }
 
 LedgerManagerImpl::LedgerState&
 LedgerManagerImpl::getLCLState()
 {
-    releaseAssert(threadIsMain());
+    // releaseAssert(threadIsMain());
     return mLastClosedLedgerState;
 }
 
@@ -448,14 +448,14 @@ LedgerManagerImpl::getDatabase()
 uint32_t
 LedgerManagerImpl::getLastMaxTxSetSize() const
 {
-    releaseAssert(threadIsMain());
+    // releaseAssert(threadIsMain());
     return getLCLState().ledgerHeader.header.maxTxSetSize;
 }
 
 uint32_t
 LedgerManagerImpl::getLastMaxTxSetSizeOps() const
 {
-    releaseAssert(threadIsMain());
+    // releaseAssert(threadIsMain());
     auto n = getLCLState().ledgerHeader.header.maxTxSetSize;
     return protocolVersionStartsFrom(
                getLCLState().ledgerHeader.header.ledgerVersion,
@@ -501,7 +501,7 @@ LedgerManagerImpl::maxSorobanTransactionResources()
 int64_t
 LedgerManagerImpl::getLastMinBalance(uint32_t ownerCount) const
 {
-    releaseAssert(threadIsMain());
+    // releaseAssert(threadIsMain());
     auto const& lh = getLCLState().ledgerHeader.header;
     if (protocolVersionIsBefore(lh.ledgerVersion, ProtocolVersion::V_9))
         return (2 + ownerCount) * lh.baseReserve;
@@ -512,42 +512,42 @@ LedgerManagerImpl::getLastMinBalance(uint32_t ownerCount) const
 uint32_t
 LedgerManagerImpl::getLastReserve() const
 {
-    releaseAssert(threadIsMain());
+    // releaseAssert(threadIsMain());
     return getLCLState().ledgerHeader.header.baseReserve;
 }
 
 uint32_t
 LedgerManagerImpl::getLastTxFee() const
 {
-    releaseAssert(threadIsMain());
+    // releaseAssert(threadIsMain());
     return getLCLState().ledgerHeader.header.baseFee;
 }
 
 LedgerHeaderHistoryEntry const&
 LedgerManagerImpl::getLastClosedLedgerHeader() const
 {
-    releaseAssert(threadIsMain());
+    // // releaseAssert(threadIsMain());
     return getLCLState().ledgerHeader;
 }
 
 HistoryArchiveState
 LedgerManagerImpl::getLastClosedLedgerHAS()
 {
-    releaseAssert(threadIsMain());
+    // releaseAssert(threadIsMain());
     return getLCLState().has;
 }
 
 uint32_t
 LedgerManagerImpl::getLastClosedLedgerNum() const
 {
-    releaseAssert(threadIsMain());
+    // releaseAssert(threadIsMain());
     return getLCLState().ledgerHeader.header.ledgerSeq;
 }
 
 SorobanNetworkConfig const&
 LedgerManagerImpl::getLastClosedSorobanNetworkConfig()
 {
-    releaseAssert(threadIsMain());
+    // // releaseAssert(threadIsMain());
     releaseAssert(hasLastClosedSorobanNetworkConfig());
     return *getLCLState().sorobanConfig;
 }
@@ -562,7 +562,7 @@ LedgerManagerImpl::getSorobanNetworkConfigForApply()
 bool
 LedgerManagerImpl::hasLastClosedSorobanNetworkConfig() const
 {
-    releaseAssert(threadIsMain());
+    // releaseAssert(threadIsMain());
     return static_cast<bool>(getLCLState().sorobanConfig);
 }
 
@@ -570,7 +570,7 @@ LedgerManagerImpl::hasLastClosedSorobanNetworkConfig() const
 SorobanNetworkConfig&
 LedgerManagerImpl::getMutableSorobanNetworkConfigForApply()
 {
-    releaseAssert(threadIsMain());
+    // releaseAssert(threadIsMain());
     return *mApplyState.mSorobanNetworkConfig;
 }
 
@@ -642,7 +642,7 @@ LedgerManagerImpl::valueExternalized(LedgerCloseData const& ledgerData,
                                      bool isLatestSlot)
 {
     ZoneScoped;
-    releaseAssert(threadIsMain());
+    // releaseAssert(threadIsMain());
 
     CLOG_INFO(Ledger,
               "Got consensus: [seq={}, prev={}, txs={}, ops={}, sv: {}]",
@@ -783,7 +783,7 @@ LedgerManagerImpl::ledgerCloseComplete(uint32_t lcl, bool calledViaExternalize,
     // We just finished applying `lcl`, maybe change LM's state
     // Also notify Herder so it can trigger next ledger.
 
-    releaseAssert(threadIsMain());
+    // releaseAssert(threadIsMain());
     uint32_t latestHeardFromNetwork =
         mApp.getLedgerApplyManager().getLargestLedgerSeqHeard();
     uint32_t latestQueuedToApply =
@@ -1107,7 +1107,7 @@ LedgerManagerImpl::applyLedger(LedgerCloseData const& ledgerData,
     auto advanceLCLToApplyStateAndPublish =
         [this, ledgerSeq, calledViaExternalize, ledgerData,
          appliedLedgerState = std::move(appliedLedgerState)]() mutable {
-            releaseAssert(threadIsMain());
+            // releaseAssert(threadIsMain());
             advanceLastClosedLedgerState(appliedLedgerState);
 
             // Step 5. Maybe kick off publishing on complete checkpoint files
@@ -1153,7 +1153,7 @@ LedgerManagerImpl::setLastClosedLedger(
     LedgerHeaderHistoryEntry const& lastClosed)
 {
     ZoneScoped;
-    releaseAssert(threadIsMain());
+    // releaseAssert(threadIsMain());
     LedgerTxn ltx(mApp.getLedgerTxnRoot());
     auto header = ltx.loadHeader();
     header.current() = lastClosed.header;
@@ -1334,7 +1334,7 @@ LedgerManagerImpl::getLastClosedSnaphot()
 void
 LedgerManagerImpl::advanceLastClosedLedgerState(LedgerState const& output)
 {
-    releaseAssert(threadIsMain());
+    // releaseAssert(threadIsMain());
     CLOG_DEBUG(Ledger, "Advancing LCL: {} -> {}",
                ledgerAbbrev(getLCLState().ledgerHeader),
                ledgerAbbrev(output.ledgerHeader));

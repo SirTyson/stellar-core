@@ -101,8 +101,17 @@ ApplicationImpl::ApplicationImpl(VirtualClock& clock, Config const& cfg)
           mLedgerCloseIOContext
               ? std::make_unique<asio::io_context::work>(*mLedgerCloseIOContext)
               : nullptr)
+    , mCheckValidIOContext(mConfig.CHECK_VALID_THREAD_POOL_SIZE > 0
+                               ? std::make_unique<asio::io_context>(
+                                     mConfig.CHECK_VALID_THREAD_POOL_SIZE)
+                               : nullptr)
+    , mCheckValidWork(
+          mCheckValidIOContext
+              ? std::make_unique<asio::io_context::work>(*mCheckValidIOContext)
+              : nullptr)
     , mWorkerThreads()
     , mEvictionThread()
+    , mCheckValidThreads()
     , mStopSignals(clock.getIOContext(), SIGINT)
     , mStarted(false)
     , mStopping(false)
@@ -171,7 +180,19 @@ ApplicationImpl::ApplicationImpl(VirtualClock& clock, Config const& cfg)
     }};
     mThreadTypes[mEvictionThread->get_id()] = ThreadType::EVICTION;
 
-    --t;
+    if (mConfig.CHECK_VALID_THREAD_POOL_SIZE > 0)
+    {
+        for (uint32 i = 0; i < mConfig.CHECK_VALID_THREAD_POOL_SIZE; i++)
+        {
+            mCheckValidThreads.emplace_back([this]() {
+                // High priority thread
+                mCheckValidIOContext->run();
+            });
+
+            mThreadTypes[mCheckValidThreads.back().get_id()] =
+                ThreadType::CHECK_VALID;
+        }
+    }
 
     while (t--)
     {
@@ -895,6 +916,11 @@ ApplicationImpl::joinAllThreads()
         mEvictionWork.reset();
     }
 
+    if (mCheckValidWork)
+    {
+        mCheckValidWork.reset();
+    }
+
     LOG_INFO(DEFAULT_LOG, "Joining {} worker threads", mWorkerThreads.size());
     for (auto& w : mWorkerThreads)
     {
@@ -912,6 +938,13 @@ ApplicationImpl::joinAllThreads()
         LOG_INFO(DEFAULT_LOG, "Joining eviction thread");
         mEvictionThread->join();
     }
+
+    for (auto& t : mCheckValidThreads)
+    {
+        LOG_INFO(DEFAULT_LOG, "Joining check valid thread");
+        t.join();
+    }
+    mCheckValidThreads.clear();
 
     LOG_INFO(DEFAULT_LOG, "Joined all {} threads", (mWorkerThreads.size() + 1));
 }
@@ -1415,6 +1448,13 @@ ApplicationImpl::getEvictionIOContext()
 }
 
 asio::io_context&
+ApplicationImpl::getCheckValidIOContext()
+{
+    releaseAssert(mCheckValidIOContext);
+    return *mCheckValidIOContext;
+}
+
+asio::io_context&
 ApplicationImpl::getOverlayIOContext()
 {
     releaseAssert(mOverlayIOContext);
@@ -1496,6 +1536,14 @@ ApplicationImpl::postOnLedgerCloseThread(std::function<void()>&& f,
         mPostOnLedgerCloseThreadDelay.Update(isSlow.checkElapsedTime());
         f();
     });
+}
+
+void
+ApplicationImpl::postOnCheckValidThread(std::function<void()>&& f,
+                                        std::string jobName)
+{
+    releaseAssert(mCheckValidIOContext);
+    asio::post(*mCheckValidIOContext, [f = std::move(f), jobName]() { f(); });
 }
 
 void

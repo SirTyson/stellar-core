@@ -1273,31 +1273,59 @@ HerderSCPDriver::checkAndCacheTxSetValid(TxSetXDRFrame const& txSet,
     bool* pRes = mTxSetValidCache.maybeGet(key);
     if (pRes == nullptr)
     {
-        // The invariant here is that we only validate tx sets nominated
-        // to be applied to the current ledger state. However, in case
-        // if we receive a bad SCP value for the current state, we still
-        // might end up with malformed tx set that doesn't refer to the
-        // LCL.
-        ApplicableTxSetFrameConstPtr applicableTxSet;
-        if (txSet.previousLedgerHash() == lcl.hash)
-        {
-            applicableTxSet = txSet.prepareForApply(mApp, lcl.header);
-        }
+        // For testing purposes, we're going to write to the DB here and skip
+        // the write in emit nomination. In practice we'd write it here with a
+        // "validated" value of false, then write just the "checked" flag at
+        // nomination
 
-        bool res = true;
-        if (applicableTxSet == nullptr)
-        {
-            CLOG_ERROR(
-                Herder, "validateValue i:{} can't prepare txSet {} for apply",
-                (lcl.header.ledgerSeq + 1), hexAbbrev(txSet.getContentsHash()));
-            res = false;
-        }
-        else
-        {
-            res = applicableTxSet->checkValid(mApp, closeTimeOffset,
-                                              closeTimeOffset, isValid);
-        }
+        // Create a shared promise to handle the async work
+        // Using shared_ptr to make the promise copyable in the lambda
+        auto promise = std::make_shared<std::promise<bool>>();
+        std::future<bool> future = promise->get_future();
 
+        // Post the validation work to the checkValidThread
+        mApp.postOnCheckValidThread(
+            // We need to copy txSet since it needs to be accessed in another
+            // thread
+            [&txSet, lcl, closeTimeOffset, isValid, &app = mApp, promise]() {
+                ZoneNamedN(checkValid, "checkValid_thread", true);
+                // The invariant here is that we only validate tx sets
+                // nominated to be applied to the current ledger state.
+                // However, in case if we receive a bad SCP value for the
+                // current state, we still might end up with malformed tx
+                // set that doesn't refer to the LCL.
+                ApplicableTxSetFrameConstPtr applicableTxSet;
+                if (txSet.previousLedgerHash() == lcl.hash)
+                {
+                    applicableTxSet = txSet.prepareForApply(app, lcl.header);
+                }
+
+                bool res = true;
+                if (applicableTxSet == nullptr)
+                {
+                    CLOG_ERROR(
+                        Herder,
+                        "validateValue i:{} can't prepare txSet {} for apply",
+                        (lcl.header.ledgerSeq + 1),
+                        hexAbbrev(txSet.getContentsHash()));
+                    res = false;
+                }
+                else
+                {
+                    res = applicableTxSet->checkValid(app, closeTimeOffset,
+                                                      closeTimeOffset, isValid);
+                }
+
+                // Set the promise with our result
+                promise->set_value(res);
+            },
+            "checkTxSetValid");
+
+        // Wait for the future to complete - this blocks until the task is done
+        bool res = future.get();
+        promise.reset();
+
+        // Cache the result
         mTxSetValidCache.put(key, res);
         return res;
     }

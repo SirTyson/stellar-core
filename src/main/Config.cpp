@@ -169,6 +169,7 @@ Config::Config() : NODE_SEED(SecretKey::random())
 
     ZSTD_COMPRESSION_LEVEL = 4;
     ZSTD_NUM_CORES = 4;
+    CHECK_VALID_THREAD_POOL_SIZE = 4;
 
     PUBLISH_TO_ARCHIVE_DELAY = std::chrono::seconds{0};
     // automatic maintenance settings:
@@ -1159,6 +1160,11 @@ Config::processConfig(std::shared_ptr<cpptoml::table> t)
                  }},
                 {"ZSTD_NUM_CORES",
                  [&]() { ZSTD_NUM_CORES = readInt<uint32_t>(item, 0, 32); }},
+                {"CHECK_VALID_THREAD_POOL_SIZE",
+                 [&]() {
+                     CHECK_VALID_THREAD_POOL_SIZE =
+                         readInt<uint32_t>(item, 0, 32);
+                 }},
                 {"EXPERIMENTAL_BUCKETLIST_DB_PERSIST_INDEX",
                  [&]() {
                      BUCKETLIST_DB_PERSIST_INDEX = readBool(item);

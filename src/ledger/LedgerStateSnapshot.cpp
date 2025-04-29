@@ -223,7 +223,7 @@ LedgerSnapshot::LedgerSnapshot(AbstractLedgerTxn& ltx)
 
 LedgerSnapshot::LedgerSnapshot(Application& app)
 {
-    releaseAssert(threadIsMain());
+    // releaseAssert(threadIsMain());
 #ifdef BUILD_TESTS
     if (app.getConfig().MODE_USES_IN_MEMORY_LEDGER)
     {

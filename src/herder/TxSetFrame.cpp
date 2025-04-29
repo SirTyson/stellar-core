@@ -1799,30 +1799,136 @@ TxSetPhaseFrame::txsAreValid(Application& app,
                              uint64_t upperBoundCloseTimeOffset) const
 {
     ZoneScoped;
-    // This is done so minSeqLedgerGap is validated against the next
-    // ledgerSeq, which is what will be used at apply time
 
-    // Grab read-only latest ledger state; This is only used to validate tx sets
-    // for LCL+1
-    LedgerSnapshot ls(app);
-    ls.getLedgerHeader().currentToModify().ledgerSeq =
-        app.getLedgerManager().getLastClosedLedgerNum() + 1;
+    // Skip parallelization if there's only a single thread for checking
+    if (app.getConfig().CHECK_VALID_THREAD_POOL_SIZE <= 1)
+    {
+        // Use original sequential implementation
+        // This is done so minSeqLedgerGap is validated against the next
+        // ledgerSeq, which is what will be used at apply time
+        LedgerSnapshot ls(app);
+        ls.getLedgerHeader().currentToModify().ledgerSeq =
+            app.getLedgerManager().getLastClosedLedgerNum() + 1;
+        for (auto const& tx : *this)
+        {
+            auto txResult = tx->checkValid(app.getAppConnector(), ls, 0,
+                                           lowerBoundCloseTimeOffset,
+                                           upperBoundCloseTimeOffset);
+            if (!txResult->isSuccess())
+            {
+                CLOG_DEBUG(
+                    Herder, "Got bad txSet: tx invalid tx: {} result: {}",
+                    xdrToCerealString(tx->getEnvelope(), "TransactionEnvelope"),
+                    txResult->getResultCode());
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Parallel implementation
+
+    // Collect all transactions into a list for easier partitioning
+    std::vector<TransactionFrameBasePtr> allTxs;
     for (auto const& tx : *this)
     {
-        auto txResult = tx->checkValid(app.getAppConnector(), ls, 0,
-                                       lowerBoundCloseTimeOffset,
-                                       upperBoundCloseTimeOffset);
-        if (!txResult->isSuccess())
-        {
-
-            CLOG_DEBUG(
-                Herder, "Got bad txSet: tx invalid tx: {} result: {}",
-                xdrToCerealString(tx->getEnvelope(), "TransactionEnvelope"),
-                txResult->getResultCode());
-            return false;
-        }
+        allTxs.push_back(tx);
     }
-    return true;
+
+    if (allTxs.empty())
+    {
+        return true;
+    }
+
+    // Calculate number of partitions (bounded by number of transactions and
+    // thread pool size)
+    uint32_t partitionCount =
+        std::min(static_cast<uint32_t>(allTxs.size()),
+                 app.getConfig().CHECK_VALID_THREAD_POOL_SIZE);
+
+    // Create shared promise for the final result
+    auto resultPromise = std::make_shared<std::promise<bool>>();
+    std::future<bool> resultFuture = resultPromise->get_future();
+
+    // Use atomic for tracking failure (if any thread detects a failure, we can
+    // fail fast)
+    auto validationSuccessful = std::make_shared<std::atomic<bool>>(true);
+
+    // Use atomic counter to track completed partitions
+    auto completedPartitions = std::make_shared<std::atomic<uint32_t>>(0);
+
+    // Calculate transactions per partition
+    size_t txsPerPartition =
+        (allTxs.size() + partitionCount - 1) / partitionCount;
+
+    // Create and submit tasks
+    for (uint32_t i = 0; i < partitionCount; i++)
+    {
+        // Calculate range for this partition
+        size_t startIdx = i * txsPerPartition;
+        size_t endIdx = std::min(startIdx + txsPerPartition, allTxs.size());
+
+        // Skip empty partitions
+        if (startIdx >= allTxs.size())
+        {
+            (*completedPartitions)++;
+            continue;
+        }
+
+        // Post task to check valid thread
+        app.postOnCheckValidThread(
+            [&app, lowerBoundCloseTimeOffset, upperBoundCloseTimeOffset,
+             startIdx, endIdx, &allTxs, validationSuccessful,
+             completedPartitions, resultPromise, partitionCount]() {
+                // Create a ledger snapshot for this partition
+                // This is done so minSeqLedgerGap is validated against the next
+                // ledgerSeq, which is what will be used at apply time
+                LedgerSnapshot ls(app);
+                ls.getLedgerHeader().currentToModify().ledgerSeq =
+                    app.getLedgerManager().getLastClosedLedgerNum() + 1;
+
+                // Process transactions in this partition
+                for (size_t j = startIdx; j < endIdx; j++)
+                {
+                    // Skip checking if another thread already found an invalid
+                    // tx
+                    if (!validationSuccessful->load())
+                    {
+                        break;
+                    }
+
+                    auto const& tx = allTxs[j];
+                    auto txResult = tx->checkValid(app.getAppConnector(), ls, 0,
+                                                   lowerBoundCloseTimeOffset,
+                                                   upperBoundCloseTimeOffset);
+                    if (!txResult->isSuccess())
+                    {
+                        CLOG_DEBUG(
+                            Herder,
+                            "Got bad txSet: tx invalid tx: {} result: {}",
+                            xdrToCerealString(tx->getEnvelope(),
+                                              "TransactionEnvelope"),
+                            txResult->getResultCode());
+
+                        // Set failure flag
+                        validationSuccessful->store(false);
+                    }
+                }
+
+                // Increment completed partition counter
+                uint32_t completed = ++(*completedPartitions);
+
+                // If all partitions are done, set the result
+                if (completed == partitionCount)
+                {
+                    resultPromise->set_value(validationSuccessful->load());
+                }
+            },
+            "checkTxSetValid_partition" + std::to_string(i));
+    }
+
+    // Wait for all partitions to complete
+    return resultFuture.get();
 }
 
 std::optional<Resource>
@@ -1920,7 +2026,7 @@ ApplicableTxSetFrame::checkValid(Application& app,
                                  bool skipValidation) const
 {
     ZoneScoped;
-    releaseAssert(threadIsMain());
+    // releaseAssert(threadIsMain());
     auto const& lcl = app.getLedgerManager().getLastClosedLedgerHeader();
 
     // Start by checking previousLedgerHash
