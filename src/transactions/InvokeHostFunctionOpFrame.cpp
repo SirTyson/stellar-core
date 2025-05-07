@@ -294,7 +294,7 @@ InvokeHostFunctionOpFrame::ApplyHelper::handleArchivedEntry(
 
         // Charge for the restoration reads. TTLEntry writes come out of
         // refundable fee, so only meter the actual code/data entry here.
-        mMetrics.noteReadEntry(isCodeKey(lk), keySize, entrySize);
+        mMetrics.noteReadEntry(isContractCodeEntry(lk), keySize, entrySize);
         if (!validateContractLedgerEntry(lk, entrySize, mSorobanConfig,
                                          mAppConfig, mOpFrame.mParentTx,
                                          mDiagnosticEvents))
@@ -304,13 +304,13 @@ InvokeHostFunctionOpFrame::ApplyHelper::handleArchivedEntry(
             return false;
         }
 
-        if (mResources.readBytes < mMetrics.mLedgerReadByte)
+        if (mResources.diskReadBytes < mMetrics.mLedgerReadByte)
         {
             mDiagnosticEvents.pushApplyTimeDiagnosticError(
                 SCE_BUDGET, SCEC_EXCEEDED_LIMIT,
                 "operation byte-read resources exceeds amount specified",
                 {makeU64SCVal(mMetrics.mLedgerReadByte),
-                 makeU64SCVal(mResources.readBytes)});
+                 makeU64SCVal(mResources.diskReadBytes)});
 
             mOpFrame.innerResult(mRes).code(
                 INVOKE_HOST_FUNCTION_RESOURCE_LIMIT_EXCEEDED);

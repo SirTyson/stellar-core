@@ -1394,6 +1394,18 @@
 		"KHSvDVDy2Lw="
 	],
 	"Vm instantiation tightening" : [ "MR6BJ3xmn2c=" ],
+	"autorestore contract instance" : [ "+cR3oq2qY0I=", "+cR3oq2qY0I=" ],
+	"autorestore with storage resize" : 
+	[
+		"+cR3oq2qY0I=",
+		"+cR3oq2qY0I=",
+		"+cR3oq2qY0I=",
+		"+cR3oq2qY0I=",
+		"+cR3oq2qY0I=",
+		"+cR3oq2qY0I=",
+		"+cR3oq2qY0I=",
+		"+cR3oq2qY0I="
+	],
 	"basic contract invocation" : 
 	[
 		"+cR3oq2qY0I=",
