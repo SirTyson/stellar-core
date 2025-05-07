@@ -1394,6 +1394,38 @@
 		"KHSvDVDy2Lw="
 	],
 	"Vm instantiation tightening" : [ "MR6BJ3xmn2c=" ],
+	"archival meta|protocol version 20" : 
+	[
+		"bKDF6V5IzTo=",
+		"bKDF6V5IzTo=",
+		"bKDF6V5IzTo=",
+		"bKDF6V5IzTo=",
+		"bKDF6V5IzTo="
+	],
+	"archival meta|protocol version 21" : 
+	[
+		"bKDF6V5IzTo=",
+		"bKDF6V5IzTo=",
+		"bKDF6V5IzTo=",
+		"bKDF6V5IzTo=",
+		"bKDF6V5IzTo="
+	],
+	"archival meta|protocol version 22" : 
+	[
+		"bKDF6V5IzTo=",
+		"bKDF6V5IzTo=",
+		"bKDF6V5IzTo=",
+		"bKDF6V5IzTo=",
+		"bKDF6V5IzTo="
+	],
+	"archival meta|protocol version 23" : 
+	[
+		"+cR3oq2qY0I=",
+		"+cR3oq2qY0I=",
+		"+cR3oq2qY0I=",
+		"+cR3oq2qY0I=",
+		"+cR3oq2qY0I="
+	],
 	"autorestore contract instance" : [ "+cR3oq2qY0I=", "+cR3oq2qY0I=" ],
 	"autorestore with storage resize" : 
 	[
