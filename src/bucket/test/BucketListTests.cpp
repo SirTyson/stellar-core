@@ -162,12 +162,29 @@ basicBucketListTest()
                 }
                 else
                 {
-                    bl.addBatch(
-                        *app, i, getAppLedgerVersion(app), {},
-                        LedgerTestUtils::generateValidUniqueLedgerKeysWithTypes(
-                            {CONTRACT_CODE, CONTRACT_DATA}, 8, seenKeys),
-                        LedgerTestUtils::generateValidUniqueLedgerKeysWithTypes(
-                            {CONTRACT_CODE, CONTRACT_DATA}, 5, seenKeys));
+                    if constexpr (std::is_same_v<BucketListT, LiveBucketList>)
+                    {
+                        bl.addBatch(
+                            *app, i, getAppLedgerVersion(app), {},
+                            LedgerTestUtils::generateValidUniqueLedgerEntries(
+                                8),
+                            LedgerTestUtils::
+                                generateValidLedgerEntryKeysWithExclusions(
+                                    {CONFIG_SETTING}, 5));
+                    }
+                    else
+                    {
+                        bl.addBatch(
+                            *app, i, getAppLedgerVersion(app),
+                            stellar::LedgerTestUtils::
+                                generateValidUniqueLedgerEntriesWithTypes(
+                                    {CONTRACT_CODE, CONTRACT_DATA}, 8,
+                                    seenKeys),
+                            stellar::LedgerTestUtils::
+                                generateValidUniqueLedgerKeysWithTypes(
+                                    {CONTRACT_CODE, CONTRACT_DATA}, 5,
+                                    seenKeys));
+                    }
                 }
 
                 if (i % 10 == 0)
@@ -420,11 +437,12 @@ TEST_CASE_VERSIONS("hot archive bucket tombstones expire at bottom level",
         auto ledger = 1;
         while (lastSnapSize() == 0)
         {
-            bl.addBatch(*app, ledger, getAppLedgerVersion(app), {},
-                        LedgerTestUtils::generateValidUniqueLedgerKeysWithTypes(
-                            {CONTRACT_CODE, CONTRACT_DATA}, 5, keys),
-                        LedgerTestUtils::generateValidUniqueLedgerKeysWithTypes(
-                            {CONTRACT_CODE, CONTRACT_DATA}, 5, keys));
+            bl.addBatch(
+                *app, ledger, getAppLedgerVersion(app),
+                LedgerTestUtils::generateValidUniqueLedgerEntriesWithTypes(
+                    {CONTRACT_DATA, CONTRACT_CODE}, 5, keys),
+                LedgerTestUtils::generateValidUniqueLedgerKeysWithTypes(
+                    {CONTRACT_CODE, CONTRACT_DATA}, 5, keys));
 
             // Once all entries merge to the bottom level, only deleted entries
             // should remain
@@ -437,7 +455,7 @@ TEST_CASE_VERSIONS("hot archive bucket tombstones expire at bottom level",
         // bucket
         while (countNonBottomLevelEntries() != 0)
         {
-            bl.addBatch(*app, ledger, getAppLedgerVersion(app), {}, {}, {});
+            bl.addBatch(*app, ledger, getAppLedgerVersion(app), {}, {});
             ++ledger;
         }
 
@@ -449,7 +467,8 @@ TEST_CASE_VERSIONS("hot archive bucket tombstones expire at bottom level",
         {
             auto be = *iter;
             REQUIRE(be.type() == HOT_ARCHIVE_ARCHIVED);
-            REQUIRE(keys.find(be.key()) != keys.end());
+            REQUIRE(keys.find(LedgerEntryKey(be.archivedEntry())) !=
+                    keys.end());
         }
     });
 }

@@ -1986,7 +1986,7 @@ LedgerManagerImpl::sealLedgerTxnAndTransferEntriesToBucketList(
                     }
                 }
                 mApp.getBucketManager().addHotArchiveBatch(
-                    mApp, lh, evictedState.archivedEntries, restoredKeys, {});
+                    mApp, lh, evictedState.archivedEntries, restoredKeys);
             }
 
             if (ledgerCloseMeta)

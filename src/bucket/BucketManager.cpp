@@ -975,8 +975,7 @@ void
 BucketManager::addHotArchiveBatch(
     Application& app, LedgerHeader header,
     std::vector<LedgerEntry> const& archivedEntries,
-    std::vector<LedgerKey> const& restoredEntries,
-    std::vector<LedgerKey> const& deletedEntries)
+    std::vector<LedgerKey> const& restoredEntries)
 {
     ZoneScoped;
     releaseAssertOrThrow(app.getConfig().MODE_ENABLES_BUCKETLIST);
@@ -991,14 +990,12 @@ BucketManager::addHotArchiveBatch(
 #endif
     auto timer = mBucketAddArchiveBatch.TimeScope();
     mBucketArchiveObjectInsertBatch.Mark(archivedEntries.size() +
-                                         restoredEntries.size() +
-                                         deletedEntries.size());
+                                         restoredEntries.size());
 
     // Hot archive should never modify an existing entry, so there are never
     // live entries
     mHotArchiveBucketList->addBatch(app, header.ledgerSeq, header.ledgerVersion,
-                                    archivedEntries, restoredEntries,
-                                    deletedEntries);
+                                    archivedEntries, restoredEntries);
     mArchiveBucketListSizeCounter.set_count(mHotArchiveBucketList->getSize());
 }
 

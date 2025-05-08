@@ -29,8 +29,7 @@ class HotArchiveBucket
 {
     static std::vector<HotArchiveBucketEntry>
     convertToBucketEntry(std::vector<LedgerEntry> const& archivedEntries,
-                         std::vector<LedgerKey> const& restoredEntries,
-                         std::vector<LedgerKey> const& deletedEntries);
+                         std::vector<LedgerKey> const& restoredEntries);
 
   public:
     // Entry type that this bucket stores
@@ -56,8 +55,7 @@ class HotArchiveBucket
     fresh(BucketManager& bucketManager, uint32_t protocolVersion,
           std::vector<LedgerEntry> const& archivedEntries,
           std::vector<LedgerKey> const& restoredEntries,
-          std::vector<LedgerKey> const& deletedEntries, bool countMergeEvents,
-          asio::io_context& ctx, bool doFsync);
+          bool countMergeEvents, asio::io_context& ctx, bool doFsync);
 
     // Returns true if the given BucketEntry should be dropped in the bottom
     // level bucket (i.e. HOT_ARCHIVE_LIVE)

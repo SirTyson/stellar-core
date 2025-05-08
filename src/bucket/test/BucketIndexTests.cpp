@@ -1004,7 +1004,6 @@ TEST_CASE("hot archive bucket lookups", "[bucket][bucketindex][archive]")
         auto app = createTestApplication<BucketTestApplication>(clock, cfg);
 
         UnorderedMap<LedgerKey, LedgerEntry> expectedArchiveEntries;
-        UnorderedSet<LedgerKey> expectedDeletedEntries;
         UnorderedSet<LedgerKey> expectedRestoredEntries;
         UnorderedSet<LedgerKey> keysToSearch;
 
@@ -1057,7 +1056,6 @@ TEST_CASE("hot archive bucket lookups", "[bucket][bucketindex][archive]")
                 expectedArchiveEntries.erase(iter);
             }
 
-            REQUIRE(expectedDeletedEntries.empty());
             REQUIRE(expectedArchiveEntries.empty());
         };
 
@@ -1072,14 +1070,6 @@ TEST_CASE("hot archive bucket lookups", "[bucket][bucketindex][archive]")
         }
 
         // Note: keys to search automatically populated by these functions
-        auto deletedEntries =
-            LedgerTestUtils::generateValidUniqueLedgerKeysWithTypes(
-                {CONTRACT_DATA, CONTRACT_CODE}, 10, keysToSearch);
-        for (auto const& k : deletedEntries)
-        {
-            expectedDeletedEntries.emplace(k);
-        }
-
         auto restoredEntries =
             LedgerTestUtils::generateValidUniqueLedgerKeysWithTypes(
                 {CONTRACT_DATA, CONTRACT_CODE}, 10, keysToSearch);
@@ -1094,7 +1084,7 @@ TEST_CASE("hot archive bucket lookups", "[bucket][bucketindex][archive]")
         header.ledgerVersion = static_cast<uint32_t>(
             HotArchiveBucket::FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION);
         addHotArchiveBatchAndUpdateSnapshot(*app, header, archivedEntries,
-                                            restoredEntries, deletedEntries);
+                                            restoredEntries);
         app->getBucketManager()
             .getBucketSnapshotManager()
             .maybeCopySearchableHotArchiveBucketListSnapshot(searchableBL);
@@ -1104,7 +1094,7 @@ TEST_CASE("hot archive bucket lookups", "[bucket][bucketindex][archive]")
         for (auto i = 0; i < 100; ++i)
         {
             header.ledgerSeq += 1;
-            addHotArchiveBatchAndUpdateSnapshot(*app, header, {}, {}, {});
+            addHotArchiveBatchAndUpdateSnapshot(*app, header, {}, {});
             app->getBucketManager()
                 .getBucketSnapshotManager()
                 .maybeCopySearchableHotArchiveBucketListSnapshot(searchableBL);
@@ -1112,11 +1102,11 @@ TEST_CASE("hot archive bucket lookups", "[bucket][bucketindex][archive]")
 
         // Shadow entries via liveEntry
         auto liveShadow1 = LedgerEntryKey(archivedEntries[0]);
-        auto liveShadow2 = deletedEntries[1];
+        auto liveShadow2 = LedgerEntryKey(archivedEntries[1]);
 
         header.ledgerSeq += 1;
         addHotArchiveBatchAndUpdateSnapshot(*app, header, {},
-                                            {liveShadow1, liveShadow2}, {});
+                                            {liveShadow1, liveShadow2});
         app->getBucketManager()
             .getBucketSnapshotManager()
             .maybeCopySearchableHotArchiveBucketListSnapshot(searchableBL);
@@ -1133,23 +1123,12 @@ TEST_CASE("hot archive bucket lookups", "[bucket][bucketindex][archive]")
             searchableBL->loadKeys({liveShadow1, liveShadow2});
         REQUIRE(bulkLoadResult.size() == 0);
 
-        // Shadow via deletedEntry
-        auto deletedShadow = LedgerEntryKey(archivedEntries[1]);
-
-        header.ledgerSeq += 1;
-        addHotArchiveBatchAndUpdateSnapshot(*app, header, {}, {},
-                                            {deletedShadow});
-        app->getBucketManager()
-            .getBucketSnapshotManager()
-            .maybeCopySearchableHotArchiveBucketListSnapshot(searchableBL);
-
-        // Shadow via archivedEntry
+        // Shadow via archivedEntries
         auto archivedShadow = archivedEntries[3];
         archivedShadow.lastModifiedLedgerSeq = ledger;
 
         header.ledgerSeq += 1;
-        addHotArchiveBatchAndUpdateSnapshot(*app, header, {archivedShadow}, {},
-                                            {});
+        addHotArchiveBatchAndUpdateSnapshot(*app, header, {archivedShadow}, {});
         app->getBucketManager()
             .getBucketSnapshotManager()
             .maybeCopySearchableHotArchiveBucketListSnapshot(searchableBL);
@@ -1162,11 +1141,11 @@ TEST_CASE("hot archive bucket lookups", "[bucket][bucketindex][archive]")
         REQUIRE(entryPtr->archivedEntry() == archivedShadow);
 
         // Bulk load
-        auto bulkLoadResult3 =
+        auto bulkLoadResult2 =
             searchableBL->loadKeys({LedgerEntryKey(archivedShadow)});
-        REQUIRE(bulkLoadResult3.size() == 1);
-        REQUIRE(bulkLoadResult3[0].type() == HOT_ARCHIVE_ARCHIVED);
-        REQUIRE(bulkLoadResult3[0].archivedEntry() == archivedShadow);
+        REQUIRE(bulkLoadResult2.size() == 1);
+        REQUIRE(bulkLoadResult2[0].type() == HOT_ARCHIVE_ARCHIVED);
+        REQUIRE(bulkLoadResult2[0].archivedEntry() == archivedShadow);
     };
 
     testAllIndexTypes(f);

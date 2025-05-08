@@ -58,12 +58,11 @@ void
 addHotArchiveBatchAndUpdateSnapshot(
     Application& app, LedgerHeader header,
     std::vector<LedgerEntry> const& archiveEntries,
-    std::vector<LedgerKey> const& restoredEntries,
-    std::vector<LedgerKey> const& deletedEntries)
+    std::vector<LedgerKey> const& restoredEntries)
 {
     auto& hotArchiveBl = app.getBucketManager().getHotArchiveBucketList();
     hotArchiveBl.addBatch(app, header.ledgerSeq, header.ledgerVersion,
-                          archiveEntries, restoredEntries, deletedEntries);
+                          archiveEntries, restoredEntries);
     auto liveSnapshot = std::make_unique<BucketListSnapshot<LiveBucket>>(
         app.getBucketManager().getLiveBucketList(), header);
     auto hotArchiveSnapshot =
@@ -254,8 +253,7 @@ LedgerManagerForBucketTests::sealLedgerTxnAndTransferEntriesToBucketList(
                         }
                     }
                     mApp.getBucketManager().addHotArchiveBatch(
-                        mApp, lh, evictedState.archivedEntries, restoredKeys,
-                        {});
+                        mApp, lh, evictedState.archivedEntries, restoredKeys);
                 }
 
                 if (ledgerCloseMeta)
