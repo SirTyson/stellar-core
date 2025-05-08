@@ -1,6 +1,6 @@
 use crate::{
     CxxBuf, CxxFeeConfiguration, CxxLedgerEntryRentChange, CxxLedgerInfo, CxxRentFeeConfiguration,
-    CxxTransactionResources, CxxWriteFeeConfiguration, FeePair, InvokeHostFunctionOutput,
+    CxxRentWriteFeeConfiguration, CxxTransactionResources, FeePair, InvokeHostFunctionOutput,
     SorobanModuleCache, SorobanVersionInfo,
 };
 
@@ -36,11 +36,22 @@ pub(crate) use p22 as soroban_curr;
 #[path = "."]
 pub(crate) mod p23 {
     pub(crate) extern crate soroban_env_host_p23;
-    use crate::SorobanModuleCache;
+    use crate::{
+        rust_bridge::{
+            CxxFeeConfiguration, CxxRentFeeConfiguration, CxxRentWriteFeeConfiguration,
+            CxxTransactionResources,
+        },
+        SorobanModuleCache,
+    };
     use soroban_env_host::{
         budget::Budget,
-        e2e_invoke::{self, InvokeHostFunctionResult},
-        xdr::DiagnosticEvent,
+        e2e_invoke::{self, InvokeHostFunctionResult, LedgerEntryChange},
+        fees::{
+            compute_rent_write_fee_per_1kb, FeeConfiguration, RentFeeConfiguration,
+            RentWriteFeeConfiguration, TransactionResources,
+        },
+        vm::wasm_module_memory_cost,
+        xdr::{ContractCodeEntry, DiagnosticEvent},
         HostError, LedgerInfo, TraceHook,
     };
     pub(crate) use soroban_env_host_p23 as soroban_env_host;
@@ -97,6 +108,70 @@ pub(crate) mod p23 {
             Some(module_cache.p23_cache.module_cache.clone()),
         )
     }
+
+    pub(crate) fn wasm_module_memory_cost_wrapper(
+        budget: &Budget,
+        contract_code_entry: &ContractCodeEntry,
+    ) -> Result<u64, HostError> {
+        wasm_module_memory_cost(budget, contract_code_entry)
+    }
+
+    pub(crate) fn compute_rent_write_fee_per_1kb_wrapper(
+        bucket_list_size: i64,
+        fee_config: CxxRentWriteFeeConfiguration,
+    ) -> i64 {
+        compute_rent_write_fee_per_1kb(bucket_list_size, &fee_config.into())
+    }
+
+    pub(crate) fn convert_transaction_resources(
+        value: &CxxTransactionResources,
+    ) -> TransactionResources {
+        TransactionResources {
+            instructions: value.instructions,
+            disk_read_entries: value.disk_read_entries,
+            write_entries: value.write_entries,
+            disk_read_bytes: value.disk_read_bytes,
+            write_bytes: value.write_bytes,
+            contract_events_size_bytes: value.contract_events_size_bytes,
+            transaction_size_bytes: value.transaction_size_bytes,
+        }
+    }
+
+    impl From<CxxRentWriteFeeConfiguration> for RentWriteFeeConfiguration {
+        fn from(value: CxxRentWriteFeeConfiguration) -> Self {
+            Self {
+                state_target_size_bytes: value.state_target_size_bytes,
+                rent_fee_1kb_state_size_low: value.rent_fee_1kb_state_size_low,
+                rent_fee_1kb_state_size_high: value.rent_fee_1kb_state_size_high,
+                state_size_rent_fee_growth_factor: value.state_size_rent_fee_growth_factor,
+            }
+        }
+    }
+
+    pub(crate) fn convert_rent_fee_configuration(
+        value: &CxxRentFeeConfiguration,
+    ) -> RentFeeConfiguration {
+        RentFeeConfiguration {
+            fee_per_rent_1kb: value.fee_per_rent_1kb,
+            fee_per_write_1kb: value.fee_per_write_1kb,
+            fee_per_write_entry: value.fee_per_write_entry,
+            persistent_rent_rate_denominator: value.persistent_rent_rate_denominator,
+            temporary_rent_rate_denominator: value.temporary_rent_rate_denominator,
+        }
+    }
+
+    pub(crate) fn convert_fee_configuration(value: CxxFeeConfiguration) -> FeeConfiguration {
+        FeeConfiguration {
+            fee_per_instruction_increment: value.fee_per_instruction_increment,
+            fee_per_disk_read_entry: value.fee_per_disk_read_entry,
+            fee_per_write_entry: value.fee_per_write_entry,
+            fee_per_disk_read_1kb: value.fee_per_disk_read_1kb,
+            fee_per_write_1kb: value.fee_per_write_1kb,
+            fee_per_historical_1kb: value.fee_per_historical_1kb,
+            fee_per_contract_event_1kb: value.fee_per_contract_event_1kb,
+            fee_per_transaction_size_1kb: value.fee_per_transaction_size_1kb,
+        }
+    }
 }
 
 #[path = "."]
@@ -104,11 +179,21 @@ pub(crate) mod p22 {
     pub(crate) extern crate soroban_env_host_p22;
     pub(crate) use soroban_env_host_p22 as soroban_env_host;
     pub(crate) mod soroban_proto_any;
-    use crate::SorobanModuleCache;
+    use crate::{
+        rust_bridge::{
+            CxxFeeConfiguration, CxxRentFeeConfiguration, CxxRentWriteFeeConfiguration,
+            CxxTransactionResources,
+        },
+        SorobanModuleCache,
+    };
     use soroban_env_host::{
         budget::{AsBudget, Budget},
-        e2e_invoke::{self, InvokeHostFunctionResult},
-        xdr::{DiagnosticEvent, Hash},
+        e2e_invoke::{self, InvokeHostFunctionResult, LedgerEntryChange},
+        fees::{
+            compute_write_fee_per_1kb, FeeConfiguration, RentFeeConfiguration,
+            TransactionResources, WriteFeeConfiguration,
+        },
+        xdr::{ContractCodeEntry, DiagnosticEvent, Hash},
         Error, HostError, LedgerInfo, TraceHook, Val,
     };
 
@@ -200,6 +285,68 @@ pub(crate) mod p22 {
             trace_hook,
         )
     }
+
+    pub(crate) fn wasm_module_memory_cost_wrapper(
+        _budget: &Budget,
+        _contract_code_entry: &ContractCodeEntry,
+    ) -> Result<u64, HostError> {
+        Err(INTERNAL_ERROR.into())
+    }
+
+    pub(crate) fn compute_rent_write_fee_per_1kb_wrapper(
+        bucket_list_size: i64,
+        fee_config: CxxRentWriteFeeConfiguration,
+    ) -> i64 {
+        compute_write_fee_per_1kb(bucket_list_size, &fee_config.into())
+    }
+
+    pub(crate) fn convert_transaction_resources(
+        value: &CxxTransactionResources,
+    ) -> TransactionResources {
+        TransactionResources {
+            instructions: value.instructions,
+            read_entries: value.disk_read_entries,
+            write_entries: value.write_entries,
+            read_bytes: value.disk_read_bytes,
+            write_bytes: value.write_bytes,
+            contract_events_size_bytes: value.contract_events_size_bytes,
+            transaction_size_bytes: value.transaction_size_bytes,
+        }
+    }
+
+    impl From<CxxRentWriteFeeConfiguration> for WriteFeeConfiguration {
+        fn from(value: CxxRentWriteFeeConfiguration) -> Self {
+            Self {
+                bucket_list_target_size_bytes: value.state_target_size_bytes,
+                write_fee_1kb_bucket_list_low: value.rent_fee_1kb_state_size_low,
+                write_fee_1kb_bucket_list_high: value.rent_fee_1kb_state_size_high,
+                bucket_list_write_fee_growth_factor: value.state_size_rent_fee_growth_factor,
+            }
+        }
+    }
+    pub(crate) fn convert_rent_fee_configuration(
+        value: &CxxRentFeeConfiguration,
+    ) -> RentFeeConfiguration {
+        RentFeeConfiguration {
+            fee_per_write_1kb: value.fee_per_rent_1kb,
+            fee_per_write_entry: value.fee_per_write_entry,
+            persistent_rent_rate_denominator: value.persistent_rent_rate_denominator,
+            temporary_rent_rate_denominator: value.temporary_rent_rate_denominator,
+        }
+    }
+
+    pub(crate) fn convert_fee_configuration(value: CxxFeeConfiguration) -> FeeConfiguration {
+        FeeConfiguration {
+            fee_per_instruction_increment: value.fee_per_instruction_increment,
+            fee_per_read_entry: value.fee_per_disk_read_entry,
+            fee_per_write_entry: value.fee_per_write_entry,
+            fee_per_read_1kb: value.fee_per_disk_read_1kb,
+            fee_per_write_1kb: value.fee_per_write_1kb,
+            fee_per_historical_1kb: value.fee_per_historical_1kb,
+            fee_per_contract_event_1kb: value.fee_per_contract_event_1kb,
+            fee_per_transaction_size_1kb: value.fee_per_transaction_size_1kb,
+        }
+    }
 }
 
 #[path = "."]
@@ -207,11 +354,21 @@ pub(crate) mod p21 {
     pub(crate) extern crate soroban_env_host_p21;
     pub(crate) use soroban_env_host_p21 as soroban_env_host;
     pub(crate) mod soroban_proto_any;
-    use crate::SorobanModuleCache;
+    use crate::{
+        rust_bridge::{
+            CxxFeeConfiguration, CxxRentFeeConfiguration, CxxRentWriteFeeConfiguration,
+            CxxTransactionResources,
+        },
+        SorobanModuleCache,
+    };
     use soroban_env_host::{
         budget::{AsBudget, Budget},
-        e2e_invoke::{self, InvokeHostFunctionResult},
-        xdr::{DiagnosticEvent, Hash},
+        e2e_invoke::{self, InvokeHostFunctionResult, LedgerEntryChange},
+        fees::{
+            compute_write_fee_per_1kb, FeeConfiguration, RentFeeConfiguration,
+            TransactionResources, WriteFeeConfiguration,
+        },
+        xdr::{ContractCodeEntry, DiagnosticEvent, Hash},
         Error, HostError, LedgerInfo, TraceHook, Val,
     };
 
@@ -303,6 +460,69 @@ pub(crate) mod p21 {
             trace_hook,
         )
     }
+
+    pub(crate) fn wasm_module_memory_cost_wrapper(
+        _budget: &Budget,
+        _contract_code_entry: &ContractCodeEntry,
+    ) -> Result<u64, HostError> {
+        Err(INTERNAL_ERROR.into())
+    }
+
+    pub(crate) fn compute_rent_write_fee_per_1kb_wrapper(
+        bucket_list_size: i64,
+        fee_config: CxxRentWriteFeeConfiguration,
+    ) -> i64 {
+        compute_write_fee_per_1kb(bucket_list_size, &fee_config.into())
+    }
+
+    pub(crate) fn convert_transaction_resources(
+        value: &CxxTransactionResources,
+    ) -> TransactionResources {
+        TransactionResources {
+            instructions: value.instructions,
+            read_entries: value.disk_read_entries,
+            write_entries: value.write_entries,
+            read_bytes: value.disk_read_bytes,
+            write_bytes: value.write_bytes,
+            contract_events_size_bytes: value.contract_events_size_bytes,
+            transaction_size_bytes: value.transaction_size_bytes,
+        }
+    }
+
+    impl From<CxxRentWriteFeeConfiguration> for WriteFeeConfiguration {
+        fn from(value: CxxRentWriteFeeConfiguration) -> Self {
+            Self {
+                bucket_list_target_size_bytes: value.state_target_size_bytes,
+                write_fee_1kb_bucket_list_low: value.rent_fee_1kb_state_size_low,
+                write_fee_1kb_bucket_list_high: value.rent_fee_1kb_state_size_high,
+                bucket_list_write_fee_growth_factor: value.state_size_rent_fee_growth_factor,
+            }
+        }
+    }
+
+    pub(crate) fn convert_rent_fee_configuration(
+        value: &CxxRentFeeConfiguration,
+    ) -> RentFeeConfiguration {
+        RentFeeConfiguration {
+            fee_per_write_1kb: value.fee_per_rent_1kb,
+            fee_per_write_entry: value.fee_per_write_entry,
+            persistent_rent_rate_denominator: value.persistent_rent_rate_denominator,
+            temporary_rent_rate_denominator: value.temporary_rent_rate_denominator,
+        }
+    }
+
+    pub(crate) fn convert_fee_configuration(value: CxxFeeConfiguration) -> FeeConfiguration {
+        FeeConfiguration {
+            fee_per_instruction_increment: value.fee_per_instruction_increment,
+            fee_per_read_entry: value.fee_per_disk_read_entry,
+            fee_per_write_entry: value.fee_per_write_entry,
+            fee_per_read_1kb: value.fee_per_disk_read_1kb,
+            fee_per_write_1kb: value.fee_per_write_1kb,
+            fee_per_historical_1kb: value.fee_per_historical_1kb,
+            fee_per_contract_event_1kb: value.fee_per_contract_event_1kb,
+            fee_per_transaction_size_1kb: value.fee_per_transaction_size_1kb,
+        }
+    }
 }
 
 // This is called on startup and does any initial internal dynamic checks.
@@ -378,8 +598,14 @@ pub(crate) struct HostModule {
         fee_config: CxxRentFeeConfiguration,
         current_ledger_seq: u32,
     ) -> i64,
-    pub(crate) compute_write_fee_per_1kb:
-        fn(bucket_list_size: i64, fee_config: CxxWriteFeeConfiguration) -> i64,
+    pub(crate) compute_rent_write_fee_per_1kb:
+        fn(bucket_list_size: i64, fee_config: CxxRentWriteFeeConfiguration) -> i64,
+    pub(crate) contract_code_memory_size_for_rent: fn(
+        contract_code_entry: &CxxBuf,
+        cpu_cost_params: &CxxBuf,
+        mem_cost_params: &CxxBuf,
+    )
+        -> Result<u32, Box<dyn std::error::Error>>,
     pub(crate) can_parse_transaction: fn(&CxxBuf, depth_limit: u32) -> bool,
     #[cfg(feature = "testutils")]
     pub(crate) rustbuf_containing_scval_to_string: fn(&RustBuf) -> String,
@@ -396,7 +622,10 @@ macro_rules! proto_versioned_functions_for_module {
             compute_transaction_resource_fee:
                 $module::soroban_proto_any::compute_transaction_resource_fee,
             compute_rent_fee: $module::soroban_proto_any::compute_rent_fee,
-            compute_write_fee_per_1kb: $module::soroban_proto_any::compute_write_fee_per_1kb,
+            compute_rent_write_fee_per_1kb:
+                $module::soroban_proto_any::compute_rent_write_fee_per_1kb,
+            contract_code_memory_size_for_rent:
+                $module::soroban_proto_any::contract_code_memory_size_for_rent,
             can_parse_transaction: $module::soroban_proto_any::can_parse_transaction,
             #[cfg(feature = "testutils")]
             rustbuf_containing_scval_to_string:

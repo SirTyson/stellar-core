@@ -14,7 +14,10 @@
 // current-protocol cache as soon as we start, as well as the next-protocol
 // cache (if it exists) so that we can upgrade without stalling.
 
-use crate::soroban_proto_all::{p23, soroban_curr};
+use crate::{
+    rust_bridge::CxxBuf,
+    soroban_proto_all::{get_host_module_for_protocol, p23, soroban_curr},
+};
 
 pub(crate) struct SorobanModuleCache {
     pub(crate) p23_cache: p23::soroban_proto_any::ProtocolSpecificModuleCache,
@@ -79,4 +82,15 @@ impl SorobanModuleCache {
 
 pub(crate) fn new_module_cache() -> Result<Box<SorobanModuleCache>, Box<dyn std::error::Error>> {
     Ok(Box::new(SorobanModuleCache::new()?))
+}
+
+pub(crate) fn contract_code_memory_size_for_rent(
+    config_max_protocol: u32,
+    protocol_version: u32,
+    contract_code_entry: &CxxBuf,
+    cpu_cost_params: &CxxBuf,
+    mem_cost_params: &CxxBuf,
+) -> Result<u32, Box<dyn std::error::Error>> {
+    let hm = get_host_module_for_protocol(config_max_protocol, protocol_version)?;
+    (hm.contract_code_memory_size_for_rent)(contract_code_entry, cpu_cost_params, mem_cost_params)
 }

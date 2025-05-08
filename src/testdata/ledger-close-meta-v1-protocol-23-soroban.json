@@ -6,27 +6,27 @@
                 "v": 0
             },
             "ledgerHeader": {
-                "hash": "cb834ca4ae28c05d99f9ef7dff06b848882222f09bcb31cb0d18697d9701c8f8",
+                "hash": "8324f7cdc83cfd8a418a9a7e90ab59a59c499bc9fbc69e1bf0e3d2d8339d92c0",
                 "header": {
                     "ledgerVersion": 23,
-                    "previousLedgerHash": "5e2b9dfe59b580e6d9a340521979c9843792d408ad34be0d893308735cb5bea5",
+                    "previousLedgerHash": "ddbed46778fb52e85ac82ce4e7fc1fea64abb15e34d667e7978e9b04f65e2d00",
                     "scpValue": {
-                        "txSetHash": "c8e5a99666ca14d4b8a56d7fd49d595061a53e22ecccf534f1b5130b7009c349",
+                        "txSetHash": "79a8d314d9cb2855460e52550ecf9a9dc4d736091ceffdbe96a6b36583080834",
                         "closeTime": 1451692801,
                         "upgrades": [],
                         "ext": {
                             "v": "STELLAR_VALUE_SIGNED",
                             "lcValueSignature": {
                                 "nodeID": "GDDOUW25MRFLNXQMN3OODP6JQEXSGLMHAFZV4XPQ2D3GA4QFIDMEJG2O",
-                                "signature": "14be6f02d17d9a31519b01a7e0b6da414b44d388f2d48f1872837eae12cca99009c526513de8f576a41dc87ce58b227e24195ed5c4b8478efc663b4f31b3b008"
+                                "signature": "9f47b3fc479371235ec36ce89b995cedd060b2aa7f14d83648ba1d489eda6fcd0650d4678c0bb480ded4112f8f41f1662116a12af0075ee4109ff9cd75821502"
                             }
                         }
                     },
-                    "txSetResultHash": "6e60d4ec375cfe4112e6aa083a44c2a59c7f87a10be6488375290b66b63971a7",
-                    "bucketListHash": "cc39e6bc0918c16dc3f2681dfc31f9041a74615772a58579edeafe1d8a00f8cf",
+                    "txSetResultHash": "decb7c0ebf6316284c60f927a948143bfcdb47b6e41729303e6a712f51cbef97",
+                    "bucketListHash": "19586c68ba0e42510a77c77387a8c8d69a357ef0c74f2f6bac8272bc8a8eb4e1",
                     "ledgerSeq": 31,
                     "totalCoins": 1000000000000000000,
-                    "feePool": 1070731,
+                    "feePool": 1180242,
                     "inflationSeq": 0,
                     "idPool": 0,
                     "baseFee": 100,
@@ -49,7 +49,7 @@
             "txSet": {
                 "v": 1,
                 "v1TxSet": {
-                    "previousLedgerHash": "5e2b9dfe59b580e6d9a340521979c9843792d408ad34be0d893308735cb5bea5",
+                    "previousLedgerHash": "ddbed46778fb52e85ac82ce4e7fc1fea64abb15e34d667e7978e9b04f65e2d00",
                     "phases": [
                         {
                             "v": 0,
@@ -144,7 +144,7 @@
                                                                         ]
                                                                     },
                                                                     "instructions": 4000000,
-                                                                    "readBytes": 10000,
+                                                                    "diskReadBytes": 10000,
                                                                     "writeBytes": 1000
                                                                 },
                                                                 "resourceFee": 126626
@@ -255,7 +255,7 @@
                                                                         ]
                                                                     },
                                                                     "instructions": 200000,
-                                                                    "readBytes": 5000,
+                                                                    "diskReadBytes": 5000,
                                                                     "writeBytes": 5000
                                                                 },
                                                                 "resourceFee": 1043855
@@ -320,7 +320,7 @@
                                                                         ]
                                                                     },
                                                                     "instructions": 0,
-                                                                    "readBytes": 5000,
+                                                                    "diskReadBytes": 5000,
                                                                     "writeBytes": 1000
                                                                 },
                                                                 "resourceFee": 1000000
@@ -405,7 +405,7 @@
                                                                         "readWrite": []
                                                                     },
                                                                     "instructions": 4000000,
-                                                                    "readBytes": 10000,
+                                                                    "diskReadBytes": 10000,
                                                                     "writeBytes": 1000
                                                                 },
                                                                 "resourceFee": 101512
@@ -476,7 +476,7 @@
                                                                         "readWrite": []
                                                                     },
                                                                     "instructions": 0,
-                                                                    "readBytes": 10000,
+                                                                    "diskReadBytes": 10000,
                                                                     "writeBytes": 0
                                                                 },
                                                                 "resourceFee": 1000000
@@ -1724,7 +1724,7 @@
                     "result": {
                         "transactionHash": "47fd1151d61624bbce0b9a9f7883c60ccd70bcdf6f6c640a53e13e3fa856609f",
                         "result": {
-                            "feeCharged": 60559,
+                            "feeCharged": 60565,
                             "result": {
                                 "code": "txSUCCESS",
                                 "results": [
@@ -2015,7 +2015,7 @@
                                             "type": "ACCOUNT",
                                             "account": {
                                                 "accountID": "GCAEBM3GKNR6SV6N73FSGBXU6NSMZ2URQVMJQHXFQFY2PJPX6YBCSAKZ",
-                                                "balance": 399939441,
+                                                "balance": 399939435,
                                                 "seqNum": 51539607553,
                                                 "numSubEntries": 0,
                                                 "inflationDest": null,
@@ -2075,9 +2075,9 @@
             ],
             "upgradesProcessing": [],
             "scpInfo": [],
-            "totalByteSizeOfBucketList": 0,
-            "evictedTemporaryLedgerKeys": [],
-            "evictedPersistentLedgerEntries": []
+            "totalByteSizeOfLiveSorobanState": 0,
+            "evictedKeys": [],
+            "unused": []
         }
     }
 }
