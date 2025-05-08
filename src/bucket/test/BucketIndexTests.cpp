@@ -1024,18 +1024,6 @@ TEST_CASE("hot archive bucket lookups", "[bucket][bucketindex][archive]")
                 {
                     REQUIRE(!entryPtr);
                 }
-
-                // Deleted entries should be HotArchiveBucketEntry of type
-                // DELETED
-                else if (expectedDeletedEntries.find(k) !=
-                         expectedDeletedEntries.end())
-                {
-                    REQUIRE(entryPtr);
-                    REQUIRE(entryPtr->type() ==
-                            HotArchiveBucketEntryType::HOT_ARCHIVE_DELETED);
-                    REQUIRE(entryPtr->key() == k);
-                }
-
                 // Archived entries should contain full LedgerEntry
                 else
                 {
@@ -1060,23 +1048,13 @@ TEST_CASE("hot archive bucket lookups", "[bucket][bucketindex][archive]")
             auto bulkLoadResult = searchableBL->loadKeys(bulkLoadKeys);
             for (auto entry : bulkLoadResult)
             {
-                if (entry.type() == HOT_ARCHIVE_DELETED)
-                {
-                    auto k = entry.key();
-                    auto iter = expectedDeletedEntries.find(k);
-                    REQUIRE(iter != expectedDeletedEntries.end());
-                    expectedDeletedEntries.erase(iter);
-                }
-                else
-                {
-                    REQUIRE(entry.type() == HOT_ARCHIVE_ARCHIVED);
-                    auto le = entry.archivedEntry();
-                    auto k = LedgerEntryKey(le);
-                    auto iter = expectedArchiveEntries.find(k);
-                    REQUIRE(iter != expectedArchiveEntries.end());
-                    REQUIRE(iter->second == le);
-                    expectedArchiveEntries.erase(iter);
-                }
+                REQUIRE(entry.type() == HOT_ARCHIVE_ARCHIVED);
+                auto le = entry.archivedEntry();
+                auto k = LedgerEntryKey(le);
+                auto iter = expectedArchiveEntries.find(k);
+                REQUIRE(iter != expectedArchiveEntries.end());
+                REQUIRE(iter->second == le);
+                expectedArchiveEntries.erase(iter);
             }
 
             REQUIRE(expectedDeletedEntries.empty());
@@ -1165,19 +1143,6 @@ TEST_CASE("hot archive bucket lookups", "[bucket][bucketindex][archive]")
             .getBucketSnapshotManager()
             .maybeCopySearchableHotArchiveBucketListSnapshot(searchableBL);
 
-        // Point load
-        auto entryPtr = searchableBL->load(deletedShadow);
-        REQUIRE(entryPtr);
-        REQUIRE(entryPtr->type() ==
-                HotArchiveBucketEntryType::HOT_ARCHIVE_DELETED);
-        REQUIRE(entryPtr->key() == deletedShadow);
-
-        // Bulk load
-        auto bulkLoadResult2 = searchableBL->loadKeys({deletedShadow});
-        REQUIRE(bulkLoadResult2.size() == 1);
-        REQUIRE(bulkLoadResult2[0].type() == HOT_ARCHIVE_DELETED);
-        REQUIRE(bulkLoadResult2[0].key() == deletedShadow);
-
         // Shadow via archivedEntry
         auto archivedShadow = archivedEntries[3];
         archivedShadow.lastModifiedLedgerSeq = ledger;
@@ -1190,7 +1155,7 @@ TEST_CASE("hot archive bucket lookups", "[bucket][bucketindex][archive]")
             .maybeCopySearchableHotArchiveBucketListSnapshot(searchableBL);
 
         // Point load
-        entryPtr = searchableBL->load(LedgerEntryKey(archivedShadow));
+        auto entryPtr = searchableBL->load(LedgerEntryKey(archivedShadow));
         REQUIRE(entryPtr);
         REQUIRE(entryPtr->type() ==
                 HotArchiveBucketEntryType::HOT_ARCHIVE_ARCHIVED);

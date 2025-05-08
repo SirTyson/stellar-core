@@ -63,13 +63,6 @@ HotArchiveBucket::convertToBucketEntry(
         be.key() = k;
         bucket.push_back(be);
     }
-    for (auto const& k : deletedEntries)
-    {
-        HotArchiveBucketEntry be;
-        be.type(HOT_ARCHIVE_DELETED);
-        be.key() = k;
-        bucket.push_back(be);
-    }
 
     BucketEntryIdCmp<HotArchiveBucket> cmp;
     std::sort(bucket.begin(), bucket.end(), cmp);

@@ -448,7 +448,7 @@ TEST_CASE_VERSIONS("hot archive bucket tombstones expire at bottom level",
         for (HotArchiveBucketInputIterator iter(bottomCurr); iter; ++iter)
         {
             auto be = *iter;
-            REQUIRE(be.type() == HOT_ARCHIVE_DELETED);
+            REQUIRE(be.type() == HOT_ARCHIVE_ARCHIVED);
             REQUIRE(keys.find(be.key()) != keys.end());
         }
     });
@@ -872,7 +872,7 @@ TEST_CASE_VERSIONS("network config snapshots BucketList size", "[bucketlist]")
             app->getLedgerManager().getLastClosedSorobanNetworkConfig();
 
         uint32_t windowSize = networkConfig.stateArchivalSettings()
-                                  .bucketListSizeWindowSampleSize;
+                                  .liveSorobanStateSizeWindowSampleSize;
         std::deque<uint64_t> correctWindow;
         for (auto i = 0u; i < windowSize; ++i)
         {
@@ -895,11 +895,12 @@ TEST_CASE_VERSIONS("network config snapshots BucketList size", "[bucketlist]")
             // Check on-disk sliding window
             LedgerKey key(CONFIG_SETTING);
             key.configSetting().configSettingID =
-                ConfigSettingID::CONFIG_SETTING_BUCKETLIST_SIZE_WINDOW;
+                ConfigSettingID::CONFIG_SETTING_LIVE_SOROBAN_STATE_SIZE_WINDOW;
             auto txle = ltx.loadWithoutRecord(key);
             releaseAssert(txle);
-            auto const& leVector =
-                txle.current().data.configSetting().bucketListSizeWindow();
+            auto const& leVector = txle.current()
+                                       .data.configSetting()
+                                       .liveSorobanStateSizeWindow();
             std::vector<uint64_t> correctWindowVec(correctWindow.begin(),
                                                    correctWindow.end());
             REQUIRE(correctWindowVec == leVector);
@@ -910,13 +911,14 @@ TEST_CASE_VERSIONS("network config snapshots BucketList size", "[bucketlist]")
 
         // Take snapshots more frequently for faster testing
         modifySorobanNetworkConfig(*app, [](SorobanNetworkConfig& cfg) {
-            cfg.mStateArchivalSettings.bucketListWindowSamplePeriod = 64;
+            cfg.mStateArchivalSettings.liveSorobanStateSizeWindowSamplePeriod =
+                64;
         });
 
         // Generate enough ledgers to fill sliding window
         auto ledgersToGenerate =
-            (windowSize + 1) *
-            networkConfig.stateArchivalSettings().bucketListWindowSamplePeriod;
+            (windowSize + 1) * networkConfig.stateArchivalSettings()
+                                   .liveSorobanStateSizeWindowSamplePeriod;
         auto lclSeq = lm.getLastClosedLedgerHeader().header.ledgerSeq;
         for (uint32_t ledger = lclSeq; ledger < ledgersToGenerate; ++ledger)
         {
@@ -925,7 +927,7 @@ TEST_CASE_VERSIONS("network config snapshots BucketList size", "[bucketlist]")
             // snapshot, so we have to take the snapshot here before closing the
             // ledger to avoid counting the new  snapshot config entry
             if ((ledger + 1) % networkConfig.stateArchivalSettings()
-                                   .bucketListWindowSamplePeriod ==
+                                   .liveSorobanStateSizeWindowSamplePeriod ==
                 0)
             {
                 correctWindow.pop_front();
@@ -940,7 +942,7 @@ TEST_CASE_VERSIONS("network config snapshots BucketList size", "[bucketlist]")
                 {});
             closeLedger(*app);
             if ((ledger + 1) % networkConfig.stateArchivalSettings()
-                                   .bucketListWindowSamplePeriod ==
+                                   .liveSorobanStateSizeWindowSamplePeriod ==
                 0)
             {
                 check();

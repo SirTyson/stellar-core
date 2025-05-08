@@ -341,19 +341,6 @@ TEST_CASE_VERSIONS("merging hot archive bucket entries", "[bucket][archival]")
                 {
                     REQUIRE(e.key() == LedgerEntryKey(e3));
                 }
-                else if (e.type() == HOT_ARCHIVE_DELETED)
-                {
-                    if (e.key() == LedgerEntryKey(e1))
-                    {
-                        REQUIRE(!seen1);
-                        seen1 = true;
-                    }
-                    else if (e.key() == LedgerEntryKey(e4))
-                    {
-                        REQUIRE(!seen4);
-                        seen4 = true;
-                    }
-                }
                 else
                 {
                     FAIL();

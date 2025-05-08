@@ -164,9 +164,6 @@ EntryCounts<HotArchiveBucket>::EntryCounts(
         case HOT_ARCHIVE_LIVE:
             ++nLive;
             break;
-        case HOT_ARCHIVE_DELETED:
-            ++nDead;
-            break;
         case HOT_ARCHIVE_METAENTRY:
             // This should never happen: only the first record can be METAENTRY
             // and it is counted above.

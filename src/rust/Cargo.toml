@@ -127,7 +127,6 @@ rev = "a3f7fca9c2ad89796c7525a648da086543502dd5"
 [features]
 
 tracy = ["dep:tracy-client"]
-
 # The "next" feature enables not-yet-released features that (a) break protocol
 # but (b) are still under development, in between protocol releases. This
 # feature is not enabled by default, and is only intended for temporary use when
