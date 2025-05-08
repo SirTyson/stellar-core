@@ -2964,13 +2964,13 @@ TEST_CASE_VERSIONS("archival meta", "[tx][soroban][archival]")
             "put_temporary", {makeSymbolSCVal("key"), makeU64SCVal(123)},
             client.writeKeySpec("key", ContractDataDurability::TEMPORARY));
         REQUIRE(invocation.withExactNonRefundableResourceFee().invoke());
-        auto lk = client.getContract().getDataKey(
+        auto temporaryLk = client.getContract().getDataKey(
             makeSymbolSCVal("key"), ContractDataDurability::TEMPORARY);
 
         auto expectedLiveUntilLedger =
             test.getLCLSeq() +
             test.getNetworkCfg().stateArchivalSettings().minTemporaryTTL - 1;
-        REQUIRE(test.getTTL(lk) == expectedLiveUntilLedger);
+        REQUIRE(test.getTTL(temporaryLk) == expectedLiveUntilLedger);
         auto const evictionLedger = 4097;
 
         // Close ledgers until temp entry is evicted
@@ -2979,18 +2979,18 @@ TEST_CASE_VERSIONS("archival meta", "[tx][soroban][archival]")
             closeLedgerOn(test.getApp(), i, 2, 1, 2016);
         }
 
-        REQUIRE(test.getTTL(lk) == expectedLiveUntilLedger);
+        REQUIRE(test.getTTL(temporaryLk) == expectedLiveUntilLedger);
 
         // This should be a noop
-        test.invokeExtendOp({lk}, 10'000, 0);
-        REQUIRE(test.getTTL(lk) == expectedLiveUntilLedger);
+        test.invokeExtendOp({temporaryLk}, 10'000, 0);
+        REQUIRE(test.getTTL(temporaryLk) == expectedLiveUntilLedger);
 
         // This will fail because the entry is expired
         REQUIRE(client.extend("key", ContractDataDurability::TEMPORARY, 10'000,
                               10'000) == INVOKE_HOST_FUNCTION_TRAPPED);
-        REQUIRE(test.getTTL(lk) == expectedLiveUntilLedger);
+        REQUIRE(test.getTTL(temporaryLk) == expectedLiveUntilLedger);
 
-        REQUIRE(!test.isEntryLive(lk, test.getLCLSeq()));
+        REQUIRE(!test.isEntryLive(temporaryLk, test.getLCLSeq()));
 
         SECTION("temp entry meta")
         {
@@ -2999,7 +2999,7 @@ TEST_CASE_VERSIONS("archival meta", "[tx][soroban][archival]")
 
             {
                 LedgerTxn ltx(test.getApp().getLedgerTxnRoot());
-                REQUIRE(!ltx.load(lk));
+                REQUIRE(!ltx.load(temporaryLk));
             }
 
             XDRInputFileStream in;
@@ -3014,8 +3014,8 @@ TEST_CASE_VERSIONS("archival meta", "[tx][soroban][archival]")
                     REQUIRE(lcm.v1().evictedKeys.size() == 2);
                     auto sortedKeys = lcm.v1().evictedKeys;
                     std::sort(sortedKeys.begin(), sortedKeys.end());
-                    REQUIRE(sortedKeys[0] == lk);
-                    REQUIRE(sortedKeys[1] == getTTLKey(lk));
+                    REQUIRE(sortedKeys[0] == temporaryLk);
+                    REQUIRE(sortedKeys[1] == getTTLKey(temporaryLk));
                     evicted = true;
                 }
                 else
@@ -3045,23 +3045,33 @@ TEST_CASE_VERSIONS("archival meta", "[tx][soroban][archival]")
                 persistentLE = ltxe.current();
             }
 
-            auto testRestore = [&]() {
-                test.invokeRestoreOp({persistentKey}, 20'048);
+            auto testRestore = [&](std::optional<uint32_t> updatedValue =
+                                       std::nullopt) {
                 auto targetRestorationLedger = test.getLCLSeq();
 
                 XDRInputFileStream in;
                 in.open(metaPath);
                 LedgerCloseMeta lcm;
                 bool restoreMeta = false;
+                bool seenUpdated = false;
+
+                // TTL Restore, Data Restore, optional Data updated
+                auto numChanges = updatedValue ? 3 : 2;
 
                 LedgerKeySet keysToRestore = {persistentKey,
                                               getTTLKey(persistentKey)};
+                LedgerKeySet updatedKeys =
+                    updatedValue ? LedgerKeySet{persistentKey} : LedgerKeySet{};
+
                 while (in.readOne(lcm))
                 {
                     REQUIRE(lcm.v() == 1);
                     if (lcm.v1().ledgerHeader.header.ledgerSeq ==
                         targetRestorationLedger)
                     {
+                        CLOG_FATAL(Bucket, "LCM {}",
+                                   stellar::xdrToCerealString(lcm, "m"));
+                        REQUIRE(lcm.v1().evictedKeys.empty());
                         REQUIRE(lcm.v1().evictedKeys.empty());
 
                         REQUIRE(lcm.v1().txProcessing.size() == 1);
@@ -3072,16 +3082,50 @@ TEST_CASE_VERSIONS("archival meta", "[tx][soroban][archival]")
 
                         auto const& changes =
                             txApplyProcessing.getLedgerEntryChangesAtOp(0);
-                        REQUIRE(changes.size() == 2);
+                        REQUIRE(changes.size() == numChanges);
                         for (auto const& change : changes)
                         {
-                            REQUIRE(
-                                change.type() ==
-                                LedgerEntryChangeType::LEDGER_ENTRY_RESTORED);
-                            auto lk = LedgerEntryKey(change.restored());
-                            REQUIRE(keysToRestore.find(lk) !=
-                                    keysToRestore.end());
-                            keysToRestore.erase(lk);
+                            if (change.type() ==
+                                LedgerEntryChangeType::LEDGER_ENTRY_RESTORED)
+                            {
+                                auto le = change.restored();
+                                auto lk = LedgerEntryKey(le);
+                                REQUIRE(keysToRestore.find(lk) !=
+                                        keysToRestore.end());
+                                keysToRestore.erase(lk);
+
+                                // If the restored value was also updated,
+                                // RESTORE meta will hold the previous value
+                                if (updatedKeys.find(lk) == updatedKeys.end())
+                                {
+                                    LedgerTxn ltx(
+                                        test.getApp().getLedgerTxnRoot());
+                                    auto ltxe = ltx.load(lk);
+                                    REQUIRE(ltxe);
+                                    REQUIRE(ltxe.current() == le);
+                                }
+                            }
+                            else if (change.type() == LedgerEntryChangeType::
+                                                          LEDGER_ENTRY_UPDATED)
+                            {
+                                auto le = change.updated();
+                                auto lk = LedgerEntryKey(le);
+                                REQUIRE(updatedKeys.find(lk) !=
+                                        updatedKeys.end());
+                                seenUpdated = true;
+
+                                LedgerTxn ltx(test.getApp().getLedgerTxnRoot());
+                                auto ltxe = ltx.load(lk);
+                                REQUIRE(ltxe);
+                                REQUIRE(ltxe.current() == le);
+                                REQUIRE(
+                                    ltxe.current().data.contractData().val ==
+                                    makeU64SCVal(*updatedValue));
+                            }
+                            else
+                            {
+                                FAIL();
+                            }
                         }
 
                         restoreMeta = true;
@@ -3090,8 +3134,12 @@ TEST_CASE_VERSIONS("archival meta", "[tx][soroban][archival]")
                 }
 
                 REQUIRE(restoreMeta);
+                REQUIRE(seenUpdated == (updatedValue.has_value()));
                 REQUIRE(keysToRestore.empty());
             };
+
+            auto persistentLk = client.getContract().getDataKey(
+                makeSymbolSCVal("key"), ContractDataDurability::PERSISTENT);
 
             // First, close ledgers until entry is expired, but not yet evicted
             auto expirationLedger =
@@ -3107,7 +3155,60 @@ TEST_CASE_VERSIONS("archival meta", "[tx][soroban][archival]")
             // identical to meta in the evicted case.
             SECTION("restore expired but not evicted")
             {
-                testRestore();
+                SECTION("manual restore")
+                {
+                    test.invokeRestoreOp({persistentKey}, 20'048);
+                    testRestore();
+                }
+
+                SECTION("autorestore")
+                {
+                    if (protocolVersionStartsFrom(
+                            cfg.TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION,
+                            LiveBucket::
+                                FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION))
+                    {
+                        auto spec = client.defaultSpecWithoutFootprint()
+                                        .setReadWriteFootprint({persistentKey})
+                                        .setReadOnlyFootprint(
+                                            client.getContract().getKeys())
+                                        .setReadBytes(5000)
+                                        .setWriteBytes(5000)
+                                        .setRefundableResourceFee(1'000'000);
+                        auto invocation =
+                            client.getContract().prepareInvocation(
+                                "has_persistent", {makeSymbolSCVal("key")},
+                                spec, /* addContractKeys */ false);
+                        REQUIRE(invocation.withExactNonRefundableResourceFee()
+                                    .invoke());
+                        testRestore();
+                    }
+                }
+
+                SECTION("autorestore with updated value")
+                {
+                    if (protocolVersionStartsFrom(
+                            cfg.TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION,
+                            LiveBucket::
+                                FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION))
+                    {
+                        auto spec = client.defaultSpecWithoutFootprint()
+                                        .setReadWriteFootprint({persistentKey})
+                                        .setReadOnlyFootprint(
+                                            client.getContract().getKeys())
+                                        .setReadBytes(5000)
+                                        .setWriteBytes(5000)
+                                        .setRefundableResourceFee(1'000'000);
+                        auto invocation =
+                            client.getContract().prepareInvocation(
+                                "put_persistent",
+                                {makeSymbolSCVal("key"), makeU64SCVal(999)},
+                                spec, /* addContractKeys */ false);
+                        REQUIRE(invocation.withExactNonRefundableResourceFee()
+                                    .invoke());
+                        testRestore(999);
+                    }
+                }
             }
 
             SECTION("entry evicted")
@@ -3204,9 +3305,59 @@ TEST_CASE_VERSIONS("archival meta", "[tx][soroban][archival]")
                     }
                 }
 
-                SECTION("Restoration Meta")
+                SECTION("manual restore")
                 {
+                    test.invokeRestoreOp({persistentKey}, 20'048);
                     testRestore();
+                }
+
+                SECTION("autorestore")
+                {
+                    if (protocolVersionStartsFrom(
+                            cfg.TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION,
+                            LiveBucket::
+                                FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION))
+                    {
+                        auto spec = client.defaultSpecWithoutFootprint()
+                                        .setReadWriteFootprint({persistentKey})
+                                        .setReadOnlyFootprint(
+                                            client.getContract().getKeys())
+                                        .setReadBytes(5000)
+                                        .setWriteBytes(5000)
+                                        .setRefundableResourceFee(1'000'000);
+                        auto invocation =
+                            client.getContract().prepareInvocation(
+                                "has_persistent", {makeSymbolSCVal("key")},
+                                spec, /* addContractKeys */ false);
+                        REQUIRE(invocation.withExactNonRefundableResourceFee()
+                                    .invoke());
+                        testRestore();
+                    }
+                }
+
+                SECTION("autorestore with updated value")
+                {
+                    if (protocolVersionStartsFrom(
+                            cfg.TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION,
+                            LiveBucket::
+                                FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION))
+                    {
+                        auto spec = client.defaultSpecWithoutFootprint()
+                                        .setReadWriteFootprint({persistentKey})
+                                        .setReadOnlyFootprint(
+                                            client.getContract().getKeys())
+                                        .setReadBytes(5000)
+                                        .setWriteBytes(5000)
+                                        .setRefundableResourceFee(1'000'000);
+                        auto invocation =
+                            client.getContract().prepareInvocation(
+                                "put_persistent",
+                                {makeSymbolSCVal("key"), makeU64SCVal(999)},
+                                spec, /* addContractKeys */ false);
+                        REQUIRE(invocation.withExactNonRefundableResourceFee()
+                                    .invoke());
+                        testRestore(999);
+                    }
                 }
             }
         }
@@ -3218,7 +3369,7 @@ TEST_CASE_VERSIONS("archival meta", "[tx][soroban][archival]")
                     INVOKE_HOST_FUNCTION_SUCCESS);
             {
                 LedgerTxn ltx(test.getApp().getLedgerTxnRoot());
-                REQUIRE(ltx.load(lk));
+                REQUIRE(ltx.load(temporaryLk));
             }
 
             // Verify that we're on the ledger where the entry would get evicted
@@ -3226,7 +3377,7 @@ TEST_CASE_VERSIONS("archival meta", "[tx][soroban][archival]")
             REQUIRE(test.getLCLSeq() == evictionLedger);
 
             // Entry is live again
-            REQUIRE(test.isEntryLive(lk, test.getLCLSeq()));
+            REQUIRE(test.isEntryLive(temporaryLk, test.getLCLSeq()));
 
             // Verify that we didn't emit an eviction
             XDRInputFileStream in;

@@ -201,7 +201,10 @@ RestoreFootprintOpFrame::doApply(AppConnector& app, AbstractLedgerTxn& ltx,
         {
             // Entry exists in the live BucketList if we get to this point due
             // to the constTTLLtxe loadWithoutRecord logic above.
-            ltx.restoreFromLiveBucketList(lk, restoredLiveUntilLedger);
+            // Get the actual ledger entry (since we know it exists already at this point)
+            auto entry = ltx.getNewestVersion(lk);
+            releaseAssertOrThrow(entry);
+            ltx.restoreFromLiveBucketList(entry->ledgerEntry(), restoredLiveUntilLedger);
         }
     }
     int64_t rentFee = rust_bridge::compute_rent_fee(
