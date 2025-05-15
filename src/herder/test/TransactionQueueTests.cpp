@@ -100,9 +100,9 @@ class TransactionQueueTest
 
     TransactionQueue::AddResult
     add(TransactionFrameBasePtr const& tx,
-        TransactionQueue::AddResultCode expected)
+        TransactionQueue::AddResultCode expected, uint32_t ledgerVersion)
     {
-        auto res = mTransactionQueue.tryAdd(tx, false);
+        auto res = mTransactionQueue.tryAdd(tx, false, ledgerVersion);
         REQUIRE(res.code == expected);
         return res;
     }
@@ -115,10 +115,10 @@ class TransactionQueueTest
 
     void
     removeApplied(std::vector<TransactionFrameBasePtr> const& toRemove,
-                  bool noChangeExpected = false)
+                  uint32_t ledgerVersion, bool noChangeExpected = false)
     {
         auto size = mTransactionQueue.getTransactions({}).size();
-        mTransactionQueue.removeApplied(toRemove);
+        mTransactionQueue.removeApplied(toRemove, ledgerVersion);
 
         if (noChangeExpected)
         {
@@ -140,7 +140,8 @@ class TransactionQueueTest
     }
 
     void
-    ban(std::vector<TransactionFrameBasePtr> const& toRemove)
+    ban(std::vector<TransactionFrameBasePtr> const& toRemove,
+        uint32_t ledgerVersion)
     {
         auto txsBefore = mTransactionQueue.getTransactions({});
         // count the number of transactions from `toRemove` already included
@@ -154,15 +155,15 @@ class TransactionQueueTest
                                               tx->getFullHash();
                                    });
             });
-        mTransactionQueue.ban(toRemove);
+        mTransactionQueue.ban(toRemove, ledgerVersion);
         auto txsAfter = mTransactionQueue.getTransactions({});
         REQUIRE(txsBefore.size() - inPoolCount >= txsAfter.size());
     }
 
     void
-    shift()
+    shift(uint32_t ledgerVersion)
     {
-        mTransactionQueue.shift();
+        mTransactionQueue.shift(ledgerVersion);
     }
 
     void
@@ -260,6 +261,9 @@ TEST_CASE("TransactionQueue complex scenarios", "[herder][transactionqueue]")
     auto app = createTestApplication(clock, cfg);
     auto queue = ClassicTransactionQueue{*app, 4, 2, 2};
     auto const minBalance2 = app->getLedgerManager().getLastMinBalance(2);
+    auto ledgerVersion = app->getLedgerManager()
+                             .getLastClosedLedgerHeader()
+                             .header.ledgerVersion;
 
     auto root = app->getRoot();
     auto account1 = root->create("a1", minBalance2);
@@ -280,91 +284,99 @@ TEST_CASE("TransactionQueue complex scenarios", "[herder][transactionqueue]")
     SECTION("multiple good sequence numbers, with four shifts")
     {
         TransactionQueueTest test{queue};
-        test.add(txSeqA1T1,
-                 TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+        test.add(txSeqA1T1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                 ledgerVersion);
         test.check({{{account1, 0, {txSeqA1T1}}, {account2}}});
         test.add(txSeqA1T2,
-                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER);
+                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER,
+                 ledgerVersion);
         test.check({{{account1, 0, {txSeqA1T1}}, {account2}}});
 
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1, 1, {txSeqA1T1}}, {account2}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1, 2, {txSeqA1T1}}, {account2}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1, 3, {txSeqA1T1}}, {account2}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1}, {account2}}, {{txSeqA1T1}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1}, {account2}}, {{}, {txSeqA1T1}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1}, {account2}}});
     }
 
     SECTION("multiple good sequence numbers, with replace")
     {
         TransactionQueueTest test{queue};
-        test.add(txSeqA1T1,
-                 TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+        test.add(txSeqA1T1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                 ledgerVersion);
         test.check({{{account1, 0, {txSeqA1T1}}, {account2}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1, 1, {txSeqA1T1}}, {account2}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1, 2, {txSeqA1T1}}, {account2}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1, 3, {txSeqA1T1}}, {account2}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1}, {account2}}, {{txSeqA1T1}}});
         // Transactions are banned
         test.add(txSeqA1T1,
-                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER);
+                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER,
+                 ledgerVersion);
         test.check({{{account1}, {account2}}, {{txSeqA1T1}}});
 
         // Can't add txSeqA1T2V2 before txSeqA1T1V2
-        test.add(txSeqA1T2V2,
-                 TransactionQueue::AddResultCode::ADD_STATUS_ERROR);
+        test.add(txSeqA1T2V2, TransactionQueue::AddResultCode::ADD_STATUS_ERROR,
+                 ledgerVersion);
         test.check({{{account1}, {account2}}, {{txSeqA1T1}}});
 
         // Adding txSeqA1T1V2 with the same seqnum as txSeqA1T1 ("replace")
         test.add(txSeqA1T1V2,
-                 TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+                 TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                 ledgerVersion);
         test.check({{{account1, 0, {txSeqA1T1V2}}, {account2}}, {{txSeqA1T1}}});
 
         // Can't add txSeqA1T1 or txSeqA1T2, still banned
         test.add(txSeqA1T1,
-                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER);
+                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER,
+                 ledgerVersion);
         test.check({{{account1, 0, {txSeqA1T1V2}}, {account2}}, {{txSeqA1T1}}});
         test.add(txSeqA1T2,
-                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER);
+                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER,
+                 ledgerVersion);
         test.check({{{account1, 0, {txSeqA1T1V2}}, {account2}}, {{txSeqA1T1}}});
     }
 
     SECTION("multiple good sequence numbers, with shifts between")
     {
         TransactionQueueTest test{queue};
-        test.add(txSeqA1T1,
-                 TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+        test.add(txSeqA1T1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                 ledgerVersion);
         test.check({{{account1, 0, {txSeqA1T1}}, {account2}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1, 1, {txSeqA1T1}}, {account2}}});
         test.add(txSeqA1T2,
-                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER);
+                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER,
+                 ledgerVersion);
         test.check({{{account1, 1, {txSeqA1T1}}, {account2}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1, 2, {txSeqA1T1}}, {account2}}});
         test.add(txSeqA1T3,
-                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER);
+                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER,
+                 ledgerVersion);
         test.check({{{account1, 2, {txSeqA1T1}}, {account2}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1, 3, {txSeqA1T1}}, {account2}}});
         test.add(txSeqA1T4,
-                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER);
+                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER,
+                 ledgerVersion);
         test.check({{{account1, 3, {txSeqA1T1}}, {account2}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1}, {account2}}, {{txSeqA1T1}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1}, {account2}}, {{}, {txSeqA1T1}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1}, {account2}}});
     }
 
@@ -372,25 +384,27 @@ TEST_CASE("TransactionQueue complex scenarios", "[herder][transactionqueue]")
         "multiple good sequence numbers, different accounts, with four shifts")
     {
         TransactionQueueTest test{queue};
-        test.add(txSeqA1T1,
-                 TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+        test.add(txSeqA1T1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                 ledgerVersion);
         test.check({{{account1, 0, {txSeqA1T1}}, {account2}}});
-        test.add(txSeqA2T1,
-                 TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+        test.add(txSeqA2T1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                 ledgerVersion);
         test.check({{{account1, 0, {txSeqA1T1}}, {account2, 0, {txSeqA2T1}}}});
         test.add(txSeqA1T2,
-                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER);
+                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER,
+                 ledgerVersion);
         test.check({{{account1, 0, {txSeqA1T1}}, {account2, 0, {txSeqA2T1}}}});
         test.add(txSeqA2T2,
-                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER);
+                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER,
+                 ledgerVersion);
         test.check({{{account1, 0, {txSeqA1T1}}, {account2, 0, {txSeqA2T1}}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1, 1, {txSeqA1T1}}, {account2, 1, {txSeqA2T1}}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1, 2, {txSeqA1T1}}, {account2, 2, {txSeqA2T1}}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1, 3, {txSeqA1T1}}, {account2, 3, {txSeqA2T1}}}});
-        test.shift();
+        test.shift(ledgerVersion);
         // Everything should be banned now
         test.check({{{account1}, {account2}}, {{txSeqA1T1, txSeqA2T1}}});
     }
@@ -399,31 +413,33 @@ TEST_CASE("TransactionQueue complex scenarios", "[herder][transactionqueue]")
             "between")
     {
         TransactionQueueTest test{queue};
-        test.add(txSeqA1T1,
-                 TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+        test.add(txSeqA1T1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                 ledgerVersion);
         test.check({{{account1, 0, {txSeqA1T1}}, {account2}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1, 1, {txSeqA1T1}}, {account2}}});
-        test.add(txSeqA2T1,
-                 TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+        test.add(txSeqA2T1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                 ledgerVersion);
         test.check({{{account1, 1, {txSeqA1T1}}, {account2, 0, {txSeqA2T1}}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1, 2, {txSeqA1T1}}, {account2, 1, {txSeqA2T1}}}});
         test.add(txSeqA1T2,
-                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER);
+                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER,
+                 ledgerVersion);
         test.check({{{account1, 2, {txSeqA1T1}}, {account2, 1, {txSeqA2T1}}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1, 3, {txSeqA1T1}}, {account2, 2, {txSeqA2T1}}}});
         test.add(txSeqA2T2,
-                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER);
+                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER,
+                 ledgerVersion);
         test.check({{{account1, 3, {txSeqA1T1}}, {account2, 2, {txSeqA2T1}}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1}, {account2, 3, {txSeqA2T1}}}, {{txSeqA1T1}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1}, {account2}}, {{txSeqA2T1}, {txSeqA1T1}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1}, {account2}}, {{}, {txSeqA2T1}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1}, {account2}}});
     }
 
@@ -433,47 +449,54 @@ TEST_CASE("TransactionQueue complex scenarios", "[herder][transactionqueue]")
         SECTION("with shift and remove")
         {
             test.add(txSeqA1T1,
-                     TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+                     TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                     ledgerVersion);
             test.check({{{account1, 0, {txSeqA1T1}}, {account2}}});
             test.add(txSeqA2T1,
-                     TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+                     TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                     ledgerVersion);
             test.check(
                 {{{account1, 0, {txSeqA1T1}}, {account2, 0, {txSeqA2T1}}}});
             test.add(
                 txSeqA1T2,
-                TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER);
+                TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER,
+                ledgerVersion);
             test.check(
                 {{{account1, 0, {txSeqA1T1}}, {account2, 0, {txSeqA2T1}}}});
             test.add(
                 txSeqA2T2,
-                TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER);
+                TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER,
+                ledgerVersion);
             test.check(
                 {{{account1, 0, {txSeqA1T1}}, {account2, 0, {txSeqA2T1}}}});
-            test.shift();
+            test.shift(ledgerVersion);
             test.check(
                 {{{account1, 1, {txSeqA1T1}}, {account2, 1, {txSeqA2T1}}}});
-            test.removeApplied({txSeqA1T1, txSeqA2T1});
+            test.removeApplied({txSeqA1T1, txSeqA2T1}, ledgerVersion);
             test.check({{{account1, 0, {}}, {account2}},
                         {{txSeqA1T1, txSeqA2T1}, {}}});
         }
         SECTION("with remove")
         {
             test.add(txSeqA1T1,
-                     TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+                     TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                     ledgerVersion);
             test.check({{{account1, 0, {txSeqA1T1}}, {account2}}});
             test.add(txSeqA2T1,
-                     TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+                     TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                     ledgerVersion);
             test.check(
                 {{{account1, 0, {txSeqA1T1}}, {account2, 0, {txSeqA2T1}}}});
             test.add(
                 txSeqA2T2,
-                TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER);
+                TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER,
+                ledgerVersion);
             test.check(
                 {{{account1, 0, {txSeqA1T1}}, {account2, 0, {txSeqA2T1}}}});
-            test.removeApplied({txSeqA2T1});
+            test.removeApplied({txSeqA2T1}, ledgerVersion);
             test.check({{{account1, 0, {txSeqA1T1}}, {account2, 0, {}}},
                         {{txSeqA2T1}, {}}});
-            test.removeApplied({txSeqA1T1});
+            test.removeApplied({txSeqA1T1}, ledgerVersion);
             test.check(
                 {{{account1}, {account2}}, {{txSeqA2T1, txSeqA1T1}, {}}});
         }
@@ -482,37 +505,42 @@ TEST_CASE("TransactionQueue complex scenarios", "[herder][transactionqueue]")
     SECTION("multiple good sequence numbers, different accounts, with ban")
     {
         TransactionQueueTest test{queue};
-        test.add(txSeqA1T1,
-                 TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
-        test.add(txSeqA2T1,
-                 TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+        test.add(txSeqA1T1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                 ledgerVersion);
+        test.add(txSeqA2T1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                 ledgerVersion);
         test.add(txSeqA1T2,
-                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER);
+                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER,
+                 ledgerVersion);
         test.add(txSeqA2T2,
-                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER);
-        test.shift();
-        test.ban({txSeqA1T1, txSeqA2T2, txSeqA3T1});
+                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER,
+                 ledgerVersion);
+        test.shift(ledgerVersion);
+        test.ban({txSeqA1T1, txSeqA2T2, txSeqA3T1}, ledgerVersion);
         test.check({{{account1}, {account2, 1, {txSeqA2T1}}},
                     {{txSeqA1T1, txSeqA2T2, txSeqA3T1}}});
         test.add(txSeqA1T1,
-                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER);
+                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER,
+                 ledgerVersion);
         test.check({{{account1}, {account2, 1, {txSeqA2T1}}},
                     {{txSeqA1T1, txSeqA2T2, txSeqA3T1}}});
 
         // still banned when we shift
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1}, {account2, 2, {txSeqA2T1}}},
                     {{}, {txSeqA1T1, txSeqA2T2, txSeqA3T1}}});
         test.add(txSeqA1T1,
-                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER);
+                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER,
+                 ledgerVersion);
         test.add(txSeqA3T1,
-                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER);
+                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER,
+                 ledgerVersion);
         // not banned anymore
-        test.shift();
-        test.add(txSeqA1T1,
-                 TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
-        test.add(txSeqA3T1,
-                 TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+        test.shift(ledgerVersion);
+        test.add(txSeqA1T1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                 ledgerVersion);
+        test.add(txSeqA3T1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                 ledgerVersion);
         test.check({{{account1, 0, {txSeqA1T1}},
                      {account2, 3, {txSeqA2T1}},
                      {account3, 0, {txSeqA3T1}}}});
@@ -529,6 +557,9 @@ testTransactionQueueBasicScenarios()
     auto app = createTestApplication(clock, cfg);
     auto queue = ClassicTransactionQueue{*app, 4, 2, 2};
     auto const minBalance2 = app->getLedgerManager().getLastMinBalance(2);
+    auto ledgerVersion = app->getLedgerManager()
+                             .getLastClosedLedgerHeader()
+                             .header.ledgerVersion;
 
     auto root = app->getRoot();
     auto account1 = root->create("a1", minBalance2);
@@ -553,21 +584,24 @@ testTransactionQueueBasicScenarios()
         CLOG_INFO(Tx, "Adding first transaction");
         // adding first tx
         // too small seqnum
-        test.add(txSeqA1T0, TransactionQueue::AddResultCode::ADD_STATUS_ERROR);
+        test.add(txSeqA1T0, TransactionQueue::AddResultCode::ADD_STATUS_ERROR,
+                 ledgerVersion);
         test.check({{{account1}, {account2}}, {}});
         // too big seqnum
-        test.add(txSeqA1T2, TransactionQueue::AddResultCode::ADD_STATUS_ERROR);
+        test.add(txSeqA1T2, TransactionQueue::AddResultCode::ADD_STATUS_ERROR,
+                 ledgerVersion);
         test.check({{{account1}, {account2}}, {}});
 
-        test.add(txSeqA1T1,
-                 TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+        test.add(txSeqA1T1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                 ledgerVersion);
         test.check({{{account1, 0, {txSeqA1T1}}, {account2}}, {}});
 
         CLOG_INFO(Tx, "Adding second transaction");
         // adding second tx
         TransactionQueueTest::TransactionQueueState state;
         test.add(txSeqA1T2,
-                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER);
+                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER,
+                 ledgerVersion);
         state = {{{account1, 0, {txSeqA1T1}}, {account2}}, {}};
         test.check(state);
 
@@ -575,176 +609,187 @@ testTransactionQueueBasicScenarios()
         // adding third tx
         // duplicates
         test.add(txSeqA1T1,
-                 TransactionQueue::AddResultCode::ADD_STATUS_DUPLICATE);
+                 TransactionQueue::AddResultCode::ADD_STATUS_DUPLICATE,
+                 ledgerVersion);
         test.check(state);
 
         test.add(txSeqA1T2,
-                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER);
+                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER,
+                 ledgerVersion);
         test.check(state);
 
         // Tx is rejected due to limit or bad seqnum
         // too low
-        test.add(txSeqA1T0, TransactionQueue::AddResultCode::ADD_STATUS_ERROR);
+        test.add(txSeqA1T0, TransactionQueue::AddResultCode::ADD_STATUS_ERROR,
+                 ledgerVersion);
         test.check(state);
         // too high
         test.add(txSeqA1T4,
-                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER);
+                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER,
+                 ledgerVersion);
         test.check(state);
         // just right
         test.add(txSeqA1T3,
-                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER);
+                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER,
+                 ledgerVersion);
         test.check(state);
     }
 
     SECTION("good sequence number, same twice with shift")
     {
         TransactionQueueTest test{queue};
-        test.add(txSeqA1T1,
-                 TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+        test.add(txSeqA1T1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                 ledgerVersion);
         test.check({{{account1, 0, {txSeqA1T1}}, {account2}}, {}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1, 1, {txSeqA1T1}}, {account2}}, {}});
         test.add(txSeqA1T1,
-                 TransactionQueue::AddResultCode::ADD_STATUS_DUPLICATE);
+                 TransactionQueue::AddResultCode::ADD_STATUS_DUPLICATE,
+                 ledgerVersion);
         test.check({{{account1, 1, {txSeqA1T1}}, {account2}}, {}});
     }
 
     SECTION("good then big sequence number, with shift")
     {
         TransactionQueueTest test{queue};
-        test.add(txSeqA1T1,
-                 TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+        test.add(txSeqA1T1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                 ledgerVersion);
         test.check({{{account1, 0, {txSeqA1T1}}, {account2}}, {}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1, 1, {txSeqA1T1}}, {account2}}, {}});
         auto status =
             TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER;
-
-        test.add(txSeqA1T3, status);
+        test.add(txSeqA1T3, status, ledgerVersion);
         test.check({{{account1, 1, {txSeqA1T1}}, {account2}}, {}});
     }
 
     SECTION("good then good sequence number, with shift")
     {
         TransactionQueueTest test{queue};
-        test.add(txSeqA1T1,
-                 TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+        test.add(txSeqA1T1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                 ledgerVersion);
         TransactionQueueTest::TransactionQueueState state = {
             {{account1, 0, {txSeqA1T1}}, {account2}}, {}};
         test.check(state);
-        test.shift();
+        test.shift(ledgerVersion);
         state.mAccountStates[0].mAge += 1;
         test.check(state);
         test.add(txSeqA1T2,
-                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER);
+                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER,
+                 ledgerVersion);
         test.check(state);
     }
 
     SECTION("good sequence number, same twice with double shift")
     {
         TransactionQueueTest test{queue};
-        test.add(txSeqA1T1,
-                 TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+        test.add(txSeqA1T1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                 ledgerVersion);
         test.check({{{account1, 0, {txSeqA1T1}}, {account2}}, {}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1, 1, {txSeqA1T1}}, {account2}}, {}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1, 2, {txSeqA1T1}}, {account2}}, {}});
         test.add(txSeqA1T1,
-                 TransactionQueue::AddResultCode::ADD_STATUS_DUPLICATE);
+                 TransactionQueue::AddResultCode::ADD_STATUS_DUPLICATE,
+                 ledgerVersion);
         test.check({{{account1, 2, {txSeqA1T1}}, {account2}}, {}});
     }
 
     SECTION("good then big sequence number, with double shift")
     {
         TransactionQueueTest test{queue};
-        test.add(txSeqA1T1,
-                 TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+        test.add(txSeqA1T1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                 ledgerVersion);
         test.check({{{account1, 0, {txSeqA1T1}}, {account2}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1, 1, {txSeqA1T1}}, {account2}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1, 2, {txSeqA1T1}}, {account2}}});
         auto status =
             TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER;
-        test.add(txSeqA1T3, status);
+        test.add(txSeqA1T3, status, ledgerVersion);
         test.check({{{account1, 2, {txSeqA1T1}}, {account2}}});
     }
 
     SECTION("good then good sequence number, with double shift")
     {
         TransactionQueueTest test{queue};
-        test.add(txSeqA1T1,
-                 TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+        test.add(txSeqA1T1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                 ledgerVersion);
         test.check({{{account1, 0, {txSeqA1T1}}, {account2}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1, 1, {txSeqA1T1}}, {account2}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1, 2, {txSeqA1T1}}, {account2}}});
         test.add(txSeqA1T2,
-                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER);
+                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER,
+                 ledgerVersion);
         test.check({{{account1, 2, {txSeqA1T1}}, {account2}}});
     }
 
     SECTION("good sequence number, same twice with four shifts, then two more")
     {
         TransactionQueueTest test{queue};
-        test.add(txSeqA1T1,
-                 TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+        test.add(txSeqA1T1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                 ledgerVersion);
         test.check({{{account1, 0, {txSeqA1T1}}, {account2}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1, 1, {txSeqA1T1}}, {account2}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1, 2, {txSeqA1T1}}, {account2}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1, 3, {txSeqA1T1}}, {account2}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1}, {account2}}, {{txSeqA1T1}}});
         test.add(txSeqA1T1,
-                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER);
+                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER,
+                 ledgerVersion);
         test.check({{{account1}, {account2}}, {{txSeqA1T1}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1}, {account2}}, {{}, {txSeqA1T1}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1}, {account2}}});
-        test.add(txSeqA1T1,
-                 TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+        test.add(txSeqA1T1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                 ledgerVersion);
         test.check({{{account1, 0, {txSeqA1T1}}, {account2}}});
     }
 
     SECTION("good then big sequence number, with four shifts")
     {
         TransactionQueueTest test{queue};
-        test.add(txSeqA1T1,
-                 TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+        test.add(txSeqA1T1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                 ledgerVersion);
         test.check({{{account1, 0, {txSeqA1T1}}, {account2}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1, 1, {txSeqA1T1}}, {account2}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1, 2, {txSeqA1T1}}, {account2}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1, 3, {txSeqA1T1}}, {account2}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1}, {account2}}, {{txSeqA1T1}}});
-        test.add(txSeqA1T3, TransactionQueue::AddResultCode::ADD_STATUS_ERROR);
+        test.add(txSeqA1T3, TransactionQueue::AddResultCode::ADD_STATUS_ERROR,
+                 ledgerVersion);
         test.check({{{account1}, {account2}}, {{txSeqA1T1}}});
     }
 
     SECTION("good then small sequence number, with four shifts")
     {
         TransactionQueueTest test{queue};
-        test.add(txSeqA1T1,
-                 TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+        test.add(txSeqA1T1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                 ledgerVersion);
         test.check({{{account1, 0, {txSeqA1T1}}, {account2}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1, 1, {txSeqA1T1}}, {account2}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1, 2, {txSeqA1T1}}, {account2}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1, 3, {txSeqA1T1}}, {account2}}});
-        test.shift();
+        test.shift(ledgerVersion);
         test.check({{{account1}, {account2}}, {{txSeqA1T1}}});
-        test.add(txSeqA1T0, TransactionQueue::AddResultCode::ADD_STATUS_ERROR);
+        test.add(txSeqA1T0, TransactionQueue::AddResultCode::ADD_STATUS_ERROR,
+                 ledgerVersion);
         test.check({{{account1}, {account2}}, {{txSeqA1T1}}});
     }
 
@@ -752,7 +797,8 @@ testTransactionQueueBasicScenarios()
     {
         TransactionQueueTest test{queue};
         test.add(invalidTransaction(*app, account1, 1),
-                 TransactionQueue::AddResultCode::ADD_STATUS_ERROR);
+                 TransactionQueue::AddResultCode::ADD_STATUS_ERROR,
+                 ledgerVersion);
         test.check({{{account1}, {account2}}});
     }
 }
@@ -770,6 +816,9 @@ TEST_CASE("TransactionQueue hitting the rate limit",
     cfg.TESTING_UPGRADE_MAX_TX_SET_SIZE = 4;
     cfg.FLOOD_TX_PERIOD_MS = 100;
     auto app = createTestApplication(clock, cfg);
+    auto ledgerVersion = app->getLedgerManager()
+                             .getLastClosedLedgerHeader()
+                             .header.ledgerVersion;
     auto queue = ClassicTransactionQueue{*app, 4, 2, 2};
     auto const minBalance2 = app->getLedgerManager().getLastMinBalance(2);
 
@@ -785,7 +834,8 @@ TEST_CASE("TransactionQueue hitting the rate limit",
     std::vector<TransactionFrameBasePtr> txs;
     auto addTx = [&](TransactionFrameBasePtr tx) {
         txs.push_back(tx);
-        testQueue.add(tx, TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+        testQueue.add(tx, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                      ledgerVersion);
     };
     // Fill the queue/limiter with 8 ops (2 * 4) - any further ops should result
     // in eviction (limit is 2 * 4=TESTING_UPGRADE_MAX_TX_SET_SIZE).
@@ -797,8 +847,9 @@ TEST_CASE("TransactionQueue hitting the rate limit",
     SECTION("cannot add low fee tx")
     {
         auto tx = transaction(*app, account5, 1, 1, 300 * 3, 3);
-        auto addResult = testQueue.add(
-            tx, TransactionQueue::AddResultCode::ADD_STATUS_ERROR);
+        auto addResult =
+            testQueue.add(tx, TransactionQueue::AddResultCode::ADD_STATUS_ERROR,
+                          ledgerVersion);
         REQUIRE(addResult.txResult->getResultCode() == txINSUFFICIENT_FEE);
         REQUIRE(addResult.txResult->getXDR().feeCharged == 300 * 3 + 1);
     }
@@ -806,13 +857,15 @@ TEST_CASE("TransactionQueue hitting the rate limit",
     {
         auto tx = transaction(*app, account5, 1, 1, 100 * 1'000, 100);
         auto addResult = testQueue.add(
-            tx, TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER);
+            tx, TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER,
+            ledgerVersion);
         REQUIRE(!addResult.txResult);
     }
     SECTION("add high fee tx with eviction")
     {
         auto tx = transaction(*app, account5, 1, 1, 300 * 3 + 1, 3);
-        testQueue.add(tx, TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+        testQueue.add(tx, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                      ledgerVersion);
         // Evict txs from `account1`, `account3` and `account4`
         testQueue.check(
             {{{account1}, {account2, 0, {txs[1]}}, {account5, 0, {tx}}},
@@ -822,7 +875,8 @@ TEST_CASE("TransactionQueue hitting the rate limit",
         {
             auto nextTx = transaction(*app, account6, 1, 1, 300, 1);
             auto addResult = testQueue.add(
-                nextTx, TransactionQueue::AddResultCode::ADD_STATUS_ERROR);
+                nextTx, TransactionQueue::AddResultCode::ADD_STATUS_ERROR,
+                ledgerVersion);
             REQUIRE(addResult.txResult->getResultCode() == txINSUFFICIENT_FEE);
             REQUIRE(addResult.txResult->getXDR().feeCharged == 301);
         }
@@ -832,7 +886,8 @@ TEST_CASE("TransactionQueue hitting the rate limit",
             // rate 400 is evicted due to seq num and is not accounted for).
             auto nextTx = transaction(*app, account6, 1, 1, 301, 1);
             testQueue.add(nextTx,
-                          TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+                          TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                          ledgerVersion);
             testQueue.check({{{account1},
                               {account2, 0, {txs[1]}},
                               {account3},
@@ -886,6 +941,9 @@ TEST_CASE("TransactionQueue with PreconditionsV2", "[herder][transactionqueue]")
     condMinSeqLedgerGap.minSeqLedgerGap = 1;
     auto txSeqA1S3MinSeqLedgerGap = transactionWithV2Precondition(
         *app, account1, 3, 200, condMinSeqLedgerGap);
+    auto ledgerVersion = app->getLedgerManager()
+                             .getLastClosedLedgerHeader()
+                             .header.ledgerVersion;
 
     SECTION("fee bump new tx with minSeqNum past lastSeq")
     {
@@ -894,7 +952,8 @@ TEST_CASE("TransactionQueue with PreconditionsV2", "[herder][transactionqueue]")
         auto tx = transactionWithV2Precondition(*app, account1, 5, 200, cond);
 
         TransactionQueueTest test{queue};
-        test.add(tx, TransactionQueue::AddResultCode::ADD_STATUS_ERROR);
+        test.add(tx, TransactionQueue::AddResultCode::ADD_STATUS_ERROR,
+                 ledgerVersion);
     }
     SECTION("fee bump only existing tx")
     {
@@ -903,25 +962,28 @@ TEST_CASE("TransactionQueue with PreconditionsV2", "[herder][transactionqueue]")
         auto tx = transactionWithV2Precondition(*app, account1, 5, 200, cond);
 
         TransactionQueueTest test{queue};
-        test.add(tx, TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+        test.add(tx, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                 ledgerVersion);
 
         auto fb = feeBump(*app, account1, tx, 4000);
-        test.add(fb, TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+        test.add(fb, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                 ledgerVersion);
 
         test.check({{{account1, 0, {fb}}, {account2}}, {}});
     }
     SECTION("fee bump existing tx and add minSeqNum")
     {
         TransactionQueueTest test{queue};
-        test.add(txSeqA1S1,
-                 TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+        test.add(txSeqA1S1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                 ledgerVersion);
 
         PreconditionsV2 cond;
         cond.minSeqNum.activate() = 2;
 
         auto tx = transactionWithV2Precondition(*app, account1, 1, 200, cond);
         auto fb = feeBump(*app, account1, tx, 4000);
-        test.add(fb, TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+        test.add(fb, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                 ledgerVersion);
 
         test.check({{{account1, 0, {fb}}, {account2}}, {}});
     }
@@ -933,10 +995,12 @@ TEST_CASE("TransactionQueue with PreconditionsV2", "[herder][transactionqueue]")
         cond.minSeqNum.activate() = 2;
 
         auto tx = transactionWithV2Precondition(*app, account1, 1, 200, cond);
-        test.add(tx, TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+        test.add(tx, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                 ledgerVersion);
 
         auto fb = feeBump(*app, account1, txSeqA1S1, 4000);
-        test.add(fb, TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+        test.add(fb, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                 ledgerVersion);
 
         test.check({{{account1, 0, {fb}}, {account2}}, {}});
     }
@@ -955,10 +1019,12 @@ TEST_CASE("TransactionQueue with PreconditionsV2", "[herder][transactionqueue]")
         {
             auto tx =
                 transactionWithV2Precondition(*app, account1, 1, 200, cond);
-            test.add(tx, TransactionQueue::AddResultCode::ADD_STATUS_ERROR);
+            test.add(tx, TransactionQueue::AddResultCode::ADD_STATUS_ERROR,
+                     ledgerVersion);
 
             tx->addSignature(account2.getSecretKey());
-            test.add(tx, TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+            test.add(tx, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                     ledgerVersion);
         }
 
         SECTION("two signers")
@@ -972,26 +1038,31 @@ TEST_CASE("TransactionQueue with PreconditionsV2", "[herder][transactionqueue]")
                 transactionWithV2Precondition(*app, account1, 1, 200, cond);
 
             // no signature
-            test.add(tx, TransactionQueue::AddResultCode::ADD_STATUS_ERROR);
+            test.add(tx, TransactionQueue::AddResultCode::ADD_STATUS_ERROR,
+                     ledgerVersion);
 
             SECTION("first signature missing")
             {
                 tx->addSignature(root->getSecretKey());
-                test.add(tx, TransactionQueue::AddResultCode::ADD_STATUS_ERROR);
+                test.add(tx, TransactionQueue::AddResultCode::ADD_STATUS_ERROR,
+                         ledgerVersion);
 
                 tx->addSignature(account2.getSecretKey());
                 test.add(tx,
-                         TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+                         TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                         ledgerVersion);
             }
 
             SECTION("second signature missing")
             {
                 tx->addSignature(account2.getSecretKey());
-                test.add(tx, TransactionQueue::AddResultCode::ADD_STATUS_ERROR);
+                test.add(tx, TransactionQueue::AddResultCode::ADD_STATUS_ERROR,
+                         ledgerVersion);
 
                 tx->addSignature(root->getSecretKey());
                 test.add(tx,
-                         TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+                         TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                         ledgerVersion);
             }
         }
     }
@@ -1031,35 +1102,42 @@ TEST_CASE("TransactionQueue with PreconditionsV2", "[herder][transactionqueue]")
             auto tx =
                 transactionWithV2Precondition(*app, account1, 5, 200, cond);
 
-            test.add(tx, TransactionQueue::AddResultCode::ADD_STATUS_ERROR);
+            test.add(tx, TransactionQueue::AddResultCode::ADD_STATUS_ERROR,
+                     ledgerVersion);
         }
 
         test.add(txSeqA1S5MinSeqNum,
-                 TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+                 TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                 ledgerVersion);
 
         // make sure duplicates are identified correctly
         test.add(txSeqA1S5MinSeqNum,
-                 TransactionQueue::AddResultCode::ADD_STATUS_DUPLICATE);
+                 TransactionQueue::AddResultCode::ADD_STATUS_DUPLICATE,
+                 ledgerVersion);
 
         // try to fill in gap with a tx
-        test.add(txSeqA1S2, TransactionQueue::AddResultCode::ADD_STATUS_ERROR);
+        test.add(txSeqA1S2, TransactionQueue::AddResultCode::ADD_STATUS_ERROR,
+                 ledgerVersion);
 
         // try to fill in gap with a minSeqNum tx
         test.add(txSeqA1S4MinSeqNum,
-                 TransactionQueue::AddResultCode::ADD_STATUS_ERROR);
+                 TransactionQueue::AddResultCode::ADD_STATUS_ERROR,
+                 ledgerVersion);
 
         test.check({{{account1, 0, {txSeqA1S5MinSeqNum}}, {account2}}, {}});
 
         // fee bump the existing minSeqNum tx
         auto fb = feeBump(*app, account1, txSeqA1S5MinSeqNum, 4000);
-        test.add(fb, TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+        test.add(fb, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                 ledgerVersion);
 
         test.check({{{account1, 0, {fb}}, {account2}}, {}});
 
         // fee bump a new minSeqNum tx fails due to account limit
         auto fb2 = feeBump(*app, account1, txSeqA1S8MinSeqNum, 400);
         test.add(fb2,
-                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER);
+                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER,
+                 ledgerVersion);
 
         test.check({{{account1, 0, {fb}}, {account2}}, {}});
     }
@@ -1108,10 +1186,11 @@ class SorobanLimitingLaneConfigForTesting : public SurgePricingLaneConfig
         mLaneOpsLimits[0] = limit;
     }
     virtual Resource
-    getTxResources(TransactionFrameBase const& tx) override
+    getTxResources(TransactionFrameBase const& tx,
+                   uint32_t ledgerVersion) override
     {
         releaseAssert(tx.isSoroban());
-        return tx.getResources(false);
+        return tx.getResources(false, ledgerVersion);
     }
 
   private:
@@ -1253,6 +1332,9 @@ TEST_CASE("Soroban TransactionQueue limits",
         // Restrict instructions to only allow 1 max instructions tx.
         cfg.mLedgerMaxInstructions = cfg.mTxMaxInstructions;
     });
+    auto ledgerVersion = app->getLedgerManager()
+                             .getLastClosedLedgerHeader()
+                             .header.ledgerVersion;
     auto const minBalance2 = app->getLedgerManager().getLastMinBalance(2);
     auto root = app->getRoot();
     auto account1 = root->create("a1", minBalance2);
@@ -1359,7 +1441,7 @@ TEST_CASE("Soroban TransactionQueue limits",
                 TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER);
 
             // ban existing tx
-            txQueue.ban({pendingTx});
+            txQueue.ban({pendingTx}, ledgerVersion);
             REQUIRE(app->getHerder().getTx(pendingTx->getFullHash()) ==
                     nullptr);
             REQUIRE(app->getHerder().isBannedTx(pendingTx->getFullHash()));
@@ -1578,8 +1660,10 @@ TEST_CASE("Soroban TransactionQueue limits",
 
         SECTION("generic fits")
         {
-            REQUIRE(
-                queue->canFitWithEviction(*tx, std::nullopt, toEvict).first);
+            REQUIRE(queue
+                        ->canFitWithEviction(*tx, std::nullopt, toEvict,
+                                             ledgerVersion)
+                        .first);
             REQUIRE(toEvict.empty());
         }
         SECTION("limited too big")
@@ -1594,8 +1678,10 @@ TEST_CASE("Soroban TransactionQueue limits",
             REQUIRE(config->getLane(*tx2) ==
                     SorobanLimitingLaneConfigForTesting::LARGE_SOROBAN_LANE);
 
-            REQUIRE(
-                !queue->canFitWithEviction(*tx2, std::nullopt, toEvict).first);
+            REQUIRE(!queue
+                         ->canFitWithEviction(*tx2, std::nullopt, toEvict,
+                                              ledgerVersion)
+                         .first);
             REQUIRE(toEvict.empty());
         }
         SECTION("limited fits")
@@ -1610,14 +1696,16 @@ TEST_CASE("Soroban TransactionQueue limits",
             REQUIRE(config->getLane(*txNew) ==
                     SorobanLimitingLaneConfigForTesting::LARGE_SOROBAN_LANE);
 
-            REQUIRE(
-                queue->canFitWithEviction(*txNew, std::nullopt, toEvict).first);
+            REQUIRE(queue
+                        ->canFitWithEviction(*txNew, std::nullopt, toEvict,
+                                             ledgerVersion)
+                        .first);
             REQUIRE(toEvict.empty());
 
             SECTION("limited evicts")
             {
                 // Add 2 generic transactions to reach generic limit
-                queue->add(tx);
+                queue->add(tx, ledgerVersion);
                 resources.instructions =
                     static_cast<uint32>(conf.ledgerMaxInstructions() / 2);
                 // The fee is slightly higher so this transactions is more
@@ -1628,17 +1716,18 @@ TEST_CASE("Soroban TransactionQueue limits",
 
                 REQUIRE(queue
                             ->canFitWithEviction(*secondGeneric, std::nullopt,
-                                                 toEvict)
+                                                 toEvict, ledgerVersion)
                             .first);
                 REQUIRE(toEvict.empty());
-                queue->add(secondGeneric);
+                queue->add(secondGeneric, ledgerVersion);
 
                 SECTION("limited evicts generic")
                 {
                     // Fit within limited lane
-                    REQUIRE(
-                        queue->canFitWithEviction(*txNew, std::nullopt, toEvict)
-                            .first);
+                    REQUIRE(queue
+                                ->canFitWithEviction(*txNew, std::nullopt,
+                                                     toEvict, ledgerVersion)
+                                .first);
                     REQUIRE(toEvict.size() == 1);
                     REQUIRE(toEvict[0].first == tx);
                 }
@@ -1652,10 +1741,11 @@ TEST_CASE("Soroban TransactionQueue limits",
                         *app, account1, initialInclusionFee * 2, resourceFee,
                         resources, std::make_optional<std::string>("limit"));
 
-                    REQUIRE(
-                        queue->canFitWithEviction(*tx2, std::nullopt, toEvict)
-                            .first);
-                    queue->add(tx2);
+                    REQUIRE(queue
+                                ->canFitWithEviction(*tx2, std::nullopt,
+                                                     toEvict, ledgerVersion)
+                                .first);
+                    queue->add(tx2, ledgerVersion);
 
                     // Add, new tx with max limited lane resources, set a high
                     // fee
@@ -1667,9 +1757,10 @@ TEST_CASE("Soroban TransactionQueue limits",
                         *app, account2, initialInclusionFee * 3, resourceFee,
                         resources, std::make_optional<std::string>("limit"));
 
-                    REQUIRE(
-                        queue->canFitWithEviction(*tx3, std::nullopt, toEvict)
-                            .first);
+                    REQUIRE(queue
+                                ->canFitWithEviction(*tx3, std::nullopt,
+                                                     toEvict, ledgerVersion)
+                                .first);
 
                     // Should evict generic _and_ limited tx
                     REQUIRE(toEvict.size() == 2);
@@ -1701,6 +1792,9 @@ TEST_CASE("TransactionQueue limits", "[herder][transactionqueue]")
     auto account6 = root->create("a6", minBalance2);
     auto account7 = root->create("a7", minBalance2);
 
+    auto ledgerVersion = app->getLedgerManager()
+                             .getLastClosedLedgerHeader()
+                             .header.ledgerVersion;
     TxQueueLimiter limiter(1, *app, false);
 
     struct SetupElement
@@ -1726,7 +1820,7 @@ TEST_CASE("TransactionQueue limits", "[herder][transactionqueue]")
                 bool can = limiter.canAddTx(tx, noTx, txsToEvict).first;
                 REQUIRE(can);
                 REQUIRE(txsToEvict.empty());
-                limiter.addTransaction(tx);
+                limiter.addTransaction(tx, ledgerVersion);
                 txs.emplace_back(tx);
             }
         }
@@ -1755,7 +1849,8 @@ TEST_CASE("TransactionQueue limits", "[herder][transactionqueue]")
         {
             int evictedOps = 0;
             limiter.evictTransactions(
-                txsToEvict, *tx, [&](TransactionFrameBasePtr const& evict) {
+                txsToEvict, *tx,
+                [&](TransactionFrameBasePtr const& evict) {
                     // can't evict cheaper transactions
                     auto cmp3 = feeRate3WayCompare(
                         evict->getInclusionFee(), evict->getNumOperations(),
@@ -1765,11 +1860,12 @@ TEST_CASE("TransactionQueue limits", "[herder][transactionqueue]")
                     bool same = evict->getSourceID() == tx->getSourceID();
                     REQUIRE(!same);
                     evictedOps += evict->getNumOperations();
-                    limiter.removeTransaction(evict);
-                });
+                    limiter.removeTransaction(evict, ledgerVersion);
+                },
+                ledgerVersion);
             REQUIRE(evictedOps == expEvictedOpsOnSuccess);
-            limiter.addTransaction(tx);
-            limiter.removeTransaction(tx);
+            limiter.addTransaction(tx, ledgerVersion);
+            limiter.removeTransaction(tx, ledgerVersion);
         }
         else
         {
@@ -1883,6 +1979,9 @@ TEST_CASE("TransactionQueue limiter with DEX separation",
 
     // 3 * 3 = 9 operations limit, 3 * 1 = 3 DEX operations limit.
     TxQueueLimiter limiter(3, *app, false);
+    auto ledgerVersion = app->getLedgerManager()
+                             .getLastClosedLedgerHeader()
+                             .header.ledgerVersion;
 
     std::vector<TransactionFrameBasePtr> txs;
 
@@ -1907,7 +2006,8 @@ TEST_CASE("TransactionQueue limiter with DEX separation",
         {
             int evictedOps = 0;
             limiter.evictTransactions(
-                txsToEvict, *tx, [&](TransactionFrameBasePtr const& evict) {
+                txsToEvict, *tx,
+                [&](TransactionFrameBasePtr const& evict) {
                     // can't evict cheaper transactions (
                     // evict.bid/evict.ops < tx->bid/tx->ops)
                     REQUIRE(bigMultiply(evict->getInclusionFee(),
@@ -1918,10 +2018,11 @@ TEST_CASE("TransactionQueue limiter with DEX separation",
                     bool same = evict->getSourceID() == tx->getSourceID();
                     REQUIRE(!same);
                     evictedOps += evict->getNumOperations();
-                    limiter.removeTransaction(evict);
-                });
+                    limiter.removeTransaction(evict, ledgerVersion);
+                },
+                ledgerVersion);
             REQUIRE(evictedOps == expEvictedOpsOnSuccess);
-            limiter.addTransaction(tx);
+            limiter.addTransaction(tx, ledgerVersion);
         }
         else
         {
@@ -2113,6 +2214,9 @@ TEST_CASE("transaction queue starting sequence boundary",
 {
     VirtualClock clock;
     auto app = createTestApplication(clock, getTestConfig());
+    auto ledgerVersion = app->getLedgerManager()
+                             .getLastClosedLedgerHeader()
+                             .header.ledgerVersion;
     auto const minBalance2 = app->getLedgerManager().getLastMinBalance(2);
 
     auto root = app->getRoot();
@@ -2131,8 +2235,9 @@ TEST_CASE("transaction queue starting sequence boundary",
         REQUIRE(acc1.loadSequenceNumber() == startingSeq - 1);
 
         ClassicTransactionQueue tq(*app, 4, 10, 4);
-        REQUIRE(tq.tryAdd(transaction(*app, acc1, 1, 1, 100), false).code ==
-                TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+        REQUIRE(
+            tq.tryAdd(transaction(*app, acc1, 1, 1, 100), false, ledgerVersion)
+                .code == TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
 
         auto checkTxSet = [&](uint32_t ledgerSeq) {
             auto lcl = app->getLedgerManager().getLastClosedLedgerHeader();
@@ -2157,6 +2262,9 @@ TEST_CASE("transaction queue with fee-bump", "[herder][transactionqueue]")
     auto const minBalance0 = app->getLedgerManager().getLastMinBalance(0);
     auto const minBalance2 = app->getLedgerManager().getLastMinBalance(2) +
                              DEFAULT_TEST_RESOURCE_FEE;
+    auto ledgerVersion = app->getLedgerManager()
+                             .getLastClosedLedgerHeader()
+                             .header.ledgerVersion;
 
     auto root = app->getRoot();
     auto account1 = root->create("a1", minBalance2);
@@ -2170,13 +2278,14 @@ TEST_CASE("transaction queue with fee-bump", "[herder][transactionqueue]")
         {
             TransactionQueueTest test{queue};
             auto tx = transaction(*app, account1, 1, 1, 100, 1, isSoroban);
-            auto fb = feeBump(*app, account1, tx, 200);
-            test.add(fb, TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+            auto fb = feeBump(*app, account1, tx, 200, ledgerVersion);
+            test.add(fb, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                     ledgerVersion);
 
             for (uint32 i = 0; i <= 3; ++i)
             {
                 test.check({{{account1, i, {fb}}, {account2}, {account3}}, {}});
-                test.shift();
+                test.shift(ledgerVersion);
             }
             test.check({{{account1}, {account2}, {account3}}, {{fb}}});
         }
@@ -2186,16 +2295,17 @@ TEST_CASE("transaction queue with fee-bump", "[herder][transactionqueue]")
             TransactionQueueTest test{queue};
             auto tx = transaction(*app, account1, 1, 1, 100, 1, isSoroban);
             auto fb = feeBump(*app, account2, tx, 200);
-            test.add(fb, TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+            test.add(fb, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                     ledgerVersion);
             test.check({{{account1, 0, {fb}}, {account2, 0}}, {}});
 
             for (uint32 i = 1; i <= 3; ++i)
             {
-                test.shift();
+                test.shift(ledgerVersion);
                 test.check(
                     {{{account1, i, {fb}}, {account2, 0}, {account3}}, {}});
             }
-            test.shift();
+            test.shift(ledgerVersion);
             test.check({{{account1}, {account2}, {account3}}, {{fb}}});
         }
         SECTION("different ops")
@@ -2213,23 +2323,25 @@ TEST_CASE("transaction queue with fee-bump", "[herder][transactionqueue]")
                 {
                     // Set fee=150*10*10, such that feePerOp is higher than tx's
                     // fee (150 > 100)
-                    fb = feeBump(*app, account1, txMultiOps, 15000);
+                    fb = feeBump(*app, account1, txMultiOps, 15000,
+                                 ledgerVersion);
                     test.add(
-                        tx,
-                        TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+                        tx, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                        ledgerVersion);
                     test.add(
-                        fb,
-                        TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+                        fb, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                        ledgerVersion);
                 }
                 SECTION("less ops")
                 {
-                    fb = feeBump(*app, account1, tx, 2000);
+                    fb = feeBump(*app, account1, tx, 2000, ledgerVersion);
                     test.add(
                         txMultiOps,
-                        TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+                        TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                        ledgerVersion);
                     test.add(
-                        fb,
-                        TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+                        fb, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                        ledgerVersion);
                 }
                 test.check({{{account1, 0, {fb}}, {account2}, {account3}}, {}});
             }
@@ -2247,11 +2359,13 @@ TEST_CASE("transaction queue with fee-bump", "[herder][transactionqueue]")
                                        /* nbOps */ 10, isSoroban);
                 auto fb = feeBump(*app, account1, tx2, 14 * 100 * 10);
                 test.add(tx1,
-                         TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+                         TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                         ledgerVersion);
                 // Allow tx discount to kick in, and fee bump replace the
                 // original tx
                 test.add(fb,
-                         TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+                         TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                         ledgerVersion);
                 test.check({{{account1, 0, {fb}}, {account2}, {account3}}, {}});
             }
         }
@@ -2260,16 +2374,18 @@ TEST_CASE("transaction queue with fee-bump", "[herder][transactionqueue]")
         {
             TransactionQueueTest test{queue};
             auto tx1 = transaction(*app, account1, 1, 1, 100, 1, isSoroban);
-            auto fb1 = feeBump(*app, account3, tx1, 200);
-            test.add(fb1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+            auto fb1 = feeBump(*app, account3, tx1, 200, ledgerVersion);
+            test.add(fb1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                     ledgerVersion);
             test.check({{{account1, 0, {fb1}}, {account2}, {account3, 0}}, {}});
 
-            test.shift();
+            test.shift(ledgerVersion);
             test.check({{{account1, 1, {fb1}}, {account2}, {account3, 0}}, {}});
 
             auto tx2 = transaction(*app, account2, 1, 1, 100, 1, isSoroban);
-            auto fb2 = feeBump(*app, account3, tx2, 200);
-            test.add(fb2, TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+            auto fb2 = feeBump(*app, account3, tx2, 200, ledgerVersion);
+            test.add(fb2, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                     ledgerVersion);
 
             for (uint32 i = 1; i <= 3; ++i)
             {
@@ -2277,11 +2393,11 @@ TEST_CASE("transaction queue with fee-bump", "[herder][transactionqueue]")
                              {account2, i - 1, {fb2}},
                              {account3, 0}},
                             {}});
-                test.shift();
+                test.shift(ledgerVersion);
             }
             test.check(
                 {{{account1}, {account2, 3, {fb2}}, {account3, 0}}, {{fb1}}});
-            test.shift();
+            test.shift(ledgerVersion);
             test.check({{{account1}, {account2}, {account3}}, {{fb2}, {fb1}}});
         }
 
@@ -2290,15 +2406,17 @@ TEST_CASE("transaction queue with fee-bump", "[herder][transactionqueue]")
         {
             TransactionQueueTest test{queue};
             auto tx1 = transaction(*app, account1, 1, 1, 100, 1, isSoroban);
-            auto fb1 = feeBump(*app, account3, tx1, 200);
-            test.add(fb1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+            auto fb1 = feeBump(*app, account3, tx1, 200, ledgerVersion);
+            test.add(fb1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                     ledgerVersion);
             test.check({{{account1, 0, {fb1}}, {account2}, {account3, 0}}, {}});
 
-            test.shift();
+            test.shift(ledgerVersion);
             test.check({{{account1, 1, {fb1}}, {account2}, {account3, 0}}, {}});
 
             auto tx2 = transaction(*app, account3, 1, 1, 100, 1, isSoroban);
-            test.add(tx2, TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+            test.add(tx2, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                     ledgerVersion);
 
             for (uint32 i = 1; i <= 3; ++i)
             {
@@ -2306,11 +2424,11 @@ TEST_CASE("transaction queue with fee-bump", "[herder][transactionqueue]")
                              {account2},
                              {account3, i - 1, {tx2}}},
                             {}});
-                test.shift();
+                test.shift(ledgerVersion);
             }
             test.check(
                 {{{account1}, {account2}, {account3, 3, {tx2}}}, {{fb1}}});
-            test.shift();
+            test.shift(ledgerVersion);
             test.check({{{account1}, {account2}, {account3}}, {{tx2}, {fb1}}});
         }
 
@@ -2319,15 +2437,17 @@ TEST_CASE("transaction queue with fee-bump", "[herder][transactionqueue]")
         {
             TransactionQueueTest test{queue};
             auto tx1 = transaction(*app, account3, 1, 1, 100, 1, isSoroban);
-            test.add(tx1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+            test.add(tx1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                     ledgerVersion);
             test.check({{{account1}, {account2}, {account3, 0, {tx1}}}, {}});
 
-            test.shift();
+            test.shift(ledgerVersion);
             test.check({{{account1}, {account2}, {account3, 1, {tx1}}}, {}});
 
             auto tx2 = transaction(*app, account1, 1, 1, 100, 1, isSoroban);
-            auto fb2 = feeBump(*app, account3, tx2, 200);
-            test.add(fb2, TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+            auto fb2 = feeBump(*app, account3, tx2, 200, ledgerVersion);
+            test.add(fb2, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                     ledgerVersion);
 
             for (uint32 i = 1; i <= 3; ++i)
             {
@@ -2335,11 +2455,11 @@ TEST_CASE("transaction queue with fee-bump", "[herder][transactionqueue]")
                              {account2},
                              {account3, i, {tx1}}},
                             {}});
-                test.shift();
+                test.shift(ledgerVersion);
             }
             test.check(
                 {{{account1, 3, {fb2}}, {account2}, {account3, 0}}, {{tx1}}});
-            test.shift();
+            test.shift(ledgerVersion);
             test.check({{{account1}, {account2}, {account3}}, {{fb2}, {tx1}}});
         }
 
@@ -2348,17 +2468,19 @@ TEST_CASE("transaction queue with fee-bump", "[herder][transactionqueue]")
         {
             TransactionQueueTest test{queue};
             auto tx1 = transaction(*app, account1, 1, 1, 100, 1, isSoroban);
-            auto fb1 = feeBump(*app, account1, tx1, 200);
-            test.add(fb1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+            auto fb1 = feeBump(*app, account1, tx1, 200, ledgerVersion);
+            test.add(fb1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                     ledgerVersion);
             test.check({{{account1, 0, {fb1}}, {account2}, {account3}}, {}});
 
             auto tx2 = transaction(*app, account1, 2, 1, 100, 1, isSoroban);
-            auto fb2 = feeBump(*app, account1, tx2, 200);
+            auto fb2 = feeBump(*app, account1, tx2, 200, ledgerVersion);
 
             // New fee-bump transaction can't replace the old one
             test.add(
                 fb2,
-                TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER);
+                TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER,
+                ledgerVersion);
             test.check({{{account1, 0, {fb1}}, {account2}, {account3}}, {}});
         }
 
@@ -2367,17 +2489,19 @@ TEST_CASE("transaction queue with fee-bump", "[herder][transactionqueue]")
         {
             TransactionQueueTest test{queue};
             auto tx1 = transaction(*app, account1, 1, 1, 100, 1, isSoroban);
-            auto fb1 = feeBump(*app, account3, tx1, 200);
-            test.add(fb1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+            auto fb1 = feeBump(*app, account3, tx1, 200, ledgerVersion);
+            test.add(fb1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                     ledgerVersion);
             test.check({{{account1, 0, {fb1}}, {account2}, {account3, 0}}, {}});
 
             auto tx2 = transaction(*app, account1, 2, 1, 100, 1, isSoroban);
-            auto fb2 = feeBump(*app, account3, tx2, 200);
+            auto fb2 = feeBump(*app, account3, tx2, 200, ledgerVersion);
 
             // New fee-bump transaction can't replace the old one
             test.add(
                 fb2,
-                TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER);
+                TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER,
+                ledgerVersion);
             test.check({{{account1, 0, {fb1}}, {account2}, {account3}}, {}});
         }
 
@@ -2399,7 +2523,8 @@ TEST_CASE("transaction queue with fee-bump", "[herder][transactionqueue]")
             auto fb1 = feeBump(*app, account3, tx1,
                                minBalance2 - minBalance0 - 1 - discount,
                                /* useInclusionAsFullFee */ true);
-            test.add(fb1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+            test.add(fb1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                     ledgerVersion);
             test.check({{{account1, 0, {fb1}}, {account2}, {account3, 0}}, {}});
             if (isSoroban)
             {
@@ -2413,7 +2538,8 @@ TEST_CASE("transaction queue with fee-bump", "[herder][transactionqueue]")
                 auto tx2 = transaction(*app, account3, 1, 1, newInclusionToPay,
                                        1, isSoroban);
                 auto addResult = test.add(
-                    tx2, TransactionQueue::AddResultCode::ADD_STATUS_ERROR);
+                    tx2, TransactionQueue::AddResultCode::ADD_STATUS_ERROR,
+                    ledgerVersion);
                 REQUIRE(addResult.txResult->getResultCode() ==
                         txINSUFFICIENT_BALANCE);
                 test.check(
@@ -2425,7 +2551,8 @@ TEST_CASE("transaction queue with fee-bump", "[herder][transactionqueue]")
                 auto tx2 = transaction(*app, account3, 1, 1, 100, 1, isSoroban);
                 auto fb2 = feeBump(*app, account3, tx2, newInclusionToPay);
                 auto addResult = test.add(
-                    fb2, TransactionQueue::AddResultCode::ADD_STATUS_ERROR);
+                    fb2, TransactionQueue::AddResultCode::ADD_STATUS_ERROR,
+                    ledgerVersion);
                 REQUIRE(addResult.txResult->getResultCode() ==
                         txINSUFFICIENT_BALANCE);
                 test.check(
@@ -2438,7 +2565,8 @@ TEST_CASE("transaction queue with fee-bump", "[herder][transactionqueue]")
                 auto fb2 = feeBump(*app, account3, tx2, newInclusionToPay);
                 REQUIRE(account3.getAvailableBalance() >= fb2->getFullFee());
                 auto addResult = test.add(
-                    fb2, TransactionQueue::AddResultCode::ADD_STATUS_ERROR);
+                    fb2, TransactionQueue::AddResultCode::ADD_STATUS_ERROR,
+                    ledgerVersion);
                 REQUIRE(addResult.txResult->getResultCode() ==
                         txINSUFFICIENT_BALANCE);
                 test.check(
@@ -2458,7 +2586,8 @@ TEST_CASE("transaction queue with fee-bump", "[herder][transactionqueue]")
 
                     test.add(
                         fb2,
-                        TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+                        TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                        ledgerVersion);
                     test.check(
                         {{{account1, 0, {fb2}}, {account2}, {account3, 0}},
                          {}});
@@ -2472,7 +2601,8 @@ TEST_CASE("transaction queue with fee-bump", "[herder][transactionqueue]")
                     SECTION("min replace-by-fee threshold")
                     {
                         fb2 = feeBump(*app, account3, tx2,
-                                      fb1->getInclusionFee() * 10);
+                                      fb1->getInclusionFee() * 10,
+                                      /* useInclusionAsFullFee */ true);
                     }
                     SECTION("maximum fee")
                     {
@@ -2481,7 +2611,8 @@ TEST_CASE("transaction queue with fee-bump", "[herder][transactionqueue]")
                     }
 
                     auto addResult = test.add(
-                        fb2, TransactionQueue::AddResultCode::ADD_STATUS_ERROR);
+                        fb2, TransactionQueue::AddResultCode::ADD_STATUS_ERROR,
+                        ledgerVersion);
 
                     REQUIRE(addResult.txResult->getResultCode() ==
                             txINSUFFICIENT_BALANCE);
@@ -2497,14 +2628,16 @@ TEST_CASE("transaction queue with fee-bump", "[herder][transactionqueue]")
             auto tx1 = transaction(*app, account1, 1, 1, 100, 1, isSoroban);
             auto discount = tx1->getFullFee() - tx1->getInclusionFee();
             auto fb1 = feeBump(*app, account3, tx1,
-                               minBalance2 - minBalance0 - 1ll - discount);
-            test.add(fb1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+                               minBalance2 - minBalance0 - 1ll - discount,
+                               /* useInclusionAsFullFee */ true);
+            test.add(fb1, TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                     ledgerVersion);
             test.check({{{account1, 0, {fb1}}, {account2}, {account3, 0}}, {}});
-            test.add(fb1,
-                     TransactionQueue::AddResultCode::ADD_STATUS_DUPLICATE);
+            test.add(fb1, TransactionQueue::AddResultCode::ADD_STATUS_DUPLICATE,
+                     ledgerVersion);
             test.check({{{account1, 0, {fb1}}, {account2}, {account3, 0}}, {}});
-            test.add(tx1,
-                     TransactionQueue::AddResultCode::ADD_STATUS_DUPLICATE);
+            test.add(tx1, TransactionQueue::AddResultCode::ADD_STATUS_DUPLICATE,
+                     ledgerVersion);
             test.check({{{account1, 0, {fb1}}, {account2}, {account3, 0}}, {}});
         }
     };
@@ -2528,7 +2661,9 @@ TEST_CASE("replace by fee", "[herder][transactionqueue]")
     cfg.FLOOD_TX_PERIOD_MS = 100;
     auto app = createTestApplication(clock, cfg);
     auto const minBalance2 = app->getLedgerManager().getLastMinBalance(2);
-
+    auto ledgerVersion = app->getLedgerManager()
+                             .getLastClosedLedgerHeader()
+                             .header.ledgerVersion;
     auto root = app->getRoot();
     auto account1 = root->create("a1", minBalance2);
     auto account2 = root->create("a2", minBalance2);
@@ -2537,7 +2672,8 @@ TEST_CASE("replace by fee", "[herder][transactionqueue]")
         std::vector<TransactionFrameBasePtr> txs;
         txs.emplace_back(transaction(*app, account1, 1, 1, 200, 1, isSoroban));
         test.add(txs.back(),
-                 TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+                 TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                 ledgerVersion);
         return txs;
     };
 
@@ -2548,7 +2684,8 @@ TEST_CASE("replace by fee", "[herder][transactionqueue]")
         auto fb = feeBump(*app, feeSource, tx, 400);
         txs.emplace_back(fb);
         test.add(txs.back(),
-                 TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+                 TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                 ledgerVersion);
         return txs;
     };
 
@@ -2559,7 +2696,8 @@ TEST_CASE("replace by fee", "[herder][transactionqueue]")
         {
             test.add(
                 transaction(*app, account1, 1, 1, 199, 1, isSoroban),
-                TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER);
+                TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER,
+                ledgerVersion);
             test.check({{{account1, 0, txs}, {account2}}, {}});
         }
 
@@ -2567,7 +2705,8 @@ TEST_CASE("replace by fee", "[herder][transactionqueue]")
         {
             test.add(
                 transaction(*app, account1, 1, 1, 1999, 1, isSoroban),
-                TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER);
+                TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER,
+                ledgerVersion);
             test.check({{{account1, 0, txs}, {account2}}, {}});
         }
 
@@ -2575,7 +2714,8 @@ TEST_CASE("replace by fee", "[herder][transactionqueue]")
         {
             test.add(
                 transaction(*app, account1, 1, 1, 2000, 1, isSoroban),
-                TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER);
+                TransactionQueue::AddResultCode::ADD_STATUS_TRY_AGAIN_LATER,
+                ledgerVersion);
             test.check({{{account1, 0, txs}, {account2}}, {}});
         }
     };
@@ -2591,7 +2731,8 @@ TEST_CASE("replace by fee", "[herder][transactionqueue]")
                 auto tx = transaction(*app, account1, 1, 1, 100, 1, isSoroban);
                 auto fb = feeBump(*app, feeSource, tx, 399);
                 auto addResult = test.add(
-                    fb, TransactionQueue::AddResultCode::ADD_STATUS_ERROR);
+                    fb, TransactionQueue::AddResultCode::ADD_STATUS_ERROR,
+                    ledgerVersion);
                 auto& txResult = addResult.txResult;
                 REQUIRE(txResult->getResultCode() == txINSUFFICIENT_FEE);
                 REQUIRE(txResult->getXDR().feeCharged ==
@@ -2608,7 +2749,8 @@ TEST_CASE("replace by fee", "[herder][transactionqueue]")
                 auto tx = transaction(*app, account1, 1, 1, 100, 1, isSoroban);
                 auto fb = feeBump(*app, feeSource, tx, 3999);
                 auto addResult = test.add(
-                    fb, TransactionQueue::AddResultCode::ADD_STATUS_ERROR);
+                    fb, TransactionQueue::AddResultCode::ADD_STATUS_ERROR,
+                    ledgerVersion);
                 auto& txResult = addResult.txResult;
                 REQUIRE(txResult->getResultCode() == txINSUFFICIENT_FEE);
                 REQUIRE(txResult->getXDR().feeCharged ==
@@ -2624,7 +2766,8 @@ TEST_CASE("replace by fee", "[herder][transactionqueue]")
                 auto fb = feeBump(*app, source, tx, 4000);
                 txs[0] = fb;
                 test.add(fb,
-                         TransactionQueue::AddResultCode::ADD_STATUS_PENDING);
+                         TransactionQueue::AddResultCode::ADD_STATUS_PENDING,
+                         ledgerVersion);
                 test.check({{{account1, 0, txs}, {account2}}, {}});
             };
             SECTION("transaction from same source account")

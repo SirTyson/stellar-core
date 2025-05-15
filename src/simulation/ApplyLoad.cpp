@@ -411,16 +411,20 @@ ApplyLoad::benchmark()
             releaseAssert((res && res->isSuccess()));
         }
 
-        if (!anyGreater(tx.second->getResources(false), resources))
+        uint32_t ledgerVersion = mApp.getLedgerManager()
+                                     .getLastClosedLedgerHeader()
+                                     .header.ledgerVersion;
+        if (!anyGreater(tx.second->getResources(false, ledgerVersion),
+                        resources))
         {
-            resources -= tx.second->getResources(false);
+            resources -= tx.second->getResources(false, ledgerVersion);
         }
         else
         {
             for (size_t i = 0; i < resources.size(); ++i)
             {
                 auto type = static_cast<Resource::Type>(i);
-                if (tx.second->getResources(false).getVal(type) >
+                if (tx.second->getResources(false, ledgerVersion).getVal(type) >
                     resources.getVal(type))
                 {
                     CLOG_INFO(Perf, "Ledger {} limit hit during tx generation",

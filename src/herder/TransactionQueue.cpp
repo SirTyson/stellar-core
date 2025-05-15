@@ -463,7 +463,7 @@ TransactionQueue::canAdd(
         mTxQueueLimiter->canAddTx(tx, currentTx, txsToEvict, ledgerVersion);
     if (!canAddRes.first)
     {
-        ban({tx});
+        ban({tx}, ledgerVersion);
         if (canAddRes.second != 0)
         {
             auto txResult = tx->createValidationSuccessResult();
@@ -555,10 +555,11 @@ TransactionQueue::releaseFeeMaybeEraseAccountState(TransactionFrameBasePtr tx)
 }
 
 void
-TransactionQueue::prepareDropTransaction(AccountState& as)
+TransactionQueue::prepareDropTransaction(AccountState& as,
+                                         uint32_t ledgerVersion)
 {
     releaseAssert(as.mTransaction);
-    mTxQueueLimiter->removeTransaction(as.mTransaction->mTx);
+    mTxQueueLimiter->removeTransaction(as.mTransaction->mTx, ledgerVersion);
     mKnownTxHashes.erase(as.mTransaction->mTx->getFullHash());
     CLOG_DEBUG(Tx, "Dropping {} transaction",
                hexAbbrev(as.mTransaction->mTx->getFullHash()));
@@ -677,7 +678,8 @@ TransactionQueue::findAllAssetPairsInvolvedInPaymentLoops(
 }
 
 TransactionQueue::AddResult
-TransactionQueue::tryAdd(TransactionFrameBasePtr tx, bool submittedFromSelf
+TransactionQueue::tryAdd(TransactionFrameBasePtr tx, bool submittedFromSelf,
+                         uint32_t ledgerVersion
 #ifdef BUILD_TESTS
                          ,
                          bool isLoadgenTx
@@ -727,7 +729,7 @@ TransactionQueue::tryAdd(TransactionFrameBasePtr tx, bool submittedFromSelf
     {
         // Drop current transaction associated with this account, replace
         // with `tx`
-        prepareDropTransaction(stateIter->second);
+        prepareDropTransaction(stateIter->second, ledgerVersion);
         *oldTx = {tx, false, mApp.getClock().now(), submittedFromSelf};
     }
     else
@@ -746,17 +748,21 @@ TransactionQueue::tryAdd(TransactionFrameBasePtr tx, bool submittedFromSelf
     // this will succeed as `canAdd` ensures that this is the case
     mTxQueueLimiter->evictTransactions(
         txsToEvict, *tx,
-        [&](TransactionFrameBasePtr const& txToEvict) { ban({txToEvict}); });
-    mTxQueueLimiter->addTransaction(tx);
+        [this, ledgerVersion](TransactionFrameBasePtr const& txToEvict) {
+            ban({txToEvict}, ledgerVersion);
+        },
+        ledgerVersion);
+    mTxQueueLimiter->addTransaction(tx, ledgerVersion);
     mKnownTxHashes[tx->getFullHash()] = tx;
 
-    broadcast(false);
+    broadcast(false, ledgerVersion);
 
     return res;
 }
 
 void
-TransactionQueue::dropTransaction(AccountStates::iterator stateIter)
+TransactionQueue::dropTransaction(AccountStates::iterator stateIter,
+                                  uint32_t ledgerVersion)
 {
     ZoneScoped;
     // Remove fees and update queue size for each transaction to be dropped.
@@ -765,7 +771,7 @@ TransactionQueue::dropTransaction(AccountStates::iterator stateIter)
     // least one transaction (otherwise we couldn't reach that line).
     releaseAssert(stateIter->second.mTransaction);
 
-    prepareDropTransaction(stateIter->second);
+    prepareDropTransaction(stateIter->second, ledgerVersion);
 
     // Actually erase the transaction to be dropped.
     stateIter->second.mTransaction.reset();
@@ -784,7 +790,8 @@ TransactionQueue::dropTransaction(AccountStates::iterator stateIter)
 }
 
 void
-TransactionQueue::removeApplied(Transactions const& appliedTxs)
+TransactionQueue::removeApplied(Transactions const& appliedTxs,
+                                uint32_t ledgerVersion)
 {
     ZoneScoped;
 
@@ -834,7 +841,7 @@ TransactionQueue::removeApplied(Transactions const& appliedTxs)
                     // WARNING: stateIter and everything that references it
                     // may be invalid from this point onward and should not
                     // be used.
-                    dropTransaction(stateIter);
+                    dropTransaction(stateIter, ledgerVersion);
                 }
             }
         }
@@ -851,7 +858,7 @@ TransactionQueue::removeApplied(Transactions const& appliedTxs)
 }
 
 void
-TransactionQueue::ban(Transactions const& banTxs)
+TransactionQueue::ban(Transactions const& banTxs, uint32_t ledgerVersion)
 {
     ZoneScoped;
     auto& bannedFront = mBannedTransactions.front();
@@ -888,7 +895,7 @@ TransactionQueue::ban(Transactions const& banTxs)
                 mQueueMetrics->mSizeByAge[stateIter->second.mAge]->dec();
                 // WARNING: stateIter and everything that references it may
                 // be invalid from this point onward and should not be used.
-                dropTransaction(stateIter);
+                dropTransaction(stateIter, ledgerVersion);
             }
         }
     }
@@ -915,7 +922,7 @@ TransactionQueue::countBanned(int index) const
 #endif
 
 void
-TransactionQueue::shift()
+TransactionQueue::shift(uint32_t ledgerVersion)
 {
     ZoneScoped;
     mBannedTransactions.pop_back();
@@ -946,7 +953,7 @@ TransactionQueue::shift()
                 // This never invalidates it because
                 //     it->second.mTransaction
                 // otherwise we couldn't have reached this line.
-                prepareDropTransaction(it->second);
+                prepareDropTransaction(it->second, ledgerVersion);
                 CLOG_DEBUG(
                     Tx, "Ban transaction {}",
                     hexAbbrev(it->second.mTransaction->mTx->getFullHash()));
@@ -1154,7 +1161,7 @@ SorobanTransactionQueue::getMaxResourcesToFloodThisPeriod() const
 }
 
 bool
-SorobanTransactionQueue::broadcastSome()
+SorobanTransactionQueue::broadcastSome(uint32_t ledgerVersion)
 {
     // broadcast transactions in surge pricing order:
     // loop over transactions by picking from the account queue with the
@@ -1174,12 +1181,12 @@ SorobanTransactionQueue::broadcastSome()
             auto tx = accountState.mTransaction->mTx;
             txsToBroadcast.emplace_back(tx);
             totalResToFlood += tx->getResources(
-                /* useByteLimitInClassic */ false);
+                /* useByteLimitInClassic */ false, ledgerVersion);
             txToAccountState[tx] = &accountState;
         }
     }
 
-    auto visitor = [this, &totalResToFlood,
+    auto visitor = [this, &totalResToFlood, ledgerVersion,
                     &txToAccountState](TransactionFrameBasePtr const& tx) {
         auto& accState = *txToAccountState.at(tx);
         // look at the next candidate transaction for that account
@@ -1191,8 +1198,8 @@ SorobanTransactionQueue::broadcastSome()
         releaseAssert(bStatus != BroadcastStatus::BROADCAST_STATUS_SKIPPED);
         if (bStatus == BroadcastStatus::BROADCAST_STATUS_SUCCESS)
         {
-            totalResToFlood -=
-                tx->getResources(/* useByteLimitInClassic */ false);
+            totalResToFlood -= tx->getResources(
+                /* useByteLimitInClassic */ false, ledgerVersion);
             return SurgePricingPriorityQueue::VisitTxResult::PROCESSED;
         }
         else
@@ -1206,7 +1213,8 @@ SorobanTransactionQueue::broadcastSome()
     SurgePricingPriorityQueue queue(
         /* isHighestPriority */ true,
         std::make_shared<SorobanGenericLaneConfig>(resToFlood), mBroadcastSeed);
-    queue.visitTopTxs(txsToBroadcast, visitor, mBroadcastOpCarryover);
+    queue.visitTopTxs(txsToBroadcast, visitor, mBroadcastOpCarryover,
+                      ledgerVersion);
 
     Resource maxPerTx =
         mApp.getLedgerManager().maxSorobanTransactionResources();
@@ -1237,7 +1245,7 @@ SorobanTransactionQueue::getMaxQueueSizeOps() const
 }
 
 bool
-ClassicTransactionQueue::broadcastSome()
+ClassicTransactionQueue::broadcastSome(uint32_t ledgerVersion)
 {
     // broadcast transactions in surge pricing order:
     // loop over transactions by picking from the account queue with the
@@ -1267,8 +1275,8 @@ ClassicTransactionQueue::broadcastSome()
     }
 
     std::vector<TransactionFrameBasePtr> banningTxs;
-    auto visitor = [this, &totalToFlood, &banningTxs,
-                    &txToAccountState](TransactionFrameBasePtr const& tx) {
+    auto visitor = [this, &totalToFlood, &banningTxs, &txToAccountState,
+                    ledgerVersion](TransactionFrameBasePtr const& tx) {
         auto const& curTracker = txToAccountState.at(tx);
         // look at the next candidate transaction for that account
         auto& cur = *curTracker->mTransaction;
@@ -1277,7 +1285,8 @@ ClassicTransactionQueue::broadcastSome()
         auto bStatus = broadcastTx(cur);
         if (bStatus == BroadcastStatus::BROADCAST_STATUS_SUCCESS)
         {
-            totalToFlood -= tx->getResources(/* useByteLimitInClassic */ false);
+            totalToFlood -= tx->getResources(/* useByteLimitInClassic */ false,
+                                             ledgerVersion);
             return SurgePricingPriorityQueue::VisitTxResult::PROCESSED;
         }
         else if (bStatus == BroadcastStatus::BROADCAST_STATUS_SKIPPED)
@@ -1298,8 +1307,9 @@ ClassicTransactionQueue::broadcastSome()
         /* isHighestPriority */ true,
         std::make_shared<DexLimitingLaneConfig>(opsToFlood, dexOpsToFlood),
         mBroadcastSeed);
-    queue.visitTopTxs(txsToBroadcast, visitor, mBroadcastOpCarryover);
-    ban(banningTxs);
+    queue.visitTopTxs(txsToBroadcast, visitor, mBroadcastOpCarryover,
+                      ledgerVersion);
+    ban(banningTxs, ledgerVersion);
     // carry over remainder, up to MAX_OPS_PER_TX ops
     // reason is that if we add 1 next round, we can flood a "worst case fee
     // bump" tx
@@ -1312,7 +1322,7 @@ ClassicTransactionQueue::broadcastSome()
 }
 
 void
-TransactionQueue::broadcast(bool fromCallback)
+TransactionQueue::broadcast(bool fromCallback, uint32_t ledgerVersion)
 {
     if (mShutdown || (!fromCallback && mWaiting))
     {
@@ -1328,7 +1338,7 @@ TransactionQueue::broadcast(bool fromCallback)
     }
     else
     {
-        needsMore = broadcastSome();
+        needsMore = broadcastSome(ledgerVersion);
     }
 
     if (needsMore)
@@ -1336,13 +1346,14 @@ TransactionQueue::broadcast(bool fromCallback)
         mWaiting = true;
         mBroadcastTimer.expires_from_now(
             std::chrono::milliseconds(getFloodPeriod()));
-        mBroadcastTimer.async_wait([&]() { broadcast(true); },
-                                   &VirtualTimer::onFailureNoop);
+        mBroadcastTimer.async_wait(
+            [this, ledgerVersion]() { broadcast(true, ledgerVersion); },
+            &VirtualTimer::onFailureNoop);
     }
 }
 
 void
-TransactionQueue::rebroadcast()
+TransactionQueue::rebroadcast(uint32_t ledgerVersion)
 {
     // force to rebroadcast everything
     for (auto& m : mAccountStates)
@@ -1353,7 +1364,7 @@ TransactionQueue::rebroadcast()
             as.mTransaction->mBroadcasted = false;
         }
     }
-    broadcast(false);
+    broadcast(false, ledgerVersion);
 }
 
 void

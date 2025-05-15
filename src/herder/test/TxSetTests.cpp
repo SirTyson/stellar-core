@@ -2816,6 +2816,7 @@ TEST_CASE("parallel tx set building benchmark",
         return txs;
     };
 
+    auto ledgerVersion = cfg.TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION;
     auto runBenchmark = [&](double mean_conflicts_per_tx,
                             double mean_ro_txs_per_conflict,
                             double mean_rw_txs_per_conflict) {
@@ -2840,7 +2841,7 @@ TEST_CASE("parallel tx set building benchmark",
                 auto start = std::chrono::steady_clock::now();
                 auto stages = buildSurgePricedParallelSorobanPhase(
                     allTxs[iter], cfg, sorobanCfg, surgePricingLaneConfig,
-                    hadTxNotFittingLane);
+                    hadTxNotFittingLane, ledgerVersion);
                 auto end = std::chrono::steady_clock::now();
                 totalDuration +=
                     std::chrono::duration_cast<std::chrono::nanoseconds>(end -

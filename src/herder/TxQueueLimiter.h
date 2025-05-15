@@ -40,8 +40,10 @@ class TxQueueLimiter
     TxQueueLimiter(uint32 multiplier, Application& app, bool isSoroban);
     ~TxQueueLimiter();
 
-    void addTransaction(TransactionFrameBasePtr const& tx);
-    void removeTransaction(TransactionFrameBasePtr const& tx);
+    void addTransaction(TransactionFrameBasePtr const& tx,
+                        uint32_t ledgerVersion);
+    void removeTransaction(TransactionFrameBasePtr const& tx,
+                           uint32_t ledgerVersion);
 #ifdef BUILD_TESTS
     size_t size() const;
     std::pair<bool, int64>
@@ -57,7 +59,8 @@ class TxQueueLimiter
     void evictTransactions(
         std::vector<std::pair<TransactionFrameBasePtr, bool>> const& txsToEvict,
         TransactionFrameBase const& txToFit,
-        std::function<void(TransactionFrameBasePtr const&)> evict);
+        std::function<void(TransactionFrameBasePtr const&)> evict,
+        uint32_t ledgerVersion);
 
     // oldTx is set when performing a replace by fee
     // return

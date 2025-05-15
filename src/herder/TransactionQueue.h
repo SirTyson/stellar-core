@@ -139,23 +139,24 @@ class TransactionQueue
 
 #ifdef BUILD_TESTS
     AddResult tryAdd(TransactionFrameBasePtr tx, bool submittedFromSelf,
-                     bool isLoadgenTx = false);
+                     uint32_t ledgerVersion, bool isLoadgenTx = false);
 #else
-    AddResult tryAdd(TransactionFrameBasePtr tx, bool submittedFromSelf);
+    AddResult tryAdd(TransactionFrameBasePtr tx, bool submittedFromSelf,
+                     uint32_t ledgerVersion);
 #endif
-    void removeApplied(Transactions const& txs);
+    void removeApplied(Transactions const& txs, uint32_t ledgerVersion);
     // Ban transactions that are no longer valid or have insufficient fee;
     // transaction per account limit applies here, so `txs` should have no
     // duplicate source accounts
-    void ban(Transactions const& txs);
+    void ban(Transactions const& txs, uint32_t ledgerVersion);
 
     /**
      * Increase age of each AccountState that has at least one transaction in
      * mTransactions. Also increments the age for each banned transaction, and
      * unbans transactions for which age equals banDepth.
      */
-    void shift();
-    void rebroadcast();
+    void shift(uint32_t ledgerVersion);
+    void rebroadcast(uint32_t ledgerVersion);
     void shutdown();
 
     bool isBanned(Hash const& hash) const;
@@ -233,11 +234,11 @@ class TransactionQueue
 
     virtual std::pair<Resource, std::optional<Resource>>
     getMaxResourcesToFloodThisPeriod() const = 0;
-    virtual bool broadcastSome() = 0;
+    virtual bool broadcastSome(uint32_t ledgerVersion) = 0;
     virtual int getFloodPeriod() const = 0;
     virtual bool allowTxBroadcast(TimestampedTx const& tx) = 0;
 
-    void broadcast(bool fromCallback);
+    void broadcast(bool fromCallback, uint32_t ledgerVersion);
     // broadcasts a single transaction
     enum class BroadcastStatus
     {
@@ -260,8 +261,9 @@ class TransactionQueue
 
     void releaseFeeMaybeEraseAccountState(TransactionFrameBasePtr tx);
 
-    void prepareDropTransaction(AccountState& as);
-    void dropTransaction(AccountStates::iterator stateIter);
+    void prepareDropTransaction(AccountState& as, uint32_t ledgerVersion);
+    void dropTransaction(AccountStates::iterator stateIter,
+                         uint32_t ledgerVersion);
 
     bool isFiltered(TransactionFrameBasePtr tx) const;
 
@@ -304,7 +306,7 @@ class SorobanTransactionQueue : public TransactionQueue
   private:
     virtual std::pair<Resource, std::optional<Resource>>
     getMaxResourcesToFloodThisPeriod() const override;
-    virtual bool broadcastSome() override;
+    virtual bool broadcastSome(uint32_t ledgerVersion) override;
     std::vector<Resource> mBroadcastOpCarryover;
     // No special flooding rules for Soroban
     virtual bool
@@ -334,7 +336,7 @@ class ClassicTransactionQueue : public TransactionQueue
 
     virtual std::pair<Resource, std::optional<Resource>>
     getMaxResourcesToFloodThisPeriod() const override;
-    virtual bool broadcastSome() override;
+    virtual bool broadcastSome(uint32_t ledgerVersion) override;
     std::vector<Resource> mBroadcastOpCarryover;
     virtual bool allowTxBroadcast(TimestampedTx const& tx) override;
 };

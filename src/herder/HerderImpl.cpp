@@ -39,6 +39,7 @@
 #include "util/Decoder.h"
 #include "util/XDRStream.h"
 #include "xdr/Stellar-internal.h"
+#include "xdr/Stellar-types.h"
 #include "xdrpp/marshal.h"
 #include "xdrpp/types.h"
 #include <Tracy.hpp>
@@ -601,6 +602,13 @@ HerderImpl::recvTransaction(TransactionFrameBasePtr tx, bool submittedFromSelf
     TransactionQueue::AddResult result(
         TransactionQueue::AddResultCode::ADD_STATUS_COUNT);
 
+    // It's possible we add a tx is p22, but the tx gets included in a block in
+    // p23. However, we should check tx validity again and drop any invalid TXs
+    // later, so it's ok that this is a sort of "best effort" protocol version.
+    uint32_t ledgerVersion = mApp.getLedgerManager()
+                                 .getLastClosedLedgerHeader()
+                                 .header.ledgerVersion;
+
     // Allow txs of the same kind to reach the tx queue in case it can be
     // replaced by fee
     bool hasSoroban =
@@ -622,7 +630,7 @@ HerderImpl::recvTransaction(TransactionFrameBasePtr tx, bool submittedFromSelf
     }
     else if (!tx->isSoroban())
     {
-        result = mTransactionQueue.tryAdd(tx, submittedFromSelf
+        result = mTransactionQueue.tryAdd(tx, submittedFromSelf, ledgerVersion
 #ifdef BUILD_TESTS
                                           ,
                                           isLoadgenTx
@@ -631,7 +639,8 @@ HerderImpl::recvTransaction(TransactionFrameBasePtr tx, bool submittedFromSelf
     }
     else if (mSorobanTransactionQueue)
     {
-        result = mSorobanTransactionQueue->tryAdd(tx, submittedFromSelf
+        result = mSorobanTransactionQueue->tryAdd(tx, submittedFromSelf,
+                                                  ledgerVersion
 #ifdef BUILD_TESTS
                                                   ,
                                                   isLoadgenTx
@@ -1487,11 +1496,13 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
     {
         releaseAssert(mSorobanTransactionQueue);
         mSorobanTransactionQueue->ban(
-            invalidTxPhases[static_cast<size_t>(TxSetPhase::SOROBAN)]);
+            invalidTxPhases[static_cast<size_t>(TxSetPhase::SOROBAN)],
+            lcl.header.ledgerVersion);
     }
 
     mTransactionQueue.ban(
-        invalidTxPhases[static_cast<size_t>(TxSetPhase::CLASSIC)]);
+        invalidTxPhases[static_cast<size_t>(TxSetPhase::CLASSIC)],
+        lcl.header.ledgerVersion);
 
     auto txSetHash = proposedSet->getContentsHash();
 
@@ -2354,17 +2365,17 @@ HerderImpl::updateTransactionQueue(TxSetXDRFrameConstPtr externalizedTxSet)
     auto lhhe = mLedgerManager.getLastClosedLedgerHeader();
 
     auto updateQueue = [&](auto& queue, auto const& applied) {
-        queue.removeApplied(applied);
-        queue.shift();
+        queue.removeApplied(applied, lhhe.header.ledgerVersion);
+        queue.shift(lhhe.header.ledgerVersion);
 
         auto txs = queue.getTransactions(lhhe.header);
 
         auto invalidTxs = TxSetUtils::getInvalidTxList(
             txs, mApp, 0,
             getUpperBoundCloseTimeOffset(mApp, lhhe.header.scpValue.closeTime));
-        queue.ban(invalidTxs);
+        queue.ban(invalidTxs, lhhe.header.ledgerVersion);
 
-        queue.rebroadcast();
+        queue.rebroadcast(lhhe.header.ledgerVersion);
     };
     if (txsPerPhase.size() > static_cast<size_t>(TxSetPhase::CLASSIC))
     {
