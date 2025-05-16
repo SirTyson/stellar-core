@@ -39,7 +39,6 @@
 #include "util/Decoder.h"
 #include "util/XDRStream.h"
 #include "xdr/Stellar-internal.h"
-#include "xdr/Stellar-types.h"
 #include "xdrpp/marshal.h"
 #include "xdrpp/types.h"
 #include <Tracy.hpp>

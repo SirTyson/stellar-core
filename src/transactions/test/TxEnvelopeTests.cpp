@@ -2718,11 +2718,7 @@ TEST_CASE("soroban transaction validation", "[tx][envelope][soroban]")
         resources.writeBytes += 1;
         validateResources(resources, false);
     }
-    SECTION("max read entries exceeded")
-    {
-        resources.footprint.readOnly.emplace_back();
-        validateResources(resources, false);
-    }
+    // Note: read entry limit tests in "Soroban footprint validation"
     SECTION("max write entries exceeded")
     {
         // Make sure that read entries limit is not exceeded.

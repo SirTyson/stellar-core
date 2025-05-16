@@ -433,7 +433,7 @@ FeeBumpTransactionFrame::getOperationFrames() const
 
 Resource
 FeeBumpTransactionFrame::getResources(bool useByteLimitInClassic,
-                                     uint32_t ledgerVersion) const
+                                      uint32_t ledgerVersion) const
 {
     auto res = mInnerTx->getResources(useByteLimitInClassic, ledgerVersion);
     res.setVal(Resource::Type::OPERATIONS, getNumOperations());

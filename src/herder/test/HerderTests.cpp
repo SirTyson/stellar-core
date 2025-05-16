@@ -4453,7 +4453,7 @@ TEST_CASE("do not flood too many soroban transactions",
     uint32_t const baseInclusionFee = 100'000;
     SorobanResources resources;
     resources.instructions = 800'000;
-    resources.diskReadBytes = 2000;
+    resources.diskReadBytes = 3000;
     resources.writeBytes = 1000;
 
     auto genTx = [&](TestAccount& source, bool highFee) {

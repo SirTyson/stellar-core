@@ -1261,6 +1261,7 @@ SorobanNetworkConfig::loadFromLedger(AbstractLedgerTxn& ltxRoot,
                                   PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION))
     {
         loadParallelComputeConfig(ltx);
+        loadLedgerCostExtConfig(ltx);
     }
     // NB: this should follow loading/updating bucket list window
     // size and state archival settings
@@ -1491,6 +1492,19 @@ SorobanNetworkConfig::loadParallelComputeConfig(AbstractLedgerTxn& ltx)
     auto const& configSetting =
         le.data.configSetting().contractParallelCompute();
     mLedgerMaxDependentTxClusters = configSetting.ledgerMaxDependentTxClusters;
+}
+
+void
+SorobanNetworkConfig::loadLedgerCostExtConfig(AbstractLedgerTxn& ltx)
+{
+    ZoneScoped;
+    LedgerKey key(CONFIG_SETTING);
+    key.configSetting().configSettingID =
+        ConfigSettingID::CONFIG_SETTING_CONTRACT_LEDGER_COST_EXT_V0;
+    auto le = ltx.loadWithoutRecord(key).current();
+    auto const& configSetting = le.data.configSetting().contractLedgerCostExt();
+    mTxMaxInMemoryReadEntries = configSetting.txMaxInMemoryReadEntries;
+    mFeeFlatRateWrite1KB = configSetting.feeWrite1KB;
 }
 
 void

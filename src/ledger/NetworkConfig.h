@@ -394,6 +394,7 @@ class SorobanNetworkConfig
     void loadliveSorobanStateSizeWindow(AbstractLedgerTxn& ltx);
     void loadEvictionIterator(AbstractLedgerTxn& ltx);
     void loadParallelComputeConfig(AbstractLedgerTxn& ltx);
+    void loadLedgerCostExtConfig(AbstractLedgerTxn& ltx);
     void computeRentWriteFee(uint32_t configMaxProtocol,
                              uint32_t protocolVersion);
     // If newSize is different than the current BucketList size sliding window,
