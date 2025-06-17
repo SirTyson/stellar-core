@@ -478,7 +478,8 @@ LedgerManagerImpl::loadLastKnownLedger(bool restoreBucketlist)
     auto const& snapshot = mLastClosedLedgerState->getBucketSnapshot();
     mApplyState.compileAllContractsInLedger(snapshot,
                                             latestLedgerHeader->ledgerVersion);
-    mApplyState.populateSorobanStateCache(snapshot);
+    mApplyState.populateSorobanStateCache(snapshot, mApp,
+                                          latestLedgerHeader->ledgerVersion);
 }
 
 Database&
@@ -672,7 +673,9 @@ LedgerManagerImpl::rebuildLedgerStateCacheForTesting()
 {
     mApplyState.mLedgerStateCache.reset();
     mApplyState.populateSorobanStateCache(
-        mLastClosedLedgerState->getBucketSnapshot());
+        mLastClosedLedgerState->getBucketSnapshot(), mApp,
+        mLastClosedLedgerState->getLastClosedLedgerHeader()
+            .header.ledgerVersion);
 }
 #endif
 
@@ -717,36 +720,37 @@ LedgerManagerImpl::ApplyState::compileAllContractsInLedger(
 
 void
 LedgerManagerImpl::ApplyState::populateSorobanStateCache(
-    SearchableSnapshotConstPtr snap)
+    SearchableSnapshotConstPtr snap, Application& app, uint32_t ledgerVersion)
 {
     mLedgerStateCache = std::make_unique<LedgerStateCache>();
 
     std::unordered_set<LedgerKey> deletedKeys;
-    auto f = [&cache = *mLedgerStateCache,
-              &deletedKeys](BucketEntry const& be) {
+
+    // Check if entry is a DEADENTRY and add it to deletedKeys. Otherwise, check
+    // if the entry is shadowed by a DEADENTRY.
+    auto shouldAddToCache = [&deletedKeys](BucketEntry const& be,
+                                           LedgerEntryType expectedType) {
         if (be.type() == DEADENTRY)
         {
             deletedKeys.insert(be.deadEntry());
-            return Loop::INCOMPLETE;
+            return false;
         }
 
         releaseAssertOrThrow(be.type() == LIVEENTRY || be.type() == INITENTRY);
-
         auto lk = LedgerEntryKey(be.liveEntry());
-        releaseAssertOrThrow(lk.type() == CONTRACT_DATA || lk.type() == TTL);
+        releaseAssertOrThrow(lk.type() == expectedType);
+        return deletedKeys.find(lk) == deletedKeys.end();
+    };
 
-        // Skip if we've seen a DEADENTRY for this key already.
-        if (deletedKeys.find(lk) != deletedKeys.end())
+    auto contractDataHandler = [&cache = *mLedgerStateCache,
+                                &shouldAddToCache](BucketEntry const& be) {
+        if (!shouldAddToCache(be, CONTRACT_DATA))
         {
             return Loop::INCOMPLETE;
         }
 
-        // Skip if we've already cached this key.
-        if (lk.type() == TTL && !cache.hasTTL(lk))
-        {
-            cache.createTTL(be.liveEntry());
-        }
-        else if (lk.type() == CONTRACT_DATA && !cache.getContractDataEntry(lk))
+        auto lk = LedgerEntryKey(be.liveEntry());
+        if (!cache.getContractDataEntry(lk))
         {
             cache.createContractDataEntry(be.liveEntry());
         }
@@ -754,10 +758,50 @@ LedgerManagerImpl::ApplyState::populateSorobanStateCache(
         return Loop::INCOMPLETE;
     };
 
-    // Only scan for TTL and data entries since we only have to store the TTL
-    // for code entries
-    snap->scanForEntriesOfType(CONTRACT_DATA, f);
-    snap->scanForEntriesOfType(TTL, f);
+    auto ttlHandler = [&cache = *mLedgerStateCache,
+                       &shouldAddToCache](BucketEntry const& be) {
+        if (!shouldAddToCache(be, TTL))
+        {
+            return Loop::INCOMPLETE;
+        }
+
+        auto lk = LedgerEntryKey(be.liveEntry());
+        if (!cache.hasTTL(lk))
+        {
+            cache.createTTL(be.liveEntry());
+        }
+
+        return Loop::INCOMPLETE;
+    };
+
+    auto contractCodeHandler = [&cache = *mLedgerStateCache, &shouldAddToCache,
+                                &config = app.getConfig(),
+                                &sorobanConfig = mSorobanNetworkConfig,
+                                ledgerVersion](BucketEntry const& be) {
+        if (!shouldAddToCache(be, CONTRACT_CODE))
+        {
+            return Loop::INCOMPLETE;
+        }
+
+        auto lk = LedgerEntryKey(be.liveEntry());
+        if (!cache.getContractCodeMemorySize(lk))
+        {
+            auto memorySizeForRent =
+                rust_bridge::contract_code_memory_size_for_rent(
+                    config.CURRENT_LEDGER_PROTOCOL_VERSION, ledgerVersion,
+                    toCxxBuf(be.liveEntry().data.contractCode()),
+                    toCxxBuf(sorobanConfig->cpuCostParams()),
+                    toCxxBuf(sorobanConfig->memCostParams()));
+
+            cache.putContractCodeMemorySize(lk, memorySizeForRent);
+        }
+
+        return Loop::INCOMPLETE;
+    };
+
+    snap->scanForEntriesOfType(CONTRACT_DATA, contractDataHandler);
+    snap->scanForEntriesOfType(TTL, ttlHandler);
+    snap->scanForEntriesOfType(CONTRACT_CODE, contractCodeHandler);
 }
 
 void
@@ -1470,7 +1514,7 @@ LedgerManagerImpl::setLastClosedLedger(
     // a snapshot _from_ the LCL state.
     auto const& snapshot = mLastClosedLedgerState->getBucketSnapshot();
     mApplyState.compileAllContractsInLedger(snapshot, lv);
-    mApplyState.populateSorobanStateCache(snapshot);
+    mApplyState.populateSorobanStateCache(snapshot, mApp, lv);
 }
 
 void
@@ -2225,6 +2269,20 @@ LedgerManagerImpl::sealLedgerTxnAndTransferEntriesToBucketList(
             {
                 mApplyState.mLedgerStateCache->createTTL(entry);
             }
+            else if (entry.data.type() == CONTRACT_CODE)
+            {
+                auto memorySizeForRent =
+                    rust_bridge::contract_code_memory_size_for_rent(
+                        mApp.getConfig().CURRENT_LEDGER_PROTOCOL_VERSION,
+                        lh.ledgerVersion, toCxxBuf(entry.data.contractCode()),
+                        toCxxBuf(
+                            mApplyState.mSorobanNetworkConfig->cpuCostParams()),
+                        toCxxBuf(mApplyState.mSorobanNetworkConfig
+                                     ->memCostParams()));
+
+                mApplyState.mLedgerStateCache->putContractCodeMemorySize(
+                    LedgerEntryKey(entry), memorySizeForRent);
+            }
         }
 
         for (auto const& entry : liveEntries)
@@ -2237,6 +2295,9 @@ LedgerManagerImpl::sealLedgerTxnAndTransferEntriesToBucketList(
             {
                 mApplyState.mLedgerStateCache->updateTTL(entry);
             }
+
+            // CONTRACT_CODE entries should never be updated
+            releaseAssertOrThrow(entry.data.type() != CONTRACT_CODE);
         }
 
         for (auto const& key : deadEntries)
@@ -2248,6 +2309,10 @@ LedgerManagerImpl::sealLedgerTxnAndTransferEntriesToBucketList(
             else if (key.type() == TTL)
             {
                 mApplyState.mLedgerStateCache->evictTTL(key);
+            }
+            else if (key.type() == CONTRACT_CODE)
+            {
+                mApplyState.mLedgerStateCache->evictContractCodeMemorySize(key);
             }
         }
     }

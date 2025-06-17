@@ -143,7 +143,9 @@ class LedgerManagerImpl : public LedgerManager
 
         // Populates all live Soroban state into the cache from the provided
         // snapshot.
-        void populateSorobanStateCache(SearchableSnapshotConstPtr snap);
+        void populateSorobanStateCache(SearchableSnapshotConstPtr snap,
+                                       Application& app,
+                                       uint32_t ledgerVersion);
 
         ApplyState(Application& app);
     };

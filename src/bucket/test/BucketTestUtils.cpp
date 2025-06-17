@@ -291,6 +291,10 @@ LedgerManagerForBucketTests::sealLedgerTxnAndTransferEntriesToBucketList(
         }
 
         // Use the testing values.
+        mApplyState.addAnyContractsToModuleCache(lh.ledgerVersion,
+                                                 mTestInitEntries);
+        mApplyState.addAnyContractsToModuleCache(lh.ledgerVersion,
+                                                 mTestLiveEntries);
         mApp.getBucketManager().addLiveBatch(
             mApp, lh, mTestInitEntries, mTestLiveEntries, mTestDeadEntries);
 
@@ -309,6 +313,22 @@ LedgerManagerForBucketTests::sealLedgerTxnAndTransferEntriesToBucketList(
                 {
                     mApplyState.mLedgerStateCache->createTTL(entry);
                 }
+                else if (entry.data.type() == CONTRACT_CODE)
+                {
+
+                    auto memorySizeForRent =
+                        rust_bridge::contract_code_memory_size_for_rent(
+                            mApp.getConfig().CURRENT_LEDGER_PROTOCOL_VERSION,
+                            lh.ledgerVersion,
+                            toCxxBuf(entry.data.contractCode()),
+                            toCxxBuf(mApplyState.mSorobanNetworkConfig
+                                         ->cpuCostParams()),
+                            toCxxBuf(mApplyState.mSorobanNetworkConfig
+                                         ->memCostParams()));
+
+                    mApplyState.mLedgerStateCache->putContractCodeMemorySize(
+                        LedgerEntryKey(entry), memorySizeForRent);
+                }
             }
 
             for (auto const& entry : mTestLiveEntries)
@@ -321,6 +341,9 @@ LedgerManagerForBucketTests::sealLedgerTxnAndTransferEntriesToBucketList(
                 {
                     mApplyState.mLedgerStateCache->updateTTL(entry);
                 }
+
+                // CONTRACT_CODE entries should never be updated
+                releaseAssertOrThrow(entry.data.type() != CONTRACT_CODE);
             }
 
             for (auto const& key : mTestDeadEntries)
@@ -332,6 +355,11 @@ LedgerManagerForBucketTests::sealLedgerTxnAndTransferEntriesToBucketList(
                 else if (key.type() == TTL)
                 {
                     mApplyState.mLedgerStateCache->evictTTL(key);
+                }
+                else if (key.type() == CONTRACT_CODE)
+                {
+                    mApplyState.mLedgerStateCache->evictContractCodeMemorySize(
+                        key);
                 }
             }
         }

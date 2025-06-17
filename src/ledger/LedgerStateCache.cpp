@@ -111,7 +111,7 @@ LedgerStateCache::createTTL(LedgerEntry const& ttlEntry)
     }
     else
     {
-        // No ContractData yet - store TTL for later
+        // No ContractData yet - store TTL in TTLs map
         // (Could be ContractCode TTL or orphaned ContractData TTL)
         auto ttlIt = mTTLs.find(lk.ttl().keyHash);
         releaseAssertOrThrow(ttlIt == mTTLs.end());
@@ -167,6 +167,39 @@ LedgerStateCache::getContractCodeTTL(LedgerKey const& ledgerKey) const
     }
 
     return it->second;
+}
+
+std::optional<uint32_t>
+LedgerStateCache::getContractCodeMemorySize(LedgerKey const& ledgerKey) const
+{
+    releaseAssertOrThrow(ledgerKey.type() == LedgerEntryType::CONTRACT_CODE);
+
+    auto it = mContractCodeMemorySize.find(ledgerKey);
+    if (it == mContractCodeMemorySize.end())
+    {
+        return std::nullopt;
+    }
+
+    return it->second;
+}
+
+void
+LedgerStateCache::putContractCodeMemorySize(LedgerKey const& ledgerKey,
+                                            uint32_t memorySizeForRent)
+{
+    releaseAssertOrThrow(ledgerKey.type() == LedgerEntryType::CONTRACT_CODE);
+
+    auto [_, inserted] =
+        mContractCodeMemorySize.emplace(ledgerKey, memorySizeForRent);
+    releaseAssertOrThrow(inserted);
+}
+
+void
+LedgerStateCache::evictContractCodeMemorySize(LedgerKey const& ledgerKey)
+{
+    releaseAssertOrThrow(ledgerKey.type() == LedgerEntryType::CONTRACT_CODE);
+    auto numRemoved = mContractCodeMemorySize.erase(ledgerKey);
+    releaseAssertOrThrow(numRemoved == 1);
 }
 
 bool

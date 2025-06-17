@@ -18,11 +18,12 @@
 #include "lib/catch.hpp"
 #include "main/Application.h"
 #include "main/Config.h"
+#include "rust/RustBridge.h"
+#include "test/TestUtils.h"
 #include "test/test.h"
+#include "transactions/TransactionUtils.h"
 
 #include "util/GlobalChecks.h"
-#include "util/UnorderedMap.h"
-#include "util/UnorderedSet.h"
 #include "util/XDRCereal.h"
 #include "util/types.h"
 #include "xdr/Stellar-ledger-entries.h"
@@ -257,20 +258,14 @@ class BucketIndexTest
             {
                 for (auto& e : toUpdate)
                 {
+                    releaseAssert(e.data.type() != CONTRACT_CODE);
                     e.lastModifiedLedgerSeq++;
                     auto iter = mTestEntries.find(LedgerEntryKey(e));
                     iter->second = e;
 
-                    if (sorobanOnly)
+                    if (sorobanOnly && e.data.type() == CONTRACT_DATA)
                     {
-                        if (e.data.type() == CONTRACT_CODE)
-                        {
-                            mContractCodeEntries.emplace(LedgerEntryKey(e), e);
-                        }
-                        else if (e.data.type() == CONTRACT_DATA)
-                        {
-                            mContractDataEntries.emplace(LedgerEntryKey(e), e);
-                        }
+                        mContractDataEntries.emplace(LedgerEntryKey(e), e);
                     }
                 }
 
@@ -305,7 +300,8 @@ class BucketIndexTest
                     {
                         mTestEntries.emplace(LedgerEntryKey(e), e);
                         mKeysToSearch.emplace(LedgerEntryKey(e));
-                        if (rand_flip())
+                        // CONTRACT_CODE entries should never be updated
+                        if (rand_flip() && e.data.type() != CONTRACT_CODE)
                         {
                             if (e.data.type() == TTL)
                             {
@@ -1101,7 +1097,8 @@ TEST_CASE("soroban cache population", "[soroban][bucketindex]")
         test.buildMultiVersionTest(/*sorobanOnly=*/true);
         test.run();
 
-        auto& lm = test.getApp().getLedgerManager();
+        auto& app = test.getApp();
+        auto& lm = app.getLedgerManager();
         auto codeEntries = test.getContractCodeEntries();
         auto dataEntries = test.getContractDataEntries();
 
@@ -1113,15 +1110,37 @@ TEST_CASE("soroban cache population", "[soroban][bucketindex]")
                                 .copySearchableLiveBucketListSnapshot();
 
             // First, test that the cache is maintained correctly via `addBatch`
-            REQUIRE(codeEntries.size() == cache.mTTLs.size());
+            REQUIRE(codeEntries.size() == cache.mContractCodeMemorySize.size());
             for (auto const& [k, v] : codeEntries)
             {
                 auto ttl = cache.getContractCodeTTL(k);
                 REQUIRE(ttl);
 
+                auto memorySize = cache.getContractCodeMemorySize(k);
+                REQUIRE(memorySize);
+
                 auto ttlEntry = snapshot->load(getTTLKey(k));
                 REQUIRE(ttlEntry);
                 REQUIRE(ttlEntry->data.ttl().liveUntilLedgerSeq == ttl);
+
+                // Verify memory size calculation by recalculating it
+                auto contractCodeLe = snapshot->load(k);
+                REQUIRE(contractCodeLe);
+
+                auto const& sorobanConfig =
+                    lm.getSorobanNetworkConfigForApply();
+                auto ledgerVersion =
+                    lm.getLastClosedLedgerHeader().header.ledgerVersion;
+
+                auto expectedMemorySize =
+                    rust_bridge::contract_code_memory_size_for_rent(
+                        app.getConfig().CURRENT_LEDGER_PROTOCOL_VERSION,
+                        ledgerVersion,
+                        toCxxBuf(contractCodeLe->data.contractCode()),
+                        toCxxBuf(sorobanConfig.cpuCostParams()),
+                        toCxxBuf(sorobanConfig.memCostParams()));
+
+                REQUIRE(*memorySize == expectedMemorySize);
             }
 
             REQUIRE(dataEntries.size() == cache.mContractDataEntries.size());

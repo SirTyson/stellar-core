@@ -383,6 +383,22 @@ makeValid(ContractCodeEntry& cce)
     auto seed = rand_uniform<uint64_t>(0, UINT64_MAX);
     auto size = rand_uniform<size_t>(64, 150);
     auto wasmBuf = rust_bridge::get_random_wasm(size, seed);
+    cce.ext.v(1);
+
+    // Set cost types such that the memory model cost is < uint32_t max
+    // Otherwise, the host will throw when trying to compute the cost
+    auto& cost = cce.ext.v1().costInputs;
+    cost.nInstructions = rand_uniform<uint64_t>(0, 100);
+    cost.nFunctions = rand_uniform<uint64_t>(0, 100);
+    cost.nGlobals = rand_uniform<uint64_t>(0, 100);
+    cost.nTableEntries = rand_uniform<uint64_t>(0, 100);
+    cost.nTypes = rand_uniform<uint64_t>(0, 100);
+    cost.nDataSegments = rand_uniform<uint64_t>(0, 100);
+    cost.nElemSegments = rand_uniform<uint64_t>(0, 100);
+    cost.nImports = rand_uniform<uint64_t>(0, 100);
+    cost.nExports = rand_uniform<uint64_t>(0, 100);
+    cost.nDataSegmentBytes = rand_uniform<uint64_t>(0, 100);
+
     cce.code.assign(wasmBuf.data.data(),
                     wasmBuf.data.data() + wasmBuf.data.size());
     cce.hash = sha256(cce.code);

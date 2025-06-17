@@ -256,6 +256,10 @@ class LedgerStateCache : public NonMovableOrCopyable
     // data entries.
     std::unordered_map<uint256, uint32_t> mTTLs;
 
+    // Storage for ContractCode memory sizes for rent calculation
+    // Maps CONTRACT_CODE LedgerKey to memory size
+    std::unordered_map<LedgerKey, uint32_t> mContractCodeMemorySize;
+
   private:
     // Helper to update an existing ContractData entry's TTL without changing
     // data
@@ -298,6 +302,20 @@ class LedgerStateCache : public NonMovableOrCopyable
     // type CONTRACT_CODE.
     std::optional<uint32_t>
     getContractCodeTTL(LedgerKey const& ledgerKey) const;
+
+    // Returns nullopt if the entry is not in the cache. LedgerKey must be of
+    // type CONTRACT_CODE. Returns the memory size for rent calculation.
+    std::optional<uint32_t>
+    getContractCodeMemorySize(LedgerKey const& ledgerKey) const;
+
+    // Stores the memory size for a CONTRACT_CODE entry.
+    // LedgerKey must be of type CONTRACT_CODE.
+    void putContractCodeMemorySize(LedgerKey const& ledgerKey,
+                                   uint32_t memorySizeForRent);
+
+    // Evicts a ContractCode memory size from the cache. LedgerKey must be of
+    // type CONTRACT_CODE.
+    void evictContractCodeMemorySize(LedgerKey const& ledgerKey);
 
     // Returns true if the given TTL entry exists in the cache. LedgerKey must
     // be of type TTL.
