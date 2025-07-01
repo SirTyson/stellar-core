@@ -307,6 +307,11 @@ LedgerManagerImpl::startNewLedger(LedgerHeader const& genesisLedger)
     auto ledgerTime = mApplyState.mMetrics.mLedgerClose.TimeScope();
     SecretKey skey = SecretKey::fromSeed(mApp.getNetworkID());
 
+    // mInMemorySorobanState is expected to exist when we go through the ledger
+    // close flow, so initialize empty in-memory state.
+    mApplyState.mInMemorySorobanState =
+        std::make_unique<InMemorySorobanState>();
+
     LedgerTxn ltx(mApp.getLedgerTxnRoot(), false);
     auto const& cfg = mApp.getConfig();
 
@@ -365,11 +370,6 @@ LedgerManagerImpl::startNewLedger(LedgerHeader const& genesisLedger)
     CLOG_INFO(Ledger, "Established genesis ledger, closing");
     CLOG_INFO(Ledger, "Root account: {}", skey.getStrKeyPublic());
     CLOG_INFO(Ledger, "Root account seed: {}", skey.getStrKeySeed().value);
-
-    // mInMemorySorobanState is expected to exist when we go through the ledger
-    // close flow, so initialize empty in-memory state.
-    mApplyState.mInMemorySorobanState =
-        std::make_unique<InMemorySorobanState>();
 
     auto output =
         sealLedgerTxnAndStoreInBucketsAndDB(ltx, /*ledgerCloseMeta*/ nullptr,
@@ -713,6 +713,13 @@ LedgerManagerImpl::getModuleCache()
     // transactions during apply only.
     releaseAssert(!mApplyState.mCompiler);
     return mApplyState.mModuleCache->shallow_clone();
+}
+
+InMemorySorobanState const&
+LedgerManagerImpl::getInMemorySorobanState() const
+{
+    releaseAssert(mApplyState.mInMemorySorobanState);
+    return *mApplyState.mInMemorySorobanState;
 }
 
 void
