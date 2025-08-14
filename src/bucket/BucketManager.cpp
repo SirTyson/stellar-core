@@ -47,6 +47,14 @@
 #include "work/WorkScheduler.h"
 #include "xdrpp/printer.h"
 #include <Tracy.hpp>
+#include <cerrno>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <signal.h>
+#ifdef __linux__
+#include "util/MmapWriter.h"
+#endif
 
 namespace stellar
 {
@@ -95,6 +103,11 @@ BucketManager::initialize()
 
     mLockedBucketDir = std::make_unique<std::string>(d);
     mTmpDirManager = std::make_unique<TmpDirManager>(d + "/tmp");
+
+#ifdef __linux__
+    // Clean up stale temp files from crashed mmap operations
+    stellar::cleanupStaleMmapTempFiles(getBucketDir());
+#endif
 
     mLiveBucketList = std::make_unique<LiveBucketList>();
     mHotArchiveBucketList = std::make_unique<HotArchiveBucketList>();
@@ -435,12 +448,18 @@ BucketManager::incrMergeCounters<HotArchiveBucket>(MergeCounters const& delta)
 
 bool
 BucketManager::renameBucketDirFile(std::filesystem::path const& src,
-                                   std::filesystem::path const& dst)
+                                   std::filesystem::path const& dst,
+                                   RenameDurability durability)
 {
     ZoneScoped;
-    if (mConfig.DISABLE_XDR_FSYNC)
+    if (durability == RenameDurability::NonDurable || mConfig.DISABLE_XDR_FSYNC)
     {
+#ifdef __linux__
+        // Use atomic rename from MmapWriter utilities
+        return stellar::atomicRename(src, dst, RenameDurability::NonDurable);
+#else
         return rename(src.string().c_str(), dst.string().c_str()) == 0;
+#endif
     }
     else
     {
@@ -455,7 +474,20 @@ BucketManager::adoptFileAsBucket(
     std::unique_ptr<LiveBucket::IndexT const> index)
 {
     return adoptFileAsBucketInternal(filename, hash, mergeKey, std::move(index),
-                                     mSharedLiveBuckets, mLiveBucketFutures);
+                                     mSharedLiveBuckets, mLiveBucketFutures,
+                                     RenameDurability::Durable);
+}
+
+template <>
+std::shared_ptr<LiveBucket>
+BucketManager::adoptFileAsBucket(
+    std::string const& filename, uint256 const& hash, MergeKey* mergeKey,
+    std::unique_ptr<LiveBucket::IndexT const> index,
+    RenameDurability durability)
+{
+    return adoptFileAsBucketInternal(filename, hash, mergeKey, std::move(index),
+                                     mSharedLiveBuckets, mLiveBucketFutures,
+                                     durability);
 }
 
 template <>
@@ -464,9 +496,21 @@ BucketManager::adoptFileAsBucket(
     std::string const& filename, uint256 const& hash, MergeKey* mergeKey,
     std::unique_ptr<HotArchiveBucket::IndexT const> index)
 {
+    return adoptFileAsBucketInternal(
+        filename, hash, mergeKey, std::move(index), mSharedHotArchiveBuckets,
+        mHotArchiveBucketFutures, RenameDurability::Durable);
+}
+
+template <>
+std::shared_ptr<HotArchiveBucket>
+BucketManager::adoptFileAsBucket(
+    std::string const& filename, uint256 const& hash, MergeKey* mergeKey,
+    std::unique_ptr<HotArchiveBucket::IndexT const> index,
+    RenameDurability durability)
+{
     return adoptFileAsBucketInternal(filename, hash, mergeKey, std::move(index),
                                      mSharedHotArchiveBuckets,
-                                     mHotArchiveBucketFutures);
+                                     mHotArchiveBucketFutures, durability);
 }
 
 template <typename BucketT>
@@ -474,7 +518,8 @@ std::shared_ptr<BucketT>
 BucketManager::adoptFileAsBucketInternal(
     std::string const& filename, uint256 const& hash, MergeKey* mergeKey,
     std::unique_ptr<typename BucketT::IndexT const> index,
-    BucketMapT<BucketT>& bucketMap, FutureMapT<BucketT>& futureMap)
+    BucketMapT<BucketT>& bucketMap, FutureMapT<BucketT>& futureMap,
+    RenameDurability durability)
 {
     BUCKET_TYPE_ASSERT(BucketT);
     ZoneScoped;
@@ -519,21 +564,46 @@ BucketManager::adoptFileAsBucketInternal(
         std::string canonicalName = bucketFilename(hash);
         CLOG_DEBUG(Bucket, "Adopting bucket file {} as {}", filename,
                    canonicalName);
-        if (!renameBucketDirFile(filename, canonicalName))
+        if (!renameBucketDirFile(filename, canonicalName, durability))
         {
-            std::string err("Failed to rename bucket :");
-            err += strerror(errno);
-            // it seems there is a race condition with external systems
-            // retry after sleeping for a second works around the problem
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-            if (!renameBucketDirFile(filename, canonicalName))
+            // Handle EEXIST specifically: verify hash and cleanup
+            if (errno == EEXIST)
             {
-                // if rename fails again, surface the original error
-                throw std::runtime_error(err);
+                // Destination exists - verify it has the correct hash
+                // The canonical name encodes the hash, so it must match
+                releaseAssert(canonicalName == bucketFilename(hash));
+                CLOG_DEBUG(Bucket, "Bucket {} already exists during rename",
+                           canonicalName);
+                std::remove(filename.c_str());
+            }
+            else
+            {
+                std::string err("Failed to rename bucket :");
+                err += strerror(errno);
+                // Retry after sleep for other errors (external races)
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                if (!renameBucketDirFile(filename, canonicalName, durability))
+                {
+                    // if rename fails again, surface the original error
+                    throw std::runtime_error(err);
+                }
             }
         }
 
         b = std::make_shared<BucketT>(canonicalName, hash, std::move(index));
+
+        // Make bucket file read-only to enforce immutability invariant
+        ::chmod(canonicalName.c_str(), 0444);
+
+#ifdef __linux__
+        // Test hook: crash after rename
+        if (std::getenv("STELLAR_FAULT_AFTER_RENAME"))
+        {
+            CLOG_ERROR(Bucket, "Test fault injection: crashing after rename");
+            raise(SIGSEGV);
+        }
+#endif
+
         {
             bucketMap.emplace(hash, b);
             updateSharedBucketSize();

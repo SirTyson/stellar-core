@@ -11,8 +11,15 @@
 #include "ledger/LedgerTypeUtils.h"
 #include "util/GlobalChecks.h"
 #include "util/ProtocolVersion.h"
+#include "util/XDROperators.h"
 #include <Tracy.hpp>
 #include <filesystem>
+#include <fmt/format.h>
+
+#ifdef __linux__
+#include <cstdlib>
+#include <signal.h>
+#endif
 
 namespace stellar
 {
@@ -22,14 +29,21 @@ namespace stellar
  * hashes them while writing to either destination. Produces a Bucket when done.
  */
 template <typename BucketT>
-BucketOutputIterator<BucketT>::BucketOutputIterator(std::string const& tmpDir,
-                                                    bool keepTombstoneEntries,
-                                                    BucketMetadata const& meta,
-                                                    MergeCounters& mc,
-                                                    asio::io_context& ctx,
-                                                    bool doFsync)
-    : mFilename(BucketT::randomBucketName(tmpDir))
-    , mOut(ctx, doFsync)
+BucketOutputIterator<BucketT>::BucketOutputIterator(
+    std::string const& tmpDir, bool keepTombstoneEntries,
+    BucketMetadata const& meta, MergeCounters& mc, asio::io_context& ctx,
+    bool doFsync, BucketWriteMode mode, std::string const& bucketDir)
+    : mMode(mode)
+#ifdef __linux__
+    , mSink(mode == BucketWriteMode::MmapCrashOnlyLinux
+                ? std::variant<XDROutputFileStream, MmapWriter>(
+                      std::in_place_type<MmapWriter>)
+                : std::variant<XDROutputFileStream, MmapWriter>(
+                      std::in_place_type<XDROutputFileStream>, ctx, doFsync))
+#else
+    , mSink(ctx, doFsync)
+#endif
+    , mBucketDir(bucketDir)
     , mCtx(ctx)
     , mBuf(nullptr)
     , mKeepTombstoneEntries(keepTombstoneEntries)
@@ -37,10 +51,40 @@ BucketOutputIterator<BucketT>::BucketOutputIterator(std::string const& tmpDir,
     , mMergeCounters(mc)
 {
     ZoneScoped;
-    CLOG_TRACE(Bucket, "BucketOutputIterator opening file to write: {}",
-               mFilename);
-    // Will throw if unable to open the file
-    mOut.open(mFilename.string());
+
+#ifdef __linux__
+    if (mode == BucketWriteMode::MmapCrashOnlyLinux)
+    {
+        releaseAssert(!bucketDir.empty());
+        // Estimate initial capacity based on typical bucket sizes
+        // Start with 8MB, will grow as needed
+        size_t initialCap = 8 << 20;
+        auto& sink = std::get<MmapWriter>(mSink);
+        sink.openInDir(bucketDir, "top", initialCap);
+        mFilename = sink.tempPath();
+        CLOG_TRACE(Bucket, "BucketOutputIterator opened mmap file: {}",
+                   mFilename);
+
+        // Test hook: crash after opening
+        if (std::getenv("STELLAR_FAULT_AFTER_MMAP_OPEN"))
+        {
+            CLOG_ERROR(Bucket,
+                       "Test fault injection: crashing after mmap open");
+            raise(SIGSEGV);
+        }
+    }
+    else
+#endif
+    {
+        mFilename = BucketT::randomBucketName(tmpDir);
+        CLOG_TRACE(Bucket, "BucketOutputIterator opening file to write: {}",
+                   mFilename);
+#ifdef __linux__
+        std::get<XDROutputFileStream>(mSink).open(mFilename.string());
+#else
+        mSink.open(mFilename.string());
+#endif
+    }
 
     if (protocolVersionStartsFrom(
             meta.ledgerVersion,
@@ -71,6 +115,56 @@ BucketOutputIterator<BucketT>::BucketOutputIterator(std::string const& tmpDir,
 
         mPutMeta = true;
     }
+}
+
+template <typename BucketT>
+void
+BucketOutputIterator<BucketT>::writeOneViaSink(
+    typename BucketT::EntryT const& e)
+{
+    ZoneScoped;
+
+#ifdef __linux__
+    if (mMode == BucketWriteMode::MmapCrashOnlyLinux)
+    {
+        // Serialize XDR directly to a temp buffer then write to mmap
+        // This mimics XDROutputFileStream::writeOne
+        uint32_t sz = (uint32_t)xdr::xdr_size(e);
+        releaseAssertOrThrow(sz < 0x80000000);
+
+        // Reuse serialization buffer to avoid per-entry allocations
+        mSerBuf.resize(sz + 4);
+
+        // Write 4 bytes of size, big-endian, with XDR 'continuation' bit set
+        // The high bit (0x80) marks this as XDR framing, not a fragment
+        mSerBuf[0] = static_cast<char>(((sz >> 24) & 0xFF) | 0x80);
+        mSerBuf[1] = static_cast<char>((sz >> 16) & 0xFF);
+        mSerBuf[2] = static_cast<char>((sz >> 8) & 0xFF);
+        mSerBuf[3] = static_cast<char>(sz & 0xFF);
+        xdr::xdr_put p(mSerBuf.data() + 4, mSerBuf.data() + 4 + sz);
+        xdr_argpack_archive(p, e);
+
+        // xdr_argpack_archive throws if it can't write all bytes, so if we
+        // reach this point, exactly sz bytes were written
+
+        // Write serialized data to mmap
+        auto& sink = std::get<MmapWriter>(mSink);
+        sink.write(mSerBuf.data(), sz + 4);
+
+        // Update hasher and counters
+        mHasher.add(ByteSlice(mSerBuf.data(), sz + 4));
+        mBytesPut += (sz + 4);
+    }
+    else
+#endif
+    {
+#ifdef __linux__
+        std::get<XDROutputFileStream>(mSink).writeOne(e, &mHasher, &mBytesPut);
+#else
+        mSink.writeOne(e, &mHasher, &mBytesPut);
+#endif
+    }
+    mObjectsPut++;
 }
 
 template <typename BucketT>
@@ -150,8 +244,7 @@ BucketOutputIterator<BucketT>::put(typename BucketT::EntryT const& e)
         if (mCmp(*mBuf, e))
         {
             ++mMergeCounters.mOutputIteratorActualWrites;
-            mOut.writeOne(*mBuf, &mHasher, &mBytesPut);
-            mObjectsPut++;
+            writeOneViaSink(*mBuf);
         }
     }
     else
@@ -169,17 +262,38 @@ std::shared_ptr<BucketT>
 BucketOutputIterator<BucketT>::getBucket(
     BucketManager& bucketManager, MergeKey* mergeKey,
     std::optional<std::vector<typename BucketT::EntryT>> inMemoryState,
-    bool shouldIndex)
+    bool shouldIndex, RenameDurability durability)
 {
     ZoneScoped;
     if (mBuf)
     {
-        mOut.writeOne(*mBuf, &mHasher, &mBytesPut);
-        mObjectsPut++;
+        writeOneViaSink(*mBuf);
         mBuf.reset();
     }
 
-    mOut.close();
+#ifdef __linux__
+    if (mMode == BucketWriteMode::MmapCrashOnlyLinux)
+    {
+        auto& sink = std::get<MmapWriter>(mSink);
+
+        // Test hook: crash before rename
+        if (std::getenv("STELLAR_FAULT_BEFORE_RENAME"))
+        {
+            CLOG_ERROR(Bucket, "Test fault injection: crashing before rename");
+            raise(SIGSEGV);
+        }
+
+        // Finalize the file: shrink to actual size, msync, mark read-only
+        sink.finalize();
+        sink.close();
+    }
+    else
+    {
+        std::get<XDROutputFileStream>(mSink).close();
+    }
+#else
+    mSink.close();
+#endif
     if (mObjectsPut == 0 || mBytesPut == 0)
     {
         releaseAssert(mObjectsPut == 0);
@@ -219,7 +333,7 @@ BucketOutputIterator<BucketT>::getBucket(
     }
 
     auto b = bucketManager.adoptFileAsBucket<BucketT>(
-        mFilename.string(), hash, mergeKey, std::move(index));
+        mFilename.string(), hash, mergeKey, std::move(index), durability);
 
     if constexpr (std::is_same_v<BucketT, LiveBucket>)
     {

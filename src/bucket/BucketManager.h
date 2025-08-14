@@ -146,7 +146,8 @@ class BucketManager : NonMovableOrCopyable
     std::shared_ptr<BucketT> adoptFileAsBucketInternal(
         std::string const& filename, uint256 const& hash, MergeKey* mergeKey,
         std::unique_ptr<typename BucketT::IndexT const> index,
-        BucketMapT<BucketT>& bucketMap, FutureMapT<BucketT>& futureMap);
+        BucketMapT<BucketT>& bucketMap, FutureMapT<BucketT>& futureMap,
+        RenameDurability durability = RenameDurability::Durable);
 
     template <class BucketT>
     std::shared_ptr<BucketT>
@@ -199,8 +200,9 @@ class BucketManager : NonMovableOrCopyable
     LiveBucketList& getLiveBucketList();
     HotArchiveBucketList& getHotArchiveBucketList();
     BucketSnapshotManager& getBucketSnapshotManager() const;
-    bool renameBucketDirFile(std::filesystem::path const& src,
-                             std::filesystem::path const& dst);
+    bool renameBucketDirFile(
+        std::filesystem::path const& src, std::filesystem::path const& dst,
+        RenameDurability durability = RenameDurability::Durable);
 
     medida::Timer& getMergeTimer();
 
@@ -239,6 +241,14 @@ class BucketManager : NonMovableOrCopyable
     // inputs to be GC'ed.
     template <class BucketT>
     void noteEmptyMergeOutput(MergeKey const& mergeKey);
+
+    // Version of adoptFileAsBucket with configurable durability
+    template <class BucketT>
+    std::shared_ptr<BucketT>
+    adoptFileAsBucket(std::string const& filename, uint256 const& hash,
+                      MergeKey* mergeKey,
+                      std::unique_ptr<typename BucketT::IndexT const> index,
+                      RenameDurability durability);
 
     // Returns a bucket by hash if it exists and is currently managed by the
     // bucket list.

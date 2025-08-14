@@ -22,6 +22,20 @@ class Counter;
 namespace stellar
 {
 
+enum class BucketWriteMode
+{
+    Stream,
+#ifdef __linux__
+    MmapCrashOnlyLinux
+#endif
+};
+
+enum class RenameDurability
+{
+    Durable,
+    NonDurable
+};
+
 class Application;
 class LiveBucket;
 class HotArchiveBucket;

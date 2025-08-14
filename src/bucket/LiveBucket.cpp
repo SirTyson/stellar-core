@@ -445,8 +445,21 @@ LiveBucket::fresh(BucketManager& bucketManager, uint32_t protocolVersion,
         convertToBucketEntry(useInit, initEntries, liveEntries, deadEntries);
 
     MergeCounters mc;
+#ifdef __linux__
+    // For storeInMemory case (top-level snap bucket), use mmap mode if enabled
+    BucketWriteMode mode = BucketWriteMode::Stream;
+    std::string bucketDir = "";
+    if (storeInMemory && bucketManager.getConfig().ENABLE_MMAP_BUCKET_WRITES)
+    {
+        mode = BucketWriteMode::MmapCrashOnlyLinux;
+        bucketDir = bucketManager.getBucketDir();
+    }
+    LiveBucketOutputIterator out(bucketManager.getTmpDir(), true, meta, mc, ctx,
+                                 doFsync, mode, bucketDir);
+#else
     LiveBucketOutputIterator out(bucketManager.getTmpDir(), true, meta, mc, ctx,
                                  doFsync);
+#endif
     for (auto const& e : entries)
     {
         out.put(e);
@@ -459,8 +472,14 @@ LiveBucket::fresh(BucketManager& bucketManager, uint32_t protocolVersion,
 
     if (storeInMemory)
     {
+#ifdef __linux__
+        // Use non-durable rename for top-level buckets
+        return out.getBucket(bucketManager, nullptr, std::move(entries),
+                             shouldIndex, RenameDurability::NonDurable);
+#else
         return out.getBucket(bucketManager, nullptr, std::move(entries),
                              shouldIndex);
+#endif
     }
 
     return out.getBucket(bucketManager);
@@ -558,9 +577,22 @@ LiveBucket::mergeInMemory(BucketManager& bucketManager,
     }
 
     // Write merge output to a bucket and save to disk
+#ifdef __linux__
+    // Use mmap mode for Linux builds on top-level bucket if enabled
+    BucketWriteMode mode = bucketManager.getConfig().ENABLE_MMAP_BUCKET_WRITES
+                               ? BucketWriteMode::MmapCrashOnlyLinux
+                               : BucketWriteMode::Stream;
+    std::string bucketDir = bucketManager.getConfig().ENABLE_MMAP_BUCKET_WRITES
+                                ? bucketManager.getBucketDir()
+                                : "";
+    LiveBucketOutputIterator out(bucketManager.getTmpDir(),
+                                 /*keepTombstoneEntries=*/true, meta, mc, ctx,
+                                 doFsync, mode, bucketDir);
+#else
     LiveBucketOutputIterator out(bucketManager.getTmpDir(),
                                  /*keepTombstoneEntries=*/true, meta, mc, ctx,
                                  doFsync);
+#endif
 
     for (auto const& e : mergedEntries)
     {
@@ -569,7 +601,17 @@ LiveBucket::mergeInMemory(BucketManager& bucketManager,
 
     // Store the merged entries in memory in the new bucket in case this
     // bucket sees another incoming merge as level 0 curr.
+#ifdef __linux__
+    // Use non-durable rename for Linux mmap mode if enabled
+    RenameDurability durability =
+        bucketManager.getConfig().ENABLE_MMAP_BUCKET_WRITES
+            ? RenameDurability::NonDurable
+            : RenameDurability::Durable;
+    return out.getBucket(bucketManager, nullptr, std::move(mergedEntries),
+                         /*shouldIndex=*/true, durability);
+#else
     return out.getBucket(bucketManager, nullptr, std::move(mergedEntries));
+#endif
 }
 
 BucketEntryCounters const&

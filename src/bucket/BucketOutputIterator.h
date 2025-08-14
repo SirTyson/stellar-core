@@ -12,6 +12,11 @@
 #include <memory>
 #include <string>
 
+#ifdef __linux__
+#include "util/MmapWriter.h"
+#include <variant>
+#endif
+
 namespace stellar
 {
 
@@ -25,8 +30,15 @@ template <typename BucketT> class BucketOutputIterator
     BUCKET_TYPE_ASSERT(BucketT);
 
   protected:
+    BucketWriteMode mMode;
+#ifdef __linux__
+    std::variant<XDROutputFileStream, MmapWriter> mSink;
+    std::vector<char> mSerBuf; // Reusable serialization buffer for mmap mode
+#else
+    XDROutputFileStream mSink;
+#endif
     std::filesystem::path mFilename;
-    XDROutputFileStream mOut;
+    std::string mBucketDir; // For mmap mode
     BucketEntryIdCmp<BucketT> mCmp;
     asio::io_context& mCtx;
     std::unique_ptr<typename BucketT::EntryT> mBuf;
@@ -38,6 +50,8 @@ template <typename BucketT> class BucketOutputIterator
     bool mPutMeta{false};
     MergeCounters& mMergeCounters;
 
+    void writeOneViaSink(typename BucketT::EntryT const& e);
+
   public:
     // BucketOutputIterators must _always_ be constructed with BucketMetadata,
     // regardless of the ledger version the bucket is being written from, even
@@ -48,7 +62,9 @@ template <typename BucketT> class BucketOutputIterator
     // (or forget to do), it's handled automatically.
     BucketOutputIterator(std::string const& tmpDir, bool keepTombstoneEntries,
                          BucketMetadata const& meta, MergeCounters& mc,
-                         asio::io_context& ctx, bool doFsync);
+                         asio::io_context& ctx, bool doFsync,
+                         BucketWriteMode mode = BucketWriteMode::Stream,
+                         std::string const& bucketDir = "");
 
     void put(typename BucketT::EntryT const& e);
 
@@ -56,6 +72,7 @@ template <typename BucketT> class BucketOutputIterator
         BucketManager& bucketManager, MergeKey* mergeKey = nullptr,
         std::optional<std::vector<typename BucketT::EntryT>> inMemoryState =
             std::nullopt,
-        bool shouldIndex = true);
+        bool shouldIndex = true,
+        RenameDurability durability = RenameDurability::Durable);
 };
 }

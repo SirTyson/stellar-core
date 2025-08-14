@@ -169,6 +169,7 @@ Config::Config() : NODE_SEED(SecretKey::random())
     BACKGROUND_OVERLAY_PROCESSING = true;
     EXPERIMENTAL_PARALLEL_LEDGER_APPLY = false;
     EXPERIMENTAL_BACKGROUND_TX_SIG_VERIFICATION = false;
+    ENABLE_MMAP_BUCKET_WRITES = true; // Default to mmap optimization on Linux
     BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT = 14; // 2^14 == 16 kb
     BUCKETLIST_DB_INDEX_CUTOFF = 20;             // 20 mb
     BUCKETLIST_DB_MEMORY_FOR_CACHING = 0;
@@ -1134,6 +1135,8 @@ Config::processConfig(std::shared_ptr<cpptoml::table> t)
                  }},
                 {"EXPERIMENTAL_TRIGGER_TIMER",
                  [&]() { EXPERIMENTAL_TRIGGER_TIMER = readBool(item); }},
+                {"ENABLE_MMAP_BUCKET_WRITES",
+                 [&]() { ENABLE_MMAP_BUCKET_WRITES = readBool(item); }},
                 {"ARTIFICIALLY_DELAY_LEDGER_CLOSE_FOR_TESTING",
                  [&]() {
                      ARTIFICIALLY_DELAY_LEDGER_CLOSE_FOR_TESTING =

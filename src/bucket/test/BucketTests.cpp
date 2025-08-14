@@ -1016,3 +1016,100 @@ TEST_CASE_VERSIONS("merging bucket entries with initentry with shadows",
         }
     });
 }
+
+#ifdef __linux__
+TEST_CASE("mmap and stream modes produce identical bucket hashes", "[bucket]")
+{
+    VirtualClock clock;
+    Config cfg = getTestConfig();
+
+    auto live = LedgerTestUtils::generateValidUniqueLedgerEntries(1000);
+    auto dead = LedgerTestUtils::generateValidLedgerEntryKeysWithExclusions(
+        {CONFIG_SETTING}, 100);
+
+    // Test with mmap both enabled and disabled
+    std::vector<Hash> hashes;
+    std::vector<size_t> fileSizes;
+
+    for (bool enableMmap : {true, false})
+    {
+        VirtualClock localClock;
+        Config localCfg = getTestConfig();
+        localCfg.ENABLE_MMAP_BUCKET_WRITES = enableMmap;
+        Application::pointer app = createTestApplication(localClock, localCfg);
+
+        CLOG_INFO(Bucket, "Testing with ENABLE_MMAP_BUCKET_WRITES={}",
+                  enableMmap ? "true" : "false");
+
+        // Create a fresh bucket with the same data
+        auto bucket = LiveBucket::fresh(
+            app->getBucketManager(), getAppLedgerVersion(app), {}, live, dead,
+            /*countMergeEvents=*/true, localClock.getIOContext(),
+            /*doFsync=*/true);
+
+        // Store hash and file size
+        hashes.push_back(bucket->getHash());
+        fileSizes.push_back(fileSize(bucket->getFilename().string()));
+
+        CLOG_INFO(Bucket, "Mode: {}, Hash: {}, Size: {}",
+                  enableMmap ? "mmap" : "stream", binToHex(bucket->getHash()),
+                  fileSizes.back());
+    }
+
+    // Verify both modes produced identical results
+    REQUIRE(hashes[0] == hashes[1]);
+    REQUIRE(fileSizes[0] == fileSizes[1]);
+
+    // Test with merges as well
+    hashes.clear();
+    fileSizes.clear();
+
+    // Generate merge test data once
+    auto live1 = LedgerTestUtils::generateValidUniqueLedgerEntries(500);
+    auto dead1 = LedgerTestUtils::generateValidLedgerEntryKeysWithExclusions(
+        {CONFIG_SETTING}, 50);
+    auto live2 = LedgerTestUtils::generateValidUniqueLedgerEntries(500);
+    auto dead2 = LedgerTestUtils::generateValidLedgerEntryKeysWithExclusions(
+        {CONFIG_SETTING}, 50);
+
+    for (bool enableMmap : {true, false})
+    {
+        VirtualClock localClock;
+        Config localCfg = getTestConfig();
+        localCfg.ENABLE_MMAP_BUCKET_WRITES = enableMmap;
+        Application::pointer app = createTestApplication(localClock, localCfg);
+
+        // Create initial bucket with the same data
+        auto bucket1 = LiveBucket::fresh(
+            app->getBucketManager(), getAppLedgerVersion(app), {}, live1, dead1,
+            /*countMergeEvents=*/true, localClock.getIOContext(),
+            /*doFsync=*/true);
+
+        // Create second bucket with the same data
+        auto bucket2 = LiveBucket::fresh(
+            app->getBucketManager(), getAppLedgerVersion(app), {}, live2, dead2,
+            /*countMergeEvents=*/true, localClock.getIOContext(),
+            /*doFsync=*/true);
+
+        // Merge buckets
+        auto merged = LiveBucket::merge(
+            app->getBucketManager(), app->getConfig().LEDGER_PROTOCOL_VERSION,
+            bucket1, bucket2,
+            /*shadows=*/{},
+            /*keepTombstoneEntries=*/false,
+            /*countMergeEvents=*/true, localClock.getIOContext(),
+            /*doFsync=*/true);
+
+        hashes.push_back(merged->getHash());
+        fileSizes.push_back(fileSize(merged->getFilename().string()));
+
+        CLOG_INFO(Bucket, "Merged Mode: {}, Hash: {}, Size: {}",
+                  enableMmap ? "mmap" : "stream", binToHex(merged->getHash()),
+                  fileSizes.back());
+    }
+
+    // Verify merged buckets also produce identical results
+    REQUIRE(hashes[0] == hashes[1]);
+    REQUIRE(fileSizes[0] == fileSizes[1]);
+}
+#endif

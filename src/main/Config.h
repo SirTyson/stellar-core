@@ -506,6 +506,13 @@ class Config : public std::enable_shared_from_this<Config>
     // also enabled. (experimental)
     bool EXPERIMENTAL_BACKGROUND_TX_SIG_VERIFICATION;
 
+    // When set to true (default), uses memory-mapped I/O for writing top-level
+    // LiveBucket files on Linux. This optimization eliminates fsync operations
+    // in the hot path by using MAP_SHARED and relying on kernel writeback.
+    // Set to false to use traditional file-based I/O. Only affects Linux
+    // builds.
+    bool ENABLE_MMAP_BUCKET_WRITES;
+
     // When set to true, BucketListDB indexes are persisted on-disk so that the
     // BucketList does not need to be reindexed on startup. Defaults to true.
     // This should only be set to false for testing purposes

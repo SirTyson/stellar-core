@@ -7,6 +7,10 @@
 #include "bucket/BucketUtils.h"
 #include "bucket/HotArchiveBucket.h"
 #include "bucket/HotArchiveBucketList.h"
+#ifdef __linux__
+#include "util/MmapWriter.h"
+#endif
+#include "util/XDRStream.h"
 #include "catchup/CatchupRange.h"
 #include "crypto/Hex.h"
 #include "crypto/Random.h"
@@ -182,10 +186,23 @@ BucketOutputIteratorForTesting<BucketT>::writeTmpTestBucket()
 
     // Finish writing and close the bucket file
     REQUIRE(this->mBuf);
-    this->mOut.writeOne(*this->mBuf, &this->mHasher, &this->mBytesPut);
-    this->mObjectsPut++;
+    this->writeOneViaSink(*this->mBuf);
     this->mBuf.reset();
-    this->mOut.close();
+    
+#ifdef __linux__
+    if (this->mMode == BucketWriteMode::MmapCrashOnlyLinux)
+    {
+        auto& sink = std::get<MmapWriter>(this->mSink);
+        sink.finalize();
+        sink.close();
+    }
+    else
+    {
+        std::get<XDROutputFileStream>(this->mSink).close();
+    }
+#else
+    this->mSink.close();
+#endif
 
     return std::pair<std::string, uint256>(this->mFilename.string(),
                                            this->mHasher.finish());
