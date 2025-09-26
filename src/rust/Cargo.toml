@@ -130,9 +130,9 @@ optional = true
 # supported host, since test material usually just grows over time.
 
 [dependencies.soroban-test-wasms]
-version = "=23.0.0"
-git = "https://github.com/stellar/rs-soroban-env"
-rev = "688bc34e6cd15c71742139e625268c7f30f55a92"
+version = "=23.0.1"
+git = "https://github.com/SirTyson/rs-soroban-env"
+branch = "batched-sac-tps"
 
 [dependencies.soroban-synth-wasm]
 version = "=23.0.0"
