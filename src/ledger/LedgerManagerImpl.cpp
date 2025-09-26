@@ -2197,6 +2197,7 @@ LedgerManagerImpl::checkAllTxBundleInvariants(
     AppConnector& app, ApplyStage const& stage, Config const& config,
     ParallelLedgerInfo const& ledgerInfo, LedgerHeader const& header)
 {
+    ZoneScoped;
     for (auto const& txBundle : stage)
     {
         // First check the invariants

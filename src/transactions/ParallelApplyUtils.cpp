@@ -121,6 +121,7 @@ maybeMergeRoTTLBumps(LedgerKey const& key, ParallelApplyEntry const& newEntry,
                      ParallelApplyEntry& oldEntry,
                      std::unordered_set<LedgerKey> const& readWriteSet)
 {
+    ZoneScoped;
     // Read Only bumps will always be updating a pre-existing value. TTL
     // creation (!oldEntry) or deletion (!newEntry) are write conflicts that
     // don't have merge special casing.
@@ -413,6 +414,7 @@ void
 GlobalParallelApplyLedgerState::commitChangesToLedgerTxn(
     AbstractLedgerTxn& ltx) const
 {
+    ZoneScoped;
     LedgerTxn ltxInner(ltx);
     for (auto const& entry : mGlobalEntryMap)
     {
@@ -490,6 +492,7 @@ GlobalParallelApplyLedgerState::commitChangeFromThread(
     LedgerKey const& key, ParallelApplyEntry const& parEntry,
     std::unordered_set<LedgerKey> const& readWriteSet)
 {
+    ZoneScoped;
     if (!parEntry.mIsDirty)
     {
         return;
@@ -509,6 +512,7 @@ GlobalParallelApplyLedgerState::commitChangesFromThread(
     AppConnector& app, ThreadParallelApplyLedgerState const& thread,
     ApplyStage const& stage)
 {
+    ZoneScoped;
     auto readWriteSet = getReadWriteKeysForStage(stage);
     for (auto const& [key, entry] : thread.getEntryMap())
     {
@@ -523,6 +527,7 @@ GlobalParallelApplyLedgerState::commitChangesFromThreads(
     std::vector<std::unique_ptr<ThreadParallelApplyLedgerState>> const& threads,
     ApplyStage const& stage)
 {
+    ZoneScoped;
     releaseAssert(threadIsMain() ||
                   app.threadIsType(Application::ThreadType::APPLY));
 
