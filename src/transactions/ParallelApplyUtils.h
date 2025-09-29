@@ -10,9 +10,17 @@
 #include "transactions/ParallelApplyStage.h"
 #include "transactions/TransactionFrameBase.h"
 #include <unordered_set>
+#include <variant>
 
 namespace stellar
 {
+
+// Two states for indexed parallel apply entries:
+// - std::monostate: Slot uninitialized (not loaded from DB yet)
+// - ParallelApplyEntry: Loaded. Note that a "loaded" entry may or may not
+// exist.
+using IndexedParallelApplyEntry =
+    std::variant<std::monostate, ParallelApplyEntry>;
 
 class InMemorySorobanState;
 class GlobalParallelApplyLedgerState;
@@ -203,34 +211,33 @@ class GlobalParallelApplyLedgerState
     SorobanNetworkConfig const& mSorobanConfig;
 
     // Contains restorations that happened during each stage of the parallel
-    // soroban phase. As with mGlobalEntryMap, this is propagated stage to
+    // soroban phase. As with mIndexedEntries, this is propagated stage to
     // stage by being split into per-thread maps and re-merged at the end of
     // the stage, before begin committed to the ltx at the end of the phase.
     // As with restorations inside the thread, these entries are the
     // restored values _at their time of restoration_ which may be further
-    // overridden by mGlobalEntryMap.
+    // overridden by mIndexedEntries.
     RestoredEntries mGlobalRestoredEntries;
 
-    // Contains two different sets of entries:
+    // Constant index mapping LedgerKey to vector index. Contains all footprint
+    // keys (and their TTLs) across all stages.
+    UnorderedMap<LedgerKey, size_t> mKeyToIndex;
+
+    // Pre-allocated indexed vector replacing mGlobalEntryMap. Contains:
     //
     //  - Classic entries modified during earlier sequential phases that are
     //    read during the parallel soroban phase. These are copied out of the
-    //    ltx before the parallel soroban phase begins.
+    //    ltx before the parallel soroban phase begins and pre-populated.
     //
     //  - Dirty entries resulting from each stage of the parallel soroban phase.
     //    These are propagated from stage to stage of the parallel soroban phase
-    //    -- split into disjoint per-thread maps during execution and merged
-    //    after -- as well as written back to the ltx at the phase's end.
-    ParallelApplyEntryMap mGlobalEntryMap;
-
-    void
-    commitChangeFromThread(LedgerKey const& key,
-                           ParallelApplyEntry const& parEntry,
-                           std::unordered_set<LedgerKey> const& readWriteSet);
-
-    void commitChangesFromThread(AppConnector& app,
-                                 ThreadParallelApplyLedgerState const& thread,
-                                 ApplyStage const& stage);
+    //    -- threads write to disjoint indices in parallel during commit --
+    //    as well as written back to the ltx at the phase's end.
+    //
+    // Uses variant with three states: monostate (uninitialized),
+    // ParallelApplyEntry with nullopt (loaded, doesn't exist),
+    // ParallelApplyEntry with entry (loaded, exists).
+    std::vector<IndexedParallelApplyEntry> mIndexedEntries;
 
   public:
     GlobalParallelApplyLedgerState(AppConnector& app, AbstractLedgerTxn& ltx,
@@ -238,7 +245,6 @@ class GlobalParallelApplyLedgerState
                                    InMemorySorobanState const& inMemoryState,
                                    SorobanNetworkConfig const& sorobanConfig);
 
-    ParallelApplyEntryMap const& getGlobalEntryMap() const;
     RestoredEntries const& getRestoredEntries() const;
 
     void commitChangesFromThreads(
@@ -253,10 +259,9 @@ class GlobalParallelApplyLedgerState
     // applying ledger sequence number.
     uint32_t getSnapshotLedgerSeq() const;
 
-    // Constructor requires access to mInMemorySorobanState
-    friend ThreadParallelApplyLedgerState::ThreadParallelApplyLedgerState(
-        AppConnector& app, GlobalParallelApplyLedgerState const& global,
-        Cluster const& cluster);
+    // ThreadParallelApplyLedgerState needs access to mInMemorySorobanState,
+    // mKeyToIndex, and mIndexedEntries
+    friend class ThreadParallelApplyLedgerState;
 };
 
 class OpParallelApplyLedgerState

@@ -15,6 +15,7 @@
 #include "xdrpp/printer.h"
 #include <fmt/core.h>
 #include <fmt/std.h>
+#include <future>
 #include <thread>
 
 namespace
@@ -397,17 +398,92 @@ GlobalParallelApplyLedgerState::GlobalParallelApplyLedgerState(
     releaseAssertOrThrow(ltx.getHeader().ledgerSeq ==
                          getSnapshotLedgerSeq() + 1);
 
-    // From now on, we will be using globalState, liveSnapshots, and the
-    // hotArchive to collect all entries. Before we continue though, we need to
-    // load into the globalEntryMap any classic entries that have been modified
-    // in this ledger because those changes won't be reflected in the
-    // globalEntryMap. The entries that could've changed are accounts and
-    // trustlines from the classic phase, as well as fee source accounts that
-    // had their sequence numbers bumped and fees charged. preParallelApply will
-    // update sequence numbers so it needs to be called before we check
-    // LedgerTxn.
-    preParallelApplyAndCollectModifiedClassicEntries(
-        app, ltx, stages, mGlobalEntryMap, mSorobanConfig);
+    // Step 1: Collect all unique keys from all stages (both readWrite and
+    // readOnly)
+    std::unordered_set<LedgerKey> allKeys;
+    for (auto const& stage : stages)
+    {
+        for (auto const& txBundle : stage)
+        {
+            auto const& fp = txBundle.getTx()->sorobanResources().footprint;
+            for (auto const& key : fp.readWrite)
+            {
+                allKeys.insert(key);
+                if (isSorobanEntry(key))
+                {
+                    allKeys.insert(getTTLKey(key));
+                }
+            }
+            for (auto const& key : fp.readOnly)
+            {
+                allKeys.insert(key);
+                if (isSorobanEntry(key))
+                {
+                    allKeys.insert(getTTLKey(key));
+                }
+            }
+        }
+    }
+
+    // Step 2: Build index and allocate vector with monostate (uninitialized)
+    mIndexedEntries.resize(allKeys.size()); // All start as std::monostate
+    size_t idx = 0;
+    for (auto const& key : allKeys)
+    {
+        mKeyToIndex[key] = idx++;
+    }
+
+    // Step 3: Call preParallelApply on all transactions to modify fee source
+    // accounts
+    for (auto const& stage : stages)
+    {
+        for (auto const& txBundle : stage)
+        {
+            txBundle.getTx()->preParallelApply(
+                app, ltx, txBundle.getEffects().getMeta(),
+                txBundle.getResPayload(), sorobanConfig);
+        }
+    }
+
+    // Step 4: Populate classic entries directly into mIndexedEntries
+    auto fetchInMemoryClassicEntries =
+        [&](xdr::xvector<LedgerKey> const& keys) {
+            for (auto const& lk : keys)
+            {
+                if (isSorobanEntry(lk))
+                {
+                    continue;
+                }
+
+                auto entryPair = ltx.getNewestVersionBelowRoot(lk);
+                if (!entryPair.first)
+                {
+                    continue;
+                }
+
+                std::optional<LedgerEntry> entry =
+                    entryPair.second
+                        ? std::make_optional<LedgerEntry>(
+                              entryPair.second->ledgerEntry())
+                        : std::nullopt;
+
+                auto it = mKeyToIndex.find(lk);
+                releaseAssert(it != mKeyToIndex.end());
+                mIndexedEntries[it->second] =
+                    ParallelApplyEntry{entry, false};
+            }
+        };
+
+    for (auto const& stage : stages)
+    {
+        for (auto const& txBundle : stage)
+        {
+            auto const& footprint =
+                txBundle.getTx()->sorobanResources().footprint;
+            fetchInMemoryClassicEntries(footprint.readWrite);
+            fetchInMemoryClassicEntries(footprint.readOnly);
+        }
+    }
 }
 
 void
@@ -416,18 +492,30 @@ GlobalParallelApplyLedgerState::commitChangesToLedgerTxn(
 {
     ZoneScoped;
     LedgerTxn ltxInner(ltx);
-    for (auto const& entry : mGlobalEntryMap)
+
+    // Loop over indexed entries using the key-to-index map
+    for (auto const& [key, idx] : mKeyToIndex)
     {
-        // Only update if dirty bit is set
-        if (!entry.second.mIsDirty)
+        auto const& slot = mIndexedEntries[idx];
+
+        // Skip uninitialized slots
+        if (!std::holds_alternative<ParallelApplyEntry>(slot))
         {
             continue;
         }
 
-        if (entry.second.mLedgerEntry)
+        auto const& entry = std::get<ParallelApplyEntry>(slot);
+
+        // Only update if dirty bit is set
+        if (!entry.mIsDirty)
         {
-            auto const& updatedEntry = *entry.second.mLedgerEntry;
-            auto ltxe = ltxInner.load(entry.first);
+            continue;
+        }
+
+        if (entry.mLedgerEntry)
+        {
+            auto const& updatedEntry = *entry.mLedgerEntry;
+            auto ltxe = ltxInner.load(key);
             if (ltxe)
             {
                 ltxe.current() = updatedEntry;
@@ -439,16 +527,16 @@ GlobalParallelApplyLedgerState::commitChangesToLedgerTxn(
         }
         else
         {
-            auto ltxe = ltxInner.load(entry.first);
+            auto ltxe = ltxInner.load(key);
             if (ltxe)
             {
-                ltxInner.erase(entry.first);
+                ltxInner.erase(key);
             }
         }
     }
 
     // While the final state of a restored key that will be written to the
-    // Live BucketList is already handled in mGlobalEntryMap, we need to
+    // Live BucketList is already handled in mIndexedEntries, we need to
     // let the ltx know what keys need to be removed from the Hot Archive.
     for (auto const& kvp : mGlobalRestoredEntries.hotArchive)
     {
@@ -475,50 +563,10 @@ GlobalParallelApplyLedgerState::getSnapshotLedgerSeq() const
     return mLiveSnapshot->getLedgerSeq();
 }
 
-ParallelApplyEntryMap const&
-GlobalParallelApplyLedgerState::getGlobalEntryMap() const
-{
-    return mGlobalEntryMap;
-}
-
 RestoredEntries const&
 GlobalParallelApplyLedgerState::getRestoredEntries() const
 {
     return mGlobalRestoredEntries;
-}
-
-void
-GlobalParallelApplyLedgerState::commitChangeFromThread(
-    LedgerKey const& key, ParallelApplyEntry const& parEntry,
-    std::unordered_set<LedgerKey> const& readWriteSet)
-{
-    ZoneScoped;
-    if (!parEntry.mIsDirty)
-    {
-        return;
-    }
-    auto [it, inserted] = mGlobalEntryMap.emplace(key, parEntry);
-    if (!inserted)
-    {
-        if (!maybeMergeRoTTLBumps(key, parEntry, it->second, readWriteSet))
-        {
-            it->second = parEntry;
-        }
-    }
-}
-
-void
-GlobalParallelApplyLedgerState::commitChangesFromThread(
-    AppConnector& app, ThreadParallelApplyLedgerState const& thread,
-    ApplyStage const& stage)
-{
-    ZoneScoped;
-    auto readWriteSet = getReadWriteKeysForStage(stage);
-    for (auto const& [key, entry] : thread.getEntryMap())
-    {
-        commitChangeFromThread(key, entry, readWriteSet);
-    }
-    mGlobalRestoredEntries.addRestoresFrom(thread.getRestoredEntries());
 }
 
 void
@@ -531,9 +579,72 @@ GlobalParallelApplyLedgerState::commitChangesFromThreads(
     releaseAssert(threadIsMain() ||
                   app.threadIsType(Application::ThreadType::APPLY));
 
+    // Phase 1: Parallel write of non-TTL entries from threads to indexed
+    // vector
+    std::vector<std::future<void>> futures;
     for (auto const& thread : threads)
     {
-        commitChangesFromThread(app, *thread, stage);
+        futures.push_back(std::async(std::launch::async, [&]() {
+            for (auto const& [key, entry] : thread->getEntryMap())
+            {
+                // Skip non-dirty and TTL entries
+                if (!entry.mIsDirty || key.type() == TTL)
+                {
+                    continue;
+                }
+
+                size_t idx = mKeyToIndex.at(key);
+                mIndexedEntries[idx] =
+                    entry; // Safe: disjoint writes guaranteed by clustering
+            }
+        }));
+    }
+
+    // Wait for all parallel writes
+    for (auto& f : futures)
+    {
+        f.get();
+    }
+
+    // Phase 2: Serial handling of TTL entries (preserve merge semantics)
+    auto readWriteSet = getReadWriteKeysForStage(stage);
+
+    for (auto const& thread : threads)
+    {
+        for (auto const& [key, entry] : thread->getEntryMap())
+        {
+            if (key.type() == TTL && entry.mIsDirty)
+            {
+                size_t idx = mKeyToIndex.at(key);
+                auto& slot = mIndexedEntries[idx];
+
+                if (readWriteSet.find(key) == readWriteSet.end())
+                {
+                    // READ_ONLY TTL - merge using max()
+                    if (std::holds_alternative<ParallelApplyEntry>(slot))
+                    {
+                        auto& existing = std::get<ParallelApplyEntry>(slot);
+                        maybeMergeRoTTLBumps(key, entry, existing,
+                                             readWriteSet);
+                    }
+                    else
+                    {
+                        slot = entry;
+                    }
+                }
+                else
+                {
+                    // READ_WRITE TTL - direct write
+                    slot = entry;
+                }
+            }
+        }
+    }
+
+    // Phase 3: Merge restored entries (unchanged)
+    for (auto const& thread : threads)
+    {
+        mGlobalRestoredEntries.addRestoresFrom(thread->getRestoredEntries());
     }
 }
 
@@ -546,31 +657,37 @@ ThreadParallelApplyLedgerState::collectClusterFootprintEntriesFromGlobal(
                   app.threadIsType(Application::ThreadType::APPLY));
 
     // As part of the initialization of this thread state, we need to
-    // collect all the keys that are in the global state map. For any keys
-    // we need not in the global state, we will fetch them from the live
+    // collect all the keys that are in the global indexed state. For any keys
+    // not in the global state, we will fetch them from the live
     // snapshot, in memory soroban state, or the hot archive later.
-    auto const& globalEntryMap = global.getGlobalEntryMap();
-
     auto fetchFromGlobal = [&](LedgerKey const& key) {
         if (mThreadEntryMap.find(key) != mThreadEntryMap.end())
         {
             return;
         }
 
-        auto entryIt = globalEntryMap.find(key);
-        if (entryIt != globalEntryMap.end())
+        // All footprint keys must be in the index
+        auto indexIt = global.mKeyToIndex.find(key);
+        releaseAssert(indexIt != global.mKeyToIndex.end());
+
+        auto const& slot = global.mIndexedEntries[indexIt->second];
+
+        // Only copy if initialized (classic entries)
+        if (std::holds_alternative<ParallelApplyEntry>(slot))
         {
-            if (entryIt->second.mLedgerEntry)
+            auto const& entry = std::get<ParallelApplyEntry>(slot);
+            if (entry.mLedgerEntry)
             {
-                mThreadEntryMap.emplace(
-                    key, ParallelApplyEntry::cleanPopulated(
-                             entryIt->second.mLedgerEntry.value()));
+                mThreadEntryMap.emplace(key, ParallelApplyEntry::cleanPopulated(
+                                                 entry.mLedgerEntry.value()));
             }
             else
             {
                 mThreadEntryMap.emplace(key, ParallelApplyEntry::cleanEmpty());
             }
         }
+        // If monostate (uninitialized), thread will load from DB later in
+        // getLiveEntryOpt()
     };
 
     for (auto const& txBundle : cluster)
