@@ -1955,9 +1955,13 @@ TransactionFrame::parallelApply(
             ledgerInfo.getLedgerVersion() >=
             config.LEDGER_PROTOCOL_MIN_VERSION_INTERNAL_ERROR_REPORT;
 
-        auto opTimer = app.getMetrics()
-                           .NewTimer({"ledger", "operation", "apply"})
-                           .TimeScope();
+        std::optional<medida::TimerContext> opTimer;
+        if (!config.DISABLE_SOROBAN_METRICS_FOR_TESTING)
+        {
+            opTimer.emplace(app.getMetrics()
+                                .NewTimer({"ledger", "operation", "apply"})
+                                .TimeScope());
+        }
 
         releaseAssertOrThrow(mOperations.size() == 1);
 
@@ -2059,13 +2063,21 @@ TransactionFrame::applyOperations(
         reportInternalErrOnException =
             ledgerVersion >=
             app.getConfig().LEDGER_PROTOCOL_MIN_VERSION_INTERNAL_ERROR_REPORT;
-        auto& opTimer =
-            app.getMetrics().NewTimer({"ledger", "operation", "apply"});
+        medida::Timer* opTimer = nullptr;
+        if (!app.getConfig().DISABLE_SOROBAN_METRICS_FOR_TESTING)
+        {
+            opTimer =
+                &app.getMetrics().NewTimer({"ledger", "operation", "apply"});
+        }
 
         uint64_t opNum{0};
         for (size_t i = 0; i < mOperations.size(); ++i)
         {
-            auto time = opTimer.TimeScope();
+            std::optional<medida::TimerContext> time;
+            if (opTimer)
+            {
+                time.emplace(opTimer->TimeScope());
+            }
 
             auto const& op = mOperations[i];
             auto& opResult = txResult.getOpResultAt(i);
