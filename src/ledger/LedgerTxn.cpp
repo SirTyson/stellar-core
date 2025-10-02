@@ -712,20 +712,21 @@ LedgerTxn::Impl::commitChild(EntryIterator iter,
 }
 
 LedgerTxnEntry
-LedgerTxn::create(InternalLedgerEntry const& entry)
+LedgerTxn::create(InternalLedgerEntry const& entry, bool skipExistenceCheck)
 {
-    return getImpl()->create(*this, entry);
+    return getImpl()->create(*this, entry, skipExistenceCheck);
 }
 
 LedgerTxnEntry
-LedgerTxn::Impl::create(LedgerTxn& self, InternalLedgerEntry const& entry)
+LedgerTxn::Impl::create(LedgerTxn& self, InternalLedgerEntry const& entry,
+                        bool skipExistenceCheck)
 {
     abortIfWrongThread("create");
     throwIfSealed();
     throwIfChild();
 
     auto key = entry.toKey();
-    if (getNewestVersion(key))
+    if (!skipExistenceCheck && getNewestVersion(key))
     {
         throw std::runtime_error("Key already exists");
     }
@@ -1896,6 +1897,67 @@ LedgerTxn::Impl::load(LedgerTxn& self, InternalLedgerKey const& key)
     // to key being deactivated. This will leave LedgerTxn unmodified.
     updateEntry(key, &newest.second, *currentEntryPtr,
                 /* effectiveActive */ true);
+    return ltxe;
+}
+
+LedgerTxnEntry
+LedgerTxn::loadWithKnownParent(
+    InternalLedgerKey const& key,
+    std::shared_ptr<InternalLedgerEntry const> knownParentEntry)
+{
+    return getImpl()->loadWithKnownParent(*this, key, knownParentEntry);
+}
+
+LedgerTxnEntry
+LedgerTxn::Impl::loadWithKnownParent(
+    LedgerTxn& self, InternalLedgerKey const& key,
+    std::shared_ptr<InternalLedgerEntry const> knownParentEntry)
+{
+    // This is identical to load() except it takes knownParentEntry as a
+    // parameter instead of calling getNewestVersionEntryMap(key)
+    abortIfWrongThread("loadWithKnownParent");
+    throwIfSealed();
+    throwIfChild();
+    if (mActive.find(key) != mActive.end())
+    {
+        throw std::runtime_error("Key is active");
+    }
+
+    // Check mEntry first, use knownParentEntry if not found
+    auto iter = mEntry.find(key);
+    std::shared_ptr<InternalLedgerEntry const> newest;
+    if (iter != mEntry.end())
+    {
+        newest = iter->second.get();
+    }
+    else
+    {
+        newest = knownParentEntry;
+    }
+
+    if (!newest)
+    {
+        return {};
+    }
+
+    std::optional<LedgerEntryPtr> currentEntryPtr;
+    if (iter != mEntry.end())
+    {
+        currentEntryPtr = std::optional<LedgerEntryPtr>(iter->second);
+    }
+    else
+    {
+        currentEntryPtr = LedgerEntryPtr::Live(
+            std::make_shared<InternalLedgerEntry>(*newest));
+    }
+
+    releaseAssert(currentEntryPtr.has_value());
+    auto impl = LedgerTxnEntry::makeSharedImpl(self, *currentEntryPtr->get());
+
+    mActive.emplace(key, toEntryImplBase(impl));
+    LedgerTxnEntry ltxe(impl);
+
+    updateEntry(key, &iter, *currentEntryPtr, /* effectiveActive */ true);
     return ltxe;
 }
 

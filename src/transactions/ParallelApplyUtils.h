@@ -120,8 +120,10 @@ class ThreadParallelApplyLedgerState
         Cluster const& cluster);
 
     void upsertEntry(LedgerKey const& key, LedgerEntry const& entry,
+                     std::optional<LedgerEntry> const& originalEntry,
                      uint32_t ledgerSeq);
-    void eraseEntry(LedgerKey const& key);
+    void eraseEntry(LedgerKey const& key,
+                    std::optional<LedgerEntry> const& originalEntry);
     void
     commitChangeFromSuccessfulOp(LedgerKey const& key,
                                  std::optional<LedgerEntry> const& entryOpt,

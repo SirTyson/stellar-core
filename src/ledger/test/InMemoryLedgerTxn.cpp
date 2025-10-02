@@ -263,7 +263,8 @@ InMemoryLedgerTxn::eraseWithoutLoading(InternalLedgerKey const& key)
 }
 
 LedgerTxnEntry
-InMemoryLedgerTxn::create(InternalLedgerEntry const& entry)
+InMemoryLedgerTxn::create(InternalLedgerEntry const& entry,
+                          bool skipExistenceCheck)
 {
     throw std::runtime_error("called create on InMemoryLedgerTxn");
 }

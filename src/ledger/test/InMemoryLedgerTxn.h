@@ -110,7 +110,8 @@ class InMemoryLedgerTxn : public LedgerTxn
     void updateWithoutLoading(InternalLedgerEntry const& entry) override;
     void eraseWithoutLoading(InternalLedgerKey const& key) override;
 
-    LedgerTxnEntry create(InternalLedgerEntry const& entry) override;
+    LedgerTxnEntry create(InternalLedgerEntry const& entry,
+                          bool skipExistenceCheck = false) override;
     void erase(InternalLedgerKey const& key) override;
     LedgerTxnEntry restoreFromLiveBucketList(LedgerEntry const& entry,
                                              uint32_t ttl) override;

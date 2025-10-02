@@ -52,29 +52,43 @@ using OpModifiedEntryMap = UnorderedMap<LedgerKey, std::optional<LedgerEntry>>;
 // be updated by successful transactions.
 struct ParallelApplyEntry
 {
-    // Will not be set if the entry doesn't exist, or if no tx was able to load
-    // it due to hitting read limits.
+    // Current state: Will not be set if the entry doesn't exist, or if no tx
+    // was able to load it due to hitting read limits.
     std::optional<LedgerEntry> mLedgerEntry;
+
+    // Initial parent state: The entry value as it existed in the parent
+    // LedgerTxn when first loaded from ltx via getNewestVersionBelowRoot. Used
+    // to optimize commit by providing known parent state to load/create/erase,
+    // avoiding redundant getNewestVersion() calls up the parent hierarchy.
+    std::optional<LedgerEntry> mInitialParentEntry;
+
     bool mIsDirty;
+
     static ParallelApplyEntry
     cleanPopulated(LedgerEntry const& e)
     {
-        return ParallelApplyEntry{e, false};
+        return ParallelApplyEntry{e, e, false};
     }
     static ParallelApplyEntry
     dirtyPopulated(LedgerEntry const& e)
     {
-        return ParallelApplyEntry{e, true};
+        releaseAssert(false);
+        // This should not be used when initial state needs to be preserved
+        // Use the direct constructor instead
+        return ParallelApplyEntry{e, e, true};
     }
     static ParallelApplyEntry
     cleanEmpty()
     {
-        return ParallelApplyEntry{std::nullopt, false};
+        return ParallelApplyEntry{std::nullopt, std::nullopt, false};
     }
     static ParallelApplyEntry
     dirtyEmpty()
     {
-        return ParallelApplyEntry{std::nullopt, true};
+        releaseAssert(false);
+        // This should not be used when initial state needs to be preserved
+        // Use the direct constructor instead
+        return ParallelApplyEntry{std::nullopt, std::nullopt, true};
     }
 };
 

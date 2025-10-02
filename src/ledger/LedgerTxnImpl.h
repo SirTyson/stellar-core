@@ -349,7 +349,8 @@ class LedgerTxn::Impl
     // - the prepared statement cache may be, but is not guaranteed to be,
     //   modified
     // - the entry cache may be, but is not guaranteed to be, cleared.
-    LedgerTxnEntry create(LedgerTxn& self, InternalLedgerEntry const& entry);
+    LedgerTxnEntry create(LedgerTxn& self, InternalLedgerEntry const& entry,
+                          bool skipExistenceCheck = false);
 
     // deactivate has the strong exception safety guarantee
     void deactivate(InternalLedgerKey const& key);
@@ -481,6 +482,14 @@ class LedgerTxn::Impl
     //   modified
     // - the entry cache may be, but is not guaranteed to be, cleared.
     LedgerTxnEntry load(LedgerTxn& self, InternalLedgerKey const& key);
+
+    // Optimized load for parallel apply that accepts known parent state from
+    // caller. Bypasses the getNewestVersion() call but otherwise follows the
+    // normal load flow, maintaining full consistency. Has the same exception
+    // safety guarantees as load().
+    LedgerTxnEntry loadWithKnownParent(
+        LedgerTxn& self, InternalLedgerKey const& key,
+        std::shared_ptr<InternalLedgerEntry const> knownParentEntry);
 
     // createWithoutLoading has the strong exception safety guarantee.
     // If it throws an exception, then the current LedgerTxn::Impl is unchanged.

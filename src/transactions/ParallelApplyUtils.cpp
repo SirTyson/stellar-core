@@ -174,7 +174,7 @@ preParallelApplyAndCollectModifiedClassicEntries(
                                            entryPair.second->ledgerEntry())
                                      : std::nullopt;
 
-                globalEntryMap.emplace(lk, ParallelApplyEntry{entry, false});
+                globalEntryMap.emplace(lk, ParallelApplyEntry{entry, entry, false});
             }
         };
 
@@ -470,7 +470,7 @@ GlobalParallelApplyLedgerState::GlobalParallelApplyLedgerState(
                 auto it = mKeyToIndex.find(lk);
                 releaseAssert(it != mKeyToIndex.end());
                 mIndexedEntries[it->second] =
-                    ParallelApplyEntry{entry, false};
+                    ParallelApplyEntry{entry, entry, false};
             }
         };
 
@@ -515,23 +515,59 @@ GlobalParallelApplyLedgerState::commitChangesToLedgerTxn(
         if (entry.mLedgerEntry)
         {
             auto const& updatedEntry = *entry.mLedgerEntry;
-            auto ltxe = ltxInner.load(key);
-            if (ltxe)
+            // auto ltxe = ltxInner.load(key);
+            // if (ltxe)
+            // {
+            //     releaseAssert(entry.mInitialParentEntry);
+            //     releaseAssert(ltxe.current() == *entry.mInitialParentEntry);
+            //     ltxe.current() = updatedEntry;
+            // }
+            // else
+            // {
+            //     releaseAssert(!entry.mInitialParentEntry);
+            //     ltxInner.create(updatedEntry);
+            // }
+
+            // // Use loadWithKnownParent optimization when we have the initial parent state
+            // // TODO: Re-enable optimization after investigating partitioning test failures
+            LedgerTxnEntry ltxe;
+            if (entry.mInitialParentEntry)
             {
+                auto knownParent = std::make_shared<InternalLedgerEntry const>(
+                     *entry.mInitialParentEntry);
+                ltxe = ltxInner.loadWithKnownParent(key, knownParent);
                 ltxe.current() = updatedEntry;
             }
             else
             {
-                ltxInner.create(updatedEntry);
+                ltxInner.create(updatedEntry, /*skipExistenceCheck=*/true);
             }
         }
         else
         {
-            auto ltxe = ltxInner.load(key);
-            if (ltxe)
+            // Entry was deleted - erase it if it exists in parent
+            // TODO: Add optimization with loadWithKnownParent
+            if (entry.mInitialParentEntry)
             {
+                auto knownParent = std::make_shared<InternalLedgerEntry const>(
+                    *entry.mInitialParentEntry);
+                auto ltxe = ltxInner.loadWithKnownParent(key, knownParent);
                 ltxInner.erase(key);
             }
+            // auto ltxe = ltxInner.load(key);
+            // if (ltxe)
+            // {
+            //     releaseAssert(entry.mInitialParentEntry);
+            //     releaseAssert(ltxe.current() == *entry.mInitialParentEntry);
+            //     ltxInner.erase(key);
+            // }
+            // else
+            // {
+            //     // Entry doesn't exist in parent - nothing to erase
+            //     // This can happen if an entry was created and then deleted
+            //     // within the parallel phase
+            //     releaseAssert(!entry.mInitialParentEntry);
+            // }
         }
     }
 
@@ -593,7 +629,14 @@ GlobalParallelApplyLedgerState::commitChangesFromThreads(
                     continue;
                 }
 
-                size_t idx = mKeyToIndex.at(key);
+                auto it = mKeyToIndex.find(key);
+                if (it == mKeyToIndex.end())
+                {
+                    throw std::runtime_error(fmt::format(
+                        "Key not in index during commit: {}",
+                        xdr::xdr_to_string(key, "key")));
+                }
+                size_t idx = it->second;
                 mIndexedEntries[idx] =
                     entry; // Safe: disjoint writes guaranteed by clustering
             }
@@ -615,7 +658,14 @@ GlobalParallelApplyLedgerState::commitChangesFromThreads(
         {
             if (key.type() == TTL && entry.mIsDirty)
             {
-                size_t idx = mKeyToIndex.at(key);
+                auto it = mKeyToIndex.find(key);
+                if (it == mKeyToIndex.end())
+                {
+                    throw std::runtime_error(fmt::format(
+                        "TTL key not in index during commit: {}",
+                        xdr::xdr_to_string(key, "key")));
+                }
+                size_t idx = it->second;
                 auto& slot = mIndexedEntries[idx];
 
                 if (readWriteSet.find(key) == readWriteSet.end())
@@ -676,14 +726,22 @@ ThreadParallelApplyLedgerState::collectClusterFootprintEntriesFromGlobal(
         if (std::holds_alternative<ParallelApplyEntry>(slot))
         {
             auto const& entry = std::get<ParallelApplyEntry>(slot);
+            // Preserve the original mInitialParentEntry from global state
             if (entry.mLedgerEntry)
             {
-                mThreadEntryMap.emplace(key, ParallelApplyEntry::cleanPopulated(
-                                                 entry.mLedgerEntry.value()));
+                mThreadEntryMap.emplace(key, ParallelApplyEntry{
+                    entry.mLedgerEntry.value(),
+                    entry.mInitialParentEntry,
+                    false
+                });
             }
             else
             {
-                mThreadEntryMap.emplace(key, ParallelApplyEntry::cleanEmpty());
+                mThreadEntryMap.emplace(key, ParallelApplyEntry{
+                    std::nullopt,
+                    entry.mInitialParentEntry,
+                    false
+                });
             }
         }
         // If monostate (uninitialized), thread will load from DB later in
@@ -749,9 +807,10 @@ ThreadParallelApplyLedgerState::flushRoTTLBumpsInTxWriteFootprint(
             // erased the TTL key from mRoTTLBumps.
             auto ttlEntry = getLiveEntryOpt(ttlKey);
             releaseAssertOrThrow(ttlEntry);
+            auto originalTtlEntry = ttlEntry;
             releaseAssertOrThrow(ttl(ttlEntry) <= b->second);
             ttl(ttlEntry) = b->second;
-            upsertEntry(ttlKey, ttlEntry.value(), getSnapshotLedgerSeq() + 1);
+            upsertEntry(ttlKey, ttlEntry.value(), originalTtlEntry, getSnapshotLedgerSeq() + 1);
             mRoTTLBumps.erase(b);
         }
     }
@@ -768,9 +827,10 @@ ThreadParallelApplyLedgerState::flushRemainingRoTTLBumps()
         releaseAssertOrThrow(entryOpt);
         if (ttl(entryOpt) < ttlBump)
         {
+            auto originalEntry = entryOpt;
             auto updated = entryOpt.value();
             ttl(updated) = ttlBump;
-            upsertEntry(lk, updated, getSnapshotLedgerSeq() + 1);
+            upsertEntry(lk, updated, originalEntry, getSnapshotLedgerSeq() + 1);
         }
     }
 }
@@ -828,17 +888,46 @@ ThreadParallelApplyLedgerState::getLiveEntryOpt(LedgerKey const& key) const
 void
 ThreadParallelApplyLedgerState::upsertEntry(LedgerKey const& key,
                                             LedgerEntry const& entry,
+                                            std::optional<LedgerEntry> const& originalEntry,
                                             uint32_t ledgerSeq)
 {
-    // Weird syntax avoid extra map lookup
-    auto& mapEntry = mThreadEntryMap[key] =
-        ParallelApplyEntry::dirtyPopulated(entry);
-    mapEntry.mLedgerEntry->lastModifiedLedgerSeq = ledgerSeq;
+    // Check if entry already exists in map to preserve its mInitialParentEntry
+    auto it = mThreadEntryMap.find(key);
+    if (it != mThreadEntryMap.end())
+    {
+        // Preserve the existing mInitialParentEntry
+        auto initialParentEntry = std::move(it->second.mInitialParentEntry);
+        auto& mapEntry = mThreadEntryMap[key] =
+            ParallelApplyEntry{entry, std::move(initialParentEntry), true};
+        mapEntry.mLedgerEntry->lastModifiedLedgerSeq = ledgerSeq;
+    }
+    else
+    {
+        // New entry - use originalEntry as mInitialParentEntry
+        auto& mapEntry = mThreadEntryMap[key] =
+            ParallelApplyEntry{entry, originalEntry, true};
+        mapEntry.mLedgerEntry->lastModifiedLedgerSeq = ledgerSeq;
+    }
 }
 void
-ThreadParallelApplyLedgerState::eraseEntry(LedgerKey const& key)
+ThreadParallelApplyLedgerState::eraseEntry(LedgerKey const& key,
+                                           std::optional<LedgerEntry> const& originalEntry)
 {
-    mThreadEntryMap[key] = ParallelApplyEntry::dirtyEmpty();
+    // Check if entry already exists in map to preserve its mInitialParentEntry
+    auto it = mThreadEntryMap.find(key);
+    if (it != mThreadEntryMap.end())
+    {
+        // Preserve the existing mInitialParentEntry
+        auto initialParentEntry = std::move(it->second.mInitialParentEntry);
+        mThreadEntryMap[key] =
+            ParallelApplyEntry{std::nullopt, std::move(initialParentEntry), true};
+    }
+    else
+    {
+        // New entry being deleted - use originalEntry as mInitialParentEntry
+        mThreadEntryMap[key] =
+            ParallelApplyEntry{std::nullopt, originalEntry, true};
+    }
 }
 
 void
@@ -855,11 +944,11 @@ ThreadParallelApplyLedgerState::commitChangeFromSuccessfulOp(
     }
     else if (entryOpt)
     {
-        upsertEntry(key, entryOpt.value(), getSnapshotLedgerSeq() + 1);
+        upsertEntry(key, entryOpt.value(), oldEntryOpt, getSnapshotLedgerSeq() + 1);
     }
     else
     {
-        eraseEntry(key);
+        eraseEntry(key, oldEntryOpt);
     }
 }
 

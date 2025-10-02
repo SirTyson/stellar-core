@@ -589,7 +589,7 @@ class AbstractLedgerTxn : public AbstractLedgerTxnParent
     // - create
     //     Creates a new LedgerTxnEntry from entry. Throws if the key
     //     associated with this entry is already associated with an entry in
-    //     this AbstractLedgerTxn or any parent.
+    //     this AbstractLedgerTxn or any parent (unless skipExistenceCheck is true).
     // - erase
     //     Erases the existing entry associated with key. Throws if the key is
     //     not already associated with an entry in this AbstractLedgerTxn or
@@ -620,7 +620,8 @@ class AbstractLedgerTxn : public AbstractLedgerTxnParent
     // All of these functions throw if the AbstractLedgerTxn is sealed or if
     // the AbstractLedgerTxn has a child.
     virtual LedgerTxnHeader loadHeader() = 0;
-    virtual LedgerTxnEntry create(InternalLedgerEntry const& entry) = 0;
+    virtual LedgerTxnEntry create(InternalLedgerEntry const& entry,
+                                  bool skipExistenceCheck = false) = 0;
     virtual void erase(InternalLedgerKey const& key) = 0;
     virtual LedgerTxnEntry restoreFromLiveBucketList(LedgerEntry const& entry,
                                                      uint32_t ttl) = 0;
@@ -629,6 +630,14 @@ class AbstractLedgerTxn : public AbstractLedgerTxnParent
     virtual LedgerTxnEntry load(InternalLedgerKey const& key) = 0;
     virtual ConstLedgerTxnEntry
     loadWithoutRecord(InternalLedgerKey const& key) = 0;
+
+    // Optimized load for parallel apply: accepts a known parent state to bypass
+    // the expensive getNewestVersion() hierarchy traversal. Identical to load()
+    // except it uses knownParentEntry instead of calling getNewestVersion().
+    // Maintains full consistency tracking unlike *WithoutLoading methods.
+    virtual LedgerTxnEntry
+    loadWithKnownParent(InternalLedgerKey const& key,
+                        std::shared_ptr<InternalLedgerEntry const> knownParentEntry) = 0;
 
     // Somewhat unsafe, non-recommended access methods: for use only during
     // bulk-loading as in catchup from buckets. These methods set an entry
@@ -766,7 +775,8 @@ class LedgerTxn : public AbstractLedgerTxn
     void commitChild(EntryIterator iter, RestoredEntries const& restoredEntries,
                      LedgerTxnConsistency cons) noexcept override;
 
-    LedgerTxnEntry create(InternalLedgerEntry const& entry) override;
+    LedgerTxnEntry create(InternalLedgerEntry const& entry,
+                          bool skipExistenceCheck = false) override;
 
     void erase(InternalLedgerKey const& key) override;
 
@@ -820,6 +830,10 @@ class LedgerTxn : public AbstractLedgerTxn
     getNewestVersionBelowRoot(InternalLedgerKey const& key) const override;
 
     LedgerTxnEntry load(InternalLedgerKey const& key) override;
+
+    LedgerTxnEntry
+    loadWithKnownParent(InternalLedgerKey const& key,
+                        std::shared_ptr<InternalLedgerEntry const> knownParentEntry) override;
 
     void createWithoutLoading(InternalLedgerEntry const& entry) override;
     void updateWithoutLoading(InternalLedgerEntry const& entry) override;
