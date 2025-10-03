@@ -54,6 +54,7 @@
 #include "util/GlobalChecks.h"
 #include "util/LogSlowExecution.h"
 #include "util/Logging.h"
+#include "util/ProtocolVersion.h"
 #include "util/StatusManager.h"
 #include "util/Thread.h"
 #include "util/TmpDir.h"
@@ -799,6 +800,15 @@ ApplicationImpl::start()
     mStarted = true;
 
     mLedgerManager->loadLastKnownLedger(/* restoreBucketlist */ true);
+
+    // Check if we're already on protocol V_24 or later and enable Rust Dalek
+    auto const& lcl = mLedgerManager->getLastClosedLedgerHeader();
+    if (protocolVersionStartsFrom(lcl.header.ledgerVersion,
+                                  ProtocolVersion::V_24))
+    {
+        PubKeyUtils::enableRustDalekVerify();
+    }
+
     startServices();
 }
 
