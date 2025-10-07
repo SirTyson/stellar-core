@@ -49,7 +49,7 @@ static uint64_t gVerifyCacheMiss = 0;
 
 // Global flag to use Rust ed25519-dalek for signature verification
 // Protected by gVerifySigCacheMutex
-static bool gUseRustDalekVerify = false;
+static bool gUseRustDalekVerify = true;
 
 static Hash
 verifySigCacheKey(PublicKey const& key, Signature const& signature,
