@@ -1031,10 +1031,10 @@ TEST_CASE("basic MAX_SAC_TPS functionality",
     cfg.IGNORE_MESSAGE_LIMITS_FOR_TESTING = true;
 
     // Configure test parameters for MAX_SAC_TPS mode
-    cfg.APPLY_LOAD_MAX_SAC_TPS_TARGET_CLOSE_TIME_MS = 1000;
+    cfg.APPLY_LOAD_MAX_TPS_TARGET_CLOSE_TIME_MS = 1000;
     cfg.APPLY_LOAD_LEDGER_MAX_DEPENDENT_TX_CLUSTERS = 2;
-    cfg.APPLY_LOAD_MAX_SAC_TPS_MIN_TPS = 200;
-    cfg.APPLY_LOAD_MAX_SAC_TPS_MAX_TPS = 220;
+    cfg.APPLY_LOAD_MAX_TPS_MIN_TPS = 200;
+    cfg.APPLY_LOAD_MAX_TPS_MAX_TPS = 220;
     cfg.APPLY_LOAD_NUM_LEDGERS = 10;
     cfg.APPLY_LOAD_NUM_ACCOUNTS = 500;
     cfg.APPLY_LOAD_BATCH_SAC_COUNT = 2;
@@ -1056,4 +1056,56 @@ TEST_CASE("basic MAX_SAC_TPS functionality",
     REQUIRE(maxClustersMetric.count() ==
             cfg.APPLY_LOAD_LEDGER_MAX_DEPENDENT_TX_CLUSTERS);
     REQUIRE(successCountMetric.count() > 200);
+}
+
+TEST_CASE("basic MAX_CLASSIC_TPS functionality",
+          "[loadgen][applyload][classic][acceptance]")
+{
+    auto cfg = getTestConfig();
+    cfg.TESTING_UPGRADE_MAX_TX_SET_SIZE = 5000;
+    cfg.USE_CONFIG_FOR_GENESIS = true;
+    cfg.LEDGER_PROTOCOL_VERSION = Config::CURRENT_LEDGER_PROTOCOL_VERSION;
+    cfg.MANUAL_CLOSE = true;
+    cfg.IGNORE_MESSAGE_LIMITS_FOR_TESTING = true;
+
+    // Configure test parameters for MAX_CLASSIC_TPS mode
+    cfg.APPLY_LOAD_MAX_TPS_TARGET_CLOSE_TIME_MS = 1000;
+    cfg.APPLY_LOAD_MAX_TPS_MIN_TPS = 100;
+    cfg.APPLY_LOAD_MAX_TPS_MAX_TPS = 500;
+    cfg.APPLY_LOAD_NUM_LEDGERS = 5;
+    cfg.APPLY_LOAD_NUM_ACCOUNTS = 1000;
+
+    VirtualClock clock(VirtualClock::REAL_TIME);
+    auto app = createTestApplication(clock, cfg);
+
+    CLOG_WARNING(Perf, "Creating ApplyLoad object for MAX_CLASSIC_TPS");
+    ApplyLoad al(*app, ApplyLoadMode::MAX_CLASSIC_TPS);
+    CLOG_WARNING(Perf, "ApplyLoad object created successfully");
+
+    // Get initial metrics
+    auto& successCountMetric =
+        app->getMetrics().NewCounter({"ledger", "apply", "success"});
+    auto& failureCountMetric =
+        app->getMetrics().NewCounter({"ledger", "apply", "failure"});
+
+    int64_t initialSuccessCount = successCountMetric.count();
+    int64_t initialFailureCount = failureCountMetric.count();
+
+    // Run the MAX_CLASSIC_TPS test
+    al.findMaxClassicTps();
+
+    // Calculate how many transactions were processed
+    int64_t totalSuccess = successCountMetric.count() - initialSuccessCount;
+    int64_t totalFailure = failureCountMetric.count() - initialFailureCount;
+
+    // Verify that transactions were applied successfully
+    REQUIRE(totalSuccess > 0);
+    REQUIRE(totalFailure == 0); // All transactions should succeed
+
+    // Since we're testing with MIN_TPS=100 and 5 ledgers,
+    // we should have processed at least 100 transactions
+    REQUIRE(totalSuccess >= 100);
+
+    // Verify success rate is 100%
+    REQUIRE(al.successRate() == 1.0);
 }

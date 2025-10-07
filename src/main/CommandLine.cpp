@@ -1878,13 +1878,18 @@ applyLoadModeParser(std::string& modeArg, ApplyLoadMode& mode)
             mode = ApplyLoadMode::MAX_SAC_TPS;
             return "";
         }
+        if (iequals(modeArg, "max_classic_tps"))
+        {
+            mode = ApplyLoadMode::MAX_CLASSIC_TPS;
+            return "";
+        }
         return "Unrecognized apply-load mode. Please select 'soroban', "
-               "'classic', 'mix', or 'max_sac_tps'.";
+               "'classic', 'mix', 'max_sac_tps', or 'max_classic_tps'.";
     };
 
     return {clara::Opt{modeArg, "MODE"}["--mode"](
                 "set the apply-load mode. Expected modes: soroban, classic, "
-                "mix, max_sac_tps. "
+                "mix, max_sac_tps, max_classic_tps. "
                 "Defaults to soroban."),
             validateMode};
 }
@@ -1915,12 +1920,12 @@ runApplyLoad(CommandLineArgs const& args)
 
             if (mode == ApplyLoadMode::MAX_SAC_TPS)
             {
-                if (config.APPLY_LOAD_MAX_SAC_TPS_MIN_TPS >=
-                    config.APPLY_LOAD_MAX_SAC_TPS_MAX_TPS)
+                if (config.APPLY_LOAD_MAX_TPS_MIN_TPS >=
+                    config.APPLY_LOAD_MAX_TPS_MAX_TPS)
                 {
                     throw std::runtime_error(
-                        "APPLY_LOAD_MAX_SAC_TPS_MIN_TPS must be less than "
-                        "APPLY_LOAD_MAX_SAC_TPS_MAX_TPS for max_sac_tps mode");
+                        "APPLY_LOAD_MAX_TPS_MIN_TPS must be less than "
+                        "APPLY_LOAD_MAX_TPS_MAX_TPS for max_sac_tps mode");
                 }
 
                 // For now, metrics are expensive at high, parallel load. We
@@ -1933,8 +1938,29 @@ runApplyLoad(CommandLineArgs const& args)
                 // We reuse accounts in max TPS tests, so we just need enough
                 // for a single ledger's worth of TXs
                 config.APPLY_LOAD_NUM_ACCOUNTS =
-                    config.APPLY_LOAD_MAX_SAC_TPS_MAX_TPS *
-                    (config.APPLY_LOAD_MAX_SAC_TPS_TARGET_CLOSE_TIME_MS /
+                    config.APPLY_LOAD_MAX_TPS_MAX_TPS *
+                    (config.APPLY_LOAD_MAX_TPS_TARGET_CLOSE_TIME_MS /
+                     1000) *
+                    2;
+
+                // Apply Load may exceed TX_SET byte size limits, so ignore them
+                config.IGNORE_MESSAGE_LIMITS_FOR_TESTING = true;
+            }
+
+            if (mode == ApplyLoadMode::MAX_CLASSIC_TPS)
+            {
+                if (config.APPLY_LOAD_MAX_TPS_MIN_TPS >=
+                    config.APPLY_LOAD_MAX_TPS_MAX_TPS)
+                {
+                    throw std::runtime_error(
+                        "APPLY_LOAD_MAX_TPS_MIN_TPS must be less than "
+                        "APPLY_LOAD_MAX_TPS_MAX_TPS for max_classic_tps mode");
+                }
+
+                // Classic transactions don't need as many accounts since they're sequential
+                config.APPLY_LOAD_NUM_ACCOUNTS =
+                    config.APPLY_LOAD_MAX_TPS_MAX_TPS *
+                    (config.APPLY_LOAD_MAX_TPS_TARGET_CLOSE_TIME_MS /
                      1000) *
                     2;
 
@@ -1981,6 +2007,12 @@ runApplyLoad(CommandLineArgs const& args)
                 if (mode == ApplyLoadMode::MAX_SAC_TPS)
                 {
                     al.findMaxSacTps();
+                    return 0;
+                }
+
+                if (mode == ApplyLoadMode::MAX_CLASSIC_TPS)
+                {
+                    al.findMaxClassicTps();
                     return 0;
                 }
 

@@ -17,7 +17,8 @@ enum class ApplyLoadMode
     SOROBAN,
     CLASSIC,
     MIX,
-    MAX_SAC_TPS
+    MAX_SAC_TPS,
+    MAX_CLASSIC_TPS
 };
 
 class ApplyLoad
@@ -35,11 +36,16 @@ class ApplyLoad
 
     // Generates SAC transactions and times just the application phase (fee and
     // sequence number processing, tx execution, and post process, but no disk
-    // writes). This will do a binary search from APPLY_LOAD_MAX_SAC_TPS_MIN_TPS
-    // to APPLY_LOAD_MAX_SAC_TPS_MAX_TPS, attempting to find the largest
+    // writes). This will do a binary search from APPLY_LOAD_MAX_TPS_MIN_TPS
+    // to APPLY_LOAD_MAX_TPS_MAX_TPS, attempting to find the largest
     // transaction set we can execute in under
-    // APPLY_LOAD_MAX_SAC_TPS_TARGET_CLOSE_TIME_MS.
+    // APPLY_LOAD_MAX_TPS_TARGET_CLOSE_TIME_MS.
     void findMaxSacTps();
+
+    // Similar to findMaxSacTps but for classic payment transactions.
+    // Uses APPLY_LOAD_MAX_TPS_MIN_TPS to APPLY_LOAD_MAX_TPS_MAX_TPS
+    // range and APPLY_LOAD_MAX_TPS_TARGET_CLOSE_TIME_MS target.
+    void findMaxClassicTps();
 
     // Returns the % of transactions that succeeded during apply time. The range
     // of values is [0,1.0].
@@ -78,10 +84,18 @@ class ApplyLoad
     // milliseconds.
     double benchmarkSacTps(uint32_t targetTps);
 
+    // Run iterations at the given TPS for classic transactions.
+    double benchmarkClassicTps(uint32_t targetTps);
+
     // Generates the given number of native asset SAC payment TXs with no
     // conflicts.
     void generateSacPayments(std::vector<TransactionFrameBasePtr>& txs,
                              uint32_t count);
+
+    // Generates the given number of classic payment TXs with unique
+    // source and destination accounts for no conflicts.
+    void generateClassicPayments(std::vector<TransactionFrameBasePtr>& txs,
+                                  uint32_t count);
 
     // Calculate instructions per transaction based on batch size
     uint64_t calculateInstructionsPerTx() const;
@@ -96,6 +110,9 @@ class ApplyLoad
 
     // Upgrades to very high limits for max TPS apply load test
     void upgradeSettingsForMaxTPS(uint32_t txsToGenerate);
+
+    // Upgrades tx set size for classic TPS test
+    void upgradeSettingsForMaxClassicTPS(uint32_t txsToGenerate);
 
     // Helper method to apply a config upgrade
     void applyConfigUpgrade(SorobanUpgradeConfig const& upgradeConfig);

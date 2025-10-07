@@ -399,10 +399,10 @@ class Config : public std::enable_shared_from_this<Config>
     std::vector<uint32_t> APPLY_LOAD_EVENT_COUNT_FOR_TESTING;
     std::vector<uint32_t> APPLY_LOAD_EVENT_COUNT_DISTRIBUTION_FOR_TESTING;
 
-    // MAX_SAC_TPS mode specific parameters
-    uint32_t APPLY_LOAD_MAX_SAC_TPS_TARGET_CLOSE_TIME_MS = 1000;
-    uint32_t APPLY_LOAD_MAX_SAC_TPS_MIN_TPS = 100;
-    uint32_t APPLY_LOAD_MAX_SAC_TPS_MAX_TPS = 50000;
+    // MAX_TPS mode parameters (shared by MAX_SAC_TPS and MAX_CLASSIC_TPS)
+    uint32_t APPLY_LOAD_MAX_TPS_TARGET_CLOSE_TIME_MS = 1000;
+    uint32_t APPLY_LOAD_MAX_TPS_MIN_TPS = 100;
+    uint32_t APPLY_LOAD_MAX_TPS_MAX_TPS = 50000;
 
     // Number of SAC payments to include in each tx for MAX_SAC_TPS mode.
     // If set to 1, each TX will be a single SAC invocation.

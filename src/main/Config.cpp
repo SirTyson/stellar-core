@@ -1683,20 +1683,37 @@ Config::processConfig(std::shared_ptr<cpptoml::table> t)
                  [&]() { APPLY_LOAD_NUM_LEDGERS = readInt<uint32_t>(item); }},
                 {"APPLY_LOAD_MAX_SAC_TPS_TARGET_CLOSE_TIME_MS",
                  [&]() {
-                     APPLY_LOAD_MAX_SAC_TPS_TARGET_CLOSE_TIME_MS =
+                     // Map old name to unified parameter for backward compatibility
+                     APPLY_LOAD_MAX_TPS_TARGET_CLOSE_TIME_MS =
                          readInt<uint32_t>(item, 10);
                  }},
                 {"APPLY_LOAD_MAX_SAC_TPS_MIN_TPS",
                  [&]() {
-                     APPLY_LOAD_MAX_SAC_TPS_MIN_TPS = readInt<uint32_t>(item);
+                     // Map old name to unified parameter for backward compatibility
+                     APPLY_LOAD_MAX_TPS_MIN_TPS = readInt<uint32_t>(item);
                  }},
                 {"APPLY_LOAD_MAX_SAC_TPS_MAX_TPS",
                  [&]() {
-                     APPLY_LOAD_MAX_SAC_TPS_MAX_TPS = readInt<uint32_t>(item);
+                     // Map old name to unified parameter for backward compatibility
+                     APPLY_LOAD_MAX_TPS_MAX_TPS = readInt<uint32_t>(item);
                  }},
                 {"APPLY_LOAD_BATCH_SAC_COUNT",
                  [&]() {
                      APPLY_LOAD_BATCH_SAC_COUNT = readInt<uint32_t>(item, 1);
+                 }},
+                // New unified MAX_TPS parameters
+                {"APPLY_LOAD_MAX_TPS_TARGET_CLOSE_TIME_MS",
+                 [&]() {
+                     APPLY_LOAD_MAX_TPS_TARGET_CLOSE_TIME_MS =
+                         readInt<uint32_t>(item, 10);
+                 }},
+                {"APPLY_LOAD_MAX_TPS_MIN_TPS",
+                 [&]() {
+                     APPLY_LOAD_MAX_TPS_MIN_TPS = readInt<uint32_t>(item);
+                 }},
+                {"APPLY_LOAD_MAX_TPS_MAX_TPS",
+                 [&]() {
+                     APPLY_LOAD_MAX_TPS_MAX_TPS = readInt<uint32_t>(item);
                  }},
                 {"APPLY_LOAD_TIME_WRITES",
                  [&]() { APPLY_LOAD_TIME_WRITES = readBool(item); }},

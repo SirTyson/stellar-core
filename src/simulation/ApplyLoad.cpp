@@ -6,6 +6,7 @@
 #include <numeric>
 #include <string>
 #include <unordered_map>
+#include <fmt/format.h>
 
 #include "bucket/test/BucketTestUtils.h"
 #include "herder/Herder.h"
@@ -267,7 +268,9 @@ ApplyLoad::ApplyLoad(Application& app, ApplyLoadMode mode)
               2,
           mApp.getConfig().APPLY_LOAD_NUM_ACCOUNTS))
     , mTotalHotArchiveEntries(
-          calculateRequiredHotArchiveEntries(app.getConfig()))
+          (mode == ApplyLoadMode::CLASSIC || mode == ApplyLoadMode::MAX_CLASSIC_TPS)
+              ? 0
+              : calculateRequiredHotArchiveEntries(app.getConfig()))
     , mTxCountUtilization(
           mApp.getMetrics().NewHistogram({"soroban", "benchmark", "tx-count"}))
     , mInstructionUtilization(
@@ -285,7 +288,15 @@ ApplyLoad::ApplyLoad(Application& app, ApplyLoadMode mode)
     , mMode(mode)
     , mTxGenerator(app, mTotalHotArchiveEntries)
 {
+    if (mode == ApplyLoadMode::MAX_CLASSIC_TPS)
+    {
+        CLOG_WARNING(Perf, "Starting setup() for MAX_CLASSIC_TPS mode");
+    }
     setup();
+    if (mode == ApplyLoadMode::MAX_CLASSIC_TPS)
+    {
+        CLOG_WARNING(Perf, "Completed setup() for MAX_CLASSIC_TPS mode");
+    }
 }
 
 void
@@ -323,6 +334,12 @@ ApplyLoad::setup()
             }
         }
     }
+    else if (mMode == ApplyLoadMode::MAX_CLASSIC_TPS)
+    {
+        // For MAX_CLASSIC_TPS, we only need accounts and tx set size upgrades
+        // Initial placeholder upgrade, will be adjusted during test
+        upgradeSettingsForMaxClassicTPS(1000);
+    }
     else
     {
         auto upgrade = xdr::xvector<UpgradeType, 6>{};
@@ -336,7 +353,11 @@ ApplyLoad::setup()
         closeLedger({}, upgrade);
     }
 
-    setupBucketList();
+    // Only setup bucket list for modes that use contracts
+    if (mMode != ApplyLoadMode::CLASSIC && mMode != ApplyLoadMode::MAX_CLASSIC_TPS)
+    {
+        setupBucketList();
+    }
 }
 
 void
@@ -344,6 +365,18 @@ ApplyLoad::closeLedger(std::vector<TransactionFrameBasePtr> const& txs,
                        xdr::xvector<UpgradeType, 6> const& upgrades)
 {
     auto txSet = makeTxSetFromTransactions(txs, mApp, 0, UINT64_MAX);
+
+    // Log the XDR size of the transaction set for max_sac_tps test
+    if (mMode == ApplyLoadMode::MAX_SAC_TPS)
+    {
+        CLOG_FATAL(Perf, "MAX_SAC_TPS txset XDR size: {} bytes",
+                   txSet.first->encodedSize());
+    }
+    else if (mMode == ApplyLoadMode::MAX_CLASSIC_TPS)
+    {
+        CLOG_FATAL(Perf, "MAX_CLASSIC_TPS txset XDR size: {} bytes",
+                   txSet.first->encodedSize());
+    }
 
     auto sv =
         mApp.getHerder().makeStellarValue(txSet.first->getContentsHash(), 1,
@@ -453,7 +486,8 @@ ApplyLoad::applyConfigUpgrade(SorobanUpgradeConfig const& upgradeConfig)
 void
 ApplyLoad::upgradeSettings()
 {
-    releaseAssertOrThrow(mMode != ApplyLoadMode::MAX_SAC_TPS);
+    releaseAssertOrThrow(mMode != ApplyLoadMode::MAX_SAC_TPS &&
+                         mMode != ApplyLoadMode::MAX_CLASSIC_TPS);
 
     auto upgradeConfig = getUpgradeConfig(mApp.getConfig());
     applyConfigUpgrade(upgradeConfig);
@@ -586,7 +620,7 @@ ApplyLoad::setupBatchTransferContracts()
         // We need to transfer enough XLM to cover all batch transfers
         // Each batch will transfer APPLY_LOAD_BATCH_SAC_COUNT * 1 stroop
         int64_t maxTxsPerCluster =
-            mApp.getConfig().APPLY_LOAD_MAX_SAC_TPS_MAX_TPS / numClusters;
+            mApp.getConfig().APPLY_LOAD_MAX_TPS_MAX_TPS / numClusters;
         int64_t amountToTransfer =
             mApp.getConfig().APPLY_LOAD_BATCH_SAC_COUNT * // Sent per tx
             maxTxsPerCluster * // Max txs per ledger per cluster
@@ -788,7 +822,8 @@ ApplyLoad::setupBucketList()
 void
 ApplyLoad::benchmark()
 {
-    releaseAssertOrThrow(mMode != ApplyLoadMode::MAX_SAC_TPS);
+    releaseAssertOrThrow(mMode != ApplyLoadMode::MAX_SAC_TPS &&
+                         mMode != ApplyLoadMode::MAX_CLASSIC_TPS);
 
     auto& lm = mApp.getLedgerManager();
     std::vector<TransactionFrameBasePtr> txs;
@@ -980,19 +1015,29 @@ ApplyLoad::benchmark()
 double
 ApplyLoad::successRate()
 {
-    if (mMode == ApplyLoadMode::CLASSIC)
+    if (mMode == ApplyLoadMode::CLASSIC || mMode == ApplyLoadMode::MAX_CLASSIC_TPS)
     {
         auto& success =
             mApp.getMetrics().NewCounter({"ledger", "apply", "success"});
         auto& failure =
             mApp.getMetrics().NewCounter({"ledger", "apply", "failure"});
-        return success.count() * 1.0 / (success.count() + failure.count());
+        auto total = success.count() + failure.count();
+        if (total == 0)
+        {
+            return 0.0; // Avoid division by zero
+        }
+        return success.count() * 1.0 / total;
     }
     else
     {
-        return mTxGenerator.getApplySorobanSuccess().count() * 1.0 /
-               (mTxGenerator.getApplySorobanSuccess().count() +
-                mTxGenerator.getApplySorobanFailure().count());
+        auto successCount = mTxGenerator.getApplySorobanSuccess().count();
+        auto failureCount = mTxGenerator.getApplySorobanFailure().count();
+        auto total = successCount + failureCount;
+        if (total == 0)
+        {
+            return 0.0; // Avoid division by zero
+        }
+        return successCount * 1.0 / total;
     }
 }
 
@@ -1051,13 +1096,13 @@ ApplyLoad::findMaxSacTps()
 {
     releaseAssertOrThrow(mMode == ApplyLoadMode::MAX_SAC_TPS);
 
-    uint32_t minTps = mApp.getConfig().APPLY_LOAD_MAX_SAC_TPS_MIN_TPS;
-    uint32_t maxTps = mApp.getConfig().APPLY_LOAD_MAX_SAC_TPS_MAX_TPS;
+    uint32_t minTps = mApp.getConfig().APPLY_LOAD_MAX_TPS_MIN_TPS;
+    uint32_t maxTps = mApp.getConfig().APPLY_LOAD_MAX_TPS_MAX_TPS;
     uint32_t bestTps = 0;
     uint32_t numClusters =
         mApp.getConfig().APPLY_LOAD_LEDGER_MAX_DEPENDENT_TX_CLUSTERS;
     double targetCloseTime =
-        mApp.getConfig().APPLY_LOAD_MAX_SAC_TPS_TARGET_CLOSE_TIME_MS;
+        mApp.getConfig().APPLY_LOAD_MAX_TPS_TARGET_CLOSE_TIME_MS;
 
     CLOG_WARNING(Perf,
                  "Starting MAX_SAC_TPS binary search between {} and {} TPS",
@@ -1259,5 +1304,175 @@ ApplyLoad::generateSacPayments(std::vector<TransactionFrameBasePtr>& txs,
             txs.push_back(tx.second);
         }
     }
+}
+
+void
+ApplyLoad::generateClassicPayments(std::vector<TransactionFrameBasePtr>& txs,
+                                   uint32_t count)
+{
+    auto const& accounts = mTxGenerator.getAccounts();
+
+    // We need at least 2 * count accounts to ensure unique source and destination
+    releaseAssert(accounts.size() >= count * 2);
+
+    // Generate classic payment transactions with unique source and destination
+    // accounts to avoid any conflicts
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        // Use a different source account for each transaction
+        uint32_t sourceIdx = i % mNumAccounts;
+        auto sourceIt = accounts.find(sourceIdx);
+        releaseAssert(sourceIt != accounts.end());
+
+        // Use a deterministic but different destination account
+        // Offset by count to ensure no overlap with source accounts
+        uint32_t destIdx = (i + count) % mNumAccounts;
+        auto destIt = accounts.find(destIdx);
+        releaseAssert(destIt != accounts.end());
+
+        // Load the source account's sequence number
+        sourceIt->second->loadSequenceNumber();
+
+        // Create a payment operation directly
+        std::vector<Operation> paymentOps;
+        paymentOps.emplace_back(
+            txtest::payment(destIt->second->getPublicKey(), 1));
+
+        // Create transaction with the payment
+        auto tx = mTxGenerator.createTransactionFramePtr(
+            sourceIt->second, paymentOps, std::nullopt, 1);
+
+        txs.push_back(tx);
+    }
+}
+
+void
+ApplyLoad::findMaxClassicTps()
+{
+    CLOG_WARNING(Perf, "Starting findMaxClassicTps");
+    releaseAssertOrThrow(mMode == ApplyLoadMode::MAX_CLASSIC_TPS);
+
+    uint32_t minTps = mApp.getConfig().APPLY_LOAD_MAX_TPS_MIN_TPS;
+    uint32_t maxTps = mApp.getConfig().APPLY_LOAD_MAX_TPS_MAX_TPS;
+    uint32_t bestTps = 0;
+    double targetCloseTime =
+        mApp.getConfig().APPLY_LOAD_MAX_TPS_TARGET_CLOSE_TIME_MS;
+
+    CLOG_WARNING(Perf,
+                 "Starting MAX_CLASSIC_TPS binary search between {} and {} TPS",
+                 minTps, maxTps);
+    CLOG_WARNING(Perf, "Target close time: {}ms", targetCloseTime);
+
+    while (minTps <= maxTps)
+    {
+        uint32_t testTps = (minTps + maxTps) / 2;
+
+        // Calculate transactions per ledger based on target close time
+        uint32_t txsPerLedger = static_cast<uint32_t>(
+            static_cast<double>(testTps) * (targetCloseTime / 1000.0));
+
+        CLOG_WARNING(Perf, "Testing {} TPS with {} TXs per ledger.", testTps,
+                     txsPerLedger);
+
+        // Upgrade settings to allow the tx set size
+        upgradeSettingsForMaxClassicTPS(txsPerLedger);
+
+        // Run benchmark iterations
+        double avgCloseTime = benchmarkClassicTps(txsPerLedger);
+
+        if (avgCloseTime <= targetCloseTime)
+        {
+            CLOG_WARNING(
+                Perf,
+                "  SUCCESS: {} TPS achieved in {:.2f}ms (target: {:.2f}ms)",
+                testTps, avgCloseTime, targetCloseTime);
+            bestTps = testTps;
+            minTps = testTps + 1;
+        }
+        else
+        {
+            CLOG_WARNING(
+                Perf,
+                "  FAILURE: {} TPS took {:.2f}ms (target: {:.2f}ms)",
+                testTps, avgCloseTime, targetCloseTime);
+            maxTps = testTps - 1;
+        }
+    }
+
+    CLOG_FATAL(Perf, "MAX_CLASSIC_TPS result: {} TPS", bestTps);
+}
+
+double
+ApplyLoad::benchmarkClassicTps(uint32_t txsPerLedger)
+{
+    // Run benchmark for a fixed number of ledgers
+    uint32_t numLedgers = 5;
+    // Use the same timer as SAC for consistency
+    auto& totalTxApplyTimer =
+        mApp.getMetrics().NewTimer({"ledger", "transaction", "total-apply"});
+    totalTxApplyTimer.Clear();
+
+    // Get initial success count to track new transactions
+    auto& success = mApp.getMetrics().NewCounter({"ledger", "apply", "success"});
+    auto& failure = mApp.getMetrics().NewCounter({"ledger", "apply", "failure"});
+    int64_t initialSuccessCount = success.count();
+    int64_t initialFailureCount = failure.count();
+
+    for (uint32_t iter = 0; iter < numLedgers; ++iter)
+    {
+        // Generate transactions for this ledger
+        std::vector<TransactionFrameBasePtr> txs;
+        txs.reserve(txsPerLedger);
+
+        generateClassicPayments(txs, txsPerLedger);
+        releaseAssertOrThrow(txs.size() == txsPerLedger);
+
+        // Make sure bucket list is ready
+        mApp.getBucketManager().getLiveBucketList().resolveAllFutures();
+        releaseAssert(
+            mApp.getBucketManager().getLiveBucketList().futuresAllResolved());
+
+        closeLedger(txs);
+
+        CLOG_WARNING(Perf, "  Ledger {}/{} completed", iter + 1, numLedgers);
+
+        // Check transaction success rate - all should succeed
+        int64_t newSuccessCount = success.count() - initialSuccessCount;
+        int64_t newFailureCount = failure.count() - initialFailureCount;
+
+        releaseAssert(newFailureCount == 0);
+        releaseAssert(newSuccessCount == static_cast<int64_t>((iter + 1) * txsPerLedger));
+    }
+
+    // Calculate average close time from all closed ledgers
+    double totalTime = totalTxApplyTimer.sum();
+    double avgTime = totalTime / numLedgers;
+
+    CLOG_WARNING(Perf, "  Total time: {:.2f}ms for {} ledgers", totalTime,
+                 numLedgers);
+    CLOG_WARNING(Perf, "  Average total tx apply time per ledger: {:.2f}ms",
+                 avgTime);
+
+    return avgTime;
+}
+
+void
+ApplyLoad::upgradeSettingsForMaxClassicTPS(uint32_t txsToGenerate)
+{
+    // For classic transactions, we only need to upgrade the max tx set size
+    // using a regular ledger upgrade, not Soroban config upgrades
+    auto upgrade = xdr::xvector<UpgradeType, 6>{};
+
+    // Upgrade max tx set size to accommodate all test transactions
+    LedgerUpgrade ledgerUpgrade;
+    ledgerUpgrade.type(LEDGER_UPGRADE_MAX_TX_SET_SIZE);
+    // Set high enough to avoid surge pricing - each classic payment is ~300 bytes
+    ledgerUpgrade.newMaxTxSetSize() = (txsToGenerate + 1000) * 500;
+
+    auto v = xdr::xdr_to_opaque(ledgerUpgrade);
+    upgrade.push_back(UpgradeType{v.begin(), v.end()});
+
+    // Apply the upgrade via a ledger close
+    closeLedger({}, upgrade);
 }
 }
