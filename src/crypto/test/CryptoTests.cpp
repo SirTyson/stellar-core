@@ -16,11 +16,15 @@
 #include "test/test.h"
 #include "util/Logging.h"
 #include "xdr/Stellar-types.h"
+#include <atomic>
 #include <autocheck/autocheck.hpp>
 #include <map>
 #include <regex>
 #include <sodium.h>
 #include <stdexcept>
+#include <thread>
+#include <array>
+#include <cstring>
 
 using namespace stellar;
 
@@ -1642,4 +1646,272 @@ TEST_CASE("Ed25519 test vectors from Zcash", "[crypto]")
         sig.assign(s.begin(), s.end());
         REQUIRE(!PubKeyUtils::verifySig(pk, sig, std::string("Zcash")));
     }
+}
+
+// Benchmarking tests for Rust crypto vs libsodium implementations
+#include "crypto/RustCrypto.h"
+#include <chrono>
+#include <random>
+#include <vector>
+
+// Helper function to generate random data
+static std::vector<uint8_t>
+generateRandomData(size_t size)
+{
+    std::vector<uint8_t> data(size);
+    randombytes(data.data(), size);
+    return data;
+}
+
+// Helper function for timing
+using Clock = std::chrono::high_resolution_clock;
+using CryptoDuration = std::chrono::duration<double, std::milli>;
+
+TEST_CASE("SHA256 Rust vs Libsodium benchmark", "[crypto][benchmark]")
+{
+    // Test different data sizes
+    std::vector<size_t> dataSizes = {32,   64,   128,   256,   512,
+                                     1024, 4096, 16384, 65536, 262144};
+    const int iterations = 50000;
+
+    LOG_INFO(
+        DEFAULT_LOG,
+        "Running SHA256 Rust vs Libsodium benchmark, iterations per size: {}",
+        iterations);
+    for (auto dataSize : dataSizes)
+    {
+        SECTION("SHA256 benchmark - " + std::to_string(dataSize) + " bytes")
+        {
+            auto testData = generateRandomData(dataSize);
+
+            // Benchmark libsodium implementation
+            rust_crypto::gUseRustCrypto = false;
+            auto start = Clock::now();
+            for (int i = 0; i < iterations; ++i)
+            {
+                sha256(testData);
+            }
+            auto libsodiumTime =
+                std::chrono::duration_cast<CryptoDuration>(Clock::now() - start)
+                    .count();
+
+            // Benchmark Rust implementation
+            rust_crypto::gUseRustCrypto = true;
+            start = Clock::now();
+            for (int i = 0; i < iterations; ++i)
+            {
+                sha256(testData);
+            }
+            auto rustTime =
+                std::chrono::duration_cast<CryptoDuration>(Clock::now() - start)
+                    .count();
+
+            // Verify both implementations produce the same result
+            rust_crypto::gUseRustCrypto = false;
+            auto libsodiumHash = sha256(testData);
+            rust_crypto::gUseRustCrypto = true;
+            auto rustHash = sha256(testData);
+            REQUIRE(libsodiumHash == rustHash);
+
+            LOG_INFO(DEFAULT_LOG,
+                     "SHA256 {} bytes: libsodium={:.3f}ms, rust={:.3f}ms, "
+                     "speedup={:.2f}x",
+                     dataSize, libsodiumTime, rustTime,
+                     libsodiumTime / rustTime);
+        }
+    }
+
+    // Reset to default
+    rust_crypto::gUseRustCrypto = true;
+}
+
+TEST_CASE("HMAC-SHA256 Rust vs Libsodium benchmark", "[crypto][benchmark]")
+{
+    std::vector<size_t> dataSizes = {32,   64,   128,   256,   512,
+                                     1024, 4096, 16384, 65536, 262144};
+    const int iterations = 10000;
+
+    // Generate a key
+    HmacSha256Key key;
+    randombytes(key.key.data(), key.key.size());
+
+    for (auto dataSize : dataSizes)
+    {
+        SECTION("HMAC-SHA256 benchmark - " + std::to_string(dataSize) +
+                " bytes")
+        {
+            auto testData = generateRandomData(dataSize);
+
+            // Benchmark libsodium implementation
+            rust_crypto::gUseRustCrypto = false;
+            auto start = Clock::now();
+            for (int i = 0; i < iterations; ++i)
+            {
+                hmacSha256(key, testData);
+            }
+            auto libsodiumTime =
+                std::chrono::duration_cast<CryptoDuration>(Clock::now() - start)
+                    .count();
+
+            // Benchmark Rust implementation
+            rust_crypto::gUseRustCrypto = true;
+            start = Clock::now();
+            for (int i = 0; i < iterations; ++i)
+            {
+                hmacSha256(key, testData);
+            }
+            auto rustTime =
+                std::chrono::duration_cast<CryptoDuration>(Clock::now() - start)
+                    .count();
+
+            // Verify both implementations produce the same result
+            rust_crypto::gUseRustCrypto = false;
+            auto libsodiumMac = hmacSha256(key, testData);
+            rust_crypto::gUseRustCrypto = true;
+            auto rustMac = hmacSha256(key, testData);
+            REQUIRE(libsodiumMac.mac == rustMac.mac);
+
+            LOG_INFO(DEFAULT_LOG,
+                     "HMAC-SHA256 {} bytes: libsodium={:.3f}ms, rust={:.3f}ms, "
+                     "speedup={:.2f}x",
+                     dataSize, libsodiumTime, rustTime,
+                     libsodiumTime / rustTime);
+        }
+    }
+
+    rust_crypto::gUseRustCrypto = true;
+}
+
+// Stress tests with high load
+TEST_CASE("SHA256 stress test - correctness under load", "[crypto][stress]")
+{
+    const int numThreads = 4;
+    const int iterationsPerThread = 100000;
+    std::vector<std::thread> threads;
+    std::atomic<int> successCount{0};
+
+    // Generate test vectors
+    std::vector<std::pair<std::vector<uint8_t>, uint256>> testVectors;
+    for (int i = 0; i < 100; ++i)
+    {
+        auto data = generateRandomData(256);
+        rust_crypto::gUseRustCrypto = false;
+        auto expectedHash = sha256(data);
+        testVectors.emplace_back(data, expectedHash);
+    }
+
+    auto workerFunc = [&]() {
+        for (int i = 0; i < iterationsPerThread; ++i)
+        {
+            auto& testVector = testVectors[i % testVectors.size()];
+
+            // Test with libsodium
+            rust_crypto::gUseRustCrypto = false;
+            auto libsodiumHash = sha256(testVector.first);
+            if (libsodiumHash == testVector.second)
+            {
+                successCount++;
+            }
+
+            // Test with Rust
+            rust_crypto::gUseRustCrypto = true;
+            auto rustHash = sha256(testVector.first);
+            if (rustHash == testVector.second)
+            {
+                successCount++;
+            }
+        }
+    };
+
+    auto start = Clock::now();
+    for (int i = 0; i < numThreads; ++i)
+    {
+        threads.emplace_back(workerFunc);
+    }
+
+    for (auto& t : threads)
+    {
+        t.join();
+    }
+    auto elapsed =
+        std::chrono::duration_cast<CryptoDuration>(Clock::now() - start)
+            .count();
+
+    REQUIRE(successCount == numThreads * iterationsPerThread * 2);
+    LOG_INFO(DEFAULT_LOG,
+             "SHA256 stress test: {} operations in {:.3f}ms ({:.0f} ops/sec)",
+             successCount.load(), elapsed,
+             (successCount.load() * 1000.0) / elapsed);
+
+    rust_crypto::gUseRustCrypto = true;
+}
+
+TEST_CASE("HMAC-SHA256 stress test - correctness under load",
+          "[crypto][stress]")
+{
+    const int numThreads = 4;
+    const int iterationsPerThread = 50000;
+    std::vector<std::thread> threads;
+    std::atomic<int> successCount{0};
+
+    // Generate test vectors
+    std::vector<std::tuple<HmacSha256Key, std::vector<uint8_t>, HmacSha256Mac>>
+        testVectors;
+    for (int i = 0; i < 100; ++i)
+    {
+        HmacSha256Key key;
+        randombytes(key.key.data(), key.key.size());
+        auto data = generateRandomData(256);
+        rust_crypto::gUseRustCrypto = false;
+        auto expectedMac = hmacSha256(key, data);
+        testVectors.emplace_back(key, data, expectedMac);
+    }
+
+    auto workerFunc = [&]() {
+        for (int i = 0; i < iterationsPerThread; ++i)
+        {
+            auto& [key, data, expectedMac] =
+                testVectors[i % testVectors.size()];
+
+            // Test with libsodium
+            rust_crypto::gUseRustCrypto = false;
+            auto libsodiumMac = hmacSha256(key, data);
+            if (libsodiumMac.mac == expectedMac.mac &&
+                hmacSha256Verify(expectedMac, key, data))
+            {
+                successCount++;
+            }
+
+            // Test with Rust
+            rust_crypto::gUseRustCrypto = true;
+            auto rustMac = hmacSha256(key, data);
+            if (rustMac.mac == expectedMac.mac &&
+                hmacSha256Verify(expectedMac, key, data))
+            {
+                successCount++;
+            }
+        }
+    };
+
+    auto start = Clock::now();
+    for (int i = 0; i < numThreads; ++i)
+    {
+        threads.emplace_back(workerFunc);
+    }
+
+    for (auto& t : threads)
+    {
+        t.join();
+    }
+    auto elapsed =
+        std::chrono::duration_cast<CryptoDuration>(Clock::now() - start)
+            .count();
+
+    REQUIRE(successCount == numThreads * iterationsPerThread * 2);
+    LOG_INFO(
+        DEFAULT_LOG,
+        "HMAC-SHA256 stress test: {} operations in {:.3f}ms ({:.0f} ops/sec)",
+        successCount.load(), elapsed, (successCount.load() * 1000.0) / elapsed);
+
+    rust_crypto::gUseRustCrypto = true;
 }

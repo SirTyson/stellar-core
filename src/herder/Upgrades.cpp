@@ -5,6 +5,7 @@
 #include "herder/Upgrades.h"
 #include "bucket/BucketManager.h"
 #include "crypto/Hex.h"
+#include "crypto/RustCrypto.h"
 #include "crypto/SHA.h"
 #include "crypto/SecretKey.h"
 #include "database/Database.h"
@@ -1229,6 +1230,7 @@ Upgrades::applyVersionUpgrade(Application& app, AbstractLedgerTxn& ltx,
     if (needUpgradeToVersion(ProtocolVersion::V_24, prevVersion, newVersion))
     {
         PubKeyUtils::enableRustDalekVerify();
+        rust_crypto::enableRustCrypto();
     }
 
     // Starting from protocol 23 we need to fully override the Soroban in-memory

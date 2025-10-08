@@ -190,6 +190,31 @@ pub(crate) mod rust_bridge {
             message_ptr: *const u8,
             message_len: usize,
         ) -> bool;
+
+        // High-performance crypto functions using Rust libraries
+        // SHA-256
+        unsafe fn compute_sha256_rust(
+            message_ptr: *const u8,
+            message_len: usize,
+            output_ptr: *mut u8,
+        );
+
+        // HMAC-SHA256
+        unsafe fn compute_hmac_sha256_rust(
+            key_ptr: *const u8,
+            key_len: usize,
+            message_ptr: *const u8,
+            message_len: usize,
+            output_ptr: *mut u8,
+        ) -> bool;
+
+        unsafe fn verify_hmac_sha256_rust(
+            key_ptr: *const u8,
+            key_len: usize,
+            message_ptr: *const u8,
+            message_len: usize,
+            mac_ptr: *const u8,
+        ) -> bool;
         fn invoke_host_function(
             config_max_protocol: u32,
             enable_diagnostics: bool,
@@ -386,6 +411,7 @@ pub(crate) mod rust_bridge {
 // code so they have to be in scope here.
 use crate::b64::*;
 use crate::common::*;
+use crate::crypto_bridge::*;
 use crate::ed25519_verify::*;
 use crate::i128::*;
 use crate::log::*;

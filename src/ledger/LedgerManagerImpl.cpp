@@ -10,6 +10,7 @@
 #include "catchup/AssumeStateWork.h"
 #include "crypto/Hex.h"
 #include "crypto/KeyUtils.h"
+#include "crypto/RustCrypto.h"
 #include "crypto/SHA.h"
 #include "crypto/SecretKey.h"
 #include "database/Database.h"
@@ -1729,6 +1730,7 @@ LedgerManagerImpl::setLastClosedLedger(
     if (protocolVersionStartsFrom(ledgerVersion, ProtocolVersion::V_24))
     {
         PubKeyUtils::enableRustDalekVerify();
+        rust_crypto::enableRustCrypto();
     }
 
     // This should not be additionally conditionalized on lv >= anything,

@@ -6,6 +6,7 @@
 #include "crypto/ByteSlice.h"
 #include "crypto/CryptoError.h"
 #include "crypto/Curve25519.h"
+#include "crypto/RustCrypto.h"
 #include "util/NonCopyable.h"
 #include <Tracy.hpp>
 #include <sodium.h>
@@ -19,9 +20,16 @@ sha256(ByteSlice const& bin)
 {
     ZoneScoped;
     uint256 out;
-    if (crypto_hash_sha256(out.data(), bin.data(), bin.size()) != 0)
+    if (rust_crypto::gUseRustCrypto)
     {
-        throw CryptoError("error from crypto_hash_sha256");
+        rust_crypto::sha256(bin.data(), bin.size(), out.data());
+    }
+    else
+    {
+        if (crypto_hash_sha256(out.data(), bin.data(), bin.size()) != 0)
+        {
+            throw CryptoError("error from crypto_hash_sha256");
+        }
     }
     return out;
 }
@@ -88,10 +96,22 @@ hmacSha256(HmacSha256Key const& key, ByteSlice const& bin)
 {
     ZoneScoped;
     HmacSha256Mac out;
-    if (crypto_auth_hmacsha256(out.mac.data(), bin.data(), bin.size(),
-                               key.key.data()) != 0)
+    if (rust_crypto::gUseRustCrypto)
     {
-        throw CryptoError("error from crypto_auto_hmacsha256");
+        if (!rust_crypto::hmacSha256(key.key.data(), key.key.size(),
+                                     bin.data(), bin.size(),
+                                     out.mac.data()))
+        {
+            throw CryptoError("error from rust hmacSha256");
+        }
+    }
+    else
+    {
+        if (crypto_auth_hmacsha256(out.mac.data(), bin.data(), bin.size(),
+                                   key.key.data()) != 0)
+        {
+            throw CryptoError("error from crypto_auto_hmacsha256");
+        }
     }
     return out;
 }
@@ -101,8 +121,17 @@ hmacSha256Verify(HmacSha256Mac const& hmac, HmacSha256Key const& key,
                  ByteSlice const& bin)
 {
     ZoneScoped;
-    return 0 == crypto_auth_hmacsha256_verify(hmac.mac.data(), bin.data(),
-                                              bin.size(), key.key.data());
+    if (rust_crypto::gUseRustCrypto)
+    {
+        return rust_crypto::hmacSha256Verify(key.key.data(), key.key.size(),
+                                              bin.data(), bin.size(),
+                                              hmac.mac.data());
+    }
+    else
+    {
+        return 0 == crypto_auth_hmacsha256_verify(hmac.mac.data(), bin.data(),
+                                                  bin.size(), key.key.data());
+    }
 }
 
 // Unsalted HKDF-extract(bytes) == HMAC(<zero>,bytes)

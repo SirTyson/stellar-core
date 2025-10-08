@@ -17,6 +17,7 @@
 #include "bucket/BucketManager.h"
 #include "catchup/ApplyBucketsWork.h"
 #include "crypto/Hex.h"
+#include "crypto/RustCrypto.h"
 #include "crypto/SHA.h"
 #include "crypto/SecretKey.h"
 #include "database/Database.h"
@@ -801,12 +802,13 @@ ApplicationImpl::start()
 
     mLedgerManager->loadLastKnownLedger(/* restoreBucketlist */ true);
 
-    // Check if we're already on protocol V_24 or later and enable Rust Dalek
+    // Check if we're already on protocol V_24 or later and enable Rust implementations
     auto const& lcl = mLedgerManager->getLastClosedLedgerHeader();
     if (protocolVersionStartsFrom(lcl.header.ledgerVersion,
                                   ProtocolVersion::V_24))
     {
         PubKeyUtils::enableRustDalekVerify();
+        rust_crypto::enableRustCrypto();
     }
 
     startServices();
