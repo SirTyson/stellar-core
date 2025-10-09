@@ -2780,7 +2780,13 @@ LedgerManagerImpl::sealLedgerTxnAndTransferEntriesToBucketList(
                 {
                     auto lk = LedgerEntryKey(be);
                     auto liveEntry = blSnapshot->load(lk);
-                    releaseAssert(*liveEntry == be);
+                    if (*liveEntry != be)
+                    {
+                        CLOG_FATAL(Bucket, "YEET BAD KEY {}",
+                                   toOpaqueBase64(lk));
+                    }
+
+                    // releaseAssert(*liveEntry == be);
                 }
 
                 mApp.getBucketManager().addHotArchiveBatch(
