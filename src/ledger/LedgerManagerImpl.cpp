@@ -27,6 +27,7 @@
 #include "ledger/LedgerTxn.h"
 #include "ledger/LedgerTxnEntry.h"
 #include "ledger/LedgerTxnHeader.h"
+#include "ledger/LedgerTxnImpl.h"
 #include "ledger/LedgerTypeUtils.h"
 #include "ledger/SharedModuleCacheCompiler.h"
 #include "main/Application.h"
@@ -2771,6 +2772,17 @@ LedgerManagerImpl::sealLedgerTxnAndTransferEntriesToBucketList(
                         restoredEntries.push_back(key);
                     }
                 }
+
+                auto blSnapshot = mApp.getBucketManager()
+                                      .getBucketSnapshotManager()
+                                      .copySearchableLiveBucketListSnapshot();
+                for (auto const& be : evictedState.archivedEntries)
+                {
+                    auto lk = LedgerEntryKey(be);
+                    auto liveEntry = blSnapshot->load(lk);
+                    releaseAssert(*liveEntry == be);
+                }
+
                 mApp.getBucketManager().addHotArchiveBatch(
                     mApp, lh, evictedState.archivedEntries, restoredEntries);
             }
