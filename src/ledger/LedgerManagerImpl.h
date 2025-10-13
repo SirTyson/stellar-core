@@ -23,6 +23,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <unordered_set>
 
 /*
 Holds the current ledger
@@ -64,6 +65,8 @@ class LedgerManagerImpl : public LedgerManager
     std::filesystem::path mMetaDebugPath;
 
   private:
+    std::unordered_set<LedgerKey> mBadKeysFilter;
+
     struct LedgerApplyMetrics
     {
         SorobanMetrics mSorobanMetrics;
