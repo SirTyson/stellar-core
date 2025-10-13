@@ -2782,8 +2782,9 @@ LedgerManagerImpl::sealLedgerTxnAndTransferEntriesToBucketList(
                     auto liveEntry = blSnapshot->load(lk);
                     if (*liveEntry != be)
                     {
-                        CLOG_FATAL(Bucket, "YEET BAD KEY {}",
-                                   toOpaqueBase64(lk));
+                        CLOG_FATAL(Bucket, "YEET BAD KEY {}, {}",
+                                   toOpaqueBase64(lk),
+                                   toOpaqueBase64(*liveEntry));
                     }
 
                     // releaseAssert(*liveEntry == be);
