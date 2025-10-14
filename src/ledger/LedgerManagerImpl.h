@@ -411,6 +411,13 @@ class LedgerManagerImpl : public LedgerManager
 
     State mState;
 
+    // Cached flag to check if ArchivedStateConsistency invariant is enabled
+    bool mArchivedStateConsistencyInvariantEnabled;
+
+    // Check that archived entries match their values in the live BucketList
+    void checkArchivedStateConsistency(EvictedStateVectors const& evictedState,
+                                       LedgerHeader const& lh);
+
 #ifdef BUILD_TESTS
     std::vector<TransactionMetaFrame> mLastLedgerTxMeta;
     std::optional<LedgerCloseMetaFrame> mLastLedgerCloseMeta;

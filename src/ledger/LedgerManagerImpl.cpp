@@ -5,8 +5,11 @@
 #include "ledger/LedgerManagerImpl.h"
 #include "bucket/BucketManager.h"
 #include "bucket/BucketSnapshotManager.h"
+#include "bucket/BucketUtils.h"
 #include "bucket/HotArchiveBucketList.h"
+#include "bucket/LedgerCmp.h"
 #include "bucket/LiveBucketList.h"
+#include "bucket/SearchableBucketList.h"
 #include "catchup/AssumeStateWork.h"
 #include "crypto/Hex.h"
 #include "crypto/KeyUtils.h"
@@ -382,8 +385,105 @@ LedgerManagerImpl::LedgerManagerImpl(Application& app)
     , mCatchupDuration(
           app.getMetrics().NewTimer({"ledger", "catchup", "duration"}))
     , mState(LM_BOOTING_STATE)
+    , mArchivedStateConsistencyInvariantEnabled(false)
 {
+    // Check if ArchivedStateConsistency invariant is enabled
+    mArchivedStateConsistencyInvariantEnabled = std::any_of(
+        app.getConfig().INVARIANT_CHECKS.begin(),
+        app.getConfig().INVARIANT_CHECKS.end(), [](std::string const& inv) {
+            try
+            {
+                std::regex r(inv, std::regex::ECMAScript | std::regex::icase);
+                return std::regex_match("ArchivedStateConsistency", r,
+                                       std::regex_constants::match_not_null);
+            }
+            catch (...)
+            {
+                return false;
+            }
+        });
+
     setupLedgerCloseMetaStream();
+}
+
+void
+LedgerManagerImpl::checkArchivedStateConsistency(
+    EvictedStateVectors const& evictedState, LedgerHeader const& lh)
+{
+    ZoneScoped;
+
+    CLOG_DEBUG(Ledger, "Checking ArchivedStateConsistency invariant");
+    auto& bucketManager = mApp.getBucketManager();
+
+    // Get a searchable snapshot of the LiveBucketList
+    auto blSnapshot = bucketManager.getBucketSnapshotManager()
+                          .copySearchableLiveBucketListSnapshot();
+
+    // Create a set of keys to load
+    std::set<LedgerKey, LedgerEntryIdCmp> keysToLoad;
+    for (auto const& archivedEntry : evictedState.archivedEntries)
+    {
+        keysToLoad.insert(LedgerEntryKey(archivedEntry));
+    }
+
+    // Load all the keys from the BucketList
+    auto loadedEntries =
+        blSnapshot->loadKeys(keysToLoad, "ArchivedStateConsistency");
+
+    // Check that we got the right number of entries
+    if (loadedEntries.size() != evictedState.archivedEntries.size())
+    {
+        std::string errorMsg = fmt::format(
+            FMT_STRING("ArchivedStateConsistency invariant failed: "
+                       "expected {} entries but loaded {}"),
+            evictedState.archivedEntries.size(), loadedEntries.size());
+        CLOG_ERROR(Ledger, "{}", errorMsg);
+        CLOG_ERROR(Ledger, "{}", REPORT_INTERNAL_BUG);
+        throw InvariantDoesNotHold{errorMsg};
+    }
+
+    // Build a map of loaded entries for efficient lookup
+    std::map<LedgerKey, LedgerEntry> loadedMap;
+    for (auto const& entry : loadedEntries)
+    {
+        loadedMap[LedgerEntryKey(entry)] = entry;
+    }
+
+    // Check each archived entry matches the BucketList value
+    for (auto const& archivedEntry : evictedState.archivedEntries)
+    {
+        LedgerKey key = LedgerEntryKey(archivedEntry);
+        auto it = loadedMap.find(key);
+
+        if (it == loadedMap.end())
+        {
+            std::string errorMsg = fmt::format(
+                FMT_STRING("ArchivedStateConsistency invariant "
+                           "failed: key not found in BucketList: {}"),
+                xdrToCerealString(key, "key"));
+            CLOG_ERROR(Ledger, "{}", errorMsg);
+            CLOG_ERROR(Ledger, "{}", REPORT_INTERNAL_BUG);
+            throw InvariantDoesNotHold{errorMsg};
+        }
+
+        if (it->second != archivedEntry)
+        {
+            std::string errorMsg = fmt::format(
+                FMT_STRING("ArchivedStateConsistency invariant "
+                           "failed: value mismatch for key {}"),
+                xdrToCerealString(key, "key"));
+
+            errorMsg += fmt::format(
+                FMT_STRING("\nExpected: {}\nActual: {}"),
+                xdrToCerealString(archivedEntry, "expected"),
+                xdrToCerealString(it->second, "actual"));
+
+            CLOG_ERROR(Ledger, "{}", errorMsg);
+            CLOG_ERROR(Ledger, "{}", REPORT_INTERNAL_BUG);
+            throw InvariantDoesNotHold{errorMsg};
+        }
+    }
+    CLOG_DEBUG(Ledger, "ArchivedStateConsistency invariant passed");
 }
 
 void
@@ -2773,6 +2873,12 @@ LedgerManagerImpl::sealLedgerTxnAndTransferEntriesToBucketList(
                 }
                 mApp.getBucketManager().addHotArchiveBatch(
                     mApp, lh, evictedState.archivedEntries, restoredEntries);
+            }
+
+            // Check ArchivedStateConsistency invariant if enabled
+            if (mArchivedStateConsistencyInvariantEnabled)
+            {
+                checkArchivedStateConsistency(evictedState, lh);
             }
 
             if (ledgerCloseMeta)
