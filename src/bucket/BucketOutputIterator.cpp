@@ -8,11 +8,15 @@
 #include "bucket/HotArchiveBucket.h"
 #include "bucket/LiveBucket.h"
 #include "bucket/LiveBucketIndex.h"
+#include "crypto/Hex.h"
 #include "ledger/LedgerTypeUtils.h"
 #include "util/GlobalChecks.h"
+#include "util/Logging.h"
 #include "util/ProtocolVersion.h"
 #include <Tracy.hpp>
+#include <chrono>
 #include <filesystem>
+#include <thread>
 
 namespace stellar
 {
@@ -215,6 +219,33 @@ BucketOutputIterator<BucketT>::getBucket(
             index = createIndex<BucketT>(bucketManager, mFilename, hash, mCtx,
                                          nullptr);
         }
+    }
+
+    // Between getBucketIfExists above and when we return the merged bucket, we have a race with bucket index GC.
+    // Sometimes, especially in historical ledgers when ledger state is small, it's possible for a Bucket hash
+    // to exsist in the BucketList, exit the BucketList, the re-enter the BucketList at a later level via merge.
+
+    // Suppose we have some bucket X on level 0, which happens to also be the result of some future merge on
+    // level 2. X exits level 0, and at this point is no longer referenced in the BL. Whenever
+    // the level 2 merge finishes, it will become the `next` bucket and be "referenced" again.
+    // However, while this function is running in the background merge thread, the
+    // bucket is not yet considered next.
+    // So the race is as follows:
+    // - Bucket X exits level 0, is no longer referenced in the BL.
+    // - The check on line 204 executes in the background. The bucket is indexed, so no redundant index is created.
+    // - Before this function returns, GC function is run on the main thread.
+    // - Main checks the BL. Level 2 has no next yet, so index of X is delted.
+    // - Background merge (this function) finishes, and level 2 adopts next. However, the index is nullptr, as the check above is outdated.
+    //
+    // This race occurs very rarely, as a bucket has to exist in the BL, leave, then happen to occur
+    // again soon at a later level. To trigger this race, we sleep on a specific
+    // background merge. This can be triggered by running catchup 13219586/1000.
+    auto hashHex = binToHex(hash);
+    if (hashHex == "d6a6959f3a9680e3bf1139e2c54b1f78748d8ea451f50c85aaae0abf8ec0aa6f")
+    {
+        CLOG_INFO(Bucket, "Sleeping 10s in race window for bucket {}",
+                  hashHex);
+        std::this_thread::sleep_for(std::chrono::seconds(10));
     }
 
     if (!index)
