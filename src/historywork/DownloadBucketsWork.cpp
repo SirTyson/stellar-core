@@ -10,6 +10,7 @@
 #include "history/HistoryArchive.h"
 #include "historywork/GetAndUnzipRemoteFileWork.h"
 #include "historywork/VerifyBucketWork.h"
+#include "util/GlobalChecks.h"
 #include "work/WorkWithCallback.h"
 #include <Tracy.hpp>
 #include <fmt/format.h>
@@ -93,6 +94,10 @@ DownloadBucketsWork::onSuccessCb(Application& app, FileTransferInfo const& ft,
         state.indexMap.erase(currId);
     }
 
+    if (!index)
+    {
+        CLOG_FATAL(Bucket, "NO INDEX ON DOWNLOAD FOR BUCKET {}", hash);
+    }
     auto b = app.getBucketManager().adoptFileAsBucket<BucketT>(
         bucketPath.string(), hexToBin256(hash),
         /*mergeKey=*/nullptr,

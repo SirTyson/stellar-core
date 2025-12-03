@@ -37,6 +37,10 @@ BucketBase<BucketT, IndexT>::getIndex() const
 {
     ZoneScoped;
     releaseAssertOrThrow(!mFilename.empty());
+    if (!mIndex)
+    {
+        CLOG_FATAL(Bucket, "NO INDEX FOR BUCKET {}", binToHex(mHash));
+    }
     releaseAssertOrThrow(mIndex);
     return *mIndex;
 }
@@ -113,6 +117,7 @@ template <class BucketT, class IndexT>
 void
 BucketBase<BucketT, IndexT>::freeIndex()
 {
+    CLOG_FATAL(Bucket, "FREEING INDEX FOR BUCKET {}", binToHex(mHash));
     mIndex.reset(nullptr);
 }
 

@@ -115,6 +115,13 @@ IndexBucketsWork<BucketT>::IndexWork::postWork()
                             self->mState = BasicWork::State::WORK_SUCCESS;
                             if (!self->isAborting())
                             {
+                                if (!self->mIndex)
+                                {
+                                    CLOG_FATAL(
+                                        Bucket,
+                                        "NO INDEX ON INDEX WORK FOR BUCKET {}",
+                                        binToHex(self->mBucket->getHash()));
+                                }
                                 self->mApp.getBucketManager().maybeSetIndex(
                                     self->mBucket, std::move(self->mIndex));
                             }

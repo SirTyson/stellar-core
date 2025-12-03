@@ -4,7 +4,9 @@
 
 #include "bucket/LiveBucketList.h"
 #include "bucket/BucketListBase.h"
+#include "crypto/Hex.h"
 #include "ledger/LedgerManager.h"
+#include "util/Logging.h"
 
 #include <medida/counter.h>
 
@@ -19,8 +21,39 @@ LiveBucketList::addBatch(Application& app, uint32_t currLedger,
                          std::vector<LedgerKey> const& deadEntries)
 {
     ZoneScoped;
+
+
+        CLOG_FATAL(Bucket, "BEFORE addBatch ledger {}", currLedger);
+        for (uint32_t i = 0; i < kNumLevels; ++i)
+        {
+            auto const& lev = mLevels[i];
+            CLOG_FATAL(Bucket, "Level {} curr={} isEmpty={} isIndexed={}",
+                       i,
+                       binToHex(lev.getCurr()->getHash()),
+                       lev.getCurr()->isEmpty(), lev.getCurr()->isIndexed());
+            CLOG_FATAL(Bucket, "Level {} snap={} isEmpty={} isIndexed={}",
+                       i,
+                       binToHex(lev.getSnap()->getHash()),
+                       lev.getSnap()->isEmpty(), lev.getSnap()->isIndexed());
+        }
+
     addBatchInternal(app, currLedger, currLedgerProtocol, initEntries,
                      liveEntries, deadEntries);
+
+
+        CLOG_FATAL(Bucket, "AFTER addBatch ledger {}", currLedger);
+        for (uint32_t i = 0; i < kNumLevels; ++i)
+        {
+            auto const& lev = mLevels[i];
+            CLOG_FATAL(Bucket, "Level {} curr={} isEmpty={} isIndexed={}",
+                       i,
+                       binToHex(lev.getCurr()->getHash()),
+                       lev.getCurr()->isEmpty(), lev.getCurr()->isIndexed());
+            CLOG_FATAL(Bucket, "Level {} snap={} isEmpty={} isIndexed={}",
+                       i,
+                       binToHex(lev.getSnap()->getHash()),
+                       lev.getSnap()->isEmpty(), lev.getSnap()->isIndexed());
+        }
 
     // Initialize caches for any new buckets we might have added
     maybeInitializeCaches(app.getConfig());

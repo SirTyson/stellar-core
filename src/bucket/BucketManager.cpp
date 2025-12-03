@@ -519,6 +519,18 @@ BucketManager::adoptFileAsBucketInternal(
 
             // race condition: two buckets + indexes were produced in parallel
             // only setIndex if there is no index already.
+            if (!index)
+            {
+                CLOG_FATAL(Bucket,
+                           "NO INDEX ON ADOPT FROM BM MAP FOR BUCKET {}",
+                           binToHex(hash));
+            }
+            if (!b->isIndexed())
+            {
+                CLOG_FATAL(Bucket,
+                           "EXISTING BUCKET IN MAP NOT INDEXED FOR BUCKET {}",
+                           binToHex(hash));
+            }
             maybeSetIndex(b, std::move(index));
         }
     }
@@ -541,6 +553,11 @@ BucketManager::adoptFileAsBucketInternal(
             }
         }
 
+        if (!index)
+        {
+            CLOG_FATAL(Bucket, "NO INDEX ON ADOPT FOR NEW BUCKET {}",
+                       binToHex(hash));
+        }
         b = std::make_shared<BucketT>(canonicalName, hash, std::move(index));
         {
             bucketMap.emplace(hash, b);
@@ -672,6 +689,8 @@ BucketManager::getBucketByHashInternal(uint256 const& hash,
 
         auto p =
             std::make_shared<BucketT>(canonicalName, hash, /*index=*/nullptr);
+        CLOG_FATAL(Bucket, "CREATING NEW BUCKET WITH NO INDEX FOR {}",
+                   binToHex(hash));
         bucketMap.emplace(hash, p);
         updateSharedBucketSize();
         return p;

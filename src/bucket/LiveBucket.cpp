@@ -607,6 +607,17 @@ LiveBucket::mergeInMemory(BucketManager& bucketManager,
 BucketEntryCounters const&
 LiveBucket::getBucketEntryCounters() const
 {
+    if (!mIndex)
+    {
+        CLOG_FATAL(Bucket, "NO INDEX FOR GETTING BUCKET ENTRY COUNTERS FOR {}",
+                   binToHex(mHash));
+        CLOG_FATAL(Bucket, "IS EMPTY {}", isEmpty());
+        CLOG_FATAL(Bucket, "HAS IN MEMORY ENTRIES {}", hasInMemoryEntries());
+        CLOG_FATAL(Bucket, "FILENAME {}", getFilename());
+        CLOG_FATAL(Bucket, "FILE EXISTS {}", fs::exists(getFilename()));
+        CLOG_FATAL(Bucket, "FILE SIZE {}", fs::size(getFilename()));
+    }
+
     releaseAssert(mIndex);
     return mIndex->getBucketEntryCounters();
 }

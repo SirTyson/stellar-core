@@ -217,6 +217,10 @@ BucketOutputIterator<BucketT>::getBucket(
         }
     }
 
+    if (!index)
+    {
+        CLOG_FATAL(Bucket, "NO INDEX ON OUTPUT FOR BUCKET {}", binToHex(hash));
+    }
     auto b = bucketManager.adoptFileAsBucket<BucketT>(
         mFilename.string(), hash, mergeKey, std::move(index));
 
