@@ -80,6 +80,71 @@ getRemainingCapacity(
     return (target > scheduled) ? target - scheduled : 0;
 }
 
+// Build weighted candidate list of buckets above minLocation with remaining
+// capacity. Returns vector of (location, weight) pairs where weight is the
+// remaining capacity.
+template <typename PendingEventMap>
+std::vector<std::pair<BucketLocation, size_t>>
+buildWeightedCandidates(BucketLocation const& minLocation,
+                        std::vector<LevelPlan> const& plans,
+                        PendingEventMap const& pendingEvents)
+{
+    std::vector<std::pair<BucketLocation, size_t>> candidates;
+
+    auto tryAdd = [&](BucketLocation const& loc) {
+        size_t cap = getRemainingCapacity(loc, plans, pendingEvents);
+        if (cap > 0)
+        {
+            candidates.emplace_back(loc, cap);
+        }
+    };
+
+    for (uint32_t level = 0; level < minLocation.level; ++level)
+    {
+        tryAdd({level, true});
+        tryAdd({level, false});
+    }
+
+    // If processing snap, can also schedule to curr at the same level
+    if (!minLocation.isCurr)
+    {
+        tryAdd({minLocation.level, true});
+    }
+
+    return candidates;
+}
+
+// Perform weighted random selection from candidates.
+// Returns index of selected candidate, or nullopt if candidates is empty.
+std::optional<size_t>
+selectWeightedIndex(
+    std::vector<std::pair<BucketLocation, size_t>> const& candidates)
+{
+    if (candidates.empty())
+    {
+        return std::nullopt;
+    }
+
+    size_t totalWeight = 0;
+    for (auto const& [loc, weight] : candidates)
+    {
+        totalWeight += weight;
+    }
+
+    size_t roll = rand_uniform<size_t>(0, totalWeight - 1);
+    size_t cumulative = 0;
+    for (size_t i = 0; i < candidates.size(); ++i)
+    {
+        cumulative += candidates[i].second;
+        if (roll < cumulative)
+        {
+            return i;
+        }
+    }
+
+    return candidates.size() - 1; // Fallback for floating point edge cases
+}
+
 // Selects a random bucket location weighted by remaining capacity and schedules
 // the event. minLocation specifies the current bucket being processed, where
 // events are scheduled to buckets "above" it. Returns true if the event was
@@ -90,50 +155,14 @@ scheduleLiveBucketListEventAtWeightedLocation(
     EventT event, BucketLocation const& minLocation,
     std::vector<LevelPlan> const& plans, PendingEventMap& pendingEvents)
 {
-    // Build weighted candidate list of buckets with remaining capacity.
-    std::vector<std::pair<BucketLocation, size_t>> candidates;
-    size_t totalWeight = 0;
-
-    auto tryAddCandidate = [&](BucketLocation const& loc) {
-        size_t cap = getRemainingCapacity(loc, plans, pendingEvents);
-        if (cap > 0)
-        {
-            candidates.emplace_back(loc, cap);
-            totalWeight += cap;
-        }
-    };
-
-    for (uint32_t level = 0; level < minLocation.level; ++level)
-    {
-        tryAddCandidate({level, true});
-        tryAddCandidate({level, false});
-    }
-
-    // If processing snap, can also schedule to curr at the same level
-    if (!minLocation.isCurr)
-    {
-        tryAddCandidate({minLocation.level, true});
-    }
-
-    if (candidates.empty())
+    auto candidates = buildWeightedCandidates(minLocation, plans, pendingEvents);
+    auto idx = selectWeightedIndex(candidates);
+    if (!idx)
     {
         return false;
     }
 
-    // Weighted random selection from candidates.
-    size_t roll = rand_uniform<size_t>(0, totalWeight - 1);
-    size_t cumulative = 0;
-    for (auto const& [loc, weight] : candidates)
-    {
-        cumulative += weight;
-        if (roll < cumulative)
-        {
-            pendingEvents.at(loc).push_back(std::move(event));
-            return true;
-        }
-    }
-
-    pendingEvents.at(candidates.back().first).push_back(std::move(event));
+    pendingEvents.at(candidates[*idx].first).push_back(std::move(event));
     return true;
 }
 
@@ -472,6 +501,74 @@ RandomBucketListGenerator::scheduleHotArchiveEvent(
         mHotArchivePendingEvents);
 }
 
+bool
+RandomBucketListGenerator::scheduleArchivedRestoredPair(
+    LedgerEntry const& entry, bool mustEndRestored,
+    BucketLocation const& minLocation)
+{
+    auto candidates = buildWeightedCandidates(minLocation, mHotArchivePlans,
+                                              mHotArchivePendingEvents);
+
+    // Need at least 2 candidates for ARCHIVE and RESTORE
+    if (candidates.size() < 2)
+    {
+        return false;
+    }
+
+    // Filter to restore candidates that have at least one older candidate.
+    // This avoids picking a restore spot with no valid archive options.
+    std::vector<std::pair<BucketLocation, size_t>> restoreCandidates;
+    for (size_t i = 0; i < candidates.size(); ++i)
+    {
+        bool hasOlderCandidate = false;
+        for (size_t j = 0; j < candidates.size(); ++j)
+        {
+            if (i != j && isOlder(candidates[j].first, candidates[i].first))
+            {
+                hasOlderCandidate = true;
+                break;
+            }
+        }
+        if (hasOlderCandidate)
+        {
+            restoreCandidates.push_back(candidates[i]);
+        }
+    }
+
+    // Pick RESTORE spot from valid candidates
+    auto restoreIdx = selectWeightedIndex(restoreCandidates);
+    if (!restoreIdx)
+    {
+        return false;
+    }
+    BucketLocation restoreSpot = restoreCandidates[*restoreIdx].first;
+
+    // Filter to candidates older than restoreSpot for ARCHIVE
+    std::vector<std::pair<BucketLocation, size_t>> olderCandidates;
+    for (auto const& [loc, weight] : candidates)
+    {
+        if (!(loc == restoreSpot) && isOlder(loc, restoreSpot))
+        {
+            olderCandidates.emplace_back(loc, weight);
+        }
+    }
+
+    // Pick ARCHIVE spot from older candidates
+    auto archiveIdx = selectWeightedIndex(olderCandidates);
+    if (!archiveIdx)
+    {
+        return false; // Should not happen given the filtering above
+    }
+    BucketLocation archiveSpot = olderCandidates[*archiveIdx].first;
+
+    // Schedule both events atomically
+    mHotArchivePendingEvents.at(archiveSpot)
+        .push_back({entry, /*isArchived=*/true, mustEndRestored});
+    mHotArchivePendingEvents.at(restoreSpot)
+        .push_back({entry, /*isArchived=*/false, mustEndRestored});
+    return true;
+}
+
 // Whenever we write a non-dead entry, this function is called to schedule the
 // next update for that key. In the case of a classic entry, this is either:
 // 1. Do nothing, last entry will not be shadowed
@@ -772,70 +869,65 @@ RandomBucketListGenerator::buildBucketEntries<HotArchiveBucket>(
     std::vector<LedgerEntry> archivedEntries;
     std::vector<LedgerKey> restoredKeys;
 
-    // Can schedule to buckets above this location (including same-level curr
-    // when processing snap)
-    bool canScheduleMore = (location.level > 0) || !location.isCurr;
-
-    // Helper to schedule a RESTORE event. Returns true if scheduled.
-    auto scheduleRestore = [&](LedgerKey const& key, LedgerEntry const& entry,
-                               HotArchiveLiveState liveState) -> bool {
-        HotArchivePendingEvent restoreEvent;
-        restoreEvent.type = HotArchiveEventType::RESTORE;
-        restoreEvent.key = key;
-        restoreEvent.entry = entry;
-        restoreEvent.liveState = liveState;
-        return scheduleHotArchiveEvent(std::move(restoreEvent), location);
-    };
-
-    // Helper to maybe schedule a RESTORE (otherwise entry stays ARCHIVE_ONLY).
-    // Only called for NOT_IN_LIVE and DEAD_IN_LIVE entries.
-    auto maybeScheduleRestore = [&](LedgerKey const& key,
-                                    LedgerEntry const& entry,
-                                    HotArchiveLiveState liveState) {
-        if (canScheduleMore && rand_flip())
-        {
-            scheduleRestore(key, entry, liveState);
-        }
-    };
-
     // Step 1: Process pending events
     auto& events = mHotArchivePendingEvents.at(location);
     for (auto& event : events)
     {
-        switch (event.type)
+        if (event.isArchived)
         {
-        case HotArchiveEventType::INITIAL_ARCHIVE:
-        {
-            // LIVE_IN_LIVE entries have RESTORE pre-scheduled; just add to
-            // bucket. Other entries may become ARCHIVE_ONLY or get RESTORE
-            // scheduled.
+            // ARCHIVED events: emit, optionally schedule RESTORE for
+            // non-constrained entries
             archivedEntries.push_back(event.entry);
-            if (event.liveState != HotArchiveLiveState::LIVE_IN_LIVE)
-            {
-                maybeScheduleRestore(event.key, event.entry, event.liveState);
-            }
-            break;
-        }
 
-        case HotArchiveEventType::REARCHIVE:
-        {
-            archivedEntries.push_back(event.entry);
-            break;
-        }
-
-        case HotArchiveEventType::RESTORE:
-        {
-            restoredKeys.push_back(event.key);
-            // LIVE_IN_LIVE entries must stay restored. Others may get
-            // REARCHIVE scheduled.
-            if (event.liveState != HotArchiveLiveState::LIVE_IN_LIVE &&
-                canScheduleMore && rand_flip())
+            if (!event.mustEndRestored && rand_flip())
             {
-                event.type = HotArchiveEventType::REARCHIVE;
-                scheduleHotArchiveEvent(std::move(event), location);
+                // Schedule RESTORE to create more cycles
+                HotArchivePendingEvent restoreEvent{
+                    event.entry, /*isArchived=*/false,
+                    /*mustEndRestored=*/false};
+                scheduleHotArchiveEvent(std::move(restoreEvent), location);
             }
-            break;
         }
+        else
+        {
+            // RESTORED events: emit, then optionally schedule more
+            restoredKeys.push_back(LedgerEntryKey(event.entry));
+
+            if (event.mustEndRestored)
+            {
+                // Live-pool entry: can only schedule archive+restore pairs
+                // (to guarantee ending in RESTORED state)
+                if (rand_flip())
+                {
+                    scheduleArchivedRestoredPair(event.entry,
+                                                 /*mustEndRestored=*/true,
+                                                 location);
+                }
+            }
+            else
+            {
+                // Non-constrained entry: can schedule archive-only, pair, or
+                // nothing
+                int choice = rand_uniform(0, 2);
+                if (choice == 0)
+                {
+                    // Archive-only -> will end in ARCHIVED
+                    // (ARCHIVE_RESTORE_ARCHIVE)
+                    HotArchivePendingEvent archiveEvent{
+                        event.entry, /*isArchived=*/true,
+                        /*mustEndRestored=*/false};
+                    scheduleHotArchiveEvent(std::move(archiveEvent), location);
+                }
+                else if (choice == 1)
+                {
+                    // Archive+restore pair -> will end in RESTORED
+                    scheduleArchivedRestoredPair(event.entry,
+                                                 /*mustEndRestored=*/false,
+                                                 location);
+                }
+                // choice == 2: do nothing, entry stays RESTORED
+                // (ARCHIVE_RESTORE)
+            }
         }
     }
     events.clear();
@@ -846,48 +938,63 @@ RandomBucketListGenerator::buildBucketEntries<HotArchiveBucket>(
         (targetEntryCount > currentCount) ? targetEntryCount - currentCount : 0;
 
     // Step 3: Generate new archive entries to fill budget
+    size_t consecutiveFailures = 0;
+    size_t const maxConsecutiveFailures = 10;
     for (size_t i = 0; i < newEntryBudget; ++i)
     {
         LedgerEntry entry;
-        LedgerKey key;
-        HotArchiveLiveState liveState;
 
         // Randomly choose: pull from pool (dead or live) OR generate new entry
         bool hasDeadEntries = !mDeadArchivableEntries.empty();
         bool hasLiveEntries = !mLiveArchivableEntries.empty();
-        releaseAssert(hasDeadEntries || hasLiveEntries);
+        if (!hasDeadEntries && !hasLiveEntries)
+        {
+            break; // Both pools exhausted
+        }
 
         // Randomly decide: use dead pool, live pool, or generate new
         int choice = rand_uniform<int>(0, 2);
         bool useDeadPool = (choice == 0) && hasDeadEntries;
-        bool useLivePool = (choice == 1) && hasLiveEntries && canScheduleMore;
+        bool useLivePool = (choice == 1) && hasLiveEntries;
 
         if (useDeadPool)
         {
-            // Pull from dead pool - these are DEAD in live BL
+            // Dead pool: no final state constraint
             entry = mDeadArchivableEntries.back();
             mDeadArchivableEntries.pop_back();
-            key = LedgerEntryKey(entry);
-            liveState = HotArchiveLiveState::DEAD_IN_LIVE;
         }
         else if (useLivePool)
         {
-            // Pull from live pool - these are LIVE in live BL, must be restored
+            // Live pool: MUST end RESTORED - schedule RESTORE before emitting
+            // ARCHIVE
             entry = mLiveArchivableEntries.back();
             mLiveArchivableEntries.pop_back();
-            key = LedgerEntryKey(entry);
-            liveState = HotArchiveLiveState::LIVE_IN_LIVE;
 
-            // Schedule RESTORE so hot archive shows entry was restored
-            if (scheduleRestore(key, entry, liveState))
+            // Schedule RESTORE first, only emit ARCHIVE if successful
+            HotArchivePendingEvent restoreEvent{
+                entry, /*isArchived=*/false, /*mustEndRestored=*/true};
+            if (scheduleHotArchiveEvent(std::move(restoreEvent), location))
             {
+                // Success: emit ARCHIVED now, RESTORE will be processed later
                 archivedEntries.push_back(entry);
+                consecutiveFailures = 0;
+            }
+            else
+            {
+                // Can't schedule RESTORE - retry budget slot with different
+                // choice (entry is dropped since we can't guarantee RESTORED)
+                ++consecutiveFailures;
+                if (consecutiveFailures < maxConsecutiveFailures)
+                {
+                    --i;
+                }
+                // else: give up on this slot to avoid infinite retry
             }
             continue;
         }
         else
         {
-            // Generate new hot-archive-only entry
+            // Generate new hot-archive-only entry: no final state constraint
             auto entries =
                 LedgerTestUtils::generateValidUniqueLedgerEntriesWithTypes(
                     {CONTRACT_DATA, CONTRACT_CODE}, 1, mGlobalSeenKeys);
@@ -902,12 +1009,18 @@ RandomBucketListGenerator::buildBucketEntries<HotArchiveBucket>(
             {
                 entry.data.contractData().durability = PERSISTENT;
             }
-            key = LedgerEntryKey(entry);
-            liveState = HotArchiveLiveState::NOT_IN_LIVE;
         }
 
+        // Dead pool and generated entries: emit ARCHIVED, optionally schedule
+        // RESTORE
         archivedEntries.push_back(entry);
-        maybeScheduleRestore(key, entry, liveState);
+        if (rand_flip())
+        {
+            // Optional: schedule RESTORE (failure OK, entry stays ARCHIVE_ONLY)
+            HotArchivePendingEvent restoreEvent{
+                entry, /*isArchived=*/false, /*mustEndRestored=*/false};
+            scheduleHotArchiveEvent(std::move(restoreEvent), location);
+        }
     }
 
     if (archivedEntries.empty() && restoredKeys.empty())

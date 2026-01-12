@@ -70,13 +70,6 @@ enum class HotArchiveLifecycle
     ARCHIVE_RESTORE_ARCHIVE
 };
 
-enum class HotArchiveLiveState
-{
-    NOT_IN_LIVE,
-    LIVE_IN_LIVE,
-    DEAD_IN_LIVE
-};
-
 // Lifecycle categories for live BucketList entries
 enum class LiveLifecycle
 {
@@ -195,6 +188,18 @@ struct BucketLocation
     }
 };
 
+// Returns true if locA is older than locB in generation order.
+// Higher level = older; same level: snap older than curr.
+inline bool
+isOlder(BucketLocation const& a, BucketLocation const& b)
+{
+    if (a.level != b.level)
+    {
+        return a.level > b.level;
+    }
+    return !a.isCurr && b.isCurr; // snap (false) is older than curr (true)
+}
+
 // Event types for pending events (Live BucketList)
 enum class EventType
 {
@@ -202,14 +207,6 @@ enum class EventType
     TTL_EXTEND,   // Extend TTL only (parent unchanged)
     DELETE,       // Delete both parent and TTL
     RECREATE      // Recreate both parent and TTL
-};
-
-// Event types for hot archive pending events
-enum class HotArchiveEventType
-{
-    INITIAL_ARCHIVE, // Initial archive from eviction
-    RESTORE,         // Restore after archive
-    REARCHIVE        // Re-archive after restore
 };
 
 // A pending event scheduled to execute at a specific bucket location.
@@ -227,10 +224,9 @@ struct PendingEvent
 // A pending event scheduled for the hot archive BucketList
 struct HotArchivePendingEvent
 {
-    HotArchiveEventType type;
-    LedgerKey key;
-    LedgerEntry entry; // The archived entry data
-    HotArchiveLiveState liveState;
+    LedgerEntry entry;        // The archived entry data
+    bool isArchived;          // true = emit ARCHIVED, false = emit RESTORED
+    bool mustEndRestored;     // true for live-pool entries (must end RESTORED)
 };
 
 // ============================================================================
@@ -355,6 +351,14 @@ class RandomBucketListGenerator
     // Returns true if scheduled, false if dropped (no capacity).
     bool scheduleHotArchiveEvent(HotArchivePendingEvent event,
                                  BucketLocation const& minLocation);
+
+    // Atomically schedule ARCHIVE then RESTORE to two different buckets.
+    // ARCHIVE goes to older bucket, RESTORE to newer bucket.
+    // Uses weighted selection for consistency with scheduleHotArchiveEvent.
+    // Returns true if both scheduled, false if neither.
+    bool scheduleArchivedRestoredPair(LedgerEntry const& entry,
+                                      bool mustEndRestored,
+                                      BucketLocation const& minLocation);
 };
 
 // ============================================================================
