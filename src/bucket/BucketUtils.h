@@ -227,6 +227,10 @@ bool isBucketMetaEntry(typename BucketT::EntryT const& be);
 template <class BucketT>
 LedgerEntryTypeAndDurability
 bucketEntryToLedgerEntryAndDurabilityType(typename BucketT::EntryT const& be);
+
+LedgerEntryTypeAndDurability
+ledgerKeyToTypeAndDurability(LedgerKey const& key);
+
 std::string toString(LedgerEntryTypeAndDurability let);
 
 // Utility functions for tracking type boundaries during bucket index

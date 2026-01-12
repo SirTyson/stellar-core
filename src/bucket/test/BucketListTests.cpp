@@ -18,7 +18,9 @@
 #include "bucket/LiveBucket.h"
 #include "bucket/LiveBucketList.h"
 #include "bucket/test/BucketTestUtils.h"
+#include "bucket/test/RandomBucketListGenerator.h"
 #include "crypto/Hex.h"
+#include "history/HistoryArchive.h"
 #include "ledger/LedgerTypeUtils.h"
 #include "ledger/test/LedgerTestUtils.h"
 #include "lib/util/stdrandom.h"
@@ -1874,5 +1876,55 @@ TEST_CASE("BucketList number dump", "[bucket][bucketlist][count][!hide]")
             "level[{:x}] curr (size:{}) = [{}, {}] snap (size:{}) = [{}, {}]",
             level, formatX32(currSz), formatX32(currOld), formatX32(currNew),
             formatX32(snapSz), formatX32(snapOld), formatX32(snapNew));
+    }
+}
+
+TEST_CASE("Random test of eviction scan",
+          "[bucketlist][archival][random][!hide]")
+{
+    // Match GENERATE_TEST_LEDGER_CLOSE_META pattern:
+    // When env var is SET: generate and persist new BucketList
+    // When env var is UNSET: load pre-generated BucketList from testdata
+    bool generateMode = getenv("GENERATE_EVICTION_TEST_BUCKETLIST") != nullptr;
+
+    VirtualClock clock;
+    Config cfg(getTestConfig());
+    cfg.USE_CONFIG_FOR_GENESIS = true;
+
+    // Ensure we're using a protocol version that supports Soroban
+    cfg.TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION =
+        Config::CURRENT_LEDGER_PROTOCOL_VERSION;
+
+    // Force DiskIndex for all buckets (even small ones) so indexes are
+    // persisted to disk. Without this, small buckets use InMemoryIndex which
+    // doesn't persist.
+    cfg.BUCKETLIST_DB_INDEX_CUTOFF = 0;
+
+    auto app = createTestApplication<BucketTestApplication>(clock, cfg);
+    auto testDataDir = getSrcTestDataPath("random-bucket-list");
+
+    RandomBucketListGenerator generator(*app);
+
+    if (generateMode)
+    {
+        CLOG_INFO(Bucket, "Generating random BucketList for eviction testing");
+
+        generator.generate();
+
+        CLOG_INFO(Bucket, "BucketList generation complete");
+
+        generator.saveFixture(testDataDir);
+
+        CLOG_INFO(Bucket, "BucketList saved to testdata");
+    }
+    else
+    {
+        // Load mode - load pre-generated BucketList from testdata
+        REQUIRE(
+            std::filesystem::exists(testDataDir / "eviction-test-has.json"));
+
+        generator.loadFixture(testDataDir);
+
+        CLOG_INFO(Bucket, "BucketList loaded and verified");
     }
 }

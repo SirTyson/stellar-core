@@ -6,6 +6,7 @@
 #include "crypto/SHA.h"
 #include "crypto/SecretKey.h"
 #include "ledger/LedgerHashUtils.h"
+#include "ledger/LedgerTypeUtils.h"
 #include "ledger/NetworkConfig.h"
 #include "main/Config.h"
 #include "util/GlobalChecks.h"
@@ -91,6 +92,8 @@ generateOpaqueVector()
 void
 randomlyModifyEntry(LedgerEntry& e)
 {
+    auto key = LedgerEntryKey(e);
+
     switch (e.data.type())
     {
     case TRUSTLINE:
@@ -142,15 +145,32 @@ randomlyModifyEntry(LedgerEntry& e)
         break;
     case CONTRACT_CODE:
     {
-        auto code = generateOpaqueVector<60000>();
-        e.data.contractCode().code.assign(code.begin(), code.end());
-        makeValid(e.data.contractCode());
+        // Only modify ContractCodeCostInputs, not code/hash (which are part of
+        // the key).
+        auto& cce = e.data.contractCode();
+        if (cce.ext.v() != 1)
+        {
+            cce.ext.v(1);
+        }
+        cce.ext.v1().costInputs.nDataSegmentBytes =
+            rand_uniform<uint32_t>(0, 1000);
+        cce.ext.v1().costInputs.nDataSegments = rand_uniform<uint32_t>(0, 100);
+        cce.ext.v1().costInputs.nElemSegments = rand_uniform<uint32_t>(0, 100);
+        cce.ext.v1().costInputs.nExports = rand_uniform<uint32_t>(0, 100);
+        cce.ext.v1().costInputs.nFunctions = rand_uniform<uint32_t>(0, 100);
+        cce.ext.v1().costInputs.nGlobals = rand_uniform<uint32_t>(0, 100);
+        cce.ext.v1().costInputs.nImports = rand_uniform<uint32_t>(0, 100);
+        cce.ext.v1().costInputs.nInstructions = rand_uniform<uint32_t>(0, 1000);
+        cce.ext.v1().costInputs.nTableEntries = rand_uniform<uint32_t>(0, 100);
+        cce.ext.v1().costInputs.nTypes = rand_uniform<uint32_t>(0, 100);
         break;
     }
     case TTL:
         e.data.ttl().liveUntilLedgerSeq = autocheck::generator<uint32_t>{}();
         break;
     }
+
+    releaseAssert(LedgerEntryKey(e) == key);
 }
 
 void
@@ -781,7 +801,7 @@ generateValidUniqueLedgerEntryKeysWithExclusions(
     res.reserve(n);
     while (seenKeys.size() < n)
     {
-        auto entry = generateValidLedgerEntryWithExclusions(excludedTypes, n);
+        auto entry = generateValidLedgerEntryWithExclusions(excludedTypes);
         auto key = LedgerEntryKey(entry);
         if (seenKeys.find(key) != seenKeys.end())
         {
@@ -821,7 +841,7 @@ generateValidUniqueLedgerEntriesWithExclusions(
     res.reserve(n);
     while (res.size() < n)
     {
-        auto entry = generateValidLedgerEntryWithExclusions(excludedTypes, n);
+        auto entry = generateValidLedgerEntryWithExclusions(excludedTypes);
         auto key = LedgerEntryKey(entry);
         if (seenKeys.find(key) != seenKeys.end())
         {

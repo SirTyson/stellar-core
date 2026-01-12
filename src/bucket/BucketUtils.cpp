@@ -51,6 +51,40 @@ toString(LedgerEntryTypeAndDurability const type)
     }
 }
 
+LedgerEntryTypeAndDurability
+ledgerKeyToTypeAndDurability(LedgerKey const& key)
+{
+    switch (key.type())
+    {
+    case ACCOUNT:
+        return LedgerEntryTypeAndDurability::ACCOUNT;
+    case TRUSTLINE:
+        return LedgerEntryTypeAndDurability::TRUSTLINE;
+    case OFFER:
+        return LedgerEntryTypeAndDurability::OFFER;
+    case DATA:
+        return LedgerEntryTypeAndDurability::DATA;
+    case CLAIMABLE_BALANCE:
+        return LedgerEntryTypeAndDurability::CLAIMABLE_BALANCE;
+    case LIQUIDITY_POOL:
+        return LedgerEntryTypeAndDurability::LIQUIDITY_POOL;
+    case CONTRACT_DATA:
+        return isTemporaryEntry(key)
+                   ? LedgerEntryTypeAndDurability::TEMPORARY_CONTRACT_DATA
+                   : LedgerEntryTypeAndDurability::PERSISTENT_CONTRACT_DATA;
+    case CONTRACT_CODE:
+        return LedgerEntryTypeAndDurability::CONTRACT_CODE;
+    case CONFIG_SETTING:
+        return LedgerEntryTypeAndDurability::CONFIG_SETTING;
+    case TTL:
+        return LedgerEntryTypeAndDurability::TTL;
+    default:
+        auto label = xdr::xdr_traits<LedgerEntryType>::enum_name(key.type());
+        throw std::runtime_error(
+            fmt::format("Unknown LedgerEntryType {}", label));
+    }
+}
+
 MergeCounters&
 MergeCounters::operator+=(MergeCounters const& delta)
 {
@@ -235,35 +269,7 @@ bucketEntryToLedgerEntryAndDurabilityType<LiveBucket>(
         throw std::runtime_error("Unexpected Bucket Meta Entry");
     }
 
-    switch (key.type())
-    {
-    case ACCOUNT:
-        return LedgerEntryTypeAndDurability::ACCOUNT;
-    case TRUSTLINE:
-        return LedgerEntryTypeAndDurability::TRUSTLINE;
-    case OFFER:
-        return LedgerEntryTypeAndDurability::OFFER;
-    case DATA:
-        return LedgerEntryTypeAndDurability::DATA;
-    case CLAIMABLE_BALANCE:
-        return LedgerEntryTypeAndDurability::CLAIMABLE_BALANCE;
-    case LIQUIDITY_POOL:
-        return LedgerEntryTypeAndDurability::LIQUIDITY_POOL;
-    case CONTRACT_DATA:
-        return isTemporaryEntry(key)
-                   ? LedgerEntryTypeAndDurability::TEMPORARY_CONTRACT_DATA
-                   : LedgerEntryTypeAndDurability::PERSISTENT_CONTRACT_DATA;
-    case CONTRACT_CODE:
-        return LedgerEntryTypeAndDurability::CONTRACT_CODE;
-    case CONFIG_SETTING:
-        return LedgerEntryTypeAndDurability::CONFIG_SETTING;
-    case TTL:
-        return LedgerEntryTypeAndDurability::TTL;
-    default:
-        auto label = xdr::xdr_traits<LedgerEntryType>::enum_name(key.type());
-        throw std::runtime_error(
-            fmt::format("Unknown LedgerEntryType {}", label));
-    }
+    return ledgerKeyToTypeAndDurability(key);
 }
 
 template <>
