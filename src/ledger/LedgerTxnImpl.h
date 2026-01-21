@@ -93,7 +93,12 @@ class LedgerTxn::Impl
 
     AbstractLedgerTxnParent& mParent;
     AbstractLedgerTxn* mChild;
+    // Lazy header copy optimization: mHeader is null until the header is
+    // actually modified (via loadHeader()). When null, getHeader() returns
+    // the parent's header via mParentHeaderPtr. This avoids copying the
+    // ~300 byte LedgerHeader on every LedgerTxn construction.
     std::unique_ptr<LedgerHeader> mHeader;
+    LedgerHeader const* mParentHeaderPtr;
     std::shared_ptr<LedgerTxnHeader::Impl> mActiveHeader;
     EntryMap mEntry;
 

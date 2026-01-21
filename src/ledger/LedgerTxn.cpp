@@ -429,7 +429,8 @@ LedgerTxn::Impl::Impl(LedgerTxn& self, AbstractLedgerTxnParent& parent,
                       bool shouldUpdateLastModified, TransactionMode mode)
     : mParent(parent)
     , mChild(nullptr)
-    , mHeader(std::make_unique<LedgerHeader>(mParent.getHeader()))
+    , mHeader(nullptr)
+    , mParentHeaderPtr(&mParent.getHeader())
     , mShouldUpdateLastModified(shouldUpdateLastModified)
     , mIsSealed(false)
     , mConsistency(LedgerTxnConsistency::EXACT)
@@ -600,9 +601,16 @@ LedgerTxn::Impl::commitChild(EntryIterator iter,
                              LedgerTxnConsistency cons) noexcept
 {
     abortIfWrongThread("commitChild");
-    // Assignment of xdrpp objects does not have the strong exception safety
-    // guarantee, so use std::unique_ptr<...>::swap to achieve it
-    auto childHeader = std::make_unique<LedgerHeader>(mChild->getHeader());
+
+    bool const childModifiedHeader =
+        &mChild->getHeader() != &getHeader();
+    std::unique_ptr<LedgerHeader> childHeader;
+    if (childModifiedHeader)
+    {
+        // Assignment of xdrpp objects does not have the strong exception safety
+        // guarantee, so use std::unique_ptr<...>::swap to achieve it
+        childHeader = std::make_unique<LedgerHeader>(mChild->getHeader());
+    }
 
     mConsistency = joinConsistencyLevels(mConsistency, cons);
 
@@ -708,8 +716,11 @@ LedgerTxn::Impl::commitChild(EntryIterator iter,
     // caught during restoration in the restoreFrom* functions.
     mRestoredEntries.addRestoresFrom(restoredEntries, /*allowDuplicates=*/true);
 
-    // std::unique_ptr<...>::swap does not throw
-    mHeader.swap(childHeader);
+    if (childModifiedHeader)
+    {
+        // std::unique_ptr<...>::swap does not throw
+        mHeader.swap(childHeader);
+    }
     mChild = nullptr;
 }
 
@@ -1474,7 +1485,7 @@ LedgerTxn::Impl::getDelta()
             // modifications are impossible.
             delta.entry[key] = {kv.second.get(), previous};
         }
-        delta.header = {*mHeader, mParent.getHeader()};
+        delta.header = {getHeader(), mParent.getHeader()};
     });
     return delta;
 }
@@ -1498,7 +1509,7 @@ LedgerHeader const&
 LedgerTxn::Impl::getHeader() const
 {
     abortIfWrongThread("getHeader");
-    return *mHeader;
+    return mHeader ? *mHeader : *mParentHeaderPtr;
 }
 
 std::vector<InflationWinner>
@@ -2111,6 +2122,11 @@ LedgerTxn::Impl::loadHeader(LedgerTxn& self)
         throw std::runtime_error("LedgerTxnHeader is active");
     }
 
+    if (!mHeader)
+    {
+        mHeader = std::make_unique<LedgerHeader>(*mParentHeaderPtr);
+    }
+
     // Set the key to active before constructing the LedgerTxnHeader, as this
     // can throw and the LedgerTxnHeader destructor requires that
     // mActiveHeader is not empty. LedgerTxnHeader constructor does not throw
@@ -2299,6 +2315,11 @@ LedgerTxn::Impl::unsealHeader(LedgerTxn& self,
         throw std::runtime_error("LedgerTxnHeader is active");
     }
 
+    if (!mHeader)
+    {
+        mHeader = std::make_unique<LedgerHeader>(*mParentHeaderPtr);
+    }
+
     mActiveHeader = LedgerTxnHeader::makeSharedImpl(self, *mHeader);
     LedgerTxnHeader header(mActiveHeader);
     f(header.current());
@@ -2363,6 +2384,7 @@ LedgerTxn::Impl::maybeUpdateLastModified() noexcept
     throwIfSealed();
     throwIfChild();
 
+    auto const& header = getHeader();
     for (auto& kv : mEntry)
     {
         auto& entry = kv.second;
@@ -2371,7 +2393,7 @@ LedgerTxn::Impl::maybeUpdateLastModified() noexcept
             if (mShouldUpdateLastModified &&
                 entry->type() == InternalLedgerEntryType::LEDGER_ENTRY)
             {
-                entry->ledgerEntry().lastModifiedLedgerSeq = mHeader->ledgerSeq;
+                entry->ledgerEntry().lastModifiedLedgerSeq = header.ledgerSeq;
             }
         }
     }
