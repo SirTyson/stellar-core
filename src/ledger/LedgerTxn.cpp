@@ -1323,6 +1323,74 @@ LedgerTxn::Impl::getBestOffer(Asset const& buying, Asset const& selling,
     return selfBest;
 }
 
+std::pair<std::optional<LedgerKey>, std::optional<OfferDescriptor>>
+LedgerTxn::Impl::getBestOfferKey(Asset const& buying, Asset const& selling)
+{
+    if (!mActive.empty())
+    {
+        throw std::runtime_error("active entries when getting best offer");
+    }
+
+    AssetPair const assets{buying, selling};
+
+    std::optional<LedgerKey> selfBestKey;
+    std::optional<OfferDescriptor> selfBestDesc;
+    auto ob = findOrderBook(buying, selling);
+    if (ob)
+    {
+        auto& offers = *ob;
+        if (!offers.empty())
+        {
+            auto const& bestOffer = offers.begin();
+            auto entryIter = mEntry.find(bestOffer->second);
+            if (entryIter == mEntry.end() || entryIter->second.isDeleted())
+            {
+                throw std::runtime_error("invalid order book state");
+            }
+            selfBestKey = bestOffer->second;
+            selfBestDesc = bestOffer->first;
+        }
+    }
+
+    std::shared_ptr<LedgerEntry const> parentBest;
+    auto wboIter = mWorstBestOffer.find(assets);
+    if (wboIter != mWorstBestOffer.end())
+    {
+        if (wboIter->second)
+        {
+            parentBest =
+                mParent.getBestOffer(buying, selling, *wboIter->second);
+        }
+    }
+    else
+    {
+        parentBest = mParent.getBestOffer(buying, selling);
+    }
+
+    while (parentBest)
+    {
+        OfferDescriptor parentDesc{parentBest->data.offer().price,
+                                   parentBest->data.offer().offerID};
+
+        if (selfBestKey && selfBestDesc &&
+            !isBetterOffer(parentDesc, *selfBestDesc))
+        {
+            return {selfBestKey, selfBestDesc};
+        }
+
+        auto parentKey = LedgerEntryKey(*parentBest);
+        if (mEntry.find(parentKey) == mEntry.end())
+        {
+            return {parentKey, parentDesc};
+        }
+
+        parentBest =
+            mParent.getBestOffer(buying, selling, parentDesc);
+    }
+
+    return {selfBestKey, selfBestDesc};
+}
+
 LedgerEntryChanges
 LedgerTxn::getChanges()
 {
@@ -1955,17 +2023,19 @@ LedgerTxn::Impl::loadBestOffer(LedgerTxn& self, Asset const& buying,
     throwIfSealed();
     throwIfChild();
 
-    auto le = getBestOffer(buying, selling);
-    auto res = le ? load(self, LedgerEntryKey(*le)) : LedgerTxnEntry();
+    // Use getBestOfferKey to avoid creating a copy of the LedgerEntry.
+    // This returns the key and descriptor without copying the entry data.
+    auto [bestKey, bestDesc] = getBestOfferKey(buying, selling);
+    auto res = bestKey ? load(self, *bestKey) : LedgerTxnEntry();
 
     try
     {
+        // Convert stack-allocated OfferDescriptor to shared_ptr only if needed.
+        // updateWorstBestOffer expects shared_ptr for storage in the map.
         std::shared_ptr<OfferDescriptor const> descPtr;
-        if (le)
+        if (bestDesc)
         {
-            auto const& oe = le->data.offer();
-            descPtr = std::make_shared<OfferDescriptor const>(
-                OfferDescriptor{oe.price, oe.offerID});
+            descPtr = std::make_shared<OfferDescriptor const>(*bestDesc);
         }
 
         // We will show that the following update procedure leaves the worst

@@ -385,6 +385,13 @@ class LedgerTxn::Impl
     getBestOffer(Asset const& buying, Asset const& selling,
                  OfferDescriptor const& worseThan);
 
+    // getBestOfferKey returns the LedgerKey of the best offer for the given
+    // asset pair without making a copy of the entry. This is an optimization
+    // for loadBestOffer which can then directly load by key. Also returns the
+    // OfferDescriptor if found, to avoid recomputing it.
+    std::pair<std::optional<LedgerKey>, std::optional<OfferDescriptor>>
+    getBestOfferKey(Asset const& buying, Asset const& selling);
+
     void forAllWorstBestOffers(WorstOfferProcessor proc);
 
     // getChanges has the basic exception safety guarantee. If it throws an
