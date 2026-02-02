@@ -9,6 +9,7 @@
 #include "xdr/Stellar-transaction.h"
 #include "xdr/Stellar-types.h"
 
+#include <atomic>
 #include <map>
 #include <set>
 #include <stdint.h>
@@ -58,10 +59,10 @@ class SignatureChecker
     std::vector<bool> mUsedSignatures;
 
     // Static fields for tracking signature verification cache performance
-    // during the `checkValid` or apply flow
-    static std::mutex gCheckValidOrApplyTxSigCacheMetricsMutex;
-    static uint64_t gCheckValidOrApplyTxSigCacheHits;
-    static uint64_t gCheckValidOrApplyTxSigCacheLookups;
+    // during the `checkValid` or apply flow. Using atomics for lock-free
+    // updates to avoid mutex contention on the hot path.
+    static std::atomic<uint64_t> gCheckValidOrApplyTxSigCacheHits;
+    static std::atomic<uint64_t> gCheckValidOrApplyTxSigCacheLookups;
 
     // Given the result of a signature cache lookup, update the static metrics
     // counters if and only if this SignatureChecker is being used in the

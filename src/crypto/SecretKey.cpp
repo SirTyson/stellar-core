@@ -45,8 +45,8 @@ namespace stellar
 constexpr size_t VERIFY_SIG_CACHE_SIZE = 250'000;
 static std::mutex gVerifySigCacheMutex;
 static RandomEvictionCache<Hash, bool> gVerifySigCache(VERIFY_SIG_CACHE_SIZE);
-static uint64_t gVerifyCacheHit = 0;
-static uint64_t gVerifyCacheMiss = 0;
+static std::atomic<uint64_t> gVerifyCacheHit{0};
+static std::atomic<uint64_t> gVerifyCacheMiss{0};
 
 // Global flag to use Rust ed25519-dalek for signature verification
 // Protected by gVerifySigCacheMutex
@@ -343,11 +343,8 @@ PubKeyUtils::seedVerifySigCache(unsigned int seed)
 void
 PubKeyUtils::flushVerifySigCacheCounts(uint64_t& hits, uint64_t& misses)
 {
-    std::lock_guard<std::mutex> guard(gVerifySigCacheMutex);
-    hits = gVerifyCacheHit;
-    misses = gVerifyCacheMiss;
-    gVerifyCacheHit = 0;
-    gVerifyCacheMiss = 0;
+    hits = gVerifyCacheHit.exchange(0, std::memory_order_relaxed);
+    misses = gVerifyCacheMiss.exchange(0, std::memory_order_relaxed);
 }
 
 std::string
@@ -462,7 +459,7 @@ PubKeyUtils::verifySig(PublicKey const& key, Signature const& signature,
         std::lock_guard<std::mutex> guard(gVerifySigCacheMutex);
         if (gVerifySigCache.exists(cacheKey))
         {
-            ++gVerifyCacheHit;
+            gVerifyCacheHit.fetch_add(1, std::memory_order_relaxed);
             std::string hitStr("hit");
             ZoneText(hitStr.c_str(), hitStr.size());
             return {gVerifySigCache.get(cacheKey),
@@ -489,8 +486,8 @@ PubKeyUtils::verifySig(PublicKey const& key, Signature const& signature,
     }
 
     std::lock_guard<std::mutex> guard(gVerifySigCacheMutex);
-    ++gVerifyCacheMiss;
     gVerifySigCache.put(cacheKey, ok);
+    gVerifyCacheMiss.fetch_add(1, std::memory_order_relaxed);
     return {ok, VerifySigCacheLookupResult::MISS};
 }
 

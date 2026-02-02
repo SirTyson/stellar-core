@@ -16,9 +16,8 @@
 
 namespace stellar
 {
-std::mutex SignatureChecker::gCheckValidOrApplyTxSigCacheMetricsMutex;
-uint64_t SignatureChecker::gCheckValidOrApplyTxSigCacheHits = 0;
-uint64_t SignatureChecker::gCheckValidOrApplyTxSigCacheLookups = 0;
+std::atomic<uint64_t> SignatureChecker::gCheckValidOrApplyTxSigCacheHits{0};
+std::atomic<uint64_t> SignatureChecker::gCheckValidOrApplyTxSigCacheLookups{0};
 
 SignatureChecker::SignatureChecker(
     uint32_t protocolVersion, Hash const& contentsHash,
@@ -168,12 +167,9 @@ SignatureChecker::checkAllSignaturesUsed() const
 std::pair<uint64_t, uint64_t>
 SignatureChecker::flushTxSigCacheCounts()
 {
-    std::lock_guard<std::mutex> lock(gCheckValidOrApplyTxSigCacheMetricsMutex);
-    auto res = std::make_pair(gCheckValidOrApplyTxSigCacheHits,
-                              gCheckValidOrApplyTxSigCacheLookups);
-    gCheckValidOrApplyTxSigCacheHits = 0;
-    gCheckValidOrApplyTxSigCacheLookups = 0;
-    return res;
+    auto hits = gCheckValidOrApplyTxSigCacheHits.exchange(0, std::memory_order_relaxed);
+    auto lookups = gCheckValidOrApplyTxSigCacheLookups.exchange(0, std::memory_order_relaxed);
+    return std::make_pair(hits, lookups);
 }
 
 void
@@ -191,15 +187,14 @@ SignatureChecker::updateTxSigCacheMetrics(
         return;
     }
 
-    std::lock_guard<std::mutex> lock(gCheckValidOrApplyTxSigCacheMetricsMutex);
     if (cacheLookupRes != PubKeyUtils::VerifySigCacheLookupResult::NO_LOOKUP)
     {
-        ++gCheckValidOrApplyTxSigCacheLookups;
+        gCheckValidOrApplyTxSigCacheLookups.fetch_add(1, std::memory_order_relaxed);
     }
 
     if (cacheLookupRes == PubKeyUtils::VerifySigCacheLookupResult::HIT)
     {
-        ++gCheckValidOrApplyTxSigCacheHits;
+        gCheckValidOrApplyTxSigCacheHits.fetch_add(1, std::memory_order_relaxed);
     }
 }
 };
