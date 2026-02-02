@@ -9,7 +9,6 @@
 #include "ledger/LedgerTxn.h"
 #include "ledger/NetworkConfig.h"
 #include "main/AppConnector.h"
-#include "transactions/MutableTransactionResult.h"
 #include "transactions/ParallelApplyStage.h"
 #include "transactions/TransactionFrameBase.h"
 #include "util/GlobalChecks.h"

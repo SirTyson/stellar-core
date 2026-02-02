@@ -2325,6 +2325,7 @@ LedgerManagerImpl::applySorobanStageClustersInParallel(
         return threadStates;
     }
 
+    // Pre-allocate vectors to avoid reallocation during async launch
     threadStates.reserve(numClusters);
     if (numClusters > 1)
     {
