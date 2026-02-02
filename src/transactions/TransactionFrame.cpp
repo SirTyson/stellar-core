@@ -1847,6 +1847,38 @@ TransactionFrame::checkValid(AppConnector& app, LedgerSnapshot const& ls,
     return txResult;
 }
 
+MutableTxResultPtr
+TransactionFrame::checkValid(AppConnector& app, LedgerSnapshot const& ls,
+                             SequenceNumber current,
+                             uint64_t lowerBoundCloseTimeOffset,
+                             uint64_t upperBoundCloseTimeOffset,
+                             DiagnosticEventManager& diagnosticEvents,
+                             SorobanNetworkConfig const* sorobanConfig) const
+{
+#ifdef BUILD_TESTS
+    if (app.getRunInOverlayOnlyMode())
+    {
+        return MutableTransactionResult::createSuccess(*this, 0);
+    }
+#endif
+
+    if (!xdr::check_xdr_depth(mEnvelope, 500))
+    {
+        return MutableTransactionResult::createTxError(txMALFORMED);
+    }
+    if (!XDRProvidesValidFee())
+    {
+        return MutableTransactionResult::createTxError(txMALFORMED);
+    }
+    int64_t minBaseFee = ls.getLedgerHeader().current().baseFee;
+    auto feeCharged = getFee(ls.getLedgerHeader().current(), minBaseFee, false);
+    auto txResult = MutableTransactionResult::createSuccess(*this, feeCharged);
+    checkValidWithOptionallyChargedFee(
+        app, ls, current, true, lowerBoundCloseTimeOffset,
+        upperBoundCloseTimeOffset, *txResult, diagnosticEvents, sorobanConfig);
+    return txResult;
+}
+
 void
 TransactionFrame::insertKeysForFeeProcessing(
     UnorderedSet<LedgerKey>& keys) const
