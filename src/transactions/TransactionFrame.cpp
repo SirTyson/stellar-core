@@ -1740,6 +1740,28 @@ TransactionFrame::checkValidWithOptionallyChargedFee(
     uint64_t upperBoundCloseTimeOffset, MutableTransactionResultBase& txResult,
     DiagnosticEventManager& diagnosticEvents) const
 {
+    SorobanNetworkConfig const* sorobanConfig = nullptr;
+    if (protocolVersionStartsFrom(ls.getLedgerHeader().current().ledgerVersion,
+                                  SOROBAN_PROTOCOL_VERSION) &&
+        isSoroban())
+    {
+        sorobanConfig =
+            &app.getLedgerManager().getLastClosedSorobanNetworkConfig();
+    }
+    checkValidWithOptionallyChargedFee(app, ls, current, chargeFee,
+                                       lowerBoundCloseTimeOffset,
+                                       upperBoundCloseTimeOffset, txResult,
+                                       diagnosticEvents, sorobanConfig);
+}
+
+void
+TransactionFrame::checkValidWithOptionallyChargedFee(
+    AppConnector& app, LedgerSnapshot const& ls, SequenceNumber current,
+    bool chargeFee, uint64_t lowerBoundCloseTimeOffset,
+    uint64_t upperBoundCloseTimeOffset, MutableTransactionResultBase& txResult,
+    DiagnosticEventManager& diagnosticEvents,
+    SorobanNetworkConfig const* sorobanConfig) const
+{
     ZoneScoped;
     mCachedAccountPreProtocol8.reset();
 
@@ -1748,13 +1770,8 @@ TransactionFrame::checkValidWithOptionallyChargedFee(
         getSignatures(mEnvelope)};
 
     std::optional<FeePair> sorobanResourceFee;
-    SorobanNetworkConfig const* sorobanConfig = nullptr;
-    if (protocolVersionStartsFrom(ls.getLedgerHeader().current().ledgerVersion,
-                                  SOROBAN_PROTOCOL_VERSION) &&
-        isSoroban())
+    if (sorobanConfig != nullptr)
     {
-        sorobanConfig =
-            &app.getLedgerManager().getLastClosedSorobanNetworkConfig();
         sorobanResourceFee = computePreApplySorobanResourceFee(
             ls.getLedgerHeader().current().ledgerVersion, *sorobanConfig,
             app.getConfig());

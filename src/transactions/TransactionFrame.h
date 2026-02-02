@@ -239,6 +239,13 @@ class TransactionFrame : public TransactionFrameBase
         uint64_t upperBoundCloseTimeOffset,
         MutableTransactionResultBase& result,
         DiagnosticEventManager& diagnosticEvents) const;
+    void checkValidWithOptionallyChargedFee(
+        AppConnector& app, LedgerSnapshot const& ls, SequenceNumber current,
+        bool chargeFee, uint64_t lowerBoundCloseTimeOffset,
+        uint64_t upperBoundCloseTimeOffset,
+        MutableTransactionResultBase& result,
+        DiagnosticEventManager& diagnosticEvents,
+        SorobanNetworkConfig const* sorobanConfig) const;
     MutableTxResultPtr
     checkValid(AppConnector& app, LedgerSnapshot const& ls,
                SequenceNumber current, uint64_t lowerBoundCloseTimeOffset,
