@@ -109,6 +109,18 @@ BucketSnapshotManager::copySearchableHotArchiveBucketListSnapshot(
             copyHistoricalSnapshots(mHotArchiveHistoricalSnapshots)));
 }
 
+SearchableHotArchiveSnapshotConstPtr
+BucketSnapshotManager::copySearchableHotArchiveBucketListSnapshot(
+    SearchableHotArchiveSnapshotConstPtr const& snapshot)
+{
+    return std::shared_ptr<SearchableHotArchiveBucketListSnapshot>(
+        new SearchableHotArchiveBucketListSnapshot(
+            snapshot->mAppConnector,
+            std::make_unique<BucketListSnapshot<HotArchiveBucket>>(
+                snapshot->getSnapshot()),
+            copyHistoricalSnapshots(snapshot->getHistoricalSnapshots())));
+}
+
 namespace
 {
 template <typename T, typename U>
