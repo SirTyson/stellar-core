@@ -353,6 +353,7 @@ GlobalParallelApplyLedgerState::
 
                 mGlobalEntryMap.emplace(lk,
                                         GlobalParallelApplyEntry{entry, false});
+                mOriginalLedgerTxnKeys.emplace(lk);
             }
         };
 
@@ -394,7 +395,6 @@ GlobalParallelApplyLedgerState::commitChangesToLedgerTxn(
     LedgerTxn ltxInner(ltx);
     for (auto const& [key, entry] : mGlobalEntryMap)
     {
-        // Only update if dirty bit is set
         if (!entry.mIsDirty)
         {
             continue;
@@ -402,24 +402,41 @@ GlobalParallelApplyLedgerState::commitChangesToLedgerTxn(
 
         std::optional<LedgerEntry> const& updatedLe =
             entry.mLedgerEntry.readInScope(*this);
-        if (updatedLe)
+
+        bool originallyExisted =
+            mOriginalLedgerTxnKeys.find(key) != mOriginalLedgerTxnKeys.end();
+        if (!originallyExisted)
         {
-            auto ltxe = ltxInner.load(key);
-            if (ltxe)
+            if (InMemorySorobanState::isInMemoryType(key))
             {
-                ltxe.current() = *updatedLe;
+                originallyExisted = mInMemorySorobanState.get(key) != nullptr;
             }
             else
             {
-                ltxInner.create(*updatedLe);
+                originallyExisted = mLiveSnapshot->load(key) != nullptr;
+            }
+        }
+
+        if (updatedLe)
+        {
+            if (originallyExisted)
+            {
+                ltxInner.updateWithoutLoading(*updatedLe);
+            }
+            else
+            {
+                ltxInner.createWithoutLoading(*updatedLe);
             }
         }
         else
         {
-            auto ltxe = ltxInner.load(key);
-            if (ltxe)
+            if (originallyExisted)
             {
-                ltxInner.erase(key);
+                auto ltxe = ltxInner.load(key);
+                if (ltxe)
+                {
+                    ltxInner.erase(key);
+                }
             }
         }
     }
@@ -552,6 +569,7 @@ ThreadParallelApplyLedgerState::collectClusterFootprintEntriesFromGlobal(
     AppConnector& app, GlobalParallelApplyLedgerState const& global,
     Cluster const& cluster)
 {
+    ZoneScoped;
     releaseAssert(threadIsMain() ||
                   app.threadIsType(Application::ThreadType::APPLY));
 
@@ -599,15 +617,16 @@ ThreadParallelApplyLedgerState::ThreadParallelApplyLedgerState(
     AppConnector& app, GlobalParallelApplyLedgerState const& global,
     Cluster const& cluster, size_t clusterIdx)
     : LedgerEntryScope(ScopeIdT(clusterIdx, global.mScopeID.mLedger))
-    // TODO: find a way to clone these from parent rather than asking the
-    // snapshot manager again. That might have changed! NB taking a shared
-    // pointer copy is not safe, the snapshot objects are not threadsafe.
-    , mHotArchiveSnapshot(app.copySearchableHotArchiveBucketListSnapshot())
-    , mLiveSnapshot(app.copySearchableLiveBucketListSnapshot())
+    , mHotArchiveSnapshot(BucketSnapshotManager::
+                              copySearchableHotArchiveBucketListSnapshot(
+                                  global.mHotArchiveSnapshot))
+    , mLiveSnapshot(BucketSnapshotManager::copySearchableLiveBucketListSnapshot(
+          global.mLiveSnapshot))
     , mInMemorySorobanState(global.mInMemorySorobanState)
     , mSorobanConfig(global.mSorobanConfig)
     , mModuleCache(app.getModuleCache())
 {
+    ZoneScoped;
     releaseAssertOrThrow(global.getSnapshotLedgerSeq() ==
                          getSnapshotLedgerSeq());
     mPreviouslyRestoredEntries.addRestoresFrom(global.getRestoredEntries());
