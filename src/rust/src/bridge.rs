@@ -190,6 +190,17 @@ pub(crate) mod rust_bridge {
             message_ptr: *const u8,
             message_len: usize,
         ) -> bool;
+
+        // Batch ed25519 signature verification using dalek library.
+        // Returns true if ALL signatures are valid, false if any fail.
+        // Provides ~2x speedup over individual verification.
+        unsafe fn verify_ed25519_signature_batch_dalek(
+            count: usize,
+            public_keys_ptr: *const u8,
+            signatures_ptr: *const u8,
+            messages_ptr: *const *const u8,
+            message_lens_ptr: *const usize,
+        ) -> bool;
         fn invoke_host_function(
             config_max_protocol: u32,
             enable_diagnostics: bool,
