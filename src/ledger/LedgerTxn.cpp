@@ -557,6 +557,7 @@ LedgerTxn::Impl::throwIfErasingConfig(InternalLedgerKey const& key) const
 void
 LedgerTxn::commit() noexcept
 {
+    ZoneScoped;
     getImpl()->commit();
     mImpl.reset();
 }
@@ -564,6 +565,7 @@ LedgerTxn::commit() noexcept
 void
 LedgerTxn::Impl::commit() noexcept
 {
+    ZoneScoped;
     abortIfWrongThread("commit");
     maybeUpdateLastModifiedThenInvokeThenSeal([&](EntryMap const& entries) {
         // getEntryIterator has the strong exception safety guarantee
@@ -578,6 +580,7 @@ LedgerTxn::commitChild(EntryIterator iter,
                        RestoredEntries const& restoredEntries,
                        LedgerTxnConsistency cons) noexcept
 {
+    ZoneScoped;
     getImpl()->commitChild(std::move(iter), restoredEntries, cons);
 }
 
@@ -2114,6 +2117,7 @@ LedgerTxn::loadHeader()
 LedgerTxnHeader
 LedgerTxn::Impl::loadHeader(LedgerTxn& self)
 {
+    ZoneScoped;
     abortIfWrongThread("loadHeader");
     throwIfSealed();
     throwIfChild();
@@ -3346,6 +3350,7 @@ LedgerTxnRoot::Impl::loadNextBestOffersIntoCache(BestOffersEntryPtr cached,
                                                  Asset const& buying,
                                                  Asset const& selling)
 {
+    ZoneScoped;
     auto& offers = cached->bestOffers;
     if (cached->allLoaded)
     {
@@ -3392,6 +3397,7 @@ LedgerTxnRoot::Impl::populateEntryCacheFromBestOffers(
     std::deque<LedgerEntry>::const_iterator iter,
     std::deque<LedgerEntry>::const_iterator const& end)
 {
+    return;
     UnorderedSet<LedgerKey> toPrefetch;
     for (; iter != end; ++iter)
     {
