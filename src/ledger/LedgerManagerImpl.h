@@ -312,6 +312,10 @@ class LedgerManagerImpl : public LedgerManager
     // is currently closing a ledger or has ledgers queued to apply.
     bool mCurrentlyApplyingLedger{false};
 
+    // Assert that the current thread is either the main thread or the APPLY
+    // thread (when parallel ledger close is enabled).
+    void assertApplyOrMainThread() const;
+
     static std::vector<MutableTxResultPtr> processFeesSeqNums(
         ApplicableTxSetFrame const& txSet, AbstractLedgerTxn& ltxOuter,
         std::unique_ptr<LedgerCloseMetaFrame> const& ledgerCloseMeta,

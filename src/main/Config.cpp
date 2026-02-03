@@ -2547,8 +2547,7 @@ Config::allBucketsInMemory() const
 bool
 Config::parallelLedgerClose() const
 {
-    // Standalone mode expects synchronous ledger application
-    return PARALLEL_LEDGER_APPLY && !RUN_STANDALONE &&
+    return PARALLEL_LEDGER_APPLY &&
            DATABASE.value != "sqlite3://:memory:";
 }
 

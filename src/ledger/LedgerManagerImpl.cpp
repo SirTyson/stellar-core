@@ -634,6 +634,20 @@ LedgerManagerImpl::getDatabase()
     return mApp.getDatabase();
 }
 
+void
+LedgerManagerImpl::assertApplyOrMainThread() const
+{
+    if (mApp.getConfig().parallelLedgerClose())
+    {
+        releaseAssert(threadIsMain() ||
+                      mApp.threadIsType(Application::ThreadType::APPLY));
+    }
+    else
+    {
+        releaseAssert(threadIsMain());
+    }
+}
+
 uint32_t
 LedgerManagerImpl::getLastMaxTxSetSize() const
 {
@@ -809,7 +823,7 @@ LedgerManagerImpl::maybeRunSnapshotInvariantFromLedgerState(
 SorobanNetworkConfig const&
 LedgerManagerImpl::getLastClosedSorobanNetworkConfig() const
 {
-    releaseAssert(threadIsMain());
+    assertApplyOrMainThread();
     releaseAssert(hasLastClosedSorobanNetworkConfig());
     return mLastClosedLedgerState->getSorobanConfig();
 }
@@ -817,7 +831,7 @@ LedgerManagerImpl::getLastClosedSorobanNetworkConfig() const
 bool
 LedgerManagerImpl::hasLastClosedSorobanNetworkConfig() const
 {
-    releaseAssert(threadIsMain());
+    assertApplyOrMainThread();
     releaseAssert(mLastClosedLedgerState);
     return mLastClosedLedgerState->hasSorobanConfig();
 }
