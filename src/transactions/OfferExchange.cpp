@@ -1110,6 +1110,8 @@ crossOfferV10(AbstractLedgerTxn& ltx, LedgerTxnEntry& sellingWheatOffer,
     releaseAssertOrThrow(maxWheatReceived > 0);
     releaseAssertOrThrow(maxSheepSend > 0);
     auto header = ltx.loadHeader();
+    // Cache ledger version to avoid repeated loadHeader() calls
+    uint32_t const ledgerVersion = header.current().ledgerVersion;
 
     auto& offer = sellingWheatOffer.current().data.offer();
     Asset sheep = offer.buying;
@@ -1205,31 +1207,41 @@ crossOfferV10(AbstractLedgerTxn& ltx, LedgerTxnEntry& sellingWheatOffer,
 
     auto res = (offer.amount == 0) ? CrossOfferResult::eOfferTaken
                                    : CrossOfferResult::eOfferPartial;
+
+    // Deactivate trustlines before calling helper functions that may need to
+    // load them. This avoids "Key is active" errors. We're done using these
+    // entries directly, so deactivating them is safe.
+    sheepLineAccountB.deactivate();
+    wheatLineAccountB.deactivate();
+
+    if (res == CrossOfferResult::eOfferTaken)
     {
-        LedgerTxn ltxInner(ltx);
-        header = ltxInner.loadHeader();
-        sellingWheatOffer = loadOffer(ltxInner, accountBID, offerID);
-        if (res == CrossOfferResult::eOfferTaken)
+        // accountB may already be loaded if native assets are involved.
+        // If not loaded yet, load it now for removeEntryWithPossibleSponsorship.
+        if (!accountB)
         {
-            auto account = loadAccount(ltxInner, accountBID);
-            removeEntryWithPossibleSponsorship(
-                ltxInner, header, sellingWheatOffer.current(), account);
-            sellingWheatOffer.erase();
+            accountB = stellar::loadAccount(ltx, accountBID);
         }
-        else
+        removeEntryWithPossibleSponsorship(
+            ltx, header, sellingWheatOffer.current(), accountB);
+        // erase() deactivates the entry, so no explicit deactivate needed
+        sellingWheatOffer.erase();
+    }
+    else
+    {
+        if (accountB)
         {
-            acquireLiabilities(ltxInner, header, sellingWheatOffer);
+            accountB.deactivate();
         }
-        ltxInner.commit();
+        acquireLiabilities(ltx, header, sellingWheatOffer);
+        // Deactivate sellingWheatOffer since it was passed by reference and
+        // the caller must not use it after this function returns.
+        sellingWheatOffer.deactivate();
     }
 
-    // Note: The previous block creates a nested LedgerTxn so all entries are
-    // deactivated at this point. Specifically, you cannot use sellingWheatOffer
-    // or offer (which is a reference) since it is not active (and may have been
-    // erased) at this point.
     offerTrail.emplace_back(
-        makeClaimAtom(ltx.loadHeader().current().ledgerVersion, accountBID,
-                      offerID, wheat, numWheatReceived, sheep, numSheepSend));
+        makeClaimAtom(ledgerVersion, accountBID, offerID, wheat,
+                      numWheatReceived, sheep, numSheepSend));
     return res;
 }
 
