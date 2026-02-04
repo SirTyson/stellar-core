@@ -40,20 +40,26 @@ class TrustLineWrapper
 
     int64_t getBalance() const;
     bool addBalance(LedgerTxnHeader const& header, int64_t delta);
+    bool addBalance(uint32_t ledgerVersion, uint32_t baseReserve, int64_t delta);
 
     int64_t getBuyingLiabilities(LedgerTxnHeader const& header);
     int64_t getSellingLiabilities(LedgerTxnHeader const& header);
 
     int64_t addBuyingLiabilities(LedgerTxnHeader const& header, int64_t delta);
+    int64_t addBuyingLiabilities(uint32_t ledgerVersion, int64_t delta);
     int64_t addSellingLiabilities(LedgerTxnHeader const& header, int64_t delta);
+    int64_t addSellingLiabilities(uint32_t ledgerVersion, uint32_t baseReserve,
+                                  int64_t delta);
 
     bool isAuthorized() const;
     bool isAuthorizedToMaintainLiabilities() const;
     bool isClawbackEnabled() const;
 
     int64_t getAvailableBalance(LedgerTxnHeader const& header) const;
+    int64_t getAvailableBalance(uint32_t ledgerVersion, uint32_t baseReserve) const;
 
     int64_t getMaxAmountReceive(LedgerTxnHeader const& header) const;
+    int64_t getMaxAmountReceive(uint32_t ledgerVersion) const;
 
     void deactivate();
 };
@@ -75,13 +81,20 @@ class TrustLineWrapper::AbstractImpl
 
     virtual int64_t getBalance() const = 0;
     virtual bool addBalance(LedgerTxnHeader const& header, int64_t delta) = 0;
+    virtual bool addBalance(uint32_t ledgerVersion, uint32_t baseReserve,
+                            int64_t delta) = 0;
 
     virtual int64_t getBuyingLiabilities(LedgerTxnHeader const& header) = 0;
     virtual int64_t getSellingLiabilities(LedgerTxnHeader const& header) = 0;
 
     virtual int64_t addBuyingLiabilities(LedgerTxnHeader const& header,
                                          int64_t delta) = 0;
+    virtual int64_t addBuyingLiabilities(uint32_t ledgerVersion,
+                                         int64_t delta) = 0;
     virtual int64_t addSellingLiabilities(LedgerTxnHeader const& header,
+                                          int64_t delta) = 0;
+    virtual int64_t addSellingLiabilities(uint32_t ledgerVersion,
+                                          uint32_t baseReserve,
                                           int64_t delta) = 0;
 
     virtual bool isAuthorized() const = 0;
@@ -90,9 +103,13 @@ class TrustLineWrapper::AbstractImpl
 
     virtual int64_t
     getAvailableBalance(LedgerTxnHeader const& header) const = 0;
+    virtual int64_t
+    getAvailableBalance(uint32_t ledgerVersion, uint32_t baseReserve) const = 0;
 
     virtual int64_t
     getMaxAmountReceive(LedgerTxnHeader const& header) const = 0;
+    virtual int64_t
+    getMaxAmountReceive(uint32_t ledgerVersion) const = 0;
 };
 
 class ConstTrustLineWrapper
@@ -125,8 +142,10 @@ class ConstTrustLineWrapper
     bool isAuthorizedToMaintainLiabilities() const;
 
     int64_t getAvailableBalance(LedgerTxnHeader const& header) const;
+    int64_t getAvailableBalance(uint32_t ledgerVersion, uint32_t baseReserve) const;
 
     int64_t getMaxAmountReceive(LedgerTxnHeader const& header) const;
+    int64_t getMaxAmountReceive(uint32_t ledgerVersion) const;
 
     void deactivate();
 };
@@ -153,8 +172,12 @@ class ConstTrustLineWrapper::AbstractImpl
 
     virtual int64_t
     getAvailableBalance(LedgerTxnHeader const& header) const = 0;
+    virtual int64_t
+    getAvailableBalance(uint32_t ledgerVersion, uint32_t baseReserve) const = 0;
 
     virtual int64_t
     getMaxAmountReceive(LedgerTxnHeader const& header) const = 0;
+    virtual int64_t
+    getMaxAmountReceive(uint32_t ledgerVersion) const = 0;
 };
 }

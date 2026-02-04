@@ -52,6 +52,29 @@ canSellAtMostBasedOnSheep(LedgerTxnHeader const& header, Asset const& sheep,
 }
 
 int64_t
+canSellAtMostBasedOnSheep(uint32_t ledgerVersion, Asset const& sheep,
+                          ConstTrustLineWrapper const& sheepLine,
+                          Price const& wheatPrice)
+{
+    if (sheep.type() == ASSET_TYPE_NATIVE)
+    {
+        return INT64_MAX;
+    }
+
+    // compute value based on what the account can receive
+    auto sellerMaxSheep = sheepLine ? sheepLine.getMaxAmountReceive(ledgerVersion) : 0;
+
+    auto wheatAmount = int64_t{};
+    if (!bigDivide(wheatAmount, sellerMaxSheep, wheatPrice.d, wheatPrice.n,
+                   ROUND_DOWN))
+    {
+        wheatAmount = INT64_MAX;
+    }
+
+    return wheatAmount;
+}
+
+int64_t
 canSellAtMost(LedgerTxnHeader const& header, LedgerTxnEntry const& account,
               Asset const& asset, TrustLineWrapper const& trustLine)
 {
@@ -88,6 +111,44 @@ canSellAtMost(LedgerTxnHeader const& header, ConstLedgerTxnEntry const& account,
 }
 
 int64_t
+canSellAtMost(uint32_t ledgerVersion, uint32_t baseReserve,
+              LedgerTxnEntry const& account, Asset const& asset,
+              TrustLineWrapper const& trustLine)
+{
+    if (asset.type() == ASSET_TYPE_NATIVE)
+    {
+        // can only send above the minimum balance
+        return std::max({getAvailableBalance(ledgerVersion, baseReserve, account), int64_t(0)});
+    }
+
+    if (trustLine && trustLine.isAuthorizedToMaintainLiabilities())
+    {
+        return std::max({trustLine.getAvailableBalance(ledgerVersion, baseReserve), int64_t(0)});
+    }
+
+    return 0;
+}
+
+int64_t
+canSellAtMost(uint32_t ledgerVersion, uint32_t baseReserve,
+              ConstLedgerTxnEntry const& account, Asset const& asset,
+              ConstTrustLineWrapper const& trustLine)
+{
+    if (asset.type() == ASSET_TYPE_NATIVE)
+    {
+        // can only send above the minimum balance
+        return std::max({getAvailableBalance(ledgerVersion, baseReserve, account), int64_t(0)});
+    }
+
+    if (trustLine && trustLine.isAuthorizedToMaintainLiabilities())
+    {
+        return std::max({trustLine.getAvailableBalance(ledgerVersion, baseReserve), int64_t(0)});
+    }
+
+    return 0;
+}
+
+int64_t
 canBuyAtMost(LedgerTxnHeader const& header, LedgerTxnEntry const& account,
              Asset const& asset, TrustLineWrapper const& trustLine)
 {
@@ -114,6 +175,38 @@ canBuyAtMost(LedgerTxnHeader const& header, ConstLedgerTxnEntry const& account,
     else
     {
         return trustLine ? std::max({trustLine.getMaxAmountReceive(header),
+                                     int64_t(0)})
+                         : 0;
+    }
+}
+
+int64_t
+canBuyAtMost(uint32_t ledgerVersion, LedgerTxnEntry const& account,
+             Asset const& asset, TrustLineWrapper const& trustLine)
+{
+    if (asset.type() == ASSET_TYPE_NATIVE)
+    {
+        return std::max({getMaxAmountReceive(ledgerVersion, account), int64_t(0)});
+    }
+    else
+    {
+        return trustLine ? std::max({trustLine.getMaxAmountReceive(ledgerVersion),
+                                     int64_t(0)})
+                         : 0;
+    }
+}
+
+int64_t
+canBuyAtMost(uint32_t ledgerVersion, ConstLedgerTxnEntry const& account,
+             Asset const& asset, ConstTrustLineWrapper const& trustLine)
+{
+    if (asset.type() == ASSET_TYPE_NATIVE)
+    {
+        return std::max({getMaxAmountReceive(ledgerVersion, account), int64_t(0)});
+    }
+    else
+    {
+        return trustLine ? std::max({trustLine.getMaxAmountReceive(ledgerVersion),
                                      int64_t(0)})
                          : 0;
     }
@@ -781,15 +874,15 @@ applyPriceErrorThresholds(Price price, int64_t wheatReceive, int64_t sheepSend,
 }
 
 static void
-adjustOffer(LedgerTxnHeader const& header, LedgerTxnEntry& offer,
+adjustOffer(uint32_t ledgerVersion, uint32_t baseReserve, LedgerTxnEntry& offer,
             LedgerTxnEntry const& account, Asset const& wheat,
             TrustLineWrapper const& wheatLine, Asset const& sheep,
             TrustLineWrapper const& sheepLine)
 {
     OfferEntry& oe = offer.current().data.offer();
     int64_t maxWheatSend =
-        std::min({oe.amount, canSellAtMost(header, account, wheat, wheatLine)});
-    int64_t maxSheepReceive = canBuyAtMost(header, account, sheep, sheepLine);
+        std::min({oe.amount, canSellAtMost(ledgerVersion, baseReserve, account, wheat, wheatLine)});
+    int64_t maxSheepReceive = canBuyAtMost(ledgerVersion, account, sheep, sheepLine);
     oe.amount = adjustOffer(oe.price, maxWheatSend, maxSheepReceive);
 }
 
@@ -1101,7 +1194,8 @@ crossOffer(AbstractLedgerTxn& ltx, LedgerTxnEntry& sellingWheatOffer,
 }
 
 static CrossOfferResult
-crossOfferV10(AbstractLedgerTxn& ltx, LedgerTxnEntry& sellingWheatOffer,
+crossOfferV10(AbstractLedgerTxn& ltx, uint32_t ledgerVersion,
+              uint32_t baseReserve, LedgerTxnEntry& sellingWheatOffer,
               int64_t maxWheatReceived, int64_t& numWheatReceived,
               int64_t maxSheepSend, int64_t& numSheepSend, bool& wheatStays,
               RoundingType round, std::vector<ClaimAtom>& offerTrail)
@@ -1109,7 +1203,6 @@ crossOfferV10(AbstractLedgerTxn& ltx, LedgerTxnEntry& sellingWheatOffer,
     ZoneScoped;
     releaseAssertOrThrow(maxWheatReceived > 0);
     releaseAssertOrThrow(maxSheepSend > 0);
-    auto header = ltx.loadHeader();
 
     auto& offer = sellingWheatOffer.current().data.offer();
     Asset sheep = offer.buying;
@@ -1125,7 +1218,7 @@ crossOfferV10(AbstractLedgerTxn& ltx, LedgerTxnEntry& sellingWheatOffer,
 
     // Remove liabilities associated with the offer being crossed. Will throw if
     // either asset is unauthorized
-    releaseLiabilities(ltx, header, sellingWheatOffer);
+    releaseLiabilities(ltx, ledgerVersion, baseReserve, sellingWheatOffer);
 
     // Load necessary accounts and trustlines. Note that any LedgerEntry loaded
     // here was also loaded during releaseLiabilities.
@@ -1139,14 +1232,14 @@ crossOfferV10(AbstractLedgerTxn& ltx, LedgerTxnEntry& sellingWheatOffer,
 
     // As of the protocol version 10, this call to adjustOffer should have no
     // effect. We leave it here only as a preventative measure.
-    adjustOffer(header, sellingWheatOffer, accountB, wheat, wheatLineAccountB,
+    adjustOffer(ledgerVersion, baseReserve, sellingWheatOffer, accountB, wheat, wheatLineAccountB,
                 sheep, sheepLineAccountB);
 
     int64_t maxWheatSend =
-        canSellAtMost(header, accountB, wheat, wheatLineAccountB);
+        canSellAtMost(ledgerVersion, baseReserve, accountB, wheat, wheatLineAccountB);
     maxWheatSend = std::min({offer.amount, maxWheatSend});
     int64_t maxSheepReceive =
-        canBuyAtMost(header, accountB, sheep, sheepLineAccountB);
+        canBuyAtMost(ledgerVersion, accountB, sheep, sheepLineAccountB);
     auto exchangeResult =
         exchangeV10(offer.price, maxWheatSend, maxWheatReceived, maxSheepSend,
                     maxSheepReceive, round);
@@ -1160,14 +1253,14 @@ crossOfferV10(AbstractLedgerTxn& ltx, LedgerTxnEntry& sellingWheatOffer,
     {
         if (sheep.type() == ASSET_TYPE_NATIVE)
         {
-            if (!addBalance(header, accountB, numSheepSend))
+            if (!addBalance(ledgerVersion, baseReserve, accountB, numSheepSend))
             {
                 throw std::runtime_error("overflowed sheep balance");
             }
         }
         else
         {
-            if (!sheepLineAccountB.addBalance(header, numSheepSend))
+            if (!sheepLineAccountB.addBalance(ledgerVersion, baseReserve, numSheepSend))
             {
                 throw std::runtime_error("overflowed sheep balance");
             }
@@ -1178,14 +1271,14 @@ crossOfferV10(AbstractLedgerTxn& ltx, LedgerTxnEntry& sellingWheatOffer,
     {
         if (wheat.type() == ASSET_TYPE_NATIVE)
         {
-            if (!addBalance(header, accountB, -numWheatReceived))
+            if (!addBalance(ledgerVersion, baseReserve, accountB, -numWheatReceived))
             {
                 throw std::runtime_error("overflowed wheat balance");
             }
         }
         else
         {
-            if (!wheatLineAccountB.addBalance(header, -numWheatReceived))
+            if (!wheatLineAccountB.addBalance(ledgerVersion, baseReserve, -numWheatReceived))
             {
                 throw std::runtime_error("overflowed wheat balance");
             }
@@ -1195,7 +1288,7 @@ crossOfferV10(AbstractLedgerTxn& ltx, LedgerTxnEntry& sellingWheatOffer,
     if (wheatStays)
     {
         offer.amount -= numWheatReceived;
-        adjustOffer(header, sellingWheatOffer, accountB, wheat,
+        adjustOffer(ledgerVersion, baseReserve, sellingWheatOffer, accountB, wheat,
                     wheatLineAccountB, sheep, sheepLineAccountB);
     }
     else
@@ -1207,18 +1300,18 @@ crossOfferV10(AbstractLedgerTxn& ltx, LedgerTxnEntry& sellingWheatOffer,
                                    : CrossOfferResult::eOfferPartial;
     {
         LedgerTxn ltxInner(ltx);
-        header = ltxInner.loadHeader();
         sellingWheatOffer = loadOffer(ltxInner, accountBID, offerID);
         if (res == CrossOfferResult::eOfferTaken)
         {
             auto account = loadAccount(ltxInner, accountBID);
             removeEntryWithPossibleSponsorship(
-                ltxInner, header, sellingWheatOffer.current(), account);
+                ltxInner, ledgerVersion, sellingWheatOffer.current(), account);
             sellingWheatOffer.erase();
         }
         else
         {
-            acquireLiabilities(ltxInner, header, sellingWheatOffer);
+            acquireLiabilities(ltxInner, ledgerVersion, baseReserve,
+                               sellingWheatOffer);
         }
         ltxInner.commit();
     }
@@ -1228,7 +1321,7 @@ crossOfferV10(AbstractLedgerTxn& ltx, LedgerTxnEntry& sellingWheatOffer,
     // or offer (which is a reference) since it is not active (and may have been
     // erased) at this point.
     offerTrail.emplace_back(
-        makeClaimAtom(ltx.loadHeader().current().ledgerVersion, accountBID,
+        makeClaimAtom(ledgerVersion, accountBID,
                       offerID, wheat, numWheatReceived, sheep, numSheepSend));
     return res;
 }
@@ -1379,7 +1472,8 @@ getPoolID(Asset const& x, Asset const& y, int32_t feeBps)
 }
 
 static bool
-exchangeWithPool(AbstractLedgerTxn& ltxOuter, Asset const& toPoolAsset,
+exchangeWithPool(AbstractLedgerTxn& ltxOuter, uint32_t ledgerVersion,
+                 bool poolTradingDisabled, Asset const& toPoolAsset,
                  int64_t maxSendToPool, int64_t& toPool,
                  Asset const& fromPoolAsset, int64_t maxReceiveFromPool,
                  int64_t& fromPool, RoundingType round,
@@ -1387,13 +1481,12 @@ exchangeWithPool(AbstractLedgerTxn& ltxOuter, Asset const& toPoolAsset,
 {
     LedgerTxn ltx(ltxOuter);
 
-    if (protocolVersionIsBefore(ltx.loadHeader().current().ledgerVersion,
-                                ProtocolVersion::V_18))
+    if (protocolVersionIsBefore(ledgerVersion, ProtocolVersion::V_18))
     {
         // Only exchange with pools starting at protocol version 18
         return false;
     }
-    if (isPoolTradingDisabled(ltx.loadHeader().current()))
+    if (poolTradingDisabled)
     {
         return false;
     }
@@ -1480,7 +1573,8 @@ exchangeWithPool(AbstractLedgerTxn& ltxOuter, Asset const& toPoolAsset,
 
 static ConvertResult
 convertWithOffers(
-    AbstractLedgerTxn& ltxOuter, Asset const& sheep, int64_t maxSheepSend,
+    AbstractLedgerTxn& ltxOuter, uint32_t ledgerVersion, uint32_t baseReserve,
+    uint32_t ledgerSeq, Asset const& sheep, int64_t maxSheepSend,
     int64_t& sheepSend, Asset const& wheat, int64_t maxWheatReceive,
     int64_t& wheatReceived, RoundingType round,
     std::function<OfferFilterResult(LedgerTxnEntry const&)> filter,
@@ -1501,8 +1595,7 @@ convertWithOffers(
 
     bool needMore = (maxWheatReceive > 0 && maxSheepSend > 0);
     if (needMore && maxOffersToCross == 0 &&
-        protocolVersionStartsFrom(ltxOuter.loadHeader().current().ledgerVersion,
-                                  ProtocolVersion::V_18))
+        protocolVersionStartsFrom(ledgerVersion, ProtocolVersion::V_18))
     {
         // offerTrail is going to be too long, fast fail
         // note that this condition can only happen in path payment when
@@ -1520,8 +1613,7 @@ convertWithOffers(
         }
 
         // Special behavior for offer 289733046 can only happen in protocol 15
-        if (gIsProductionNetwork &&
-            ltx.loadHeader().current().ledgerSeq == 34793621 &&
+        if (gIsProductionNetwork && ledgerSeq == 34793621 &&
             wheatOffer.current().data.offer().offerID == 289733046)
         {
             auto const sponsorStrKey = "GAS3CQSW3HE27IF5KDWKCM7K6FG6AHR"
@@ -1557,11 +1649,10 @@ convertWithOffers(
         int64_t numWheatReceived;
         int64_t numSheepSend;
         CrossOfferResult cor;
-        if (protocolVersionStartsFrom(ltx.loadHeader().current().ledgerVersion,
-                                      ProtocolVersion::V_10))
+        if (protocolVersionStartsFrom(ledgerVersion, ProtocolVersion::V_10))
         {
             bool wheatStays;
-            cor = crossOfferV10(ltx, wheatOffer, maxWheatReceive,
+            cor = crossOfferV10(ltx, ledgerVersion, baseReserve, wheatOffer, maxWheatReceive,
                                 numWheatReceived, maxSheepSend, numSheepSend,
                                 wheatStays, round, offerTrail);
             needMore = !wheatStays;
@@ -1600,8 +1691,7 @@ convertWithOffers(
             return ConvertResult::ePartial;
         }
     }
-    if (protocolVersionIsBefore(ltxOuter.loadHeader().current().ledgerVersion,
-                                ProtocolVersion::V_10) ||
+    if (protocolVersionIsBefore(ledgerVersion, ProtocolVersion::V_10) ||
         !needMore)
     {
         return ConvertResult::eOK;
@@ -1647,7 +1737,9 @@ shouldConvertWithOffers(std::optional<ExchangedQuantities> const& poolExchange,
 // returns true if converting with offers, false otherwise
 static bool
 maybeConvertWithOffers(
-    AbstractLedgerTxn& ltxOuter, Asset const& sheep, int64_t maxSheepSend,
+    AbstractLedgerTxn& ltxOuter, uint32_t ledgerVersion, uint32_t baseReserve,
+    uint32_t ledgerSeq, bool poolTradingDisabled, Asset const& sheep,
+    int64_t maxSheepSend,
     int64_t& sheepSend, Asset const& wheat, int64_t maxWheatReceive,
     int64_t& wheatReceived, RoundingType round,
     std::function<OfferFilterResult(LedgerTxnEntry const&)> filter,
@@ -1660,7 +1752,8 @@ maybeConvertWithOffers(
     {
         LedgerTxn ltxExchangeWithPool(ltxOuter); // Always rolls back
         ExchangedQuantities res;
-        if (exchangeWithPool(ltxExchangeWithPool, sheep, maxSheepSend,
+        if (exchangeWithPool(ltxExchangeWithPool, ledgerVersion,
+                             poolTradingDisabled, sheep, maxSheepSend,
                              res.sheepSend, wheat, maxWheatReceive,
                              res.wheatReceived, round, maxOffersToCross))
         {
@@ -1675,8 +1768,9 @@ maybeConvertWithOffers(
         std::vector<ClaimAtom> tempOfferTrail;
         ExchangedQuantities bookExchange;
         auto res = convertWithOffers(
-            ltxConvertWithOffers, sheep, maxSheepSend, bookExchange.sheepSend,
-            wheat, maxWheatReceive, bookExchange.wheatReceived, round, filter,
+            ltxConvertWithOffers, ledgerVersion, baseReserve, ledgerSeq,
+            sheep, maxSheepSend, bookExchange.sheepSend, wheat,
+            maxWheatReceive, bookExchange.wheatReceived, round, filter,
             tempOfferTrail, maxOffersToCross);
 
         if (shouldConvertWithOffers(poolExchange, bookExchange, res))
@@ -1695,7 +1789,9 @@ maybeConvertWithOffers(
 
 ConvertResult
 convertWithOffersAndPools(
-    AbstractLedgerTxn& ltxOuter, Asset const& sheep, int64_t maxSheepSend,
+    AbstractLedgerTxn& ltxOuter, uint32_t ledgerVersion, uint32_t baseReserve,
+    uint32_t ledgerSeq, bool poolTradingDisabled, Asset const& sheep,
+    int64_t maxSheepSend,
     int64_t& sheepSend, Asset const& wheat, int64_t maxWheatReceive,
     int64_t& wheatReceived, RoundingType round,
     std::function<OfferFilterResult(LedgerTxnEntry const&)> filter,
@@ -1712,8 +1808,10 @@ convertWithOffersAndPools(
 
     {
         ConvertResult convertRes;
-        if (maybeConvertWithOffers(ltxOuter, sheep, maxSheepSend, sheepSend,
-                                   wheat, maxWheatReceive, wheatReceived, round,
+        if (maybeConvertWithOffers(ltxOuter, ledgerVersion, baseReserve,
+                                   ledgerSeq, poolTradingDisabled, sheep,
+                                   maxSheepSend, sheepSend, wheat,
+                                   maxWheatReceive, wheatReceived, round,
                                    filter, offerTrail, maxOffersToCross,
                                    convertRes))
         {
@@ -1728,8 +1826,9 @@ convertWithOffersAndPools(
     wheatReceived = 0;
 
     // Compute the exchange from the liquidity pool and actually do the exchange
-    exchangeWithPool(ltxOuter, sheep, maxSheepSend, sheepSend, wheat,
-                     maxWheatReceive, wheatReceived, round, maxOffersToCross);
+    exchangeWithPool(ltxOuter, ledgerVersion, poolTradingDisabled, sheep,
+                     maxSheepSend, sheepSend, wheat, maxWheatReceive,
+                     wheatReceived, round, maxOffersToCross);
 
     ClaimAtom atom(CLAIM_ATOM_TYPE_LIQUIDITY_POOL);
     atom.liquidityPool() =

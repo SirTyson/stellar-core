@@ -155,18 +155,26 @@ ConstLedgerTxnEntry loadContractCode(AbstractLedgerTxn& ltx, Hash const& hash);
 
 void acquireLiabilities(AbstractLedgerTxn& ltx, LedgerTxnHeader const& header,
                         LedgerTxnEntry const& offer);
+void acquireLiabilities(AbstractLedgerTxn& ltx, uint32_t ledgerVersion,
+                        uint32_t baseReserve, LedgerTxnEntry const& offer);
 
 bool addBalanceSkipAuthorization(LedgerTxnHeader const& header,
                                  LedgerTxnEntry& entry, int64_t amount);
 
 bool addBalance(LedgerTxnHeader const& header, LedgerTxnEntry& entry,
                 int64_t delta);
+bool addBalance(uint32_t ledgerVersion, uint32_t baseReserve,
+                LedgerTxnEntry& entry, int64_t delta);
 
 bool addBuyingLiabilities(LedgerTxnHeader const& header, LedgerTxnEntry& entry,
+                          int64_t delta);
+bool addBuyingLiabilities(uint32_t ledgerVersion, LedgerTxnEntry& entry,
                           int64_t delta);
 
 bool addSellingLiabilities(LedgerTxnHeader const& header, LedgerTxnEntry& entry,
                            int64_t delta);
+bool addSellingLiabilities(uint32_t ledgerVersion, uint32_t baseReserve,
+                           LedgerTxnEntry& entry, int64_t delta);
 
 uint64_t generateID(LedgerTxnHeader& header);
 
@@ -174,6 +182,10 @@ int64_t getAvailableBalance(LedgerHeader const& header, LedgerEntry const& le);
 int64_t getAvailableBalance(LedgerTxnHeader const& header,
                             LedgerTxnEntry const& entry);
 int64_t getAvailableBalance(LedgerTxnHeader const& header,
+                            ConstLedgerTxnEntry const& entry);
+int64_t getAvailableBalance(uint32_t ledgerVersion, uint32_t baseReserve,
+                            LedgerTxnEntry const& entry);
+int64_t getAvailableBalance(uint32_t ledgerVersion, uint32_t baseReserve,
                             ConstLedgerTxnEntry const& entry);
 
 int64_t getBuyingLiabilities(LedgerTxnHeader const& header,
@@ -187,10 +199,19 @@ int64_t getMaxAmountReceive(LedgerTxnHeader const& header,
                             LedgerTxnEntry const& entry);
 int64_t getMaxAmountReceive(LedgerTxnHeader const& header,
                             ConstLedgerTxnEntry const& entry);
+int64_t getMaxAmountReceive(uint32_t ledgerVersion,
+                            LedgerTxnEntry const& entry);
+int64_t getMaxAmountReceive(uint32_t ledgerVersion,
+                            ConstLedgerTxnEntry const& entry);
 
 int64_t getMinBalance(LedgerHeader const& header, AccountEntry const& acc);
 int64_t getMinBalance(LedgerHeader const& header, uint32_t numSubentries,
                       uint32_t numSponsoring, uint32_t numSponsored);
+int64_t getMinBalance(uint32_t ledgerVersion, uint32_t baseReserve,
+                      AccountEntry const& acc);
+int64_t getMinBalance(uint32_t ledgerVersion, uint32_t baseReserve,
+                      uint32_t numSubentries, uint32_t numSponsoring,
+                      uint32_t numSponsored);
 
 int64_t getMinimumLimit(LedgerTxnHeader const& header, LedgerEntry const& le);
 int64_t getMinimumLimit(LedgerTxnHeader const& header,
@@ -202,16 +223,27 @@ int64_t getOfferBuyingLiabilities(LedgerTxnHeader const& header,
                                   LedgerEntry const& entry);
 int64_t getOfferBuyingLiabilities(LedgerTxnHeader const& header,
                                   LedgerTxnEntry const& entry);
+int64_t getOfferBuyingLiabilities(uint32_t ledgerVersion,
+                                  LedgerEntry const& entry);
+int64_t getOfferBuyingLiabilities(uint32_t ledgerVersion,
+                                  LedgerTxnEntry const& entry);
 
 int64_t getOfferSellingLiabilities(LedgerTxnHeader const& header,
                                    LedgerEntry const& entry);
 int64_t getOfferSellingLiabilities(LedgerTxnHeader const& header,
+                                   LedgerTxnEntry const& entry);
+int64_t getOfferSellingLiabilities(uint32_t ledgerVersion,
+                                   LedgerEntry const& entry);
+int64_t getOfferSellingLiabilities(uint32_t ledgerVersion,
                                    LedgerTxnEntry const& entry);
 
 int64_t getSellingLiabilities(LedgerHeader const& header,
                               LedgerEntry const& le);
 int64_t getSellingLiabilities(LedgerTxnHeader const& header,
                               LedgerTxnEntry const& offer);
+int64_t getSellingLiabilities(uint32_t ledgerVersion, LedgerEntry const& le);
+
+int64_t getBuyingLiabilities(uint32_t ledgerVersion, LedgerEntry const& le);
 
 SequenceNumber getStartingSequenceNumber(uint32_t ledgerSeq);
 SequenceNumber getStartingSequenceNumber(LedgerTxnHeader const& header);
@@ -246,6 +278,8 @@ bool isPoolTradingDisabled(LedgerHeader const& header);
 
 void releaseLiabilities(AbstractLedgerTxn& ltx, LedgerTxnHeader const& header,
                         LedgerTxnEntry const& offer);
+void releaseLiabilities(AbstractLedgerTxn& ltx, uint32_t ledgerVersion,
+                        uint32_t baseReserve, LedgerTxnEntry const& offer);
 
 AccountID toAccountID(MuxedAccount const& m);
 MuxedAccount toMuxedAccount(AccountID const& a,

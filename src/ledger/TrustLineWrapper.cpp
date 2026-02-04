@@ -24,13 +24,19 @@ class TrustLineWrapper::NonIssuerImpl : public TrustLineWrapper::AbstractImpl
 
     int64_t getBalance() const override;
     bool addBalance(LedgerTxnHeader const& header, int64_t delta) override;
+    bool addBalance(uint32_t ledgerVersion, uint32_t baseReserve,
+                    int64_t delta) override;
 
     int64_t getBuyingLiabilities(LedgerTxnHeader const& header) override;
     int64_t getSellingLiabilities(LedgerTxnHeader const& header) override;
 
     int64_t addBuyingLiabilities(LedgerTxnHeader const& header,
                                  int64_t delta) override;
+    int64_t addBuyingLiabilities(uint32_t ledgerVersion,
+                                 int64_t delta) override;
     int64_t addSellingLiabilities(LedgerTxnHeader const& header,
+                                  int64_t delta) override;
+    int64_t addSellingLiabilities(uint32_t ledgerVersion, uint32_t baseReserve,
                                   int64_t delta) override;
 
     bool isAuthorized() const override;
@@ -38,8 +44,11 @@ class TrustLineWrapper::NonIssuerImpl : public TrustLineWrapper::AbstractImpl
     bool isClawbackEnabled() const override;
 
     int64_t getAvailableBalance(LedgerTxnHeader const& header) const override;
+    int64_t getAvailableBalance(uint32_t ledgerVersion,
+                                uint32_t baseReserve) const override;
 
     int64_t getMaxAmountReceive(LedgerTxnHeader const& header) const override;
+    int64_t getMaxAmountReceive(uint32_t ledgerVersion) const override;
 };
 
 class TrustLineWrapper::IssuerImpl : public TrustLineWrapper::AbstractImpl
@@ -54,13 +63,19 @@ class TrustLineWrapper::IssuerImpl : public TrustLineWrapper::AbstractImpl
 
     int64_t getBalance() const override;
     bool addBalance(LedgerTxnHeader const& header, int64_t delta) override;
+    bool addBalance(uint32_t ledgerVersion, uint32_t baseReserve,
+                    int64_t delta) override;
 
     int64_t getBuyingLiabilities(LedgerTxnHeader const& header) override;
     int64_t getSellingLiabilities(LedgerTxnHeader const& header) override;
 
     int64_t addBuyingLiabilities(LedgerTxnHeader const& header,
                                  int64_t delta) override;
+    int64_t addBuyingLiabilities(uint32_t ledgerVersion,
+                                 int64_t delta) override;
     int64_t addSellingLiabilities(LedgerTxnHeader const& header,
+                                  int64_t delta) override;
+    int64_t addSellingLiabilities(uint32_t ledgerVersion, uint32_t baseReserve,
                                   int64_t delta) override;
 
     bool isAuthorized() const override;
@@ -68,8 +83,11 @@ class TrustLineWrapper::IssuerImpl : public TrustLineWrapper::AbstractImpl
     bool isClawbackEnabled() const override;
 
     int64_t getAvailableBalance(LedgerTxnHeader const& header) const override;
+    int64_t getAvailableBalance(uint32_t ledgerVersion,
+                                uint32_t baseReserve) const override;
 
     int64_t getMaxAmountReceive(LedgerTxnHeader const& header) const override;
+    int64_t getMaxAmountReceive(uint32_t ledgerVersion) const override;
 };
 
 // Implementation of TrustLineWrapper -----------------------------------------
@@ -129,6 +147,13 @@ TrustLineWrapper::addBalance(LedgerTxnHeader const& header, int64_t delta)
     return getImpl()->addBalance(header, delta);
 }
 
+bool
+TrustLineWrapper::addBalance(uint32_t ledgerVersion, uint32_t baseReserve,
+                             int64_t delta)
+{
+    return getImpl()->addBalance(ledgerVersion, baseReserve, delta);
+}
+
 int64_t
 TrustLineWrapper::getBuyingLiabilities(LedgerTxnHeader const& header)
 {
@@ -149,10 +174,23 @@ TrustLineWrapper::addBuyingLiabilities(LedgerTxnHeader const& header,
 }
 
 int64_t
+TrustLineWrapper::addBuyingLiabilities(uint32_t ledgerVersion, int64_t delta)
+{
+    return getImpl()->addBuyingLiabilities(ledgerVersion, delta);
+}
+
+int64_t
 TrustLineWrapper::addSellingLiabilities(LedgerTxnHeader const& header,
                                         int64_t delta)
 {
     return getImpl()->addSellingLiabilities(header, delta);
+}
+
+int64_t
+TrustLineWrapper::addSellingLiabilities(uint32_t ledgerVersion,
+                                        uint32_t baseReserve, int64_t delta)
+{
+    return getImpl()->addSellingLiabilities(ledgerVersion, baseReserve, delta);
 }
 
 bool
@@ -180,9 +218,22 @@ TrustLineWrapper::getAvailableBalance(LedgerTxnHeader const& header) const
 }
 
 int64_t
+TrustLineWrapper::getAvailableBalance(uint32_t ledgerVersion,
+                                      uint32_t baseReserve) const
+{
+    return getImpl()->getAvailableBalance(ledgerVersion, baseReserve);
+}
+
+int64_t
 TrustLineWrapper::getMaxAmountReceive(LedgerTxnHeader const& header) const
 {
     return getImpl()->getMaxAmountReceive(header);
+}
+
+int64_t
+TrustLineWrapper::getMaxAmountReceive(uint32_t ledgerVersion) const
+{
+    return getImpl()->getMaxAmountReceive(ledgerVersion);
 }
 
 void
@@ -226,6 +277,13 @@ TrustLineWrapper::NonIssuerImpl::addBalance(LedgerTxnHeader const& header,
     return stellar::addBalance(header, mEntry, delta);
 }
 
+bool
+TrustLineWrapper::NonIssuerImpl::addBalance(uint32_t ledgerVersion,
+                                            uint32_t baseReserve, int64_t delta)
+{
+    return stellar::addBalance(ledgerVersion, baseReserve, mEntry, delta);
+}
+
 int64_t
 TrustLineWrapper::NonIssuerImpl::getBuyingLiabilities(
     LedgerTxnHeader const& header)
@@ -248,10 +306,25 @@ TrustLineWrapper::NonIssuerImpl::addBuyingLiabilities(
 }
 
 int64_t
+TrustLineWrapper::NonIssuerImpl::addBuyingLiabilities(uint32_t ledgerVersion,
+                                                      int64_t delta)
+{
+    return stellar::addBuyingLiabilities(ledgerVersion, mEntry, delta);
+}
+
+int64_t
 TrustLineWrapper::NonIssuerImpl::addSellingLiabilities(
     LedgerTxnHeader const& header, int64_t delta)
 {
     return stellar::addSellingLiabilities(header, mEntry, delta);
+}
+
+int64_t
+TrustLineWrapper::NonIssuerImpl::addSellingLiabilities(uint32_t ledgerVersion,
+                                                       uint32_t baseReserve,
+                                                       int64_t delta)
+{
+    return stellar::addSellingLiabilities(ledgerVersion, baseReserve, mEntry, delta);
 }
 
 bool
@@ -280,10 +353,24 @@ TrustLineWrapper::NonIssuerImpl::getAvailableBalance(
 }
 
 int64_t
+TrustLineWrapper::NonIssuerImpl::getAvailableBalance(
+    uint32_t ledgerVersion, uint32_t baseReserve) const
+{
+    return stellar::getAvailableBalance(ledgerVersion, baseReserve, mEntry);
+}
+
+int64_t
 TrustLineWrapper::NonIssuerImpl::getMaxAmountReceive(
     LedgerTxnHeader const& header) const
 {
     return stellar::getMaxAmountReceive(header, mEntry);
+}
+
+int64_t
+TrustLineWrapper::NonIssuerImpl::getMaxAmountReceive(
+    uint32_t ledgerVersion) const
+{
+    return stellar::getMaxAmountReceive(ledgerVersion, mEntry);
 }
 
 // Implementation of TrustLineWrapper::IssuerImpl -----------------------------
@@ -312,6 +399,13 @@ TrustLineWrapper::IssuerImpl::addBalance(LedgerTxnHeader const& header,
     return true;
 }
 
+bool
+TrustLineWrapper::IssuerImpl::addBalance(uint32_t ledgerVersion,
+                                         uint32_t baseReserve, int64_t delta)
+{
+    return true;
+}
+
 int64_t
 TrustLineWrapper::IssuerImpl::getBuyingLiabilities(
     LedgerTxnHeader const& header)
@@ -334,8 +428,23 @@ TrustLineWrapper::IssuerImpl::addBuyingLiabilities(
 }
 
 int64_t
+TrustLineWrapper::IssuerImpl::addBuyingLiabilities(uint32_t ledgerVersion,
+                                                   int64_t delta)
+{
+    return true;
+}
+
+int64_t
 TrustLineWrapper::IssuerImpl::addSellingLiabilities(
     LedgerTxnHeader const& header, int64_t delta)
+{
+    return true;
+}
+
+int64_t
+TrustLineWrapper::IssuerImpl::addSellingLiabilities(uint32_t ledgerVersion,
+                                                    uint32_t baseReserve,
+                                                    int64_t delta)
 {
     return true;
 }
@@ -366,8 +475,21 @@ TrustLineWrapper::IssuerImpl::getAvailableBalance(
 }
 
 int64_t
+TrustLineWrapper::IssuerImpl::getAvailableBalance(
+    uint32_t ledgerVersion, uint32_t baseReserve) const
+{
+    return INT64_MAX;
+}
+
+int64_t
 TrustLineWrapper::IssuerImpl::getMaxAmountReceive(
     LedgerTxnHeader const& header) const
+{
+    return INT64_MAX;
+}
+
+int64_t
+TrustLineWrapper::IssuerImpl::getMaxAmountReceive(uint32_t ledgerVersion) const
 {
     return INT64_MAX;
 }
@@ -389,8 +511,11 @@ class ConstTrustLineWrapper::NonIssuerImpl
     bool isAuthorizedToMaintainLiabilities() const override;
 
     int64_t getAvailableBalance(LedgerTxnHeader const& header) const override;
+    int64_t getAvailableBalance(uint32_t ledgerVersion,
+                                uint32_t baseReserve) const override;
 
     int64_t getMaxAmountReceive(LedgerTxnHeader const& header) const override;
+    int64_t getMaxAmountReceive(uint32_t ledgerVersion) const override;
 };
 
 class ConstTrustLineWrapper::IssuerImpl
@@ -405,8 +530,11 @@ class ConstTrustLineWrapper::IssuerImpl
     bool isAuthorizedToMaintainLiabilities() const override;
 
     int64_t getAvailableBalance(LedgerTxnHeader const& header) const override;
+    int64_t getAvailableBalance(uint32_t ledgerVersion,
+                                uint32_t baseReserve) const override;
 
     int64_t getMaxAmountReceive(LedgerTxnHeader const& header) const override;
+    int64_t getMaxAmountReceive(uint32_t ledgerVersion) const override;
 };
 
 // Implementation of ConstTrustLineWrapper ------------------------------------
@@ -474,9 +602,22 @@ ConstTrustLineWrapper::getAvailableBalance(LedgerTxnHeader const& header) const
 }
 
 int64_t
+ConstTrustLineWrapper::getAvailableBalance(uint32_t ledgerVersion,
+                                            uint32_t baseReserve) const
+{
+    return getImpl()->getAvailableBalance(ledgerVersion, baseReserve);
+}
+
+int64_t
 ConstTrustLineWrapper::getMaxAmountReceive(LedgerTxnHeader const& header) const
 {
     return getImpl()->getMaxAmountReceive(header);
+}
+
+int64_t
+ConstTrustLineWrapper::getMaxAmountReceive(uint32_t ledgerVersion) const
+{
+    return getImpl()->getMaxAmountReceive(ledgerVersion);
 }
 
 std::unique_ptr<ConstTrustLineWrapper::AbstractImpl> const&
@@ -527,10 +668,24 @@ ConstTrustLineWrapper::NonIssuerImpl::getAvailableBalance(
 }
 
 int64_t
+ConstTrustLineWrapper::NonIssuerImpl::getAvailableBalance(
+    uint32_t ledgerVersion, uint32_t baseReserve) const
+{
+    return stellar::getAvailableBalance(ledgerVersion, baseReserve, mEntry);
+}
+
+int64_t
 ConstTrustLineWrapper::NonIssuerImpl::getMaxAmountReceive(
     LedgerTxnHeader const& header) const
 {
     return stellar::getMaxAmountReceive(header, mEntry);
+}
+
+int64_t
+ConstTrustLineWrapper::NonIssuerImpl::getMaxAmountReceive(
+    uint32_t ledgerVersion) const
+{
+    return stellar::getMaxAmountReceive(ledgerVersion, mEntry);
 }
 
 // Implementation of ConstTrustLineWrapper::IssuerImpl ------------------------
@@ -566,8 +721,22 @@ ConstTrustLineWrapper::IssuerImpl::getAvailableBalance(
 }
 
 int64_t
+ConstTrustLineWrapper::IssuerImpl::getAvailableBalance(
+    uint32_t ledgerVersion, uint32_t baseReserve) const
+{
+    return INT64_MAX;
+}
+
+int64_t
 ConstTrustLineWrapper::IssuerImpl::getMaxAmountReceive(
     LedgerTxnHeader const& header) const
+{
+    return INT64_MAX;
+}
+
+int64_t
+ConstTrustLineWrapper::IssuerImpl::getMaxAmountReceive(
+    uint32_t ledgerVersion) const
 {
     return INT64_MAX;
 }

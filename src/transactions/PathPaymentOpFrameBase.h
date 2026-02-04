@@ -14,7 +14,9 @@ class AbstractLedgerTxn;
 class PathPaymentOpFrameBase : public OperationFrame
 {
   protected:
-    bool convert(AbstractLedgerTxn& ltx, int64_t maxOffersToCross,
+    bool convert(AbstractLedgerTxn& ltx, uint32_t ledgerVersion,
+                 uint32_t baseReserve, uint32_t ledgerSeq,
+                 bool poolTradingDisabled, int64_t maxOffersToCross,
                  Asset const& sendAsset, int64_t maxSend, int64_t& amountSend,
                  Asset const& recvAsset, int64_t maxRecv, int64_t& amountRecv,
                  RoundingType round, std::vector<ClaimAtom>& offerTrail,
@@ -22,15 +24,17 @@ class PathPaymentOpFrameBase : public OperationFrame
 
     bool shouldBypassIssuerCheck(std::vector<Asset> const& path) const;
 
-    bool updateSourceBalance(AbstractLedgerTxn& ltx, OperationResult& res,
+    bool updateSourceBalance(AbstractLedgerTxn& ltx, uint32_t ledgerVersion,
+                             uint32_t baseReserve, OperationResult& res,
                              int64_t amount, bool bypassIssuerCheck,
                              bool doesSourceAccountExist) const;
 
-    bool updateDestBalance(AbstractLedgerTxn& ltx, int64_t amount,
+    bool updateDestBalance(AbstractLedgerTxn& ltx, uint32_t ledgerVersion,
+                           uint32_t baseReserve, int64_t amount,
                            bool bypassIssuerCheck, OperationResult& res) const;
 
-    bool checkIssuer(AbstractLedgerTxn& ltx, Asset const& asset,
-                     OperationResult& res) const;
+    bool checkIssuer(AbstractLedgerTxn& ltx, uint32_t ledgerVersion,
+                     Asset const& asset, OperationResult& res) const;
 
   public:
     PathPaymentOpFrameBase(Operation const& op,

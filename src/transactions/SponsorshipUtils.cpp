@@ -583,6 +583,35 @@ canRemoveEntryWithSponsorship(LedgerHeader const& lh, LedgerEntry const& le,
     }
 }
 
+static void
+canRemoveEntryWithSponsorship(uint32_t ledgerVersion, LedgerEntry const& le,
+                              LedgerEntry const& sponsoringAcc,
+                              LedgerEntry const* sponsoredAcc)
+{
+    if (protocolVersionIsBefore(ledgerVersion, ProtocolVersion::V_14))
+    {
+        throw std::runtime_error("sponsorship before version 14");
+    }
+
+    uint32_t mult = computeMultiplier(le);
+    if (getNumSponsoring(sponsoringAcc) < mult)
+    {
+        throw std::runtime_error("invalid sponsoring account state");
+    }
+
+    if (le.data.type() == ACCOUNT && (!sponsoredAcc || le != *sponsoredAcc))
+    {
+        throw std::runtime_error("invalid sponsored account");
+    }
+
+    if (sponsoredAcc && ((le.data.type() != ACCOUNT &&
+                          sponsoredAcc->data.account().numSubEntries < mult) ||
+                         getNumSponsored(*sponsoredAcc) < mult))
+    {
+        throw std::runtime_error("invalid sponsored account state");
+    }
+}
+
 SponsorshipResult
 canCreateSignerWithoutSponsorship(LedgerHeader const& lh,
                                   LedgerEntry const& acc)
@@ -842,6 +871,50 @@ removeEntryWithPossibleSponsorship(AbstractLedgerTxn& ltx,
     else
     {
         canRemoveEntryWithoutSponsorship(header.current(), le, acc.current());
+        removeEntryWithoutSponsorship(le, acc.current());
+    }
+}
+
+void
+removeEntryWithPossibleSponsorship(AbstractLedgerTxn& ltx,
+                                   uint32_t ledgerVersion, LedgerEntry& le,
+                                   LedgerTxnEntry& acc)
+{
+    if (le.ext.v() == 1 && le.ext.v1().sponsoringID)
+    {
+        // claimable balances are not subentries, so there's no sponsored
+        // account
+        LedgerEntry* sponsoredAccount =
+            le.data.type() == CLAIMABLE_BALANCE ? nullptr : &acc.current();
+
+        if (acc.current().data.account().accountID == *le.ext.v1().sponsoringID)
+        {
+            if (le.data.type() != CLAIMABLE_BALANCE)
+            {
+                throw std::runtime_error("sponsoringID == sourceAccount for "
+                                         "non-CLAIMABLE_BALANCE entry");
+            }
+            canRemoveEntryWithSponsorship(ledgerVersion, le, acc.current(),
+                                          sponsoredAccount);
+            removeEntryWithSponsorship(le, acc.current(), sponsoredAccount);
+        }
+        else
+        {
+            auto sponsoringAcc = loadAccount(ltx, *le.ext.v1().sponsoringID);
+
+            canRemoveEntryWithSponsorship(ledgerVersion, le,
+                                          sponsoringAcc.current(),
+                                          sponsoredAccount);
+            removeEntryWithSponsorship(le, sponsoringAcc.current(),
+                                       sponsoredAccount);
+        }
+    }
+    else
+    {
+        // canRemoveEntryWithoutSponsorship doesn't use the header
+        LedgerHeader dummyHeader;
+        dummyHeader.ledgerVersion = ledgerVersion;
+        canRemoveEntryWithoutSponsorship(dummyHeader, le, acc.current());
         removeEntryWithoutSponsorship(le, acc.current());
     }
 }

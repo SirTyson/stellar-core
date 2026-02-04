@@ -53,12 +53,12 @@ PathPaymentOpFrameBase::isDexOperation() const
 }
 
 bool
-PathPaymentOpFrameBase::checkIssuer(AbstractLedgerTxn& ltx, Asset const& asset,
+PathPaymentOpFrameBase::checkIssuer(AbstractLedgerTxn& ltx,
+                                    uint32_t ledgerVersion, Asset const& asset,
                                     OperationResult& res) const
 {
     if (asset.type() != ASSET_TYPE_NATIVE)
     {
-        uint32_t ledgerVersion = ltx.loadHeader().current().ledgerVersion;
         if (protocolVersionIsBefore(ledgerVersion, ProtocolVersion::V_13) &&
             !stellar::loadAccountWithoutRecord(ltx, getIssuer(asset)))
         {
@@ -71,18 +71,20 @@ PathPaymentOpFrameBase::checkIssuer(AbstractLedgerTxn& ltx, Asset const& asset,
 
 bool
 PathPaymentOpFrameBase::convert(
-    AbstractLedgerTxn& ltx, int64_t maxOffersToCross, Asset const& sendAsset,
-    int64_t maxSend, int64_t& amountSend, Asset const& recvAsset,
-    int64_t maxRecv, int64_t& amountRecv, RoundingType round,
-    std::vector<ClaimAtom>& offerTrail, OperationResult& res) const
+    AbstractLedgerTxn& ltx, uint32_t ledgerVersion, uint32_t baseReserve,
+    uint32_t ledgerSeq, bool poolTradingDisabled, int64_t maxOffersToCross,
+    Asset const& sendAsset, int64_t maxSend, int64_t& amountSend,
+    Asset const& recvAsset, int64_t maxRecv, int64_t& amountRecv,
+    RoundingType round, std::vector<ClaimAtom>& offerTrail,
+    OperationResult& res) const
 {
     releaseAssertOrThrow(offerTrail.empty());
     releaseAssertOrThrow(!(sendAsset == recvAsset));
 
     // sendAsset -> recvAsset
     ConvertResult r = convertWithOffersAndPools(
-        ltx, sendAsset, maxSend, amountSend, recvAsset, maxRecv, amountRecv,
-        round,
+        ltx, ledgerVersion, baseReserve, ledgerSeq, poolTradingDisabled,
+        sendAsset, maxSend, amountSend, recvAsset, maxRecv, amountRecv, round,
         [this](LedgerTxnEntry const& o) {
             auto const& offer = o.current().data.offer();
             if (offer.sellerID == getSourceID())
@@ -138,6 +140,8 @@ PathPaymentOpFrameBase::shouldBypassIssuerCheck(
 
 bool
 PathPaymentOpFrameBase::updateSourceBalance(AbstractLedgerTxn& ltx,
+                                            uint32_t ledgerVersion,
+                                            uint32_t baseReserve,
                                             OperationResult& res,
                                             int64_t amount,
                                             bool bypassIssuerCheck,
@@ -147,10 +151,8 @@ PathPaymentOpFrameBase::updateSourceBalance(AbstractLedgerTxn& ltx,
 
     if (asset.type() == ASSET_TYPE_NATIVE)
     {
-        auto header = ltx.loadHeader();
         LedgerTxnEntry sourceAccount;
-        if (protocolVersionStartsFrom(header.current().ledgerVersion,
-                                      ProtocolVersion::V_8))
+        if (protocolVersionStartsFrom(ledgerVersion, ProtocolVersion::V_8))
         {
             sourceAccount = stellar::loadAccount(ltx, getSourceID());
             if (!sourceAccount)
@@ -161,10 +163,13 @@ PathPaymentOpFrameBase::updateSourceBalance(AbstractLedgerTxn& ltx,
         }
         else
         {
+            // Legacy pre-V8 path: need header for loadSourceAccount
+            auto header = ltx.loadHeader();
             sourceAccount = loadSourceAccount(ltx, header);
         }
 
-        if (amount > getAvailableBalance(header, sourceAccount))
+        if (amount > getAvailableBalance(ledgerVersion, baseReserve,
+                                         sourceAccount))
         { // they don't have enough to send
             setResultUnderfunded(res);
             return false;
@@ -175,12 +180,12 @@ PathPaymentOpFrameBase::updateSourceBalance(AbstractLedgerTxn& ltx,
             throw std::runtime_error("modifying account that does not exist");
         }
 
-        auto ok = addBalance(header, sourceAccount, -amount);
+        auto ok = addBalance(ledgerVersion, baseReserve, sourceAccount, -amount);
         releaseAssertOrThrow(ok);
     }
     else
     {
-        if (!bypassIssuerCheck && !checkIssuer(ltx, asset, res))
+        if (!bypassIssuerCheck && !checkIssuer(ltx, ledgerVersion, asset, res))
         {
             return false;
         }
@@ -198,7 +203,7 @@ PathPaymentOpFrameBase::updateSourceBalance(AbstractLedgerTxn& ltx,
             return false;
         }
 
-        if (!sourceLine.addBalance(ltx.loadHeader(), -amount))
+        if (!sourceLine.addBalance(ledgerVersion, baseReserve, -amount))
         {
             setResultUnderfunded(res);
             return false;
@@ -210,7 +215,8 @@ PathPaymentOpFrameBase::updateSourceBalance(AbstractLedgerTxn& ltx,
 
 bool
 PathPaymentOpFrameBase::updateDestBalance(AbstractLedgerTxn& ltx,
-                                          int64_t amount,
+                                          uint32_t ledgerVersion,
+                                          uint32_t baseReserve, int64_t amount,
                                           bool bypassIssuerCheck,
                                           OperationResult& res) const
 {
@@ -220,11 +226,9 @@ PathPaymentOpFrameBase::updateDestBalance(AbstractLedgerTxn& ltx,
     if (asset.type() == ASSET_TYPE_NATIVE)
     {
         auto destination = stellar::loadAccount(ltx, destID);
-        if (!addBalance(ltx.loadHeader(), destination, amount))
+        if (!addBalance(ledgerVersion, baseReserve, destination, amount))
         {
-            if (protocolVersionStartsFrom(
-                    ltx.loadHeader().current().ledgerVersion,
-                    ProtocolVersion::V_11))
+            if (protocolVersionStartsFrom(ledgerVersion, ProtocolVersion::V_11))
             {
                 setResultLineFull(res);
             }
@@ -237,7 +241,7 @@ PathPaymentOpFrameBase::updateDestBalance(AbstractLedgerTxn& ltx,
     }
     else
     {
-        if (!bypassIssuerCheck && !checkIssuer(ltx, asset, res))
+        if (!bypassIssuerCheck && !checkIssuer(ltx, ledgerVersion, asset, res))
         {
             return false;
         }
@@ -255,7 +259,7 @@ PathPaymentOpFrameBase::updateDestBalance(AbstractLedgerTxn& ltx,
             return false;
         }
 
-        if (!destLine.addBalance(ltx.loadHeader(), amount))
+        if (!destLine.addBalance(ledgerVersion, baseReserve, amount))
         {
             setResultLineFull(res);
             return false;

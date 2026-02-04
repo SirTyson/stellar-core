@@ -42,9 +42,14 @@ PathPaymentStrictReceiveOpFrame::doApply(AppConnector& app,
 
     setResultSuccess(res);
 
+    auto const& header = ltx.loadHeader().current();
+    uint32_t const ledgerVersion = header.ledgerVersion;
+    uint32_t const baseReserve = header.baseReserve;
+    uint32_t const ledgerSeq = header.ledgerSeq;
+    bool const poolTradingDisabled = isPoolTradingDisabled(header);
+
     bool doesSourceAccountExist = true;
-    if (protocolVersionIsBefore(ltx.loadHeader().current().ledgerVersion,
-                                ProtocolVersion::V_8))
+    if (protocolVersionIsBefore(ledgerVersion, ProtocolVersion::V_8))
     {
         doesSourceAccountExist =
             (bool)stellar::loadAccountWithoutRecord(ltx, getSourceID());
@@ -60,8 +65,8 @@ PathPaymentStrictReceiveOpFrame::doApply(AppConnector& app,
         }
     }
 
-    if (!updateDestBalance(ltx, mPathPayment.destAmount, bypassIssuerCheck,
-                           res))
+    if (!updateDestBalance(ltx, ledgerVersion, baseReserve,
+                           mPathPayment.destAmount, bypassIssuerCheck, res))
     {
         return false;
     }
@@ -84,15 +89,14 @@ PathPaymentStrictReceiveOpFrame::doApply(AppConnector& app,
             continue;
         }
 
-        if (!checkIssuer(ltx, sendAsset, res))
+        if (!checkIssuer(ltx, ledgerVersion, sendAsset, res))
         {
             return false;
         }
 
         int64_t maxOffersToCross = INT64_MAX;
         if (protocolVersionStartsFrom(
-                ltx.loadHeader().current().ledgerVersion,
-                FIRST_PROTOCOL_SUPPORTING_OPERATION_LIMITS))
+                ledgerVersion, FIRST_PROTOCOL_SUPPORTING_OPERATION_LIMITS))
         {
             size_t offersCrossed = innerResult(res).success().offers.size();
             // offersCrossed will never be bigger than INT64_MAX because
@@ -105,10 +109,11 @@ PathPaymentStrictReceiveOpFrame::doApply(AppConnector& app,
         int64_t amountSend = 0;
         int64_t amountRecv = 0;
         std::vector<ClaimAtom> offerTrail;
-        if (!convert(ltx, maxOffersToCross, sendAsset, INT64_MAX, amountSend,
-                     recvAsset, maxAmountRecv, amountRecv,
-                     RoundingType::PATH_PAYMENT_STRICT_RECEIVE, offerTrail,
-                     res))
+        if (!convert(ltx, ledgerVersion, baseReserve, ledgerSeq,
+                     poolTradingDisabled, maxOffersToCross, sendAsset,
+                     INT64_MAX, amountSend, recvAsset, maxAmountRecv,
+                     amountRecv, RoundingType::PATH_PAYMENT_STRICT_RECEIVE,
+                     offerTrail, res))
         {
             return false;
         }
@@ -128,7 +133,8 @@ PathPaymentStrictReceiveOpFrame::doApply(AppConnector& app,
         return false;
     }
 
-    if (!updateSourceBalance(ltx, res, maxAmountRecv, bypassIssuerCheck,
+    if (!updateSourceBalance(ltx, ledgerVersion, baseReserve, res,
+                             maxAmountRecv, bypassIssuerCheck,
                              doesSourceAccountExist))
     {
         return false;

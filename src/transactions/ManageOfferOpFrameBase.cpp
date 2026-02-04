@@ -319,6 +319,12 @@ ManageOfferOpFrameBase::doApply(AppConnector& app, AbstractLedgerTxn& ltxOuter,
 
     if (!isDeleteOffer())
     {
+        auto header = ltx.loadHeader();
+        uint32_t ledgerVersion = header.current().ledgerVersion;
+        uint32_t baseReserve = header.current().baseReserve;
+        uint32_t ledgerSeq = header.current().ledgerSeq;
+        bool poolTradingDisabled = isPoolTradingDisabled(header.current());
+
         int64_t maxSheepSend = 0;
         int64_t maxWheatReceive = 0;
         if (!computeOfferExchangeParameters(ltx, res, creatingNewOffer,
@@ -336,8 +342,7 @@ ManageOfferOpFrameBase::doApply(AppConnector& app, AbstractLedgerTxn& ltxOuter,
 
         int64_t maxOffersToCross = INT64_MAX;
         if (protocolVersionStartsFrom(
-                ltx.loadHeader().current().ledgerVersion,
-                FIRST_PROTOCOL_SUPPORTING_OPERATION_LIMITS))
+                ledgerVersion, FIRST_PROTOCOL_SUPPORTING_OPERATION_LIMITS))
         {
             maxOffersToCross = getMaxOffersToCross();
         }
@@ -346,7 +351,8 @@ ManageOfferOpFrameBase::doApply(AppConnector& app, AbstractLedgerTxn& ltxOuter,
         std::vector<ClaimAtom> offerTrail;
         Price maxWheatPrice(mPrice.d, mPrice.n);
         ConvertResult r = convertWithOffersAndPools(
-            ltx, mSheep, maxSheepSend, sheepSent, mWheat, maxWheatReceive,
+            ltx, ledgerVersion, baseReserve, ledgerSeq, poolTradingDisabled,
+            mSheep, maxSheepSend, sheepSent, mWheat, maxWheatReceive,
             wheatReceived, RoundingType::NORMAL,
             [this, passive, &maxWheatPrice](LedgerTxnEntry const& entry) {
                 auto const& o = entry.current().data.offer();
@@ -395,13 +401,13 @@ ManageOfferOpFrameBase::doApply(AppConnector& app, AbstractLedgerTxn& ltxOuter,
             getSuccessResult(res).offersClaimed.push_back(oatom);
         }
 
-        auto header = ltx.loadHeader();
         if (wheatReceived > 0)
         {
             if (mWheat.type() == ASSET_TYPE_NATIVE)
             {
+                auto header = ltx.loadHeader();
                 auto sourceAccount = loadSourceAccount(ltx, header);
-                if (!addBalance(header, sourceAccount, wheatReceived))
+                if (!addBalance(ledgerVersion, baseReserve, sourceAccount, wheatReceived))
                 {
                     // this would indicate a bug in OfferExchange
                     throw std::runtime_error("offer claimed over limit");
@@ -410,7 +416,7 @@ ManageOfferOpFrameBase::doApply(AppConnector& app, AbstractLedgerTxn& ltxOuter,
             else
             {
                 auto wheatLineA = loadTrustLine(ltx, getSourceID(), mWheat);
-                if (!wheatLineA.addBalance(header, wheatReceived))
+                if (!wheatLineA.addBalance(ledgerVersion, baseReserve, wheatReceived))
                 {
                     // this would indicate a bug in OfferExchange
                     throw std::runtime_error("offer claimed over limit");
@@ -419,8 +425,9 @@ ManageOfferOpFrameBase::doApply(AppConnector& app, AbstractLedgerTxn& ltxOuter,
 
             if (mSheep.type() == ASSET_TYPE_NATIVE)
             {
+                auto header = ltx.loadHeader();
                 auto sourceAccount = loadSourceAccount(ltx, header);
-                if (!addBalance(header, sourceAccount, -sheepSent))
+                if (!addBalance(ledgerVersion, baseReserve, sourceAccount, -sheepSent))
                 {
                     // this would indicate a bug in OfferExchange
                     throw std::runtime_error("offer sold more than balance");
@@ -429,7 +436,7 @@ ManageOfferOpFrameBase::doApply(AppConnector& app, AbstractLedgerTxn& ltxOuter,
             else
             {
                 auto sheepLineA = loadTrustLine(ltx, getSourceID(), mSheep);
-                if (!sheepLineA.addBalance(header, -sheepSent))
+                if (!sheepLineA.addBalance(ledgerVersion, baseReserve, -sheepSent))
                 {
                     // this would indicate a bug in OfferExchange
                     throw std::runtime_error("offer sold more than balance");
@@ -437,8 +444,7 @@ ManageOfferOpFrameBase::doApply(AppConnector& app, AbstractLedgerTxn& ltxOuter,
             }
         }
 
-        if (protocolVersionStartsFrom(header.current().ledgerVersion,
-                                      ProtocolVersion::V_10))
+        if (protocolVersionStartsFrom(ledgerVersion, ProtocolVersion::V_10))
         {
             if (sheepStays)
             {
@@ -450,9 +456,9 @@ ManageOfferOpFrameBase::doApply(AppConnector& app, AbstractLedgerTxn& ltxOuter,
                     ltx, getSourceID(), mWheat);
 
                 int64_t sheepSendLimit =
-                    canSellAtMost(header, sourceAccount, mSheep, sheepLineA);
+                    canSellAtMost(ledgerVersion, baseReserve, sourceAccount, mSheep, sheepLineA);
                 int64_t wheatReceiveLimit =
-                    canBuyAtMost(header, sourceAccount, mWheat, wheatLineA);
+                    canBuyAtMost(ledgerVersion, sourceAccount, mWheat, wheatLineA);
                 applyOperationSpecificLimits(sheepSendLimit, sheepSent,
                                              wheatReceiveLimit, wheatReceived);
                 amount = adjustOffer(mPrice, sheepSendLimit, wheatReceiveLimit);

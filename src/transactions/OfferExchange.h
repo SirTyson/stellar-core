@@ -247,6 +247,9 @@ int64_t canSellAtMostBasedOnSheep(LedgerTxnHeader const& header,
                                   Asset const& sheep,
                                   ConstTrustLineWrapper const& sheepLine,
                                   Price const& wheatPrice);
+int64_t canSellAtMostBasedOnSheep(uint32_t ledgerVersion, Asset const& sheep,
+                                  ConstTrustLineWrapper const& sheepLine,
+                                  Price const& wheatPrice);
 
 int64_t canSellAtMost(LedgerTxnHeader const& header,
                       LedgerTxnEntry const& account, Asset const& asset,
@@ -254,11 +257,23 @@ int64_t canSellAtMost(LedgerTxnHeader const& header,
 int64_t canSellAtMost(LedgerTxnHeader const& header,
                       ConstLedgerTxnEntry const& account, Asset const& asset,
                       ConstTrustLineWrapper const& trustLine);
+int64_t canSellAtMost(uint32_t ledgerVersion, uint32_t baseReserve,
+                      LedgerTxnEntry const& account, Asset const& asset,
+                      TrustLineWrapper const& trustLine);
+int64_t canSellAtMost(uint32_t ledgerVersion, uint32_t baseReserve,
+                      ConstLedgerTxnEntry const& account, Asset const& asset,
+                      ConstTrustLineWrapper const& trustLine);
 
 int64_t canBuyAtMost(LedgerTxnHeader const& header,
                      LedgerTxnEntry const& account, Asset const& asset,
                      TrustLineWrapper const& trustLine);
 int64_t canBuyAtMost(LedgerTxnHeader const& header,
+                     ConstLedgerTxnEntry const& account, Asset const& asset,
+                     ConstTrustLineWrapper const& trustLine);
+int64_t canBuyAtMost(uint32_t ledgerVersion,
+                     LedgerTxnEntry const& account, Asset const& asset,
+                     TrustLineWrapper const& trustLine);
+int64_t canBuyAtMost(uint32_t ledgerVersion,
                      ConstLedgerTxnEntry const& account, Asset const& asset,
                      ConstTrustLineWrapper const& trustLine);
 
@@ -314,9 +329,10 @@ enum class CrossOfferResult
 // buys wheat with sheep, crossing as many offers as necessary or using a
 // liquidity pool
 ConvertResult convertWithOffersAndPools(
-    AbstractLedgerTxn& ltx, Asset const& sheep, int64_t maxSheepSent,
-    int64_t& sheepSend, Asset const& wheat, int64_t maxWheatReceive,
-    int64_t& wheatReceived, RoundingType round,
+    AbstractLedgerTxn& ltx, uint32_t ledgerVersion, uint32_t baseReserve,
+    uint32_t ledgerSeq, bool poolTradingDisabled, Asset const& sheep,
+    int64_t maxSheepSent, int64_t& sheepSend, Asset const& wheat,
+    int64_t maxWheatReceive, int64_t& wheatReceived, RoundingType round,
     std::function<OfferFilterResult(LedgerTxnEntry const&)> filter,
     std::vector<ClaimAtom>& offerTrail, int64_t maxOffersToCross);
 

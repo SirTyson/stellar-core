@@ -48,6 +48,12 @@ PathPaymentStrictSendOpFrame::doApply(AppConnector& app, AbstractLedgerTxn& ltx,
 
     setResultSuccess(res);
 
+    auto const& header = ltx.loadHeader().current();
+    uint32_t const ledgerVersion = header.ledgerVersion;
+    uint32_t const baseReserve = header.baseReserve;
+    uint32_t const ledgerSeq = header.ledgerSeq;
+    bool const poolTradingDisabled = isPoolTradingDisabled(header);
+
     bool bypassIssuerCheck = shouldBypassIssuerCheck(mPathPayment.path);
     if (!bypassIssuerCheck)
     {
@@ -58,8 +64,8 @@ PathPaymentStrictSendOpFrame::doApply(AppConnector& app, AbstractLedgerTxn& ltx,
         }
     }
 
-    if (!updateSourceBalance(ltx, res, mPathPayment.sendAmount,
-                             bypassIssuerCheck, true))
+    if (!updateSourceBalance(ltx, ledgerVersion, baseReserve, res,
+                             mPathPayment.sendAmount, bypassIssuerCheck, true))
     {
         return false;
     }
@@ -80,7 +86,7 @@ PathPaymentStrictSendOpFrame::doApply(AppConnector& app, AbstractLedgerTxn& ltx,
             continue;
         }
 
-        if (!checkIssuer(ltx, recvAsset, res))
+        if (!checkIssuer(ltx, ledgerVersion, recvAsset, res))
         {
             return false;
         }
@@ -95,9 +101,11 @@ PathPaymentStrictSendOpFrame::doApply(AppConnector& app, AbstractLedgerTxn& ltx,
         int64_t amountSend = 0;
         int64_t amountRecv = 0;
         std::vector<ClaimAtom> offerTrail;
-        if (!convert(ltx, maxOffersToCross, sendAsset, maxAmountSend,
-                     amountSend, recvAsset, INT64_MAX, amountRecv,
-                     RoundingType::PATH_PAYMENT_STRICT_SEND, offerTrail, res))
+        if (!convert(ltx, ledgerVersion, baseReserve, ledgerSeq,
+                     poolTradingDisabled, maxOffersToCross, sendAsset,
+                     maxAmountSend, amountSend, recvAsset, INT64_MAX,
+                     amountRecv, RoundingType::PATH_PAYMENT_STRICT_SEND,
+                     offerTrail, res))
         {
             return false;
         }
@@ -105,19 +113,18 @@ PathPaymentStrictSendOpFrame::doApply(AppConnector& app, AbstractLedgerTxn& ltx,
         maxAmountSend = amountRecv;
         sendAsset = recvAsset;
 
-        // add offers that got taken on the way
-        // insert in back to match the path's order
         auto& offers = innerResult(res).success().offers;
         offers.insert(offers.end(), offerTrail.begin(), offerTrail.end());
     }
 
     if (maxAmountSend < mPathPayment.destMin)
-    { // make sure not over the max
+    {
         setResultConstraintNotMet(res);
         return false;
     }
 
-    if (!updateDestBalance(ltx, maxAmountSend, bypassIssuerCheck, res))
+    if (!updateDestBalance(ltx, ledgerVersion, baseReserve, maxAmountSend,
+                           bypassIssuerCheck, res))
     {
         return false;
     }

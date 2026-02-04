@@ -523,11 +523,93 @@ acquireOrReleaseLiabilities(AbstractLedgerTxn& ltx,
     }
 }
 
+static void
+acquireOrReleaseLiabilities(AbstractLedgerTxn& ltx, uint32_t ledgerVersion,
+                            uint32_t baseReserve,
+                            LedgerTxnEntry const& offerEntry, bool isAcquire)
+{
+    ZoneScoped;
+    // This should never happen
+    auto const& offer = offerEntry.current().data.offer();
+    if (offer.buying == offer.selling)
+    {
+        throw std::runtime_error("buying and selling same asset");
+    }
+    auto const& sellerID = offer.sellerID;
+
+    auto loadAccountAndValidate = [&ltx, &sellerID]() {
+        auto account = stellar::loadAccount(ltx, sellerID);
+        if (!account)
+        {
+            throw std::runtime_error("account does not exist");
+        }
+        return account;
+    };
+
+    auto loadTrustAndValidate = [&ltx, &sellerID](Asset const& asset) {
+        auto trust = stellar::loadTrustLine(ltx, sellerID, asset);
+        if (!trust)
+        {
+            throw std::runtime_error("trustline does not exist");
+        }
+        return trust;
+    };
+
+    int64_t buyingLiabilities =
+        isAcquire ? getOfferBuyingLiabilities(ledgerVersion, offerEntry)
+                  : -getOfferBuyingLiabilities(ledgerVersion, offerEntry);
+    if (offer.buying.type() == ASSET_TYPE_NATIVE)
+    {
+        auto account = loadAccountAndValidate();
+        if (!addBuyingLiabilities(ledgerVersion, account, buyingLiabilities))
+        {
+            throw std::runtime_error("could not add buying liabilities");
+        }
+    }
+    else
+    {
+        auto buyingTrust = loadTrustAndValidate(offer.buying);
+        if (!buyingTrust.addBuyingLiabilities(ledgerVersion, buyingLiabilities))
+        {
+            throw std::runtime_error("could not add buying liabilities");
+        }
+    }
+
+    int64_t sellingLiabilities =
+        isAcquire ? getOfferSellingLiabilities(ledgerVersion, offerEntry)
+                  : -getOfferSellingLiabilities(ledgerVersion, offerEntry);
+    if (offer.selling.type() == ASSET_TYPE_NATIVE)
+    {
+        auto account = loadAccountAndValidate();
+        if (!addSellingLiabilities(ledgerVersion, baseReserve, account,
+                                    sellingLiabilities))
+        {
+            throw std::runtime_error("could not add selling liabilities");
+        }
+    }
+    else
+    {
+        auto sellingTrust = loadTrustAndValidate(offer.selling);
+        if (!sellingTrust.addSellingLiabilities(ledgerVersion, baseReserve,
+                                                 sellingLiabilities))
+        {
+            throw std::runtime_error("could not add selling liabilities");
+        }
+    }
+}
+
 void
 acquireLiabilities(AbstractLedgerTxn& ltx, LedgerTxnHeader const& header,
                    LedgerTxnEntry const& offer)
 {
     acquireOrReleaseLiabilities(ltx, header, offer, true);
+}
+
+void
+acquireLiabilities(AbstractLedgerTxn& ltx, uint32_t ledgerVersion,
+                   uint32_t baseReserve, LedgerTxnEntry const& offer)
+{
+    acquireOrReleaseLiabilities(ltx, ledgerVersion, baseReserve, offer, true);
 }
 
 bool
@@ -612,6 +694,85 @@ addBalance(LedgerTxnHeader const& header, LedgerTxnEntry& entry, int64_t delta)
 }
 
 bool
+addBalance(uint32_t ledgerVersion, uint32_t baseReserve, LedgerTxnEntry& entry,
+           int64_t delta)
+{
+    if (entry.current().data.type() == ACCOUNT)
+    {
+        if (delta == 0)
+        {
+            return true;
+        }
+
+        auto& acc = entry.current().data.account();
+        auto newBalance = acc.balance;
+        if (!stellar::addBalance(newBalance, delta))
+        {
+            return false;
+        }
+        if (protocolVersionStartsFrom(ledgerVersion, ProtocolVersion::V_10))
+        {
+            auto minBalance = getMinBalance(ledgerVersion, baseReserve, acc);
+            if (delta < 0 &&
+                newBalance - minBalance <
+                    getSellingLiabilities(ledgerVersion, entry.current()))
+            {
+                return false;
+            }
+            if (newBalance >
+                INT64_MAX - getBuyingLiabilities(ledgerVersion, entry.current()))
+            {
+                return false;
+            }
+        }
+
+        acc.balance = newBalance;
+        return true;
+    }
+    else if (entry.current().data.type() == TRUSTLINE)
+    {
+        if (delta == 0)
+        {
+            return true;
+        }
+
+        if (protocolVersionStartsFrom(ledgerVersion, ProtocolVersion::V_10))
+        {
+            if (!isAuthorizedToMaintainLiabilities(entry))
+            {
+                return false;
+            }
+        }
+
+        auto& tl = entry.current().data.trustLine();
+        auto newBalance = tl.balance;
+        if (!stellar::addBalance(newBalance, delta, tl.limit))
+        {
+            return false;
+        }
+        if (protocolVersionStartsFrom(ledgerVersion, ProtocolVersion::V_10))
+        {
+            if (newBalance < getSellingLiabilities(ledgerVersion, entry.current()))
+            {
+                return false;
+            }
+            if (newBalance >
+                tl.limit - getBuyingLiabilities(ledgerVersion, entry.current()))
+            {
+                return false;
+            }
+        }
+
+        tl.balance = newBalance;
+        return true;
+    }
+    else
+    {
+        throw std::runtime_error("Unknown LedgerEntry type");
+    }
+}
+
+bool
 addBuyingLiabilities(LedgerTxnHeader const& header, LedgerTxnEntry& entry,
                      int64_t delta)
 {
@@ -640,6 +801,56 @@ addBuyingLiabilities(LedgerTxnHeader const& header, LedgerTxnEntry& entry,
         if (!checkAuthorization(header.current(), entry.current()))
         {
             return false;
+        }
+
+        auto& tl = entry.current().data.trustLine();
+        int64_t maxLiabilities = tl.limit - tl.balance;
+        bool res = stellar::addBalance(buyingLiab, delta, maxLiabilities);
+        if (res)
+        {
+            prepareTrustLineEntryExtensionV1(tl).liabilities.buying =
+                buyingLiab;
+        }
+        return res;
+    }
+    else
+    {
+        throw std::runtime_error("Unknown LedgerEntry type");
+    }
+}
+
+bool
+addBuyingLiabilities(uint32_t ledgerVersion, LedgerTxnEntry& entry,
+                     int64_t delta)
+{
+    int64_t buyingLiab = getBuyingLiabilities(ledgerVersion, entry.current());
+
+    // Fast-succeed when not actually adding any liabilities
+    if (delta == 0)
+    {
+        return true;
+    }
+
+    if (entry.current().data.type() == ACCOUNT)
+    {
+        auto& acc = entry.current().data.account();
+
+        int64_t maxLiabilities = INT64_MAX - acc.balance;
+        bool res = stellar::addBalance(buyingLiab, delta, maxLiabilities);
+        if (res)
+        {
+            prepareAccountEntryExtensionV1(acc).liabilities.buying = buyingLiab;
+        }
+        return res;
+    }
+    else if (entry.current().data.type() == TRUSTLINE)
+    {
+        if (protocolVersionStartsFrom(ledgerVersion, ProtocolVersion::V_10))
+        {
+            if (!isAuthorizedToMaintainLiabilities(entry))
+            {
+                throw std::runtime_error("Invalid authorization");
+            }
         }
 
         auto& tl = entry.current().data.trustLine();
@@ -711,6 +922,62 @@ addSellingLiabilities(LedgerTxnHeader const& header, LedgerTxnEntry& entry,
     }
 }
 
+bool
+addSellingLiabilities(uint32_t ledgerVersion, uint32_t baseReserve,
+                      LedgerTxnEntry& entry, int64_t delta)
+{
+    int64_t sellingLiab =
+        getSellingLiabilities(ledgerVersion, entry.current());
+
+    if (delta == 0)
+    {
+        return true;
+    }
+
+    if (entry.current().data.type() == ACCOUNT)
+    {
+        auto& acc = entry.current().data.account();
+        int64_t maxLiabilities =
+            acc.balance - getMinBalance(ledgerVersion, baseReserve, acc);
+        if (maxLiabilities < 0)
+        {
+            return false;
+        }
+
+        bool res = stellar::addBalance(sellingLiab, delta, maxLiabilities);
+        if (res)
+        {
+            prepareAccountEntryExtensionV1(acc).liabilities.selling =
+                sellingLiab;
+        }
+        return res;
+    }
+    else if (entry.current().data.type() == TRUSTLINE)
+    {
+        if (protocolVersionStartsFrom(ledgerVersion, ProtocolVersion::V_10))
+        {
+            if (!isAuthorizedToMaintainLiabilities(entry))
+            {
+                throw std::runtime_error("Invalid authorization");
+            }
+        }
+
+        auto& tl = entry.current().data.trustLine();
+        int64_t maxLiabilities = tl.balance;
+        bool res = stellar::addBalance(sellingLiab, delta, maxLiabilities);
+        if (res)
+        {
+            prepareTrustLineEntryExtensionV1(tl).liabilities.selling =
+                sellingLiab;
+        }
+        return res;
+    }
+    else
+    {
+        throw std::runtime_error("Unknown LedgerEntry type");
+    }
+}
+
 uint64_t
 generateID(LedgerTxnHeader& header)
 {
@@ -757,6 +1024,76 @@ getAvailableBalance(LedgerTxnHeader const& header,
                     ConstLedgerTxnEntry const& entry)
 {
     return getAvailableBalance(header.current(), entry.current());
+}
+
+int64_t
+getAvailableBalance(uint32_t ledgerVersion, uint32_t baseReserve,
+                    LedgerTxnEntry const& entry)
+{
+    auto const& le = entry.current();
+    int64_t avail = 0;
+    if (le.data.type() == ACCOUNT)
+    {
+        auto const& acc = le.data.account();
+        avail = acc.balance - getMinBalance(ledgerVersion, baseReserve, acc);
+    }
+    else if (le.data.type() == TRUSTLINE)
+    {
+        if (protocolVersionStartsFrom(ledgerVersion, ProtocolVersion::V_10))
+        {
+            if (!isAuthorizedToMaintainLiabilities(entry))
+            {
+                throw std::runtime_error(
+                    "Asset is not authorized to maintain liabilities");
+            }
+        }
+        avail = le.data.trustLine().balance;
+    }
+    else
+    {
+        throw std::runtime_error("Unknown LedgerEntry type");
+    }
+
+    if (protocolVersionStartsFrom(ledgerVersion, ProtocolVersion::V_10))
+    {
+        avail -= getSellingLiabilities(ledgerVersion, le);
+    }
+    return avail;
+}
+
+int64_t
+getAvailableBalance(uint32_t ledgerVersion, uint32_t baseReserve,
+                    ConstLedgerTxnEntry const& entry)
+{
+    auto const& le = entry.current();
+    int64_t avail = 0;
+    if (le.data.type() == ACCOUNT)
+    {
+        auto const& acc = le.data.account();
+        avail = acc.balance - getMinBalance(ledgerVersion, baseReserve, acc);
+    }
+    else if (le.data.type() == TRUSTLINE)
+    {
+        if (protocolVersionStartsFrom(ledgerVersion, ProtocolVersion::V_10))
+        {
+            if (!isAuthorizedToMaintainLiabilities(entry))
+            {
+                throw std::runtime_error(
+                    "Asset is not authorized to maintain liabilities");
+            }
+        }
+        avail = le.data.trustLine().balance;
+    }
+    else
+    {
+        throw std::runtime_error("Unknown LedgerEntry type");
+    }
+
+    if (protocolVersionStartsFrom(ledgerVersion, ProtocolVersion::V_10))
+    {
+        avail -= getSellingLiabilities(ledgerVersion, le);
+    }
+    return avail;
 }
 
 int64_t
@@ -837,6 +1174,82 @@ getMaxAmountReceive(LedgerTxnHeader const& header,
 }
 
 int64_t
+getMaxAmountReceive(uint32_t ledgerVersion, LedgerTxnEntry const& entry)
+{
+    auto const& le = entry.current();
+    if (le.data.type() == ACCOUNT)
+    {
+        int64_t maxReceive = INT64_MAX;
+        if (protocolVersionStartsFrom(ledgerVersion, ProtocolVersion::V_10))
+        {
+            auto const& acc = le.data.account();
+            maxReceive -= acc.balance + getBuyingLiabilities(ledgerVersion, le);
+        }
+        return maxReceive;
+    }
+    if (le.data.type() == TRUSTLINE)
+    {
+        if (protocolVersionStartsFrom(ledgerVersion, ProtocolVersion::V_10))
+        {
+            if (!isAuthorizedToMaintainLiabilities(entry))
+            {
+                return 0;
+            }
+        }
+
+        auto const& tl = le.data.trustLine();
+        int64_t amount = tl.limit - tl.balance;
+        if (protocolVersionStartsFrom(ledgerVersion, ProtocolVersion::V_10))
+        {
+            amount -= getBuyingLiabilities(ledgerVersion, le);
+        }
+        return amount;
+    }
+    else
+    {
+        throw std::runtime_error("Unknown LedgerEntry type");
+    }
+}
+
+int64_t
+getMaxAmountReceive(uint32_t ledgerVersion, ConstLedgerTxnEntry const& entry)
+{
+    auto const& le = entry.current();
+    if (le.data.type() == ACCOUNT)
+    {
+        int64_t maxReceive = INT64_MAX;
+        if (protocolVersionStartsFrom(ledgerVersion, ProtocolVersion::V_10))
+        {
+            auto const& acc = le.data.account();
+            maxReceive -= acc.balance + getBuyingLiabilities(ledgerVersion, le);
+        }
+        return maxReceive;
+    }
+    if (le.data.type() == TRUSTLINE)
+    {
+        if (protocolVersionStartsFrom(ledgerVersion, ProtocolVersion::V_10))
+        {
+            if (!isAuthorizedToMaintainLiabilities(entry))
+            {
+                return 0;
+            }
+        }
+
+        auto const& tl = le.data.trustLine();
+        int64_t amount = tl.limit - tl.balance;
+        if (protocolVersionStartsFrom(ledgerVersion, ProtocolVersion::V_10))
+        {
+            amount -= getBuyingLiabilities(ledgerVersion, le);
+        }
+        return amount;
+    }
+    else
+    {
+        throw std::runtime_error("Unknown LedgerEntry type");
+    }
+}
+
+int64_t
 getMinBalance(LedgerHeader const& header, AccountEntry const& acc)
 {
     uint32_t numSponsoring = 0;
@@ -877,6 +1290,51 @@ getMinBalance(LedgerHeader const& lh, uint32_t numSubentries,
             throw std::runtime_error("unexpected account state");
         }
         return effEntries * int64_t(lh.baseReserve);
+    }
+}
+
+int64_t
+getMinBalance(uint32_t ledgerVersion, uint32_t baseReserve,
+              AccountEntry const& acc)
+{
+    uint32_t numSponsoring = 0;
+    uint32_t numSponsored = 0;
+    if (protocolVersionStartsFrom(ledgerVersion, ProtocolVersion::V_14) &&
+        hasAccountEntryExtV2(acc))
+    {
+        numSponsoring = acc.ext.v1().ext.v2().numSponsoring;
+        numSponsored = acc.ext.v1().ext.v2().numSponsored;
+    }
+    return getMinBalance(ledgerVersion, baseReserve, acc.numSubEntries,
+                         numSponsoring, numSponsored);
+}
+
+int64_t
+getMinBalance(uint32_t ledgerVersion, uint32_t baseReserve,
+              uint32_t numSubentries, uint32_t numSponsoring,
+              uint32_t numSponsored)
+{
+    if (protocolVersionIsBefore(ledgerVersion, ProtocolVersion::V_14) &&
+        (numSponsored != 0 || numSponsoring != 0))
+    {
+        throw std::runtime_error("unexpected sponsorship state");
+    }
+
+    if (protocolVersionIsBefore(ledgerVersion, ProtocolVersion::V_9))
+    {
+        return (2 + numSubentries) * baseReserve;
+    }
+    else
+    {
+        int64_t effEntries = 2LL;
+        effEntries += numSubentries;
+        effEntries += numSponsoring;
+        effEntries -= numSponsored;
+        if (effEntries < 0)
+        {
+            throw std::runtime_error("unexpected account state");
+        }
+        return effEntries * int64_t(baseReserve);
     }
 }
 
@@ -954,6 +1412,48 @@ getOfferSellingLiabilities(LedgerTxnHeader const& header,
 }
 
 int64_t
+getOfferBuyingLiabilities(uint32_t ledgerVersion, LedgerEntry const& entry)
+{
+    if (protocolVersionIsBefore(ledgerVersion, ProtocolVersion::V_10))
+    {
+        throw std::runtime_error(
+            "Offer liabilities calculated before version 10");
+    }
+    auto const& oe = entry.data.offer();
+    auto res = exchangeV10WithoutPriceErrorThresholds(
+        oe.price, oe.amount, INT64_MAX, INT64_MAX, INT64_MAX,
+        RoundingType::NORMAL);
+    return res.numSheepSend;
+}
+
+int64_t
+getOfferBuyingLiabilities(uint32_t ledgerVersion, LedgerTxnEntry const& entry)
+{
+    return getOfferBuyingLiabilities(ledgerVersion, entry.current());
+}
+
+int64_t
+getOfferSellingLiabilities(uint32_t ledgerVersion, LedgerEntry const& entry)
+{
+    if (protocolVersionIsBefore(ledgerVersion, ProtocolVersion::V_10))
+    {
+        throw std::runtime_error(
+            "Offer liabilities calculated before version 10");
+    }
+    auto const& oe = entry.data.offer();
+    auto res = exchangeV10WithoutPriceErrorThresholds(
+        oe.price, oe.amount, INT64_MAX, INT64_MAX, INT64_MAX,
+        RoundingType::NORMAL);
+    return res.numWheatReceived;
+}
+
+int64_t
+getOfferSellingLiabilities(uint32_t ledgerVersion, LedgerTxnEntry const& entry)
+{
+    return getOfferSellingLiabilities(ledgerVersion, entry.current());
+}
+
+int64_t
 getSellingLiabilities(LedgerHeader const& header, LedgerEntry const& le)
 {
     if (protocolVersionIsBefore(header.ledgerVersion, ProtocolVersion::V_10))
@@ -979,6 +1479,48 @@ getSellingLiabilities(LedgerTxnHeader const& header,
                       LedgerTxnEntry const& entry)
 {
     return getSellingLiabilities(header.current(), entry.current());
+}
+
+int64_t
+getSellingLiabilities(uint32_t ledgerVersion, LedgerEntry const& le)
+{
+    if (protocolVersionIsBefore(ledgerVersion, ProtocolVersion::V_10))
+    {
+        throw std::runtime_error("Liabilities accessed before version 10");
+    }
+
+    if (le.data.type() == ACCOUNT)
+    {
+        auto const& acc = le.data.account();
+        return (acc.ext.v() == 0) ? 0 : acc.ext.v1().liabilities.selling;
+    }
+    else if (le.data.type() == TRUSTLINE)
+    {
+        auto const& tl = le.data.trustLine();
+        return (tl.ext.v() == 0) ? 0 : tl.ext.v1().liabilities.selling;
+    }
+    throw std::runtime_error("Unknown LedgerEntry type");
+}
+
+int64_t
+getBuyingLiabilities(uint32_t ledgerVersion, LedgerEntry const& le)
+{
+    if (protocolVersionIsBefore(ledgerVersion, ProtocolVersion::V_10))
+    {
+        throw std::runtime_error("Liabilities accessed before version 10");
+    }
+
+    if (le.data.type() == ACCOUNT)
+    {
+        auto const& acc = le.data.account();
+        return (acc.ext.v() == 0) ? 0 : acc.ext.v1().liabilities.buying;
+    }
+    else if (le.data.type() == TRUSTLINE)
+    {
+        auto const& tl = le.data.trustLine();
+        return (tl.ext.v() == 0) ? 0 : tl.ext.v1().liabilities.buying;
+    }
+    throw std::runtime_error("Unknown LedgerEntry type");
 }
 
 SequenceNumber
@@ -1147,6 +1689,13 @@ releaseLiabilities(AbstractLedgerTxn& ltx, LedgerTxnHeader const& header,
                    LedgerTxnEntry const& offer)
 {
     acquireOrReleaseLiabilities(ltx, header, offer, false);
+}
+
+void
+releaseLiabilities(AbstractLedgerTxn& ltx, uint32_t ledgerVersion,
+                   uint32_t baseReserve, LedgerTxnEntry const& offer)
+{
+    acquireOrReleaseLiabilities(ltx, ledgerVersion, baseReserve, offer, false);
 }
 
 AccountID

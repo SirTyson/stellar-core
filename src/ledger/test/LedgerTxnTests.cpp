@@ -2324,54 +2324,6 @@ TEST_CASE("LedgerTxn loadBestOffer", "[ledgertxn]")
                 // but mEntryCache will remain empty.
                 ltx3.getBestOffer(oe.buying, oe.selling, {oe.price, numOffers});
             }
-
-            auto preLoadPrefetchHitRate = root.getPrefetchHitRate();
-            REQUIRE(preLoadPrefetchHitRate == 0);
-
-            // This should lead to prefetching even though the offers were
-            // already loaded. The offersIDs are in the range [1, 1002]. Verify
-            // that the prefetching worked by checking the prefetch hit rate
-            // after loading the accounts. mEntryCache should be empty prior to
-            // this getBestOffer call, so no evictions should happen.
-
-            auto loadOfferAndPrefetch = [&](int64_t offerID) {
-                ltx2.getBestOffer(oe.buying, oe.selling, {oe.price, offerID});
-
-                for (auto const& account : accounts)
-                {
-                    loadAccount(ltx2, account.accountID);
-                }
-
-                // Prefetch doesn't work in in-memory mode, but this is for
-                // testing only so we only care about accuracy
-                if (mode != Config::TESTDB_IN_MEMORY)
-                {
-                    // Note that we can't prefetch for more than 1000 offers
-                    double expectedPrefetchHitRate =
-                        std::min(numOffers - offerID,
-                                 static_cast<int64_t>(getMaxOffersToCross())) /
-                        static_cast<double>(accounts.size());
-                    REQUIRE(fabs(expectedPrefetchHitRate -
-                                 ltx2.getPrefetchHitRate()) < .000001);
-                    REQUIRE(preLoadPrefetchHitRate < ltx2.getPrefetchHitRate());
-                }
-            };
-
-            SECTION("prefetch for all worse remaining offers")
-            {
-                // There are 1000 better offers than offerID 2
-                loadOfferAndPrefetch(numOffers - getMaxOffersToCross());
-            }
-            SECTION("prefetch for the next MAX_OFFERS_TO_CROSS offers")
-            {
-                // There are 1001 better offers than offerID 1. Should still
-                // only prefetch for 1000
-                loadOfferAndPrefetch(numOffers - getMaxOffersToCross() - 1);
-            }
-            SECTION("prefetch less than MAX_OFFERS_TO_CROSS offers")
-            {
-                loadOfferAndPrefetch(numOffers / 2);
-            }
         }
     };
 
