@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "ledger/TrustLineWrapper.h"
 #include "transactions/EventManager.h"
 #include "util/NonCopyable.h"
 #include "util/ProtocolVersion.h"
@@ -280,6 +281,18 @@ void releaseLiabilities(AbstractLedgerTxn& ltx, LedgerTxnHeader const& header,
                         LedgerTxnEntry const& offer);
 void releaseLiabilities(AbstractLedgerTxn& ltx, uint32_t ledgerVersion,
                         uint32_t baseReserve, LedgerTxnEntry const& offer);
+
+struct ReleasedLiabilitiesEntries
+{
+    LedgerTxnEntry account;
+    TrustLineWrapper buyingTrustline;
+    TrustLineWrapper sellingTrustline;
+};
+
+ReleasedLiabilitiesEntries
+releaseLiabilitiesAndReturnEntries(AbstractLedgerTxn& ltx,
+                                   uint32_t ledgerVersion, uint32_t baseReserve,
+                                   LedgerTxnEntry const& offer);
 
 AccountID toAccountID(MuxedAccount const& m);
 MuxedAccount toMuxedAccount(AccountID const& a,

@@ -1216,24 +1216,18 @@ crossOfferV10(AbstractLedgerTxn& ltx, uint32_t ledgerVersion,
     //         "invalid database state: offer must have matching account");
     // }
 
-    // Remove liabilities associated with the offer being crossed. Will throw if
-    // either asset is unauthorized
-    releaseLiabilities(ltx, ledgerVersion, baseReserve, sellingWheatOffer);
+    auto releasedEntries = releaseLiabilitiesAndReturnEntries(
+        ltx, ledgerVersion, baseReserve, sellingWheatOffer);
 
-    // Load necessary accounts and trustlines. Note that any LedgerEntry loaded
-    // here was also loaded during releaseLiabilities.
-    LedgerTxnEntry accountB;
-    if (wheat.type() == ASSET_TYPE_NATIVE || sheep.type() == ASSET_TYPE_NATIVE)
-    {
-        accountB = stellar::loadAccount(ltx, accountBID);
-    }
-    auto sheepLineAccountB = loadTrustLineIfNotNative(ltx, accountBID, sheep);
-    auto wheatLineAccountB = loadTrustLineIfNotNative(ltx, accountBID, wheat);
+    LedgerTxnEntry accountB = std::move(releasedEntries.account);
+    auto sheepLineAccountB = std::move(releasedEntries.buyingTrustline);
+    auto wheatLineAccountB = std::move(releasedEntries.sellingTrustline);
 
     // As of the protocol version 10, this call to adjustOffer should have no
     // effect. We leave it here only as a preventative measure.
-    adjustOffer(ledgerVersion, baseReserve, sellingWheatOffer, accountB, wheat, wheatLineAccountB,
-                sheep, sheepLineAccountB);
+    // adjustOffer(ledgerVersion, baseReserve, sellingWheatOffer, accountB,
+    // wheat, wheatLineAccountB,
+    //             sheep, sheepLineAccountB);
 
     int64_t maxWheatSend =
         canSellAtMost(ledgerVersion, baseReserve, accountB, wheat, wheatLineAccountB);

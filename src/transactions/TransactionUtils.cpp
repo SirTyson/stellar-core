@@ -464,13 +464,18 @@ acquireOrReleaseLiabilities(AbstractLedgerTxn& ltx,
     }
     auto const& sellerID = offer.sellerID;
 
-    auto loadAccountAndValidate = [&ltx, &sellerID]() {
-        auto account = stellar::loadAccount(ltx, sellerID);
-        if (!account)
+    // Cache account load to avoid double-load when both assets are NATIVE
+    std::optional<LedgerTxnEntry> cachedAccount;
+    auto loadAccountAndValidate = [&ltx, &sellerID, &cachedAccount]() -> LedgerTxnEntry& {
+        if (!cachedAccount)
         {
-            throw std::runtime_error("account does not exist");
+            cachedAccount.emplace(stellar::loadAccount(ltx, sellerID));
+            if (!*cachedAccount)
+            {
+                throw std::runtime_error("account does not exist");
+            }
         }
-        return account;
+        return *cachedAccount;
     };
 
     auto loadTrustAndValidate = [&ltx, &sellerID](Asset const& asset) {
@@ -487,7 +492,7 @@ acquireOrReleaseLiabilities(AbstractLedgerTxn& ltx,
                   : -getOfferBuyingLiabilities(header, offerEntry);
     if (offer.buying.type() == ASSET_TYPE_NATIVE)
     {
-        auto account = loadAccountAndValidate();
+        auto& account = loadAccountAndValidate();
         if (!addBuyingLiabilities(header, account, buyingLiabilities))
         {
             throw std::runtime_error("could not add buying liabilities");
@@ -507,7 +512,7 @@ acquireOrReleaseLiabilities(AbstractLedgerTxn& ltx,
                   : -getOfferSellingLiabilities(header, offerEntry);
     if (offer.selling.type() == ASSET_TYPE_NATIVE)
     {
-        auto account = loadAccountAndValidate();
+        auto& account = loadAccountAndValidate();
         if (!addSellingLiabilities(header, account, sellingLiabilities))
         {
             throw std::runtime_error("could not add selling liabilities");
@@ -537,13 +542,18 @@ acquireOrReleaseLiabilities(AbstractLedgerTxn& ltx, uint32_t ledgerVersion,
     }
     auto const& sellerID = offer.sellerID;
 
-    auto loadAccountAndValidate = [&ltx, &sellerID]() {
-        auto account = stellar::loadAccount(ltx, sellerID);
-        if (!account)
+    // Cache account load to avoid double-load when both assets are NATIVE
+    std::optional<LedgerTxnEntry> cachedAccount;
+    auto loadAccountAndValidate = [&ltx, &sellerID, &cachedAccount]() -> LedgerTxnEntry& {
+        if (!cachedAccount)
         {
-            throw std::runtime_error("account does not exist");
+            cachedAccount.emplace(stellar::loadAccount(ltx, sellerID));
+            if (!*cachedAccount)
+            {
+                throw std::runtime_error("account does not exist");
+            }
         }
-        return account;
+        return *cachedAccount;
     };
 
     auto loadTrustAndValidate = [&ltx, &sellerID](Asset const& asset) {
@@ -560,7 +570,7 @@ acquireOrReleaseLiabilities(AbstractLedgerTxn& ltx, uint32_t ledgerVersion,
                   : -getOfferBuyingLiabilities(ledgerVersion, offerEntry);
     if (offer.buying.type() == ASSET_TYPE_NATIVE)
     {
-        auto account = loadAccountAndValidate();
+        auto& account = loadAccountAndValidate();
         if (!addBuyingLiabilities(ledgerVersion, account, buyingLiabilities))
         {
             throw std::runtime_error("could not add buying liabilities");
@@ -580,7 +590,7 @@ acquireOrReleaseLiabilities(AbstractLedgerTxn& ltx, uint32_t ledgerVersion,
                   : -getOfferSellingLiabilities(ledgerVersion, offerEntry);
     if (offer.selling.type() == ASSET_TYPE_NATIVE)
     {
-        auto account = loadAccountAndValidate();
+        auto& account = loadAccountAndValidate();
         if (!addSellingLiabilities(ledgerVersion, baseReserve, account,
                                     sellingLiabilities))
         {
@@ -1696,6 +1706,88 @@ releaseLiabilities(AbstractLedgerTxn& ltx, uint32_t ledgerVersion,
                    uint32_t baseReserve, LedgerTxnEntry const& offer)
 {
     acquireOrReleaseLiabilities(ltx, ledgerVersion, baseReserve, offer, false);
+}
+
+ReleasedLiabilitiesEntries
+releaseLiabilitiesAndReturnEntries(AbstractLedgerTxn& ltx,
+                                   uint32_t ledgerVersion, uint32_t baseReserve,
+                                   LedgerTxnEntry const& offerEntry)
+{
+    ZoneScoped;
+    auto const& offer = offerEntry.current().data.offer();
+    if (offer.buying == offer.selling)
+    {
+        throw std::runtime_error("buying and selling same asset");
+    }
+    auto const& sellerID = offer.sellerID;
+
+    ReleasedLiabilitiesEntries result;
+
+    std::optional<LedgerTxnEntry> cachedAccount;
+    auto loadAccountAndValidate = [&]() -> LedgerTxnEntry& {
+        if (!cachedAccount)
+        {
+            cachedAccount.emplace(stellar::loadAccount(ltx, sellerID));
+            if (!*cachedAccount)
+            {
+                throw std::runtime_error("account does not exist");
+            }
+        }
+        return *cachedAccount;
+    };
+
+    int64_t buyingLiabilities = -getOfferBuyingLiabilities(ledgerVersion, offerEntry);
+    if (offer.buying.type() == ASSET_TYPE_NATIVE)
+    {
+        auto& account = loadAccountAndValidate();
+        if (!addBuyingLiabilities(ledgerVersion, account, buyingLiabilities))
+        {
+            throw std::runtime_error("could not add buying liabilities");
+        }
+    }
+    else
+    {
+        result.buyingTrustline = stellar::loadTrustLine(ltx, sellerID, offer.buying);
+        if (!result.buyingTrustline)
+        {
+            throw std::runtime_error("trustline does not exist");
+        }
+        if (!result.buyingTrustline.addBuyingLiabilities(ledgerVersion, buyingLiabilities))
+        {
+            throw std::runtime_error("could not add buying liabilities");
+        }
+    }
+
+    int64_t sellingLiabilities = -getOfferSellingLiabilities(ledgerVersion, offerEntry);
+    if (offer.selling.type() == ASSET_TYPE_NATIVE)
+    {
+        auto& account = loadAccountAndValidate();
+        if (!addSellingLiabilities(ledgerVersion, baseReserve, account,
+                                   sellingLiabilities))
+        {
+            throw std::runtime_error("could not add selling liabilities");
+        }
+    }
+    else
+    {
+        result.sellingTrustline = stellar::loadTrustLine(ltx, sellerID, offer.selling);
+        if (!result.sellingTrustline)
+        {
+            throw std::runtime_error("trustline does not exist");
+        }
+        if (!result.sellingTrustline.addSellingLiabilities(ledgerVersion, baseReserve,
+                                                           sellingLiabilities))
+        {
+            throw std::runtime_error("could not add selling liabilities");
+        }
+    }
+
+    if (cachedAccount)
+    {
+        result.account = std::move(*cachedAccount);
+    }
+
+    return result;
 }
 
 AccountID
