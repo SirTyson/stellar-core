@@ -1210,11 +1210,11 @@ crossOfferV10(AbstractLedgerTxn& ltx, uint32_t ledgerVersion,
     AccountID accountBID = offer.sellerID;
     int64_t offerID = offer.offerID;
 
-    if (!stellar::loadAccountWithoutRecord(ltx, accountBID))
-    {
-        throw std::runtime_error(
-            "invalid database state: offer must have matching account");
-    }
+    // if (!stellar::loadAccountWithoutRecord(ltx, accountBID))
+    // {
+    //     throw std::runtime_error(
+    //         "invalid database state: offer must have matching account");
+    // }
 
     // Remove liabilities associated with the offer being crossed. Will throw if
     // either asset is unauthorized
