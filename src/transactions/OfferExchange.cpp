@@ -1586,24 +1586,20 @@ exchangeWithPool(AbstractLedgerTxn& ltxOuter, uint32_t ledgerVersion,
     return res;
 }
 
+// V10+ optimized path: operates directly on ltxOuter without per-iteration
+// child LedgerTxn. This is safe because crossOfferV10 never returns
+// eOfferCantConvert (it throws on error), so there's no need for rollback
+// within the loop. The WorstBestOfferMap is updated by loadBestOffer calls.
 static ConvertResult
-convertWithOffers(
+convertWithOffersV10(
     AbstractLedgerTxn& ltxOuter, uint32_t ledgerVersion, uint32_t baseReserve,
-    uint32_t ledgerSeq, Asset const& sheep, int64_t maxSheepSend,
-    int64_t& sheepSend, Asset const& wheat, int64_t maxWheatReceive,
-    int64_t& wheatReceived, RoundingType round,
+    Asset const& sheep, int64_t maxSheepSend, int64_t& sheepSend,
+    Asset const& wheat, int64_t maxWheatReceive, int64_t& wheatReceived,
+    RoundingType round,
     std::function<OfferFilterResult(LedgerTxnEntry const&)> filter,
     std::vector<ClaimAtom>& offerTrail, int64_t maxOffersToCross)
 {
     ZoneScoped;
-    std::string pairStr = assetToString(sheep);
-    pairStr += ":";
-    pairStr += assetToString(wheat);
-    ZoneText(pairStr.c_str(), pairStr.size());
-
-    // If offerTrail is not empty at the start, then the limit maxOffersToCross
-    // will not be imposed correctly.
-    releaseAssertOrThrow(offerTrail.empty());
 
     sheepSend = 0;
     wheatReceived = 0;
@@ -1612,11 +1608,82 @@ convertWithOffers(
     if (needMore && maxOffersToCross == 0 &&
         protocolVersionStartsFrom(ledgerVersion, ProtocolVersion::V_18))
     {
-        // offerTrail is going to be too long, fast fail
-        // note that this condition can only happen in path payment when
-        // performing subsequent hops
         return ConvertResult::eCrossedTooMany;
     }
+
+    while (needMore)
+    {
+        auto wheatOffer = ltxOuter.loadBestOffer(sheep, wheat);
+        if (!wheatOffer)
+        {
+            break;
+        }
+
+        if (filter)
+        {
+            switch (filter(wheatOffer))
+            {
+            case OfferFilterResult::eKeep:
+                break;
+            case OfferFilterResult::eStopBadPrice:
+                return ConvertResult::eFilterStopBadPrice;
+            case OfferFilterResult::eStopCrossSelf:
+                return ConvertResult::eFilterStopCrossSelf;
+            default:
+                throw std::runtime_error("unexpected filter result");
+            }
+        }
+
+        if (offerTrail.size() >= static_cast<uint64_t>(maxOffersToCross))
+        {
+            return ConvertResult::eCrossedTooMany;
+        }
+
+        int64_t numWheatReceived;
+        int64_t numSheepSend;
+        bool wheatStays;
+        crossOfferV10(ltxOuter, ledgerVersion, baseReserve, wheatOffer,
+                      maxWheatReceive, numWheatReceived, maxSheepSend,
+                      numSheepSend, wheatStays, round, offerTrail);
+        needMore = !wheatStays;
+
+        releaseAssertOrThrow(numSheepSend >= 0);
+        releaseAssertOrThrow(numSheepSend <= maxSheepSend);
+        releaseAssertOrThrow(numWheatReceived >= 0);
+        releaseAssertOrThrow(numWheatReceived <= maxWheatReceive);
+
+        sheepSend += numSheepSend;
+        maxSheepSend -= numSheepSend;
+
+        wheatReceived += numWheatReceived;
+        maxWheatReceive -= numWheatReceived;
+
+        needMore = needMore && (maxWheatReceive > 0 && maxSheepSend > 0);
+        if (!needMore)
+        {
+            return ConvertResult::eOK;
+        }
+    }
+    return needMore ? ConvertResult::ePartial : ConvertResult::eOK;
+}
+
+// Pre-V10 path: requires per-iteration child LedgerTxn for rollback support
+// because crossOffer can return eOfferCantConvert. Also handles the special
+// production network case for offer 289733046.
+static ConvertResult
+convertWithOffersPreV10(
+    AbstractLedgerTxn& ltxOuter, uint32_t ledgerVersion, uint32_t ledgerSeq,
+    Asset const& sheep, int64_t maxSheepSend, int64_t& sheepSend,
+    Asset const& wheat, int64_t maxWheatReceive, int64_t& wheatReceived,
+    std::function<OfferFilterResult(LedgerTxnEntry const&)> filter,
+    std::vector<ClaimAtom>& offerTrail, int64_t maxOffersToCross)
+{
+    ZoneScoped;
+
+    sheepSend = 0;
+    wheatReceived = 0;
+
+    bool needMore = (maxWheatReceive > 0 && maxSheepSend > 0);
 
     while (needMore)
     {
@@ -1663,21 +1730,10 @@ convertWithOffers(
 
         int64_t numWheatReceived;
         int64_t numSheepSend;
-        CrossOfferResult cor;
-        if (protocolVersionStartsFrom(ledgerVersion, ProtocolVersion::V_10))
-        {
-            bool wheatStays;
-            cor = crossOfferV10(ltx, ledgerVersion, baseReserve, wheatOffer,
-                                maxWheatReceive, numWheatReceived, maxSheepSend,
-                                numSheepSend, wheatStays, round, offerTrail);
-            needMore = !wheatStays;
-        }
-        else
-        {
-            cor = crossOffer(ltx, wheatOffer, maxWheatReceive, numWheatReceived,
-                             maxSheepSend, numSheepSend, offerTrail);
-            needMore = true;
-        }
+        CrossOfferResult cor =
+            crossOffer(ltx, wheatOffer, maxWheatReceive, numWheatReceived,
+                       maxSheepSend, numSheepSend, offerTrail);
+        needMore = true;
 
         releaseAssertOrThrow(numSheepSend >= 0);
         releaseAssertOrThrow(numSheepSend <= maxSheepSend);
@@ -1706,14 +1762,41 @@ convertWithOffers(
             return ConvertResult::ePartial;
         }
     }
-    if (protocolVersionIsBefore(ledgerVersion, ProtocolVersion::V_10) ||
-        !needMore)
+    return ConvertResult::eOK;
+}
+
+static ConvertResult
+convertWithOffers(
+    AbstractLedgerTxn& ltxOuter, uint32_t ledgerVersion, uint32_t baseReserve,
+    uint32_t ledgerSeq, Asset const& sheep, int64_t maxSheepSend,
+    int64_t& sheepSend, Asset const& wheat, int64_t maxWheatReceive,
+    int64_t& wheatReceived, RoundingType round,
+    std::function<OfferFilterResult(LedgerTxnEntry const&)> filter,
+    std::vector<ClaimAtom>& offerTrail, int64_t maxOffersToCross)
+{
+    ZoneScoped;
+    std::string pairStr = assetToString(sheep);
+    pairStr += ":";
+    pairStr += assetToString(wheat);
+    ZoneText(pairStr.c_str(), pairStr.size());
+
+    // If offerTrail is not empty at the start, then the limit maxOffersToCross
+    // will not be imposed correctly.
+    releaseAssertOrThrow(offerTrail.empty());
+
+    if (protocolVersionStartsFrom(ledgerVersion, ProtocolVersion::V_10))
     {
-        return ConvertResult::eOK;
+        return convertWithOffersV10(ltxOuter, ledgerVersion, baseReserve, sheep,
+                                    maxSheepSend, sheepSend, wheat,
+                                    maxWheatReceive, wheatReceived, round,
+                                    filter, offerTrail, maxOffersToCross);
     }
     else
     {
-        return ConvertResult::ePartial;
+        return convertWithOffersPreV10(ltxOuter, ledgerVersion, ledgerSeq,
+                                       sheep, maxSheepSend, sheepSend, wheat,
+                                       maxWheatReceive, wheatReceived, filter,
+                                       offerTrail, maxOffersToCross);
     }
 }
 
