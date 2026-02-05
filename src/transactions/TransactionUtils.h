@@ -158,6 +158,10 @@ void acquireLiabilities(AbstractLedgerTxn& ltx, LedgerTxnHeader const& header,
                         LedgerTxnEntry const& offer);
 void acquireLiabilities(AbstractLedgerTxn& ltx, uint32_t ledgerVersion,
                         uint32_t baseReserve, LedgerTxnEntry const& offer);
+void acquireLiabilities(uint32_t ledgerVersion, uint32_t baseReserve,
+                        LedgerTxnEntry const& offer, LedgerTxnEntry& account,
+                        TrustLineWrapper& buyingTrustline,
+                        TrustLineWrapper& sellingTrustline);
 
 bool addBalanceSkipAuthorization(LedgerTxnHeader const& header,
                                  LedgerTxnEntry& entry, int64_t amount);

@@ -466,7 +466,8 @@ acquireOrReleaseLiabilities(AbstractLedgerTxn& ltx,
 
     // Cache account load to avoid double-load when both assets are NATIVE
     std::optional<LedgerTxnEntry> cachedAccount;
-    auto loadAccountAndValidate = [&ltx, &sellerID, &cachedAccount]() -> LedgerTxnEntry& {
+    auto loadAccountAndValidate = [&ltx, &sellerID,
+                                   &cachedAccount]() -> LedgerTxnEntry& {
         if (!cachedAccount)
         {
             cachedAccount.emplace(stellar::loadAccount(ltx, sellerID));
@@ -544,7 +545,8 @@ acquireOrReleaseLiabilities(AbstractLedgerTxn& ltx, uint32_t ledgerVersion,
 
     // Cache account load to avoid double-load when both assets are NATIVE
     std::optional<LedgerTxnEntry> cachedAccount;
-    auto loadAccountAndValidate = [&ltx, &sellerID, &cachedAccount]() -> LedgerTxnEntry& {
+    auto loadAccountAndValidate = [&ltx, &sellerID,
+                                   &cachedAccount]() -> LedgerTxnEntry& {
         if (!cachedAccount)
         {
             cachedAccount.emplace(stellar::loadAccount(ltx, sellerID));
@@ -592,7 +594,7 @@ acquireOrReleaseLiabilities(AbstractLedgerTxn& ltx, uint32_t ledgerVersion,
     {
         auto& account = loadAccountAndValidate();
         if (!addSellingLiabilities(ledgerVersion, baseReserve, account,
-                                    sellingLiabilities))
+                                   sellingLiabilities))
         {
             throw std::runtime_error("could not add selling liabilities");
         }
@@ -601,7 +603,66 @@ acquireOrReleaseLiabilities(AbstractLedgerTxn& ltx, uint32_t ledgerVersion,
     {
         auto sellingTrust = loadTrustAndValidate(offer.selling);
         if (!sellingTrust.addSellingLiabilities(ledgerVersion, baseReserve,
-                                                 sellingLiabilities))
+                                                sellingLiabilities))
+        {
+            throw std::runtime_error("could not add selling liabilities");
+        }
+    }
+}
+
+// Variant of acquireOrReleaseLiabilities that operates on pre-loaded entries
+// instead of loading them from a LedgerTxn. This avoids the overhead of
+// creating a nested LedgerTxn when the caller already holds the relevant
+// account and trustline entries (e.g., from
+// releaseLiabilitiesAndReturnEntries).
+static void
+acquireOrReleaseLiabilities(uint32_t ledgerVersion, uint32_t baseReserve,
+                            LedgerTxnEntry const& offerEntry,
+                            LedgerTxnEntry& account,
+                            TrustLineWrapper& buyingTrustline,
+                            TrustLineWrapper& sellingTrustline, bool isAcquire)
+{
+    ZoneScoped;
+    auto const& offer = offerEntry.current().data.offer();
+    if (offer.buying == offer.selling)
+    {
+        throw std::runtime_error("buying and selling same asset");
+    }
+
+    int64_t buyingLiabilities =
+        isAcquire ? getOfferBuyingLiabilities(ledgerVersion, offerEntry)
+                  : -getOfferBuyingLiabilities(ledgerVersion, offerEntry);
+    if (offer.buying.type() == ASSET_TYPE_NATIVE)
+    {
+        if (!addBuyingLiabilities(ledgerVersion, account, buyingLiabilities))
+        {
+            throw std::runtime_error("could not add buying liabilities");
+        }
+    }
+    else
+    {
+        if (!buyingTrustline.addBuyingLiabilities(ledgerVersion,
+                                                  buyingLiabilities))
+        {
+            throw std::runtime_error("could not add buying liabilities");
+        }
+    }
+
+    int64_t sellingLiabilities =
+        isAcquire ? getOfferSellingLiabilities(ledgerVersion, offerEntry)
+                  : -getOfferSellingLiabilities(ledgerVersion, offerEntry);
+    if (offer.selling.type() == ASSET_TYPE_NATIVE)
+    {
+        if (!addSellingLiabilities(ledgerVersion, baseReserve, account,
+                                   sellingLiabilities))
+        {
+            throw std::runtime_error("could not add selling liabilities");
+        }
+    }
+    else
+    {
+        if (!sellingTrustline.addSellingLiabilities(ledgerVersion, baseReserve,
+                                                    sellingLiabilities))
         {
             throw std::runtime_error("could not add selling liabilities");
         }
@@ -620,6 +681,16 @@ acquireLiabilities(AbstractLedgerTxn& ltx, uint32_t ledgerVersion,
                    uint32_t baseReserve, LedgerTxnEntry const& offer)
 {
     acquireOrReleaseLiabilities(ltx, ledgerVersion, baseReserve, offer, true);
+}
+
+void
+acquireLiabilities(uint32_t ledgerVersion, uint32_t baseReserve,
+                   LedgerTxnEntry const& offer, LedgerTxnEntry& account,
+                   TrustLineWrapper& buyingTrustline,
+                   TrustLineWrapper& sellingTrustline)
+{
+    acquireOrReleaseLiabilities(ledgerVersion, baseReserve, offer, account,
+                                buyingTrustline, sellingTrustline, true);
 }
 
 bool
@@ -729,8 +800,8 @@ addBalance(uint32_t ledgerVersion, uint32_t baseReserve, LedgerTxnEntry& entry,
             {
                 return false;
             }
-            if (newBalance >
-                INT64_MAX - getBuyingLiabilities(ledgerVersion, entry.current()))
+            if (newBalance > INT64_MAX - getBuyingLiabilities(ledgerVersion,
+                                                              entry.current()))
             {
                 return false;
             }
@@ -762,7 +833,8 @@ addBalance(uint32_t ledgerVersion, uint32_t baseReserve, LedgerTxnEntry& entry,
         }
         if (protocolVersionStartsFrom(ledgerVersion, ProtocolVersion::V_10))
         {
-            if (newBalance < getSellingLiabilities(ledgerVersion, entry.current()))
+            if (newBalance <
+                getSellingLiabilities(ledgerVersion, entry.current()))
             {
                 return false;
             }
@@ -936,8 +1008,7 @@ bool
 addSellingLiabilities(uint32_t ledgerVersion, uint32_t baseReserve,
                       LedgerTxnEntry& entry, int64_t delta)
 {
-    int64_t sellingLiab =
-        getSellingLiabilities(ledgerVersion, entry.current());
+    int64_t sellingLiab = getSellingLiabilities(ledgerVersion, entry.current());
 
     if (delta == 0)
     {
@@ -1736,7 +1807,8 @@ releaseLiabilitiesAndReturnEntries(AbstractLedgerTxn& ltx,
         return *cachedAccount;
     };
 
-    int64_t buyingLiabilities = -getOfferBuyingLiabilities(ledgerVersion, offerEntry);
+    int64_t buyingLiabilities =
+        -getOfferBuyingLiabilities(ledgerVersion, offerEntry);
     if (offer.buying.type() == ASSET_TYPE_NATIVE)
     {
         auto& account = loadAccountAndValidate();
@@ -1747,18 +1819,21 @@ releaseLiabilitiesAndReturnEntries(AbstractLedgerTxn& ltx,
     }
     else
     {
-        result.buyingTrustline = stellar::loadTrustLine(ltx, sellerID, offer.buying);
+        result.buyingTrustline =
+            stellar::loadTrustLine(ltx, sellerID, offer.buying);
         if (!result.buyingTrustline)
         {
             throw std::runtime_error("trustline does not exist");
         }
-        if (!result.buyingTrustline.addBuyingLiabilities(ledgerVersion, buyingLiabilities))
+        if (!result.buyingTrustline.addBuyingLiabilities(ledgerVersion,
+                                                         buyingLiabilities))
         {
             throw std::runtime_error("could not add buying liabilities");
         }
     }
 
-    int64_t sellingLiabilities = -getOfferSellingLiabilities(ledgerVersion, offerEntry);
+    int64_t sellingLiabilities =
+        -getOfferSellingLiabilities(ledgerVersion, offerEntry);
     if (offer.selling.type() == ASSET_TYPE_NATIVE)
     {
         auto& account = loadAccountAndValidate();
@@ -1770,13 +1845,14 @@ releaseLiabilitiesAndReturnEntries(AbstractLedgerTxn& ltx,
     }
     else
     {
-        result.sellingTrustline = stellar::loadTrustLine(ltx, sellerID, offer.selling);
+        result.sellingTrustline =
+            stellar::loadTrustLine(ltx, sellerID, offer.selling);
         if (!result.sellingTrustline)
         {
             throw std::runtime_error("trustline does not exist");
         }
-        if (!result.sellingTrustline.addSellingLiabilities(ledgerVersion, baseReserve,
-                                                           sellingLiabilities))
+        if (!result.sellingTrustline.addSellingLiabilities(
+                ledgerVersion, baseReserve, sellingLiabilities))
         {
             throw std::runtime_error("could not add selling liabilities");
         }
