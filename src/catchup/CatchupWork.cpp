@@ -11,6 +11,7 @@
 #include "catchup/CatchupRange.h"
 #include "catchup/DownloadApplyTxsWork.h"
 #include "catchup/VerifyLedgerChainWork.h"
+#include "database/Database.h"
 #include "herder/Herder.h"
 #include "history/FileTransferInfo.h"
 #include "history/HistoryManager.h"
@@ -20,6 +21,7 @@
 #include "historywork/GetAndUnzipRemoteFileWork.h"
 #include "historywork/GetHistoryArchiveStateWork.h"
 #include "ledger/LedgerManager.h"
+#include "ledger/LedgerTxn.h"
 #include "main/Application.h"
 #include "main/PersistentState.h"
 #include "util/GlobalChecks.h"
@@ -465,40 +467,6 @@ CatchupWork::runCatchupStep()
 
             return State::WORK_SUCCESS;
         }
-        else if (mBucketVerifyApplySeq)
-        {
-            if (mBucketVerifyApplySeq->getState() == State::WORK_SUCCESS &&
-                !mBucketsAppliedEmitted)
-            {
-                // Do not rebuild state if we're simply applying buckets in
-                // offline mode
-                bool rebuildInMemoryState = !mCatchupConfiguration.offline() ||
-                                            catchupRange.replayLedgers();
-
-                // If we crash before this call to setLastClosedLedger, then
-                // the node will have to catch up again and it will clear the
-                // ledger because clearRebuildForType has not been called yet.
-                mApp.getLedgerManager().setLastClosedLedger(
-                    mVerifiedLedgerRangeStart, rebuildInMemoryState);
-                mBucketsAppliedEmitted = true;
-                mLiveBuckets.clear();
-                mHotBuckets.clear();
-                mLastApplied =
-                    mApp.getLedgerManager().getLastClosedLedgerHeader();
-
-                // We've applied buckets successfully, so we don't need to
-                // rebuild on startup.
-                //
-                // If we crash after the call to setLastClosedLedger but before
-                // clearRebuildForType, then the new HAS will have already been
-                // written in the call to setLastClosedLedger. In this case, we
-                // will unnecessarily rebuild the ledger but the buckets are
-                // persistently available locally so it will return us to the
-                // correct state.
-                auto& ps = mApp.getPersistentState();
-                ps.clearRebuildForOfferTable();
-            }
-        }
         else if (mTransactionsVerifyApplySeq)
         {
             if (mTransactionsVerifyApplySeq->getState() ==
@@ -565,6 +533,53 @@ CatchupWork::runCatchupStep()
                 // Step 4.2: Download, verify and apply buckets
                 mBucketVerifyApplySeq = downloadApplyBuckets();
                 seq.push_back(mBucketVerifyApplySeq);
+
+                // Step 4.2.1: after buckets are applied, install the new LCL
+                // and populate co-located offer dependency data before replay.
+                auto postBucketApplyCb =
+                    [this, rebuildInMemoryState =
+                               !mCatchupConfiguration.offline() ||
+                               catchupRange.replayLedgers()](Application& app) {
+                        if (mBucketsAppliedEmitted)
+                        {
+                            return true;
+                        }
+
+                        // If we crash before this call to setLastClosedLedger,
+                        // then the node will have to catch up again and it
+                        // will clear the ledger because clearRebuildForType has
+                        // not been called yet.
+                        app.getLedgerManager().setLastClosedLedger(
+                            mVerifiedLedgerRangeStart, rebuildInMemoryState);
+                        mBucketsAppliedEmitted = true;
+                        mLiveBuckets.clear();
+                        mHotBuckets.clear();
+                        mLastApplied =
+                            app.getLedgerManager().getLastClosedLedgerHeader();
+
+                        // We've applied buckets successfully, so we don't need
+                        // to rebuild on startup.
+                        //
+                        // If we crash after the call to setLastClosedLedger but
+                        // before clearRebuildForType, then the new HAS will
+                        // have already been written in the call to
+                        // setLastClosedLedger. In this case, we will
+                        // unnecessarily rebuild the ledger but the buckets are
+                        // persistently available locally so it will return us
+                        // to the correct state.
+                        {
+                            soci::transaction depTx(
+                                app.getDatabase().getRawSession());
+                            app.getLedgerTxnRoot().populateOfferDeps();
+                            depTx.commit();
+                        }
+                        auto& ps = app.getPersistentState();
+                        ps.clearRebuildForOfferTable();
+                        return true;
+                    };
+
+                seq.push_back(std::make_shared<WorkWithCallback>(
+                    mApp, "post-apply-buckets-work", postBucketApplyCb));
             }
 
             if (catchupRange.replayLedgers())

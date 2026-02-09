@@ -189,7 +189,8 @@ InMemoryLedgerTxn::getFilteredEntryIterator(EntryIterator const& iter)
 void
 InMemoryLedgerTxn::commitChild(EntryIterator iter,
                                RestoredEntries const& restoredEntries,
-                               LedgerTxnConsistency cons) noexcept
+                               LedgerTxnConsistency cons,
+                               bool childShouldUpdateLastModified) noexcept
 {
     if (!mTransaction)
     {
@@ -200,7 +201,8 @@ InMemoryLedgerTxn::commitChild(EntryIterator iter,
         auto filteredIter = getFilteredEntryIterator(iter);
         updateLedgerKeyMap(filteredIter);
 
-        LedgerTxn::commitChild(filteredIter, restoredEntries, cons);
+        LedgerTxn::commitChild(filteredIter, restoredEntries, cons,
+                               childShouldUpdateLastModified);
         mTransaction->commit();
         mTransaction.reset();
     }
@@ -379,6 +381,12 @@ void
 InMemoryLedgerTxn::dropOffers()
 {
     mRealRootForOffers.dropOffers();
+}
+
+void
+InMemoryLedgerTxn::populateOfferDeps()
+{
+    mRealRootForOffers.populateOfferDeps();
 }
 
 uint64_t

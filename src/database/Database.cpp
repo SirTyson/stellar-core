@@ -344,6 +344,67 @@ Database::applySchemaUpgrade(unsigned long vers)
             dropMiscTablesFromMain(mApp);
         }
         break;
+    case 27:
+    {
+        // Add co-located account/trustline columns to offers table for
+        // performance optimization (eliminates bucket reads during offer
+        // crossing). Trigger a full offer table rebuild to populate the new
+        // columns from the BucketList.
+        //
+        // The offers table may not exist yet for new databases (dropOffers()
+        // in maybeRebuildLedger creates it with all columns), or it may
+        // already have these columns if dropOffers() ran before this upgrade.
+        // Only ALTER if the table exists and the columns are missing.
+        int colCount = 0;
+        if (isSqlite())
+        {
+            getRawSession()
+                << "SELECT COUNT(*) FROM pragma_table_info('offers') "
+                   "WHERE name='accountentry'",
+                soci::into(colCount);
+        }
+        else
+        {
+            getRawSession()
+                << "SELECT COUNT(*) FROM information_schema.columns WHERE "
+                   "table_name='offers' AND column_name='accountentry'",
+                soci::into(colCount);
+        }
+        if (colCount == 0)
+        {
+            // Table doesn't exist or columns are missing. If the table
+            // exists without the columns, add them. If it doesn't exist,
+            // dropOffers() will create it with all columns.
+            int tableCount = 0;
+            if (isSqlite())
+            {
+                getRawSession() << "SELECT COUNT(*) FROM sqlite_master WHERE "
+                                   "type='table' AND name='offers'",
+                    soci::into(tableCount);
+            }
+            else
+            {
+                getRawSession()
+                    << "SELECT COUNT(*) FROM information_schema.tables "
+                       "WHERE table_name='offers'",
+                    soci::into(tableCount);
+            }
+            if (tableCount > 0)
+            {
+                getRawSession()
+                    << "ALTER TABLE offers ADD COLUMN accountentry TEXT "
+                       "NOT NULL DEFAULT ''";
+                getRawSession()
+                    << "ALTER TABLE offers ADD COLUMN sellingtlentry TEXT "
+                       "NOT NULL DEFAULT ''";
+                getRawSession()
+                    << "ALTER TABLE offers ADD COLUMN buyingtlentry TEXT "
+                       "NOT NULL DEFAULT ''";
+            }
+        }
+        mApp.getPersistentState().setRebuildForOfferTable();
+        break;
+    }
     default:
         throw std::runtime_error("Unknown DB schema version");
     }

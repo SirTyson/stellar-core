@@ -444,7 +444,8 @@ class AbstractLedgerTxnParent
     // the child.
     virtual void commitChild(EntryIterator iter,
                              RestoredEntries const& restoredEntries,
-                             LedgerTxnConsistency cons) noexcept = 0;
+                             LedgerTxnConsistency cons,
+                             bool childShouldUpdateLastModified) noexcept = 0;
     virtual void rollbackChild() noexcept = 0;
 
     // getAllOffers, getBestOffer, and getOffersByAccountAndAsset are used to
@@ -512,6 +513,10 @@ class AbstractLedgerTxnParent
     // Delete all offer ledger entries. Will throw when called on anything other
     // than a (real or stub) root LedgerTxn.
     virtual void dropOffers() = 0;
+
+    // Populate co-located account/trustline data in the offers table from the
+    // BucketList. Called on startup after applying buckets.
+    virtual void populateOfferDeps() = 0;
 
     // Return the current cache hit rate for prefetched ledger entries, as a
     // fraction from 0.0 to 1.0. Will throw when called on anything other than a
@@ -764,7 +769,8 @@ class LedgerTxn : public AbstractLedgerTxn
     void commit() noexcept override;
 
     void commitChild(EntryIterator iter, RestoredEntries const& restoredEntries,
-                     LedgerTxnConsistency cons) noexcept override;
+                     LedgerTxnConsistency cons,
+                     bool childShouldUpdateLastModified) noexcept override;
 
     LedgerTxnEntry create(InternalLedgerEntry const& entry) override;
 
@@ -852,6 +858,7 @@ class LedgerTxn : public AbstractLedgerTxn
     uint64_t countOffers(LedgerRange const& ledgers) const override;
     void deleteOffersModifiedOnOrAfterLedger(uint32_t ledger) const override;
     void dropOffers() override;
+    void populateOfferDeps() override;
 
     double getPrefetchHitRate() const override;
     uint32_t prefetch(UnorderedSet<LedgerKey> const& keys) override;
@@ -908,13 +915,15 @@ class LedgerTxnRoot : public AbstractLedgerTxnParent
     void addChild(AbstractLedgerTxn& child, TransactionMode mode) override;
 
     void commitChild(EntryIterator iter, RestoredEntries const& restoredEntries,
-                     LedgerTxnConsistency cons) noexcept override;
+                     LedgerTxnConsistency cons,
+                     bool childShouldUpdateLastModified) noexcept override;
 
     uint64_t countOffers(LedgerRange const& ledgers) const override;
 
     void deleteOffersModifiedOnOrAfterLedger(uint32_t ledger) const override;
 
     void dropOffers() override;
+    void populateOfferDeps() override;
 
 #ifdef BUILD_TESTS
     void resetForFuzzer() override;

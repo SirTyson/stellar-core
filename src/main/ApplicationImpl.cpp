@@ -230,11 +230,35 @@ maybeRebuildLedger(Application& app, bool applyBuckets)
             {
                 throw std::runtime_error("Could not rebuild ledger tables");
             }
+
+            // Ensure offers have co-located account/trustline deps before
+            // ledger close resumes.
+            LOG_INFO(DEFAULT_LOG, "Populating offer dependency data");
+            soci::transaction depTx(app.getDatabase().getRawSession());
+            app.getLedgerTxnRoot().populateOfferDeps();
+            depTx.commit();
         }
         LOG_INFO(DEFAULT_LOG, "Successfully rebuilt ledger tables");
     }
 
     ps.clearRebuildForOfferTable();
+
+    // One-time fixup for deployments that may still have offers without
+    // co-located account dependencies.
+    {
+        int emptyCount = 0;
+        app.getDatabase().getRawSession()
+            << "SELECT COUNT(*) FROM offers WHERE accountentry = ''",
+            soci::into(emptyCount);
+        if (emptyCount > 0)
+        {
+            LOG_INFO(DEFAULT_LOG, "Found {} offers with empty deps, populating",
+                     emptyCount);
+            soci::transaction depTx(app.getDatabase().getRawSession());
+            app.getLedgerTxnRoot().populateOfferDeps();
+            depTx.commit();
+        }
+    }
 }
 
 void

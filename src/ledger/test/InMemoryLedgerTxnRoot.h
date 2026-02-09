@@ -39,7 +39,8 @@ class InMemoryLedgerTxnRoot : public AbstractLedgerTxnParent
     );
     void addChild(AbstractLedgerTxn& child, TransactionMode mode) override;
     void commitChild(EntryIterator iter, RestoredEntries const& restoredEntries,
-                     LedgerTxnConsistency cons) noexcept override;
+                     LedgerTxnConsistency cons,
+                     bool childShouldUpdateLastModified) noexcept override;
     void rollbackChild() noexcept override;
 
     UnorderedMap<LedgerKey, LedgerEntry> getAllOffers() override;
@@ -77,6 +78,7 @@ class InMemoryLedgerTxnRoot : public AbstractLedgerTxnParent
     void deleteOffersModifiedOnOrAfterLedger(uint32_t ledger) const override;
 
     void dropOffers() override;
+    void populateOfferDeps() override;
     double getPrefetchHitRate() const override;
     uint32_t prefetch(UnorderedSet<LedgerKey> const& keys) override;
 

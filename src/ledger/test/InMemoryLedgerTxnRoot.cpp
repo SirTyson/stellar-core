@@ -35,7 +35,8 @@ InMemoryLedgerTxnRoot::addChild(AbstractLedgerTxn& child, TransactionMode mode)
 void
 InMemoryLedgerTxnRoot::commitChild(EntryIterator iter,
                                    RestoredEntries const& restoredEntries,
-                                   LedgerTxnConsistency cons) noexcept
+                                   LedgerTxnConsistency cons,
+                                   bool childShouldUpdateLastModified) noexcept
 {
     printErrorAndAbort("committing to stub InMemoryLedgerTxnRoot");
 }
@@ -130,6 +131,11 @@ InMemoryLedgerTxnRoot::deleteOffersModifiedOnOrAfterLedger(
 
 void
 InMemoryLedgerTxnRoot::dropOffers()
+{
+}
+
+void
+InMemoryLedgerTxnRoot::populateOfferDeps()
 {
 }
 

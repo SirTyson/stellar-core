@@ -1621,10 +1621,6 @@ LedgerManagerImpl::applyLedger(LedgerCloseData const& ledgerData,
             *applicableTxSet, ltx, ledgerCloseMeta, ledgerData);
         txResultSet = applyTransactions(*applicableTxSet, mutableTxResults, ltx,
                                         ledgerCloseMeta);
-        if (ledgerData.getLedgerSeq() == 60996137)
-        {
-            releaseAssert(false);
-        }
     }
 
     if (mApp.getConfig().MODE_STORES_HISTORY_MISC)

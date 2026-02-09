@@ -4,6 +4,7 @@
 
 #include "bucket/BucketManager.h"
 #include "bucket/test/BucketTestUtils.h"
+#include "database/Database.h"
 #include "ledger/LedgerTxn.h"
 #include "ledger/LedgerTxnEntry.h"
 #include "ledger/LedgerTxnHeader.h"
@@ -2337,6 +2338,99 @@ TEST_CASE("LedgerTxn loadBestOffer", "[ledgertxn]")
     SECTION("in-memory")
     {
         runTest(Config::TESTDB_IN_MEMORY);
+    }
+
+#ifdef USE_POSTGRES
+    SECTION("postgresql")
+    {
+        runTest(Config::TESTDB_POSTGRESQL);
+    }
+#endif
+}
+
+TEST_CASE("LedgerTxn updates offer account dependency blobs", "[ledgertxn]")
+{
+    auto runTest = [&](Config::TestDbMode mode) {
+        VirtualClock clock;
+        auto app = createTestApplication(clock, getTestConfig(0, mode));
+        auto root = app->getRoot();
+
+        auto minBalance = app->getLedgerManager().getLastMinBalance(10);
+        auto native = txtest::makeNativeAsset();
+        auto usd = txtest::makeAsset(*root, "USD");
+
+        auto seller = root->create("seller", minBalance);
+        seller.changeTrust(usd, 1'000);
+        root->pay(seller, usd, 500);
+
+        auto offerID = seller.manageOffer(0, native, usd, Price{1, 1}, 100,
+                                          MANAGE_OFFER_CREATED);
+
+        std::string blobBefore;
+        app->getDatabase().getRawSession()
+            << "SELECT accountentry FROM offers WHERE offerid = :id",
+            soci::into(blobBefore), soci::use(offerID);
+        REQUIRE(!blobBefore.empty());
+
+        root->pay(seller, 1);
+
+        std::string blobAfter;
+        app->getDatabase().getRawSession()
+            << "SELECT accountentry FROM offers WHERE offerid = :id",
+            soci::into(blobAfter), soci::use(offerID);
+        REQUIRE(!blobAfter.empty());
+        REQUIRE(blobAfter != blobBefore);
+    };
+
+    SECTION("bucketlist")
+    {
+        runTest(Config::TESTDB_BUCKET_DB_PERSISTENT);
+    }
+
+#ifdef USE_POSTGRES
+    SECTION("postgresql")
+    {
+        runTest(Config::TESTDB_POSTGRESQL);
+    }
+#endif
+}
+
+TEST_CASE("LedgerTxn updates offer trustline dependency blobs", "[ledgertxn]")
+{
+    auto runTest = [&](Config::TestDbMode mode) {
+        VirtualClock clock;
+        auto app = createTestApplication(clock, getTestConfig(0, mode));
+        auto root = app->getRoot();
+
+        auto minBalance = app->getLedgerManager().getLastMinBalance(10);
+        auto native = txtest::makeNativeAsset();
+        auto usd = txtest::makeAsset(*root, "USD");
+
+        auto seller = root->create("seller", minBalance);
+        seller.changeTrust(usd, 10'000);
+        root->pay(seller, usd, 500);
+        auto offerID = seller.manageOffer(0, native, usd, Price{1, 1}, 100,
+                                          MANAGE_OFFER_CREATED);
+
+        std::string blobBefore;
+        app->getDatabase().getRawSession()
+            << "SELECT buyingtlentry FROM offers WHERE offerid = :id",
+            soci::into(blobBefore), soci::use(offerID);
+        REQUIRE(!blobBefore.empty());
+
+        root->pay(seller, usd, 1);
+
+        std::string blobAfter;
+        app->getDatabase().getRawSession()
+            << "SELECT buyingtlentry FROM offers WHERE offerid = :id",
+            soci::into(blobAfter), soci::use(offerID);
+        REQUIRE(!blobAfter.empty());
+        REQUIRE(blobAfter != blobBefore);
+    };
+
+    SECTION("bucketlist")
+    {
+        runTest(Config::TESTDB_BUCKET_DB_PERSISTENT);
     }
 
 #ifdef USE_POSTGRES

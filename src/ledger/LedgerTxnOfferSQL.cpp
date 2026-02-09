@@ -2,6 +2,9 @@
 // under the Apache License, Version 2.0. See the COPYING file at the root
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
+#include "bucket/BucketListSnapshot.h"
+#include "bucket/BucketManager.h"
+#include "bucket/LedgerCmp.h"
 #include "crypto/KeyUtils.h"
 #include "crypto/SecretKey.h"
 #include "database/Database.h"
@@ -102,6 +105,37 @@ LedgerTxnRoot::Impl::loadBestOffers(std::deque<LedgerEntry>& offers,
 }
 
 std::deque<LedgerEntry>::const_iterator
+LedgerTxnRoot::Impl::loadBestOffers(
+    std::deque<LedgerEntry>& offers, Asset const& buying, Asset const& selling,
+    size_t numOffers,
+    UnorderedMap<LedgerKey, std::shared_ptr<LedgerEntry const>>& colocatedDeps)
+    const
+{
+    ZoneScoped;
+    std::string sql = "SELECT sellerid, offerid, sellingasset, buyingasset, "
+                      "amount, pricen, priced, flags, lastmodified, extension, "
+                      "ledgerext, accountentry, sellingtlentry, buyingtlentry "
+                      "FROM offers "
+                      "WHERE sellingasset = :v1 AND buyingasset = :v2 "
+                      "ORDER BY price, offerid LIMIT :n";
+
+    std::string buyingAsset, sellingAsset;
+    buyingAsset = decoder::encode_b64(xdr::xdr_to_opaque(buying));
+    sellingAsset = decoder::encode_b64(xdr::xdr_to_opaque(selling));
+
+    auto prep = mApp.getDatabase().getPreparedStatement(sql, getSession());
+    auto& st = prep.statement();
+    st.exchange(soci::use(sellingAsset));
+    st.exchange(soci::use(buyingAsset));
+    st.exchange(soci::use(numOffers));
+
+    {
+        auto timer = mApp.getDatabase().getSelectTimer("offer");
+        return loadOffersWithDeps(prep, offers, colocatedDeps);
+    }
+}
+
+std::deque<LedgerEntry>::const_iterator
 LedgerTxnRoot::Impl::loadBestOffers(std::deque<LedgerEntry>& offers,
                                     Asset const& buying, Asset const& selling,
                                     OfferDescriptor const& worseThan,
@@ -161,6 +195,65 @@ LedgerTxnRoot::Impl::loadBestOffers(std::deque<LedgerEntry>& offers,
     {
         auto timer = mApp.getDatabase().getSelectTimer("offer");
         return loadOffers(prep, offers);
+    }
+}
+
+std::deque<LedgerEntry>::const_iterator
+LedgerTxnRoot::Impl::loadBestOffers(
+    std::deque<LedgerEntry>& offers, Asset const& buying, Asset const& selling,
+    OfferDescriptor const& worseThan, size_t numOffers,
+    UnorderedMap<LedgerKey, std::shared_ptr<LedgerEntry const>>& colocatedDeps)
+    const
+{
+    ZoneScoped;
+    if (worseThan.offerID == INT64_MAX)
+    {
+        throw std::runtime_error("maximum offerID encountered");
+    }
+
+    std::string sql =
+        "WITH r1 AS "
+        "(SELECT sellerid, offerid, sellingasset, buyingasset, amount, price, "
+        "pricen, priced, flags, lastmodified, extension, "
+        "ledgerext, accountentry, sellingtlentry, buyingtlentry FROM offers "
+        "WHERE sellingasset = :v1 AND buyingasset = :v2 AND price > :v3 "
+        "ORDER BY price, offerid LIMIT :v4), "
+        "r2 AS "
+        "(SELECT sellerid, offerid, sellingasset, buyingasset, amount, price, "
+        "pricen, priced, flags, lastmodified, extension, "
+        "ledgerext, accountentry, sellingtlentry, buyingtlentry FROM offers "
+        "WHERE sellingasset = :v5 AND buyingasset = :v6 AND price = :v7 "
+        "AND offerid >= :v8 ORDER BY price, offerid LIMIT :v9) "
+        "SELECT sellerid, offerid, sellingasset, buyingasset, "
+        "amount, pricen, priced, flags, lastmodified, extension, "
+        "ledgerext, accountentry, sellingtlentry, buyingtlentry "
+        "FROM (SELECT * FROM r1 UNION ALL SELECT * FROM r2) AS res "
+        "ORDER BY price, offerid LIMIT :v10";
+
+    std::string buyingAsset, sellingAsset;
+    buyingAsset = decoder::encode_b64(xdr::xdr_to_opaque(buying));
+    sellingAsset = decoder::encode_b64(xdr::xdr_to_opaque(selling));
+
+    double worseThanPrice =
+        (double)worseThan.price.n / (double)worseThan.price.d;
+    int64_t worseThanOfferID = worseThan.offerID + 1;
+
+    auto prep = mApp.getDatabase().getPreparedStatement(sql, getSession());
+    auto& st = prep.statement();
+    st.exchange(soci::use(sellingAsset));
+    st.exchange(soci::use(buyingAsset));
+    st.exchange(soci::use(worseThanPrice));
+    st.exchange(soci::use(numOffers));
+    st.exchange(soci::use(sellingAsset));
+    st.exchange(soci::use(buyingAsset));
+    st.exchange(soci::use(worseThanPrice));
+    st.exchange(soci::use(worseThanOfferID));
+    st.exchange(soci::use(numOffers));
+    st.exchange(soci::use(numOffers));
+
+    {
+        auto timer = mApp.getDatabase().getSelectTimer("offer");
+        return loadOffersWithDeps(prep, offers, colocatedDeps);
     }
 }
 
@@ -251,6 +344,20 @@ processAsset(std::string const& asset)
     return res;
 }
 
+static bool
+needsTrustlineDep(AccountID const& sellerID, Asset const& asset)
+{
+    if (asset.type() == ASSET_TYPE_NATIVE)
+    {
+        return false;
+    }
+    if (asset.type() == ASSET_TYPE_POOL_SHARE)
+    {
+        return true;
+    }
+    return !isIssuer(sellerID, asset);
+}
+
 template <typename T>
 static typename T::const_iterator
 loadOffersHelper(StatementContext& prep, T& offers)
@@ -309,11 +416,151 @@ loadOffersHelper(StatementContext& prep, T& offers)
     return offers.cend() - n;
 }
 
+// Variant of loadOffersHelper that also reads co-located account/trustline
+// columns and populates a dependency map.
+static std::deque<LedgerEntry>::const_iterator
+loadOffersWithDepsHelper(
+    StatementContext& prep, std::deque<LedgerEntry>& offers,
+    UnorderedMap<LedgerKey, std::shared_ptr<LedgerEntry const>>& colocatedDeps)
+{
+    ZoneScoped;
+
+    std::string actIDStrKey;
+    int64_t offerID;
+    std::string sellingAsset, buyingAsset;
+    int64_t amount;
+    Price price;
+    uint32_t flags, lastModified;
+    std::string extensionStr;
+    std::string ledgerExtStr;
+    std::string accountEntryStr;
+    std::string sellingTLEntryStr;
+    std::string buyingTLEntryStr;
+
+    auto& st = prep.statement();
+    st.exchange(soci::into(actIDStrKey));
+    st.exchange(soci::into(offerID));
+    st.exchange(soci::into(sellingAsset));
+    st.exchange(soci::into(buyingAsset));
+    st.exchange(soci::into(amount));
+    st.exchange(soci::into(price.n));
+    st.exchange(soci::into(price.d));
+    st.exchange(soci::into(flags));
+    st.exchange(soci::into(lastModified));
+    st.exchange(soci::into(extensionStr));
+    st.exchange(soci::into(ledgerExtStr));
+    st.exchange(soci::into(accountEntryStr));
+    st.exchange(soci::into(sellingTLEntryStr));
+    st.exchange(soci::into(buyingTLEntryStr));
+    st.define_and_bind();
+    st.execute(true);
+
+    size_t n = 0;
+    while (st.got_data())
+    {
+        ++n;
+        offers.emplace_back();
+        auto& le = offers.back();
+        le.data.type(OFFER);
+        auto& oe = le.data.offer();
+
+        oe.sellerID = KeyUtils::fromStrKey<PublicKey>(actIDStrKey);
+        oe.offerID = offerID;
+        oe.selling = processAsset(sellingAsset);
+        oe.buying = processAsset(buyingAsset);
+        oe.amount = amount;
+        oe.price = price;
+        oe.flags = flags;
+        le.lastModifiedLedgerSeq = lastModified;
+
+        decodeOpaqueXDR(extensionStr, oe.ext);
+        decodeOpaqueXDR(ledgerExtStr, le.ext);
+
+        // Decode co-located data.
+        if (accountEntryStr.empty())
+        {
+            throw std::runtime_error(
+                "missing co-located account dependency for "
+                "offer " +
+                std::to_string(oe.offerID));
+        }
+        auto acctLE = std::make_shared<LedgerEntry>();
+        fromOpaqueBase64(*acctLE, accountEntryStr);
+        auto expectedKey = accountKey(oe.sellerID);
+#ifndef BUILD_TESTS
+        if (LedgerEntryKey(*acctLE) != expectedKey)
+        {
+            throw std::runtime_error(
+                "mismatched co-located account dependency for offer " +
+                std::to_string(oe.offerID));
+        }
+#endif
+        colocatedDeps[expectedKey] = acctLE;
+        if (needsTrustlineDep(oe.sellerID, oe.selling))
+        {
+            if (sellingTLEntryStr.empty())
+            {
+                throw std::runtime_error("missing co-located selling trustline "
+                                         "dependency for offer " +
+                                         std::to_string(oe.offerID));
+            }
+            auto tlLE = std::make_shared<LedgerEntry>();
+            fromOpaqueBase64(*tlLE, sellingTLEntryStr);
+            auto expectedKey = trustlineKey(oe.sellerID, oe.selling);
+#ifndef BUILD_TESTS
+            if (LedgerEntryKey(*tlLE) != expectedKey)
+            {
+                throw std::runtime_error(
+                    "mismatched co-located selling trustline dependency "
+                    "for offer " +
+                    std::to_string(oe.offerID));
+            }
+#endif
+            colocatedDeps[expectedKey] = tlLE;
+        }
+        if (needsTrustlineDep(oe.sellerID, oe.buying))
+        {
+            if (buyingTLEntryStr.empty())
+            {
+                throw std::runtime_error("missing co-located buying trustline "
+                                         "dependency for offer " +
+                                         std::to_string(oe.offerID));
+            }
+            auto tlLE = std::make_shared<LedgerEntry>();
+            fromOpaqueBase64(*tlLE, buyingTLEntryStr);
+            auto expectedKey = trustlineKey(oe.sellerID, oe.buying);
+#ifndef BUILD_TESTS
+            if (LedgerEntryKey(*tlLE) != expectedKey)
+            {
+                throw std::runtime_error(
+                    "mismatched co-located buying trustline dependency "
+                    "for offer " +
+                    std::to_string(oe.offerID));
+            }
+#endif
+            colocatedDeps[expectedKey] = tlLE;
+        }
+
+        st.fetch();
+    }
+
+    return offers.cend() - n;
+}
+
 std::deque<LedgerEntry>::const_iterator
 LedgerTxnRoot::Impl::loadOffers(StatementContext& prep,
                                 std::deque<LedgerEntry>& offers) const
 {
     return loadOffersHelper(prep, offers);
+}
+
+std::deque<LedgerEntry>::const_iterator
+LedgerTxnRoot::Impl::loadOffersWithDeps(
+    StatementContext& prep, std::deque<LedgerEntry>& offers,
+    UnorderedMap<LedgerKey, std::shared_ptr<LedgerEntry const>>& colocatedDeps)
+    const
+{
+    return loadOffersWithDepsHelper(prep, offers, colocatedDeps);
 }
 
 std::vector<LedgerEntry>
@@ -340,6 +587,9 @@ class BulkUpsertOffersOperation : public DatabaseTypeSpecificOperation<void>
     std::vector<int32_t> mLastModifieds;
     std::vector<std::string> mExtensions;
     std::vector<std::string> mLedgerExtensions;
+    std::vector<std::string> mAccountEntries;
+    std::vector<std::string> mSellingTLEntries;
+    std::vector<std::string> mBuyingTLEntries;
 
     void
     accumulateEntry(LedgerEntry const& entry)
@@ -368,6 +618,10 @@ class BulkUpsertOffersOperation : public DatabaseTypeSpecificOperation<void>
             decoder::encode_b64(xdr::xdr_to_opaque(offer.ext)));
         mLedgerExtensions.emplace_back(
             decoder::encode_b64(xdr::xdr_to_opaque(entry.ext)));
+        // Co-located data defaults to empty; filled by bulkUpdateOfferDeps
+        mAccountEntries.emplace_back("");
+        mSellingTLEntries.emplace_back("");
+        mBuyingTLEntries.emplace_back("");
     }
 
   public:
@@ -388,6 +642,9 @@ class BulkUpsertOffersOperation : public DatabaseTypeSpecificOperation<void>
         mLastModifieds.reserve(entries.size());
         mExtensions.reserve(entries.size());
         mLedgerExtensions.reserve(entries.size());
+        mAccountEntries.reserve(entries.size());
+        mSellingTLEntries.reserve(entries.size());
+        mBuyingTLEntries.reserve(entries.size());
 
         for (auto const& e : entries)
         {
@@ -412,6 +669,9 @@ class BulkUpsertOffersOperation : public DatabaseTypeSpecificOperation<void>
         mLastModifieds.reserve(entries.size());
         mExtensions.reserve(entries.size());
         mLedgerExtensions.reserve(entries.size());
+        mAccountEntries.reserve(entries.size());
+        mSellingTLEntries.reserve(entries.size());
+        mBuyingTLEntries.reserve(entries.size());
 
         for (auto const& e : entries)
         {
@@ -429,9 +689,10 @@ class BulkUpsertOffersOperation : public DatabaseTypeSpecificOperation<void>
             "INSERT INTO offers ( "
             "sellerid, offerid, sellingasset, buyingasset, "
             "amount, pricen, priced, price, flags, lastmodified, extension, "
-            "ledgerext "
+            "ledgerext, accountentry, sellingtlentry, buyingtlentry "
             ") VALUES ( "
-            ":v1, :v2, :v3, :v4, :v5, :v6, :v7, :v8, :v9, :v10, :v11, :v12 "
+            ":v1, :v2, :v3, :v4, :v5, :v6, :v7, :v8, :v9, :v10, :v11, "
+            ":v12, :v13, :v14, :v15 "
             ") ON CONFLICT (offerid) DO UPDATE SET "
             "sellerid = excluded.sellerid, "
             "sellingasset = excluded.sellingasset, "
@@ -443,7 +704,13 @@ class BulkUpsertOffersOperation : public DatabaseTypeSpecificOperation<void>
             "flags = excluded.flags, "
             "lastmodified = excluded.lastmodified, "
             "extension = excluded.extension, "
-            "ledgerext = excluded.ledgerext";
+            "ledgerext = excluded.ledgerext, "
+            "accountentry = CASE WHEN excluded.accountentry = '' "
+            "THEN offers.accountentry ELSE excluded.accountentry END, "
+            "sellingtlentry = CASE WHEN excluded.sellingtlentry = '' "
+            "THEN offers.sellingtlentry ELSE excluded.sellingtlentry END, "
+            "buyingtlentry = CASE WHEN excluded.buyingtlentry = '' "
+            "THEN offers.buyingtlentry ELSE excluded.buyingtlentry END";
         auto prep = mDB.getPreparedStatement(sql, mSession);
         soci::statement& st = prep.statement();
         st.exchange(soci::use(mSellerIDs));
@@ -458,6 +725,9 @@ class BulkUpsertOffersOperation : public DatabaseTypeSpecificOperation<void>
         st.exchange(soci::use(mLastModifieds));
         st.exchange(soci::use(mExtensions));
         st.exchange(soci::use(mLedgerExtensions));
+        st.exchange(soci::use(mAccountEntries));
+        st.exchange(soci::use(mSellingTLEntries));
+        st.exchange(soci::use(mBuyingTLEntries));
         st.define_and_bind();
         {
             auto timer = mDB.getUpsertTimer("offer");
@@ -482,7 +752,8 @@ class BulkUpsertOffersOperation : public DatabaseTypeSpecificOperation<void>
 
         std::string strSellerIDs, strOfferIDs, strSellingAssets,
             strBuyingAssets, strAmounts, strPriceNs, strPriceDs, strPrices,
-            strFlags, strLastModifieds, strExtensions, strLedgerExtensions;
+            strFlags, strLastModifieds, strExtensions, strLedgerExtensions,
+            strAccountEntries, strSellingTLEntries, strBuyingTLEntries;
 
         PGconn* conn = pg->conn_;
         marshalToPGArray(conn, strSellerIDs, mSellerIDs);
@@ -499,6 +770,9 @@ class BulkUpsertOffersOperation : public DatabaseTypeSpecificOperation<void>
         marshalToPGArray(conn, strLastModifieds, mLastModifieds);
         marshalToPGArray(conn, strExtensions, mExtensions);
         marshalToPGArray(conn, strLedgerExtensions, mLedgerExtensions);
+        marshalToPGArray(conn, strAccountEntries, mAccountEntries);
+        marshalToPGArray(conn, strSellingTLEntries, mSellingTLEntries);
+        marshalToPGArray(conn, strBuyingTLEntries, mBuyingTLEntries);
 
         std::string sql =
             "WITH r AS (SELECT "
@@ -513,12 +787,15 @@ class BulkUpsertOffersOperation : public DatabaseTypeSpecificOperation<void>
             "unnest(:v9::INT[]), "
             "unnest(:v10::INT[]), "
             "unnest(:v11::TEXT[]), "
-            "unnest(:v12::TEXT[]) "
+            "unnest(:v12::TEXT[]), "
+            "unnest(:v13::TEXT[]), "
+            "unnest(:v14::TEXT[]), "
+            "unnest(:v15::TEXT[]) "
             ")"
             "INSERT INTO offers ( "
             "sellerid, offerid, sellingasset, buyingasset, "
             "amount, pricen, priced, price, flags, lastmodified, extension, "
-            "ledgerext "
+            "ledgerext, accountentry, sellingtlentry, buyingtlentry "
             ") SELECT * from r "
             "ON CONFLICT (offerid) DO UPDATE SET "
             "sellerid = excluded.sellerid, "
@@ -531,7 +808,13 @@ class BulkUpsertOffersOperation : public DatabaseTypeSpecificOperation<void>
             "flags = excluded.flags, "
             "lastmodified = excluded.lastmodified, "
             "extension = excluded.extension, "
-            "ledgerext = excluded.ledgerext";
+            "ledgerext = excluded.ledgerext, "
+            "accountentry = CASE WHEN excluded.accountentry = '' "
+            "THEN offers.accountentry ELSE excluded.accountentry END, "
+            "sellingtlentry = CASE WHEN excluded.sellingtlentry = '' "
+            "THEN offers.sellingtlentry ELSE excluded.sellingtlentry END, "
+            "buyingtlentry = CASE WHEN excluded.buyingtlentry = '' "
+            "THEN offers.buyingtlentry ELSE excluded.buyingtlentry END";
         auto prep = mDB.getPreparedStatement(sql, mSession);
         soci::statement& st = prep.statement();
         st.exchange(soci::use(strSellerIDs));
@@ -546,6 +829,9 @@ class BulkUpsertOffersOperation : public DatabaseTypeSpecificOperation<void>
         st.exchange(soci::use(strLastModifieds));
         st.exchange(soci::use(strExtensions));
         st.exchange(soci::use(strLedgerExtensions));
+        st.exchange(soci::use(strAccountEntries));
+        st.exchange(soci::use(strSellingTLEntries));
+        st.exchange(soci::use(strBuyingTLEntries));
         st.define_and_bind();
         {
             auto timer = mDB.getUpsertTimer("offer");
@@ -658,6 +944,369 @@ LedgerTxnRoot::Impl::bulkDeleteOffers(std::vector<EntryIterator> const& entries,
 }
 
 void
+LedgerTxnRoot::Impl::bulkUpdateOfferDeps(
+    BulkLedgerEntryChangeAccumulator const& bleca)
+{
+    ZoneScoped;
+
+    auto const& changedAccounts = bleca.getChangedAccounts();
+    auto const& changedTrustlines = bleca.getChangedTrustlines();
+    auto const& deletedAccounts = bleca.getDeletedAccounts();
+    auto const& deletedTrustlines = bleca.getDeletedTrustlines();
+
+    if (changedAccounts.empty() && changedTrustlines.empty() &&
+        deletedAccounts.empty() && deletedTrustlines.empty())
+    {
+        return;
+    }
+
+    auto& session = getSession().session();
+
+    // Update accountentry for changed accounts
+    for (auto const& [accountID, le] : changedAccounts)
+    {
+        std::string blob = toOpaqueBase64(le);
+        std::string sellerStr = KeyUtils::toStrKey(accountID);
+        session << "UPDATE offers SET accountentry = :blob WHERE sellerid = "
+                   ":sid",
+            soci::use(blob), soci::use(sellerStr);
+    }
+
+    // Deleted accounts must not own any remaining offers.
+    for (auto const& accountID : deletedAccounts)
+    {
+        std::string sellerStr = KeyUtils::toStrKey(accountID);
+        int64_t danglingOffers = 0;
+        session << "SELECT COUNT(*) FROM offers WHERE sellerid = :sid",
+            soci::into(danglingOffers), soci::use(sellerStr);
+        if (danglingOffers != 0)
+        {
+            throw std::runtime_error(
+                "dangling offers for deleted account while updating deps");
+        }
+    }
+
+    // Update trustline entries for changed trustlines
+    for (auto const& [tlKey, le] : changedTrustlines)
+    {
+        std::string blob = toOpaqueBase64(le);
+        std::string sellerStr = KeyUtils::toStrKey(tlKey.trustLine().accountID);
+        std::string assetStr =
+            decoder::encode_b64(xdr::xdr_to_opaque(tlKey.trustLine().asset));
+
+        // Update sellingtlentry where this trustline's asset is the selling
+        // asset
+        session << "UPDATE offers SET sellingtlentry = :blob WHERE sellerid "
+                   "= :sid AND sellingasset = :asset",
+            soci::use(blob), soci::use(sellerStr), soci::use(assetStr);
+
+        // Update buyingtlentry where this trustline's asset is the buying
+        // asset
+        session << "UPDATE offers SET buyingtlentry = :blob WHERE sellerid = "
+                   ":sid AND buyingasset = :asset",
+            soci::use(blob), soci::use(sellerStr), soci::use(assetStr);
+    }
+
+    // Deleted trustlines must not be referenced by any remaining offers.
+    for (auto const& tlKey : deletedTrustlines)
+    {
+        std::string sellerStr = KeyUtils::toStrKey(tlKey.trustLine().accountID);
+        std::string assetStr =
+            decoder::encode_b64(xdr::xdr_to_opaque(tlKey.trustLine().asset));
+        int64_t danglingOffers = 0;
+        session << "SELECT COUNT(*) FROM offers "
+                   "WHERE sellerid = :sid "
+                   "AND (sellingasset = :sasset OR buyingasset = :basset)",
+            soci::into(danglingOffers), soci::use(sellerStr),
+            soci::use(assetStr), soci::use(assetStr);
+        if (danglingOffers != 0)
+        {
+            throw std::runtime_error(
+                "dangling offers for deleted trustline while updating deps");
+        }
+    }
+}
+
+void
+LedgerTxnRoot::Impl::bulkPopulateNewOfferDeps(
+    BulkLedgerEntryChangeAccumulator const& bleca)
+{
+    ZoneScoped;
+
+    auto const& upsertedOffers = bleca.getUpsertedOffers();
+    auto const& changedAccounts = bleca.getChangedAccounts();
+    auto const& deletedAccounts = bleca.getDeletedAccounts();
+    auto const& changedTrustlines = bleca.getChangedTrustlines();
+    auto const& deletedTrustlines = bleca.getDeletedTrustlines();
+
+    // Refresh deps for all offers owned by any seller whose account/trustline
+    // changed, plus sellers with upserted offers.
+    UnorderedSet<AccountID> sellersToRefresh;
+    sellersToRefresh.reserve(upsertedOffers.size() + changedAccounts.size() +
+                             deletedAccounts.size() + changedTrustlines.size() +
+                             deletedTrustlines.size());
+    for (auto const& info : upsertedOffers)
+    {
+        sellersToRefresh.emplace(info.sellerID);
+    }
+    for (auto const& [sellerID, _] : changedAccounts)
+    {
+        sellersToRefresh.emplace(sellerID);
+    }
+    for (auto const& sellerID : deletedAccounts)
+    {
+        sellersToRefresh.emplace(sellerID);
+    }
+    for (auto const& [tlKey, _] : changedTrustlines)
+    {
+        sellersToRefresh.emplace(tlKey.trustLine().accountID);
+    }
+    for (auto const& tlKey : deletedTrustlines)
+    {
+        sellersToRefresh.emplace(tlKey.trustLine().accountID);
+    }
+
+    if (sellersToRefresh.empty())
+    {
+        return;
+    }
+
+    struct OfferDepInfo
+    {
+        int64_t offerID;
+        AccountID sellerID;
+        Asset selling;
+        Asset buying;
+    };
+    UnorderedMap<int64_t, OfferDepInfo> offersToRefresh;
+    for (auto const& sellerID : sellersToRefresh)
+    {
+        std::string sellerStr = KeyUtils::toStrKey(sellerID);
+        int64_t offerID = 0;
+        std::string sellingAssetStr;
+        std::string buyingAssetStr;
+        auto prep = mApp.getDatabase().getPreparedStatement(
+            "SELECT offerid, sellingasset, buyingasset "
+            "FROM offers WHERE sellerid = :sid",
+            getSession());
+        auto& st = prep.statement();
+        st.exchange(soci::use(sellerStr));
+        st.exchange(soci::into(offerID));
+        st.exchange(soci::into(sellingAssetStr));
+        st.exchange(soci::into(buyingAssetStr));
+        st.define_and_bind();
+        st.execute(true);
+        while (st.got_data())
+        {
+            offersToRefresh.emplace(offerID,
+                                    OfferDepInfo{offerID, sellerID,
+                                                 processAsset(sellingAssetStr),
+                                                 processAsset(buyingAssetStr)});
+            st.fetch();
+        }
+    }
+
+    if (offersToRefresh.empty())
+    {
+        return;
+    }
+
+    UnorderedSet<LedgerKey> missingKeys;
+    for (auto const& [_, info] : offersToRefresh)
+    {
+        if (changedAccounts.find(info.sellerID) == changedAccounts.end())
+        {
+            missingKeys.emplace(accountKey(info.sellerID));
+        }
+
+        if (needsTrustlineDep(info.sellerID, info.selling))
+        {
+            auto key = trustlineKey(info.sellerID, info.selling);
+            if (changedTrustlines.find(key) == changedTrustlines.end())
+            {
+                missingKeys.emplace(key);
+            }
+        }
+
+        if (needsTrustlineDep(info.sellerID, info.buying))
+        {
+            auto key = trustlineKey(info.sellerID, info.buying);
+            if (changedTrustlines.find(key) == changedTrustlines.end())
+            {
+                missingKeys.emplace(key);
+            }
+        }
+    }
+
+    UnorderedMap<LedgerKey, std::string> blobMap;
+    for (auto const& [sellerID, le] : changedAccounts)
+    {
+        blobMap.emplace(accountKey(sellerID), toOpaqueBase64(le));
+    }
+    for (auto const& [tlKey, le] : changedTrustlines)
+    {
+        blobMap.emplace(tlKey, toOpaqueBase64(le));
+    }
+    if (!missingKeys.empty())
+    {
+        auto const& snapshot = getSearchableLiveBucketListSnapshot();
+        std::set<LedgerKey, LedgerEntryIdCmp> orderedKeys(missingKeys.begin(),
+                                                          missingKeys.end());
+        auto loaded =
+            snapshot.loadKeys(orderedKeys, "bulkPopulateNewOfferDeps");
+        for (auto const& le : loaded)
+        {
+            blobMap.emplace(LedgerEntryKey(le), toOpaqueBase64(le));
+        }
+    }
+
+    auto& session = getSession().session();
+    for (auto const& offerToRefresh : offersToRefresh)
+    {
+        auto const& info = offerToRefresh.second;
+        int64_t const offerID = info.offerID;
+        auto getRequiredBlob = [&](LedgerKey const& key,
+                                   char const* depType) -> std::string const& {
+            auto blobIter = blobMap.find(key);
+            if (blobIter == blobMap.end() || blobIter->second.empty())
+            {
+                throw std::runtime_error(std::string("missing required ") +
+                                         depType + " dependency for offer " +
+                                         std::to_string(offerID));
+            }
+            return blobIter->second;
+        };
+
+        auto const& accountBlob =
+            getRequiredBlob(accountKey(info.sellerID), "account");
+
+        std::string sellingTlBlob;
+        if (needsTrustlineDep(info.sellerID, info.selling))
+        {
+            sellingTlBlob = getRequiredBlob(
+                trustlineKey(info.sellerID, info.selling), "selling trustline");
+        }
+
+        std::string buyingTlBlob;
+        if (needsTrustlineDep(info.sellerID, info.buying))
+        {
+            buyingTlBlob = getRequiredBlob(
+                trustlineKey(info.sellerID, info.buying), "buying trustline");
+        }
+
+        session << "UPDATE offers "
+                   "SET accountentry = :acct, "
+                   "sellingtlentry = :stl, "
+                   "buyingtlentry = :btl "
+                   "WHERE offerid = :oid",
+            soci::use(accountBlob), soci::use(sellingTlBlob),
+            soci::use(buyingTlBlob), soci::use(offerID);
+    }
+}
+
+void
+LedgerTxnRoot::Impl::populateOfferDeps()
+{
+    ZoneScoped;
+    throwIfChild();
+
+    LOG_INFO(DEFAULT_LOG, "Populating offer dependency data (co-located "
+                          "account/trustline entries)");
+
+    // Load all offers to determine needed accounts and trustlines
+    auto allOffers = loadAllOffers();
+
+    if (allOffers.empty())
+    {
+        LOG_INFO(DEFAULT_LOG, "No offers to populate dependencies for");
+        return;
+    }
+
+    // Collect unique keys needed
+    UnorderedSet<LedgerKey> keysToLoad;
+    for (auto const& le : allOffers)
+    {
+        auto const& oe = le.data.offer();
+        keysToLoad.emplace(accountKey(oe.sellerID));
+        if (needsTrustlineDep(oe.sellerID, oe.selling))
+        {
+            keysToLoad.emplace(trustlineKey(oe.sellerID, oe.selling));
+        }
+        if (needsTrustlineDep(oe.sellerID, oe.buying))
+        {
+            keysToLoad.emplace(trustlineKey(oe.sellerID, oe.buying));
+        }
+    }
+
+    LOG_INFO(DEFAULT_LOG,
+             "Loading {} dependency entries for {} offers from BucketList",
+             keysToLoad.size(), allOffers.size());
+
+    // Bulk-load from BucketList
+    auto const& snapshot = getSearchableLiveBucketListSnapshot();
+    std::set<LedgerKey, LedgerEntryIdCmp> orderedKeys(keysToLoad.begin(),
+                                                      keysToLoad.end());
+    auto loaded = snapshot.loadKeys(orderedKeys, "populateOfferDeps");
+
+    // Build a map from key -> LedgerEntry blob
+    UnorderedMap<LedgerKey, std::string> blobMap;
+    for (auto const& le : loaded)
+    {
+        blobMap[LedgerEntryKey(le)] = toOpaqueBase64(le);
+    }
+
+    LOG_INFO(DEFAULT_LOG,
+             "Loaded {} entries from BucketList, updating offers table",
+             loaded.size());
+
+    // Update offers in batches
+    auto& session = getSession().session();
+    size_t updated = 0;
+    for (auto const& le : allOffers)
+    {
+        auto const& oe = le.data.offer();
+
+        auto getRequiredBlob = [&](LedgerKey const& key,
+                                   char const* depType) -> std::string const& {
+            auto blobIter = blobMap.find(key);
+            if (blobIter == blobMap.end() || blobIter->second.empty())
+            {
+                throw std::runtime_error(std::string("missing required ") +
+                                         depType + " dependency for offer " +
+                                         std::to_string(oe.offerID));
+            }
+            return blobIter->second;
+        };
+
+        auto const& acctBlob =
+            getRequiredBlob(accountKey(oe.sellerID), "account");
+
+        std::string sellingTLBlob;
+        if (needsTrustlineDep(oe.sellerID, oe.selling))
+        {
+            sellingTLBlob = getRequiredBlob(
+                trustlineKey(oe.sellerID, oe.selling), "selling trustline");
+        }
+
+        std::string buyingTLBlob;
+        if (needsTrustlineDep(oe.sellerID, oe.buying))
+        {
+            buyingTLBlob = getRequiredBlob(trustlineKey(oe.sellerID, oe.buying),
+                                           "buying trustline");
+        }
+
+        int64_t offerID = oe.offerID;
+        session << "UPDATE offers SET accountentry = :acct, sellingtlentry = "
+                   ":stl, buyingtlentry = :btl WHERE offerid = :oid",
+            soci::use(acctBlob), soci::use(sellingTLBlob),
+            soci::use(buyingTLBlob), soci::use(offerID);
+        ++updated;
+    }
+
+    LOG_INFO(DEFAULT_LOG, "Populated co-located data for {} offers", updated);
+}
+
+void
 LedgerTxnRoot::Impl::dropOffers()
 {
     throwIfChild();
@@ -683,6 +1332,9 @@ LedgerTxnRoot::Impl::dropOffers()
            "lastmodified     INT              NOT NULL,"
            "extension        TEXT             NOT NULL,"
            "ledgerext        TEXT             NOT NULL,"
+           "accountentry     TEXT             NOT NULL DEFAULT '',"
+           "sellingtlentry   TEXT             NOT NULL DEFAULT '',"
+           "buyingtlentry    TEXT             NOT NULL DEFAULT '',"
            "PRIMARY KEY      (offerid)"
            ");";
     mApp.getDatabase().getRawSession()

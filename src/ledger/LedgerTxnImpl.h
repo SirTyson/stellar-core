@@ -59,6 +59,21 @@ class BulkLedgerEntryChangeAccumulator
     std::vector<EntryIterator> mOffersToUpsert;
     std::vector<EntryIterator> mOffersToDelete;
 
+    // Track account/trustline changes for co-located data updates
+    UnorderedMap<AccountID, LedgerEntry> mChangedAccounts;
+    UnorderedMap<LedgerKey, LedgerEntry> mChangedTrustlines;
+    UnorderedSet<AccountID> mDeletedAccounts;
+    UnorderedSet<LedgerKey> mDeletedTrustlines;
+    // Track offers that were upserted (deps must be present after updates)
+    struct UpsertedOfferInfo
+    {
+        int64_t offerID;
+        AccountID sellerID;
+        Asset selling;
+        Asset buying;
+    };
+    std::vector<UpsertedOfferInfo> mUpsertedOffers;
+
   public:
     std::vector<EntryIterator>&
     getOffersToUpsert()
@@ -70,6 +85,36 @@ class BulkLedgerEntryChangeAccumulator
     getOffersToDelete()
     {
         return mOffersToDelete;
+    }
+
+    UnorderedMap<AccountID, LedgerEntry> const&
+    getChangedAccounts() const
+    {
+        return mChangedAccounts;
+    }
+
+    UnorderedMap<LedgerKey, LedgerEntry> const&
+    getChangedTrustlines() const
+    {
+        return mChangedTrustlines;
+    }
+
+    UnorderedSet<AccountID> const&
+    getDeletedAccounts() const
+    {
+        return mDeletedAccounts;
+    }
+
+    UnorderedSet<LedgerKey> const&
+    getDeletedTrustlines() const
+    {
+        return mDeletedTrustlines;
+    }
+
+    std::vector<UpsertedOfferInfo> const&
+    getUpsertedOffers() const
+    {
+        return mUpsertedOffers;
     }
 
     bool accumulate(EntryIterator const& iter);
@@ -340,7 +385,8 @@ class LedgerTxn::Impl
     void commit() noexcept;
 
     void commitChild(EntryIterator iter, RestoredEntries const& restoredEntries,
-                     LedgerTxnConsistency cons) noexcept;
+                     LedgerTxnConsistency cons,
+                     bool childShouldUpdateLastModified) noexcept;
 
     // create has the basic exception safety guarantee. If it throws an
     // exception, then
@@ -601,6 +647,10 @@ class LedgerTxnRoot::Impl
     struct BestOffersEntry
     {
         std::deque<LedgerEntry> bestOffers;
+        // Co-located account/trustline data loaded alongside offers from SQL.
+        // Key = LedgerKey (account or trustline), Value = LedgerEntry
+        UnorderedMap<LedgerKey, std::shared_ptr<LedgerEntry const>>
+            colocatedDeps;
         bool allLoaded;
     };
     typedef std::shared_ptr<BestOffersEntry> BestOffersEntryPtr;
@@ -638,13 +688,28 @@ class LedgerTxnRoot::Impl
     std::vector<LedgerEntry> loadAllOffers() const;
     std::deque<LedgerEntry>::const_iterator
     loadOffers(StatementContext& prep, std::deque<LedgerEntry>& offers) const;
+    std::deque<LedgerEntry>::const_iterator loadOffersWithDeps(
+        StatementContext& prep, std::deque<LedgerEntry>& offers,
+        UnorderedMap<LedgerKey, std::shared_ptr<LedgerEntry const>>&
+            colocatedDeps) const;
     std::deque<LedgerEntry>::const_iterator
     loadBestOffers(std::deque<LedgerEntry>& offers, Asset const& buying,
                    Asset const& selling, size_t numOffers) const;
     std::deque<LedgerEntry>::const_iterator
     loadBestOffers(std::deque<LedgerEntry>& offers, Asset const& buying,
+                   Asset const& selling, size_t numOffers,
+                   UnorderedMap<LedgerKey, std::shared_ptr<LedgerEntry const>>&
+                       colocatedDeps) const;
+    std::deque<LedgerEntry>::const_iterator
+    loadBestOffers(std::deque<LedgerEntry>& offers, Asset const& buying,
                    Asset const& selling, OfferDescriptor const& worseThan,
                    size_t numOffers) const;
+    std::deque<LedgerEntry>::const_iterator
+    loadBestOffers(std::deque<LedgerEntry>& offers, Asset const& buying,
+                   Asset const& selling, OfferDescriptor const& worseThan,
+                   size_t numOffers,
+                   UnorderedMap<LedgerKey, std::shared_ptr<LedgerEntry const>>&
+                       colocatedDeps) const;
     std::vector<LedgerEntry>
     loadOffersByAccountAndAsset(AccountID const& accountID,
                                 Asset const& asset) const;
@@ -655,6 +720,9 @@ class LedgerTxnRoot::Impl
     void bulkUpsertOffers(std::vector<EntryIterator> const& entries);
     void bulkDeleteOffers(std::vector<EntryIterator> const& entries,
                           LedgerTxnConsistency cons);
+    void bulkUpdateOfferDeps(BulkLedgerEntryChangeAccumulator const& bleca);
+    void
+    bulkPopulateNewOfferDeps(BulkLedgerEntryChangeAccumulator const& bleca);
 
     // The entry cache maintains relatively strong invariants:
     //
@@ -683,11 +751,10 @@ class LedgerTxnRoot::Impl
     std::deque<LedgerEntry>::const_iterator
     loadNextBestOffersIntoCache(BestOffersEntryPtr cached, Asset const& buying,
                                 Asset const& selling);
-    void populateEntryCacheFromBestOffers(
-        std::deque<LedgerEntry>::const_iterator iter,
-        std::deque<LedgerEntry>::const_iterator const& end);
-
-    bool areEntriesMissingInCacheForOffer(OfferEntry const& oe);
+    void cacheOfferAndDependencies(
+        LedgerEntry const& offer,
+        UnorderedMap<LedgerKey, std::shared_ptr<LedgerEntry const>> const&
+            colocatedDeps);
 
     SearchableLiveBucketListSnapshot const&
     getSearchableLiveBucketListSnapshot() const;
@@ -708,7 +775,8 @@ class LedgerTxnRoot::Impl
     void addChild(AbstractLedgerTxn& child, TransactionMode mode);
 
     void commitChild(EntryIterator iter, RestoredEntries const& restoredEntries,
-                     LedgerTxnConsistency cons) noexcept;
+                     LedgerTxnConsistency cons,
+                     bool childShouldUpdateLastModified) noexcept;
 
     // countOffers has the strong exception safety guarantee.
     uint64_t countOffers(LedgerRange const& ledgers) const;
@@ -720,6 +788,7 @@ class LedgerTxnRoot::Impl
 
     // no exception safety guarantees.
     void dropOffers();
+    void populateOfferDeps();
 
 #ifdef BUILD_TESTS
     void resetForFuzzer();

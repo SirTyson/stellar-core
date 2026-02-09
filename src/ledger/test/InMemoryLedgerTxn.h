@@ -103,7 +103,8 @@ class InMemoryLedgerTxn : public LedgerTxn
 
     void addChild(AbstractLedgerTxn& child, TransactionMode mode) override;
     void commitChild(EntryIterator iter, RestoredEntries const& restoredEntries,
-                     LedgerTxnConsistency cons) noexcept override;
+                     LedgerTxnConsistency cons,
+                     bool childShouldUpdateLastModified) noexcept override;
     void rollbackChild() noexcept override;
 
     void createWithoutLoading(InternalLedgerEntry const& entry) override;
@@ -136,6 +137,7 @@ class InMemoryLedgerTxn : public LedgerTxn
                  OfferDescriptor const& worseThan) override;
 
     void dropOffers() override;
+    void populateOfferDeps() override;
     uint64_t countOffers(LedgerRange const& ledgers) const override;
     void deleteOffersModifiedOnOrAfterLedger(uint32_t ledger) const override;
     SessionWrapper& getSession() const override;

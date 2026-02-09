@@ -570,17 +570,19 @@ LedgerTxn::Impl::commit() noexcept
         // getEntryIterator has the strong exception safety guarantee
         // commitChild has the strong exception safety guarantee
         mParent.commitChild(getEntryIterator(entries), mRestoredEntries,
-                            mConsistency);
+                            mConsistency, mShouldUpdateLastModified);
     });
 }
 
 void
 LedgerTxn::commitChild(EntryIterator iter,
                        RestoredEntries const& restoredEntries,
-                       LedgerTxnConsistency cons) noexcept
+                       LedgerTxnConsistency cons,
+                       bool childShouldUpdateLastModified) noexcept
 {
     ZoneScoped;
-    getImpl()->commitChild(std::move(iter), restoredEntries, cons);
+    getImpl()->commitChild(std::move(iter), restoredEntries, cons,
+                           childShouldUpdateLastModified);
 }
 
 static LedgerTxnConsistency
@@ -600,8 +602,10 @@ joinConsistencyLevels(LedgerTxnConsistency c1, LedgerTxnConsistency c2)
 void
 LedgerTxn::Impl::commitChild(EntryIterator iter,
                              RestoredEntries const& restoredEntries,
-                             LedgerTxnConsistency cons) noexcept
+                             LedgerTxnConsistency cons,
+                             bool childShouldUpdateLastModified) noexcept
 {
+    (void)childShouldUpdateLastModified;
     abortIfWrongThread("commitChild");
     // Assignment of xdrpp objects does not have the strong exception safety
     // guarantee, so use std::unique_ptr<...>::swap to achieve it
@@ -2257,6 +2261,12 @@ LedgerTxn::dropOffers()
     throw std::runtime_error("called dropOffers on non-root LedgerTxn");
 }
 
+void
+LedgerTxn::populateOfferDeps()
+{
+    throw std::runtime_error("called populateOfferDeps on non-root LedgerTxn");
+}
+
 double
 LedgerTxn::getPrefetchHitRate() const
 {
@@ -2839,9 +2849,11 @@ LedgerTxnRoot::Impl::abortIfWrongThread(char const* functionName) const
 void
 LedgerTxnRoot::commitChild(EntryIterator iter,
                            RestoredEntries const& restoredEntries,
-                           LedgerTxnConsistency cons) noexcept
+                           LedgerTxnConsistency cons,
+                           bool childShouldUpdateLastModified) noexcept
 {
-    mImpl->commitChild(std::move(iter), restoredEntries, cons);
+    mImpl->commitChild(std::move(iter), restoredEntries, cons,
+                       childShouldUpdateLastModified);
 }
 
 static void
@@ -2864,8 +2876,38 @@ BulkLedgerEntryChangeAccumulator::accumulate(EntryIterator const& iter)
         return false;
     }
 
-    // Don't accumulate entry types that are supported by BucketListDB
     auto type = iter.key().ledgerKey().type();
+
+    // Collect account/trustline changes for co-located data updates
+    if (type == ACCOUNT)
+    {
+        if (iter.entryExists())
+        {
+            mChangedAccounts
+                [iter.entry().ledgerEntry().data.account().accountID] =
+                    iter.entry().ledgerEntry();
+        }
+        else
+        {
+            mDeletedAccounts.insert(iter.key().ledgerKey().account().accountID);
+        }
+        return false;
+    }
+    if (type == TRUSTLINE)
+    {
+        if (iter.entryExists())
+        {
+            mChangedTrustlines[iter.key().ledgerKey()] =
+                iter.entry().ledgerEntry();
+        }
+        else
+        {
+            mDeletedTrustlines.insert(iter.key().ledgerKey());
+        }
+        return false;
+    }
+
+    // Don't accumulate entry types that are supported by BucketListDB
     if (!LiveBucketIndex::typeNotSupported(type))
     {
         return false;
@@ -2873,6 +2915,15 @@ BulkLedgerEntryChangeAccumulator::accumulate(EntryIterator const& iter)
 
     releaseAssertOrThrow(type == OFFER);
     accum(iter, mOffersToUpsert, mOffersToDelete);
+
+    // Track upserted offers for dependency population
+    if (iter.entryExists())
+    {
+        auto const& oe = iter.entry().ledgerEntry().data.offer();
+        mUpsertedOffers.push_back(
+            {oe.offerID, oe.sellerID, oe.selling, oe.buying});
+    }
+
     return true;
 }
 
@@ -2899,7 +2950,8 @@ LedgerTxnRoot::Impl::bulkApply(BulkLedgerEntryChangeAccumulator& bleca,
 void
 LedgerTxnRoot::Impl::commitChild(EntryIterator iter,
                                  RestoredEntries const& /* restoredEntries */,
-                                 LedgerTxnConsistency cons) noexcept
+                                 LedgerTxnConsistency cons,
+                                 bool childShouldUpdateLastModified) noexcept
 {
     ZoneScoped;
     abortIfWrongThread("commitChild");
@@ -2936,6 +2988,14 @@ LedgerTxnRoot::Impl::commitChild(EntryIterator iter,
         // FIXME: there is no medida histogram for this presently,
         // but maybe we would like one?
         TracyPlot("ledger.entry.commit", counter);
+
+        if (childShouldUpdateLastModified)
+        {
+            // During normal ledger close, keep co-located offer dependencies
+            // synchronized as account/trustline state changes.
+            bulkUpdateOfferDeps(bleca);
+            bulkPopulateNewOfferDeps(bleca);
+        }
 
         ZoneNamedN(commitZone, "SOCI commit", true);
         mTransaction->commit();
@@ -3015,6 +3075,12 @@ void
 LedgerTxnRoot::dropOffers()
 {
     mImpl->dropOffers();
+}
+
+void
+LedgerTxnRoot::populateOfferDeps()
+{
+    mImpl->populateOfferDeps();
 }
 
 uint32_t
@@ -3274,13 +3340,15 @@ LedgerTxnRoot::Impl::loadNextBestOffersIntoCache(BestOffersEntryPtr cached,
     {
         if (offers.empty())
         {
-            iter = loadBestOffers(offers, buying, selling, BATCH_SIZE);
+            iter = loadBestOffers(offers, buying, selling, BATCH_SIZE,
+                                  cached->colocatedDeps);
         }
         else
         {
             auto const& oe = offers.back().data.offer();
-            iter = loadBestOffers(offers, buying, selling,
-                                  {oe.price, oe.offerID}, BATCH_SIZE);
+            iter =
+                loadBestOffers(offers, buying, selling, {oe.price, oe.offerID},
+                               BATCH_SIZE, cached->colocatedDeps);
         }
     }
     catch (std::exception& e)
@@ -3300,52 +3368,59 @@ LedgerTxnRoot::Impl::loadNextBestOffersIntoCache(BestOffersEntryPtr cached,
     return iter;
 }
 
-void
-LedgerTxnRoot::Impl::populateEntryCacheFromBestOffers(
-    std::deque<LedgerEntry>::const_iterator iter,
-    std::deque<LedgerEntry>::const_iterator const& end)
+static bool
+needsTrustlineDep(AccountID const& sellerID, Asset const& asset)
 {
-    return;
-    UnorderedSet<LedgerKey> toPrefetch;
-    for (; iter != end; ++iter)
+    if (asset.type() == ASSET_TYPE_NATIVE)
     {
-        auto const& oe = iter->data.offer();
-        toPrefetch.emplace(accountKey(oe.sellerID));
-        if (oe.buying.type() != ASSET_TYPE_NATIVE)
-        {
-            toPrefetch.emplace(trustlineKey(oe.sellerID, oe.buying));
-        }
-        if (oe.selling.type() != ASSET_TYPE_NATIVE)
-        {
-            toPrefetch.emplace(trustlineKey(oe.sellerID, oe.selling));
-        }
+        return false;
     }
-    prefetch(toPrefetch);
-}
-
-bool
-LedgerTxnRoot::Impl::areEntriesMissingInCacheForOffer(OfferEntry const& oe)
-{
-    if (!mEntryCache.exists(accountKey(oe.sellerID)))
+    if (asset.type() == ASSET_TYPE_POOL_SHARE)
     {
         return true;
     }
-    if (oe.buying.type() != ASSET_TYPE_NATIVE)
-    {
-        if (!mEntryCache.exists(trustlineKey(oe.sellerID, oe.buying)))
-        {
-            return true;
-        }
-    }
-    if (oe.selling.type() != ASSET_TYPE_NATIVE)
-    {
-        if (!mEntryCache.exists(trustlineKey(oe.sellerID, oe.selling)))
-        {
-            return true;
-        }
-    }
+    return !isIssuer(sellerID, asset);
+}
 
-    return false;
+void
+LedgerTxnRoot::Impl::cacheOfferAndDependencies(
+    LedgerEntry const& offer,
+    UnorderedMap<LedgerKey, std::shared_ptr<LedgerEntry const>> const&
+        colocatedDeps)
+{
+    ZoneScoped;
+    auto const& oe = offer.data.offer();
+
+    auto cacheDependency = [&](LedgerKey const& key, char const* depType) {
+        // Only populate the cache if the key is not already loaded. If a
+        // previous transaction in this ledger modified the account or
+        // trustline, the entry cache may already contain the up-to-date
+        // version (written by prefetch or a prior load). Overwriting it
+        // with the co-located snapshot (captured at ledger open) would
+        // introduce stale data visible to subsequent loads from root.
+        if (mEntryCache.exists(key, /*countAccess=*/false))
+        {
+            return;
+        }
+        auto dep = colocatedDeps.find(key);
+        if (dep == colocatedDeps.end() || !dep->second)
+        {
+            printErrorAndAbort("missing co-located dependency for offer");
+        }
+        putInEntryCache(key, dep->second, LoadType::IMMEDIATE);
+    };
+
+    cacheDependency(accountKey(oe.sellerID), "account");
+    if (needsTrustlineDep(oe.sellerID, oe.buying))
+    {
+        cacheDependency(trustlineKey(oe.sellerID, oe.buying),
+                        "buying trustline");
+    }
+    if (needsTrustlineDep(oe.sellerID, oe.selling))
+    {
+        cacheDependency(trustlineKey(oe.sellerID, oe.selling),
+                        "selling trustline");
+    }
 }
 
 SearchableLiveBucketListSnapshot const&
@@ -3378,7 +3453,6 @@ LedgerTxnRoot::Impl::getBestOffer(Asset const& buying, Asset const& selling,
 
     // Batch-load best offers until an offer worse than *worseThan is found
     // (or until any offer is found if !worseThan)
-    size_t initialBestOffersSize = offers.size();
     auto iter = findIncludedOffer(offers.cbegin(), offers.cend(), worseThan);
     while (iter == offers.cend() && !cached->allLoaded)
     {
@@ -3386,37 +3460,10 @@ LedgerTxnRoot::Impl::getBestOffer(Asset const& buying, Asset const& selling,
         iter = findIncludedOffer(iter, offers.cend(), worseThan);
     }
 
-    bool newOffersLoaded = offers.size() != initialBestOffersSize;
-    // Populate entry cache with upcoming best offers and prefetch associated
-    // accounts and trust lines
-    if (newOffersLoaded)
-    {
-        // At this point, we know that new offers were loaded. But new offers
-        // will only be loaded if there were no offers worse than *worseThan
-        // in the original list (or if the original list was empty if
-        // !worseThan). In that case, iter must point into the newly loaded
-        // offers so we will never try to prefetch the offers that had been
-        // previously loaded.
-        populateEntryCacheFromBestOffers(iter, offers.cend());
-    }
-
     if (iter != offers.cend())
     {
         releaseAssert(!worseThan || isBetterOffer(*worseThan, *iter));
-
-        // Check if we didn't prefetch and that we're missing
-        // accounts/trustlines for this offer in the cache. If we are, batch
-        // load for this offer and the next 999
-        if (!newOffersLoaded &&
-            areEntriesMissingInCacheForOffer(iter->data.offer()))
-        {
-            bool fullBatch =
-                static_cast<size_t>(std::distance(iter, offers.cend())) >
-                mMaxBestOffersBatchSize;
-            auto lastOfferIter =
-                fullBatch ? iter + mMaxBestOffersBatchSize : offers.cend();
-            populateEntryCacheFromBestOffers(iter, lastOfferIter);
-        }
+        cacheOfferAndDependencies(*iter, cached->colocatedDeps);
 
         auto le = std::make_shared<LedgerEntry const>(*iter);
         putInEntryCache(LedgerEntryKey(*iter), le, LoadType::IMMEDIATE);
@@ -3763,7 +3810,7 @@ LedgerTxnRoot::Impl::getFromBestOffers(Asset const& buying,
         }
 
         auto emptyPtr =
-            std::make_shared<BestOffersEntry>(BestOffersEntry{{}, false});
+            std::make_shared<BestOffersEntry>(BestOffersEntry{{}, {}, false});
         mBestOffers.emplace(offersKey, emptyPtr);
         return emptyPtr;
     }
