@@ -1234,10 +1234,6 @@ TEST_CASE("serialize bucket indexes", "[bucket][bucketindex]")
     cfg.BUCKETLIST_DB_PERSIST_INDEX = true;
     cfg.INVARIANT_CHECKS = {};
 
-    // Node is not a validator, so indexes will persist
-    cfg.NODE_IS_VALIDATOR = false;
-    cfg.FORCE_SCP = false;
-
     auto test = BucketIndexTest(cfg, /*levels=*/3);
     test.buildGeneralTest();
 
@@ -1308,6 +1304,74 @@ TEST_CASE("serialize bucket indexes", "[bucket][bucketindex]")
         auto onDiskIndex =
             loadIndex<LiveBucket>(test.getBM(), indexFilename, b->getSize());
         REQUIRE((inMemoryIndex == *onDiskIndex));
+    }
+}
+
+TEST_CASE("disk index with small buckets", "[bucket][bucketindex]")
+{
+    Config cfg(getTestConfig(0, Config::TESTDB_BUCKET_DB_PERSISTENT));
+
+    // Force DiskIndex for all bucket sizes
+    cfg.BUCKETLIST_DB_INDEX_CUTOFF = 0;
+    cfg.BUCKETLIST_DB_PERSIST_INDEX = true;
+    cfg.INVARIANT_CHECKS = {};
+
+    auto clock = VirtualClock();
+    auto app = createTestApplication<BucketTestApplication>(clock, cfg);
+
+    SECTION("single entry bucket")
+    {
+        // Generate exactly one entry (exclude soroban types to avoid TTL)
+        auto entry = LedgerTestUtils::generateValidLedgerEntryWithExclusions(
+            {CONFIG_SETTING, TTL, CONTRACT_CODE, CONTRACT_DATA});
+
+        // Construct bucket directly on disk (outside of BucketList)
+        auto& bm = app->getBucketManager();
+        auto b = LiveBucket::fresh(bm, getAppLedgerVersion(app), {},
+                                   {entry}, {},
+                                   /*countMergeEvents=*/true,
+                                   clock.getIOContext(),
+                                   /*doFsync=*/true);
+        REQUIRE(!b->isEmpty());
+        REQUIRE(!b->hasInMemoryEntries());
+        REQUIRE(b->isIndexed());
+
+        // Verify lookup returns a file offset for the entry we inserted
+        auto lookupResult = b->getIndexForTesting().lookup(
+            LedgerEntryKey(entry));
+        REQUIRE(lookupResult.getState() == IndexReturnState::FILE_OFFSET);
+
+        // Verify serialization round-trip: persisted index should
+        // deserialize to match the in-memory index
+        auto indexFilename = bm.bucketIndexFilename(b->getHash());
+        REQUIRE(fs::exists(indexFilename));
+
+        auto onDiskIndex = loadIndex<LiveBucket>(
+            bm, indexFilename, b->getSize());
+        REQUIRE(onDiskIndex);
+        REQUIRE((b->getIndexForTesting() == *onDiskIndex));
+    }
+
+    SECTION("empty bucket")
+    {
+        // Close a ledger with no entries
+        app->getLedgerManager().setNextLedgerEntryBatchForBucketTesting({}, {},
+                                                                        {});
+        closeLedger(*app);
+
+        // Verify lookup returns nothing for any key
+        auto searchableBL = app->getBucketManager()
+                                .getBucketSnapshotManager()
+                                .copySearchableLiveBucketListSnapshot();
+        UnorderedSet<LedgerKey> seenKeys;
+        auto missingKeys =
+            LedgerTestUtils::generateValidUniqueLedgerKeysWithTypes(
+                {ACCOUNT, TRUSTLINE}, 5, seenKeys);
+        for (auto const& mk : missingKeys)
+        {
+            auto result = searchableBL->load(mk);
+            REQUIRE(!result);
+        }
     }
 }
 
