@@ -22,6 +22,7 @@
 #include "lib/util/stdrandom.h"
 #include "main/Application.h"
 #include "test/Catch2.h"
+#include "test/CovMark.h"
 #include "test/TestUtils.h"
 #include "test/test.h"
 #include "util/Fs.h"
@@ -1016,4 +1017,150 @@ TEST_CASE_VERSIONS("merging bucket entries with initentry with shadows",
             }
         }
     });
+}
+
+TEST_CASE("merge entry covmarks", "[bucket][initentry][covmark]")
+{
+    VirtualClock clock;
+    Config const& cfg = getTestConfig();
+    Application::pointer app = createTestApplication(clock, cfg);
+    auto& bm = app->getBucketManager();
+    auto vers = static_cast<uint32_t>(
+        LiveBucket::FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY);
+
+    LedgerEntry liveEntry = generateAccount();
+    LedgerEntry liveEntry2 = generateSameAccountDifferentState({liveEntry});
+    LedgerEntry initEntry = generateSameAccountDifferentState(
+        {liveEntry, liveEntry2});
+    LedgerKey deadEntry = LedgerEntryKey(liveEntry);
+
+    SECTION("BUCKET_MERGE_DEAD_NEW_INIT: old DEAD + new INIT produces LIVE")
+    {
+        COVMARK_CHECK_HIT_IN_CURR_SCOPE(BUCKET_MERGE_DEAD_NEW_INIT);
+        // Old bucket has a DEAD entry, new bucket has an INIT entry for
+        // the same key.  The merge should produce a LIVE entry.
+        auto bDead = LiveBucket::fresh(bm, vers, {}, {}, {deadEntry},
+                                       /*countMergeEvents=*/true,
+                                       clock.getIOContext(),
+                                       /*doFsync=*/true);
+        auto bInit = LiveBucket::fresh(bm, vers, {initEntry}, {}, {},
+                                       /*countMergeEvents=*/true,
+                                       clock.getIOContext(),
+                                       /*doFsync=*/true);
+        auto merged = LiveBucket::merge(
+            bm, vers, bDead, bInit, /*shadows=*/{},
+            /*keepTombstoneEntries=*/true,
+            /*countMergeEvents=*/true, clock.getIOContext(),
+            /*doFsync=*/true);
+        EntryCounts e(merged);
+        CHECK(e.nMeta == 1);
+        CHECK(e.nLive == 1);
+        CHECK(e.nInitOrArchived == 0);
+        CHECK(e.nDead == 0);
+    }
+
+    SECTION("BUCKET_MERGE_OLD_INIT_NEW_LIVE: old INIT + new LIVE produces INIT")
+    {
+        COVMARK_CHECK_HIT_IN_CURR_SCOPE(BUCKET_MERGE_OLD_INIT_NEW_LIVE);
+        auto bInit = LiveBucket::fresh(bm, vers, {initEntry}, {}, {},
+                                       /*countMergeEvents=*/true,
+                                       clock.getIOContext(),
+                                       /*doFsync=*/true);
+        auto bLive = LiveBucket::fresh(bm, vers, {}, {liveEntry2}, {},
+                                       /*countMergeEvents=*/true,
+                                       clock.getIOContext(),
+                                       /*doFsync=*/true);
+        auto merged = LiveBucket::merge(
+            bm, vers, bInit, bLive, /*shadows=*/{},
+            /*keepTombstoneEntries=*/true,
+            /*countMergeEvents=*/true, clock.getIOContext(),
+            /*doFsync=*/true);
+        EntryCounts e(merged);
+        CHECK(e.nMeta == 1);
+        CHECK(e.nInitOrArchived == 1);
+        CHECK(e.nLive == 0);
+        CHECK(e.nDead == 0);
+    }
+
+    SECTION("BUCKET_MERGE_OLD_INIT_NEW_DEAD: old INIT + new DEAD annihilates")
+    {
+        COVMARK_CHECK_HIT_IN_CURR_SCOPE(BUCKET_MERGE_OLD_INIT_NEW_DEAD);
+        auto bInit = LiveBucket::fresh(bm, vers, {initEntry}, {}, {},
+                                       /*countMergeEvents=*/true,
+                                       clock.getIOContext(),
+                                       /*doFsync=*/true);
+        auto bDead = LiveBucket::fresh(bm, vers, {}, {}, {deadEntry},
+                                       /*countMergeEvents=*/true,
+                                       clock.getIOContext(),
+                                       /*doFsync=*/true);
+        auto merged = LiveBucket::merge(
+            bm, vers, bInit, bDead, /*shadows=*/{},
+            /*keepTombstoneEntries=*/true,
+            /*countMergeEvents=*/true, clock.getIOContext(),
+            /*doFsync=*/true);
+        EntryCounts e(merged);
+        CHECK(e.nMeta == 1);
+        CHECK(e.nInitOrArchived == 0);
+        CHECK(e.nLive == 0);
+        CHECK(e.nDead == 0);
+    }
+}
+
+TEST_CASE("bucket output iterator covmarks", "[bucket][covmark]")
+{
+    VirtualClock clock;
+    Config const& cfg = getTestConfig();
+    Application::pointer app = createTestApplication(clock, cfg);
+    auto& bm = app->getBucketManager();
+
+    SECTION("BUCKET_OUTPUT_EMPTY_MERGE: getBucket with no entries")
+    {
+        COVMARK_CHECK_HIT_IN_CURR_SCOPE(BUCKET_OUTPUT_EMPTY_MERGE);
+        // Use a pre-INITENTRY protocol so no META entry is written
+        // by the constructor, resulting in a truly empty bucket.
+        auto vers = static_cast<uint32_t>(
+            LiveBucket::FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY) - 1;
+        BucketMetadata meta;
+        meta.ledgerVersion = vers;
+        MergeCounters mc;
+        LiveBucketOutputIterator out(bm.getTmpDir(), true, meta, mc,
+                                     clock.getIOContext(), /*doFsync=*/true);
+        auto result = out.getBucket(bm);
+        CHECK(result->isEmpty());
+    }
+
+    SECTION("BUCKET_OUTPUT_TOMBSTONE_ELISION: tombstones dropped at bottom")
+    {
+        COVMARK_CHECK_HIT_IN_CURR_SCOPE(BUCKET_OUTPUT_TOMBSTONE_ELISION);
+        auto vers = static_cast<uint32_t>(
+            LiveBucket::FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY);
+        // Create a bucket with a DEAD entry and keepTombstoneEntries=false
+        // so the tombstone is elided by the output iterator.
+        auto live =
+            LedgerTestUtils::generateValidUniqueLedgerEntriesWithExclusions(
+                {CONFIG_SETTING}, 3);
+        std::vector<LedgerKey> dead;
+        for (auto& e : live)
+        {
+            dead.push_back(LedgerEntryKey(e));
+        }
+        auto bLive = LiveBucket::fresh(bm, vers, {}, live, {},
+                                       /*countMergeEvents=*/true,
+                                       clock.getIOContext(),
+                                       /*doFsync=*/true);
+        auto bDead = LiveBucket::fresh(bm, vers, {}, {}, dead,
+                                       /*countMergeEvents=*/true,
+                                       clock.getIOContext(),
+                                       /*doFsync=*/true);
+        // Merge with keepTombstoneEntries=false to trigger tombstone elision.
+        auto merged = LiveBucket::merge(
+            bm, vers, bLive, bDead, /*shadows=*/{},
+            /*keepTombstoneEntries=*/false,
+            /*countMergeEvents=*/true, clock.getIOContext(),
+            /*doFsync=*/true);
+        // The DEAD entries should have been elided, leaving only META.
+        EntryCounts e(merged);
+        CHECK(e.nDead == 0);
+        CHECK(e.nMeta == 1);
+    }
 }

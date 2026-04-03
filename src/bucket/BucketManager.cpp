@@ -14,6 +14,7 @@
 #include "bucket/LiveBucketList.h"
 #include "crypto/BLAKE2.h"
 #include "crypto/Hex.h"
+#include "test/CovMark.h"
 #include "history/HistoryManager.h"
 #include "historywork/VerifyBucketWork.h"
 #include "invariant/InvariantManager.h"
@@ -516,6 +517,7 @@ BucketManager::adoptFileAsBucketInternal(
     std::shared_ptr<BucketT> b = getBucketByHashInternal(hash, bucketMap);
     if (b)
     {
+        COVMARK_HIT(BUCKET_ADOPT_EXISTING);
         CLOG_DEBUG(
             Bucket,
             "Deleting bucket file {} that is redundant with existing bucket",
@@ -736,6 +738,7 @@ BucketManager::getMergeFutureInternal(MergeKey const& key,
                 std::promise<std::shared_ptr<BucketT>> promise;
                 auto future = promise.get_future().share();
                 promise.set_value(bucket);
+                COVMARK_HIT(BUCKET_MANAGER_MERGE_REATTACH_FINISHED);
                 mc.mFinishedMergeReattachments++;
                 incrMergeCounters<BucketT>(mc);
                 return future;
@@ -751,6 +754,7 @@ BucketManager::getMergeFutureInternal(MergeKey const& key,
         Bucket,
         "BucketManager::getMergeFuture returning running future for merge {}",
         key);
+    COVMARK_HIT(BUCKET_MANAGER_MERGE_REATTACH_RUNNING);
     mc.mRunningMergeReattachments++;
     incrMergeCounters<BucketT>(mc);
     return i->second;

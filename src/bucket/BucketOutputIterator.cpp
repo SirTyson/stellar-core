@@ -9,6 +9,7 @@
 #include "bucket/LiveBucket.h"
 #include "bucket/LiveBucketIndex.h"
 #include "ledger/LedgerTypeUtils.h"
+#include "test/CovMark.h"
 #include "util/GlobalChecks.h"
 #include "util/ProtocolVersion.h"
 #include <Tracy.hpp>
@@ -93,6 +94,7 @@ BucketOutputIterator<BucketT>::put(typename BucketT::EntryT const& e)
 
         if (!mKeepTombstoneEntries && BucketT::isTombstoneEntry(e))
         {
+            COVMARK_HIT(BUCKET_OUTPUT_TOMBSTONE_ELISION);
             ++mMergeCounters.mOutputIteratorTombstoneElisions;
             return;
         }
@@ -133,6 +135,7 @@ BucketOutputIterator<BucketT>::put(typename BucketT::EntryT const& e)
         // (similar to DEADENTRY) on live BucketLists
         if (!mKeepTombstoneEntries && BucketT::isTombstoneEntry(e))
         {
+            COVMARK_HIT(BUCKET_OUTPUT_TOMBSTONE_ELISION);
             ++mMergeCounters.mOutputIteratorTombstoneElisions;
             return;
         }
@@ -181,6 +184,7 @@ BucketOutputIterator<BucketT>::getBucket(
     mOut.close();
     if (mObjectsPut == 0 || mBytesPut == 0)
     {
+        COVMARK_HIT(BUCKET_OUTPUT_EMPTY_MERGE);
         releaseAssert(mObjectsPut == 0);
         releaseAssert(mBytesPut == 0);
         CLOG_DEBUG(Bucket, "Deleting empty bucket file {}", mFilename);

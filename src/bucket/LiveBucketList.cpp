@@ -5,6 +5,7 @@
 #include "bucket/LiveBucketList.h"
 #include "bucket/BucketListBase.h"
 #include "ledger/LedgerManager.h"
+#include "test/CovMark.h"
 
 #include <medida/counter.h>
 
@@ -137,6 +138,7 @@ LiveBucketList::updateEvictionIterAndRecordStats(
         // level
         if (iter.bucketListLevel == kNumLevels)
         {
+            COVMARK_HIT(EVICTION_SCAN_CYCLE_RESTART);
             iter.bucketListLevel = configFirstScanLevel;
 
             // Record then reset metrics at beginning of new eviction cycle
@@ -166,6 +168,7 @@ LiveBucketList::checkIfEvictionScanIsStuck(EvictionIterator const& evictionIter,
                                          evictionIter.isCurrBucket);
     if (period * scanSize < b->getSize())
     {
+        COVMARK_HIT(EVICTION_BUCKET_TOO_LARGE);
         CLOG_WARNING(Bucket,
                      "Bucket too large for current eviction scan size.");
         metrics.incompleteBucketScan.inc();

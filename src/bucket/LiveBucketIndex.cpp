@@ -7,6 +7,7 @@
 #include "bucket/BucketManager.h"
 #include "bucket/BucketUtils.h"
 #include "bucket/DiskIndex.h"
+#include "test/CovMark.h"
 #include "util/Fs.h"
 #include "util/GlobalChecks.h"
 #include "util/Logging.h"
@@ -51,7 +52,7 @@ LiveBucketIndex::LiveBucketIndex(BucketManager& bm,
     auto pageSize = getPageSize(bm.getConfig(), fs::size(filename.string()));
     if (pageSize == 0)
     {
-
+        COVMARK_HIT(BUCKET_INDEX_CREATE_IN_MEMORY);
         CLOG_DEBUG(Bucket,
                    "LiveBucketIndex::createIndex() using in-memory index for "
                    "bucket {}",
@@ -60,6 +61,7 @@ LiveBucketIndex::LiveBucketIndex(BucketManager& bm,
     }
     else
     {
+        COVMARK_HIT(BUCKET_INDEX_CREATE_DISK);
         CLOG_DEBUG(Bucket,
                    "LiveBucketIndex::createIndex() indexing key range with "
                    "page size {} in bucket {}",
@@ -98,12 +100,14 @@ LiveBucketIndex::maybeInitializeCache(size_t totalBucketListAccountsSizeBytes,
     // Everything is already in memory, no need for a redundant cache.
     if (mInMemoryIndex)
     {
+        COVMARK_HIT(BUCKET_INDEX_CACHE_SKIP_IN_MEMORY);
         return;
     }
 
     // Cache is already initialized
     if (SharedLockShared lock(mCacheMutex); mCache)
     {
+        COVMARK_HIT(BUCKET_INDEX_CACHE_ALREADY_INIT);
         return;
     }
 
@@ -120,17 +124,20 @@ LiveBucketIndex::maybeInitializeCache(size_t totalBucketListAccountsSizeBytes,
     // Nothing to cache. or cache is disabled
     if (accountsInThisBucket == 0 || maxBucketListBytesToCache == 0)
     {
+        COVMARK_HIT(BUCKET_INDEX_CACHE_DISABLED_OR_EMPTY);
         return;
     }
 
     SharedLockExclusive lock(mCacheMutex);
     if (totalBucketListAccountsSizeBytes < maxBucketListBytesToCache)
     {
+        COVMARK_HIT(BUCKET_INDEX_CACHE_FULL);
         // We can cache the entire bucket
         mCache = std::make_unique<CacheT>(accountsInThisBucket);
     }
     else
     {
+        COVMARK_HIT(BUCKET_INDEX_CACHE_PARTIAL);
         // The random eviction cache has an entry limit, but we expose a memory
         // limit in the validator config. We can't do an exact 1 to 1 mapping
         // because account entries have different sizes.
@@ -206,6 +213,7 @@ LiveBucketIndex::getCachedEntry(LedgerKey const& k) const
         auto cachePtr = mCache->maybeGet(k);
         if (cachePtr)
         {
+            COVMARK_HIT(BUCKET_INDEX_CACHE_HIT);
             mCacheHitMeter.Mark();
             return *cachePtr;
         }

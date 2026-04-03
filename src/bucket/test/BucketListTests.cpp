@@ -25,6 +25,7 @@
 #include "main/Application.h"
 #include "main/Config.h"
 #include "test/Catch2.h"
+#include "test/CovMark.h"
 #include "test/TestUtils.h"
 #include "test/test.h"
 #include "util/Math.h"
@@ -221,6 +222,74 @@ TEST_CASE_VERSIONS("bucket list", "[bucket][bucketlist]")
     SECTION("hot archive bl")
     {
         basicBucketListTest<HotArchiveBucketList>();
+    }
+}
+
+TEST_CASE("bucket list merge covmarks", "[bucket][bucketlist][covmark]")
+{
+    VirtualClock clock;
+    Config const& cfg = getTestConfig();
+    Application::pointer app = createTestApplication(clock, cfg);
+
+    SECTION("in-memory merge and empty curr")
+    {
+        // Exercises level-0 in-memory merge and the shouldMergeWithEmptyCurr
+        // path at higher levels.
+        COVMARK_CHECK_HIT_IN_CURR_SCOPE(BUCKET_MERGE_WITH_EMPTY_CURR);
+        COVMARK_CHECK_HIT_IN_CURR_SCOPE(BUCKET_LEVEL0_IN_MEMORY_MERGE);
+
+        LiveBucketList bl;
+        for (uint32_t i = 1;
+             !app->getClock().getIOContext().stopped() && i < 130; ++i)
+        {
+            app->getClock().crank(false);
+            bl.addBatch(
+                *app, i, getAppLedgerVersion(app), {},
+                LedgerTestUtils::
+                    generateValidUniqueLedgerEntriesWithExclusions(
+                        {CONFIG_SETTING, CONTRACT_DATA, CONTRACT_CODE, TTL}, 8),
+                LedgerTestUtils::generateValidLedgerEntryKeysWithExclusions(
+                    {CONFIG_SETTING, CONTRACT_DATA, CONTRACT_CODE, TTL}, 5));
+        }
+    }
+
+    SECTION("disk merge fallback when level 0 lacks in-memory entries")
+    {
+        // When level 0 curr was loaded from disk (no in-memory state),
+        // prepareFirstLevel falls back to the disk merge path.
+        COVMARK_CHECK_HIT_IN_CURR_SCOPE(BUCKET_LEVEL0_DISK_MERGE_FALLBACK);
+
+        auto& bm = app->getBucketManager();
+        auto vers = getAppLedgerVersion(app);
+        LiveBucketList bl;
+
+        // Populate level 0 with a disk-only bucket (no in-memory entries).
+        bl.getLevel(0).setCurr(LiveBucket::fresh(
+            bm, vers, {},
+            LedgerTestUtils::generateValidUniqueLedgerEntriesWithExclusions(
+                {CONFIG_SETTING, CONTRACT_DATA, CONTRACT_CODE, TTL}, 8),
+            LedgerTestUtils::generateValidLedgerEntryKeysWithExclusions(
+                {CONFIG_SETTING, CONTRACT_DATA, CONTRACT_CODE, TTL}, 5),
+            /*countMergeEvents=*/true, clock.getIOContext(),
+            /*doFsync=*/true));
+
+        // addBatch triggers prepareFirstLevel which should take the disk
+        // merge fallback because curr has no in-memory entries.
+        bl.addBatch(
+            *app, 1, vers, {},
+            LedgerTestUtils::generateValidUniqueLedgerEntriesWithExclusions(
+                {CONFIG_SETTING, CONTRACT_DATA, CONTRACT_CODE, TTL}, 8),
+            LedgerTestUtils::generateValidLedgerEntryKeysWithExclusions(
+                {CONFIG_SETTING, CONTRACT_DATA, CONTRACT_CODE, TTL}, 5));
+        app->getClock().crank(false);
+        for (uint32_t k = 0u; k < LiveBucketList::kNumLevels; ++k)
+        {
+            auto& next = bl.getLevel(k).getNext();
+            if (next.isLive())
+            {
+                next.resolve();
+            }
+        }
     }
 }
 
@@ -544,6 +613,8 @@ TEST_CASE_VERSIONS("live bucket tombstones expire at bottom level",
     Config const& cfg = getTestConfig();
 
     for_versions_with_differing_bucket_logic(cfg, [&](Config const& cfg) {
+        COVMARK_CHECK_HIT_IN_CURR_SCOPE(BUCKET_OUTPUT_TOMBSTONE_ELISION);
+        COVMARK_CHECK_HIT_IN_CURR_SCOPE(BUCKET_LEVEL0_DISK_MERGE_FALLBACK);
         Application::pointer app = createTestApplication(clock, cfg);
         LiveBucketList bl;
         BucketManager& bm = app->getBucketManager();
@@ -1252,6 +1323,7 @@ TEST_CASE_VERSIONS("eviction scan", "[bucketlist][archival][soroban]")
 
         SECTION("basic eviction test")
         {
+            COVMARK_CHECK_HIT_IN_CURR_SCOPE(EVICTION_SCAN_CYCLE_RESTART);
             // Set eviction to start at level where the entries
             // currently are
             updateStateArchivalSettings(
@@ -1451,6 +1523,9 @@ TEST_CASE_VERSIONS("eviction scan", "[bucketlist][archival][soroban]")
 
         SECTION("evictionScanSize")
         {
+            // With scanSize=1 and a non-trivial bucket, the bucket
+            // is too large to finish before it receives an update.
+            COVMARK_CHECK_HIT_IN_CURR_SCOPE(EVICTION_BUCKET_TOO_LARGE);
             // Set smallest possible scan size so eviction iterator
             // scans one entry per scan
             updateStateArchivalSettings(

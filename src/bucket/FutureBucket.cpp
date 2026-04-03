@@ -17,6 +17,7 @@
 #include "ledger/NetworkConfig.h"
 #include "main/Application.h"
 #include "main/ErrorMessages.h"
+#include "test/CovMark.h"
 #include "util/GlobalChecks.h"
 #include "util/LogSlowExecution.h"
 #include "util/Logging.h"
@@ -396,6 +397,7 @@ FutureBucket<BucketT>::startMerge(Application& app, uint32_t maxProtocolVersion,
 
     if (f.valid())
     {
+        COVMARK_HIT(FUTURE_BUCKET_REATTACH_MERGE);
         CLOG_TRACE(Bucket,
                    "Re-attached to existing merge of curr={} with snap={}",
                    hexAbbrev(curr->getHash()), hexAbbrev(snap->getHash()));

@@ -10,6 +10,7 @@
 #include "bucket/LiveBucket.h"
 #include "crypto/Hex.h"
 #include "crypto/ShortHash.h"
+#include "test/CovMark.h"
 #include "util/BufferedAsioCerealOutputArchive.h"
 #include "util/Fs.h"
 #include "util/GlobalChecks.h"
@@ -77,10 +78,12 @@ DiskIndex<BucketT>::scan(IterT start, LedgerKey const& k) const
         keyIter == mData.keysToOffset.end() ||
         keyNotInIndexEntry(k, keyIter->first))
     {
+        COVMARK_HIT(DISK_INDEX_BLOOM_MISS);
         return {IndexReturnT(), keyIter};
     }
     else
     {
+        COVMARK_HIT(DISK_INDEX_KEY_FOUND);
         return {keyIter->second, keyIter};
     }
 }

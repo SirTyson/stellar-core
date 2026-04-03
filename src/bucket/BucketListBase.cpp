@@ -10,6 +10,7 @@
 #include "crypto/SHA.h"
 #include "ledger/LedgerTxn.h"
 #include "main/Application.h"
+#include "test/CovMark.h"
 #include "util/GlobalChecks.h"
 #include "util/Logging.h"
 #include "util/ProtocolVersion.h"
@@ -129,6 +130,7 @@ BucketListBase<BucketT>::shouldMergeWithEmptyCurr(uint32_t ledger,
         uint32_t nextChangeLedger = mergeStartLedger + levelHalf(level - 1);
         if (levelShouldSpill(nextChangeLedger, level))
         {
+            COVMARK_HIT(BUCKET_MERGE_WITH_EMPTY_CURR);
             return true;
         }
     }
@@ -214,6 +216,7 @@ BucketLevel<LiveBucket>::prepareFirstLevel(Application& app,
     // fallback to normal prepare
     if (!curr->hasInMemoryEntries())
     {
+        COVMARK_HIT(BUCKET_LEVEL0_DISK_MERGE_FALLBACK);
         auto snap = LiveBucket::fresh(
             app.getBucketManager(), currLedgerProtocol, inputVectors...,
             countMergeEvents, app.getClock().getIOContext(), doFsync);
@@ -222,6 +225,7 @@ BucketLevel<LiveBucket>::prepareFirstLevel(Application& app,
         return;
     }
 
+    COVMARK_HIT(BUCKET_LEVEL0_IN_MEMORY_MERGE);
     // This bucket is the "level -1" snap bucket, which is created and
     // immediately merges with level 0 curr. This merge will produce a
     // BucketIndex for the result, so there's no reason to index this Bucket

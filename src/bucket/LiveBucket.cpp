@@ -10,6 +10,7 @@
 #include "bucket/BucketOutputIterator.h"
 #include "bucket/BucketUtils.h"
 #include "bucket/LedgerCmp.h"
+#include "test/CovMark.h"
 #include <medida/counter.h>
 
 namespace stellar
@@ -274,6 +275,7 @@ LiveBucket::mergeCasesWithEqualKeys(
             throw std::runtime_error(
                 "Malformed bucket: old non-DEAD + new INIT.");
         }
+        COVMARK_HIT(BUCKET_MERGE_DEAD_NEW_INIT);
         BucketEntry newLive;
         newLive.type(LIVEENTRY);
         newLive.liveEntry() = newEntry.liveEntry();
@@ -286,6 +288,7 @@ LiveBucket::mergeCasesWithEqualKeys(
         // If we get here, new is not INIT; may be LIVE or DEAD.
         if (newEntry.type() == LIVEENTRY)
         {
+            COVMARK_HIT(BUCKET_MERGE_OLD_INIT_NEW_LIVE);
             // Merge a create+update to a fresher create.
             BucketEntry newInit;
             newInit.type(INITENTRY);
@@ -296,6 +299,7 @@ LiveBucket::mergeCasesWithEqualKeys(
         }
         else
         {
+            COVMARK_HIT(BUCKET_MERGE_OLD_INIT_NEW_DEAD);
             // Merge a create+delete to nothingness.
             ++mc.mOldInitEntriesMergedWithNewDead;
         }

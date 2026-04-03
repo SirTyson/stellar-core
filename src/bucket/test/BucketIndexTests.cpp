@@ -18,6 +18,7 @@
 #include "main/Application.h"
 #include "main/Config.h"
 #include "test/Catch2.h"
+#include "test/CovMark.h"
 #include "test/test.h"
 
 #include "util/GlobalChecks.h"
@@ -795,14 +796,57 @@ testAllIndexTypes(std::function<void(Config&)> f)
 
 TEST_CASE("key-value lookup", "[bucket][bucketindex]")
 {
-    auto f = [&](Config& cfg) {
+    SECTION("individual index only")
+    {
+        Config cfg(getTestConfig());
+        cfg.BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT = 0;
+
+        // All buckets are small enough to use in-memory indexes.
+        // maybeInitializeCache returns early because in-memory indexes
+        // have no separate cache.
+        COVMARK_CHECK_HIT_IN_CURR_SCOPE(BUCKET_INDEX_CREATE_IN_MEMORY);
+        COVMARK_CHECK_HIT_IN_CURR_SCOPE(BUCKET_INDEX_CACHE_SKIP_IN_MEMORY);
+
         auto test = BucketIndexTest(cfg);
         test.buildGeneralTest();
         test.run();
         test.testInvalidKeys();
-    };
+    }
 
-    testAllIndexTypes(f);
+    SECTION("individual and range index")
+    {
+        Config cfg(getTestConfig());
+        // First 3 levels individual, last 3 range index
+        cfg.BUCKETLIST_DB_INDEX_CUTOFF = 1;
+
+        // Both index types are created.
+        COVMARK_CHECK_HIT_IN_CURR_SCOPE(BUCKET_INDEX_CREATE_IN_MEMORY);
+        COVMARK_CHECK_HIT_IN_CURR_SCOPE(BUCKET_INDEX_CREATE_DISK);
+        COVMARK_CHECK_HIT_IN_CURR_SCOPE(BUCKET_INDEX_CACHE_SKIP_IN_MEMORY);
+
+        auto test = BucketIndexTest(cfg);
+        test.buildGeneralTest();
+        test.run();
+        test.testInvalidKeys();
+    }
+
+    SECTION("range index only")
+    {
+        Config cfg(getTestConfig());
+        cfg.BUCKETLIST_DB_INDEX_CUTOFF = 0;
+
+        // Every bucket uses a disk index. Successful lookups hit
+        // DISK_INDEX_KEY_FOUND; lookups for keys not in the bucket list
+        // hit DISK_INDEX_BLOOM_MISS.
+        COVMARK_CHECK_HIT_IN_CURR_SCOPE(BUCKET_INDEX_CREATE_DISK);
+        COVMARK_CHECK_HIT_IN_CURR_SCOPE(DISK_INDEX_KEY_FOUND);
+        COVMARK_CHECK_HIT_IN_CURR_SCOPE(DISK_INDEX_BLOOM_MISS);
+
+        auto test = BucketIndexTest(cfg);
+        test.buildGeneralTest();
+        test.run();
+        test.testInvalidKeys();
+    }
 }
 
 TEST_CASE("bl cache", "[bucket][bucketindex]")
@@ -812,6 +856,11 @@ TEST_CASE("bl cache", "[bucket][bucketindex]")
         Config cfg(getTestConfig());
         cfg.BUCKETLIST_DB_INDEX_CUTOFF = 0;
         cfg.BUCKETLIST_DB_MEMORY_FOR_CACHING = 0;
+
+        // With caching disabled (BUCKETLIST_DB_MEMORY_FOR_CACHING == 0) and all
+        // buckets using disk indexes, maybeInitializeCache will take the
+        // "disabled or empty" early-return path for every bucket.
+        COVMARK_CHECK_HIT_IN_CURR_SCOPE(BUCKET_INDEX_CACHE_DISABLED_OR_EMPTY);
 
         auto test = BucketIndexTest(cfg);
         test.buildGeneralTest(/*isCacheTest=*/true);
@@ -867,7 +916,15 @@ TEST_CASE("bl cache", "[bucket][bucketindex]")
         }
     };
 
-    // First run the test with a very large cache limit so we cache everything
+    // First run the test with a very large cache limit so we cache everything.
+    // With a 5 GB cache limit the full BucketList fits, so every disk-indexed
+    // bucket will take the "cache full" path in maybeInitializeCache.
+    // After the cache is initialized, subsequent addBatch calls will hit the
+    // "cache already initialized" early-return. The second load pass in
+    // run(expectedHitRate) then produces cache hits.
+    COVMARK_CHECK_HIT_IN_CURR_SCOPE(BUCKET_INDEX_CACHE_FULL);
+    COVMARK_CHECK_HIT_IN_CURR_SCOPE(BUCKET_INDEX_CACHE_ALREADY_INIT);
+    COVMARK_CHECK_HIT_IN_CURR_SCOPE(BUCKET_INDEX_CACHE_HIT);
     auto approximateCacheSizeBytes =
         runCacheTest(5'000, checkCompleteCacheSize, 1.0);
 
@@ -896,7 +953,13 @@ TEST_CASE("bl cache", "[bucket][bucketindex]")
     double expectedCachedRatio =
         smallCacheSizeMB * 1024.0 * 1024.0 / approximateCacheSizeBytes;
 
-    runCacheTest(smallCacheSizeMB, checkPartialCacheSize, expectedCachedRatio);
+    // With a cache limit smaller than the total BucketList size, buckets
+    // will take the "partial cache" allocation path in maybeInitializeCache.
+    {
+        COVMARK_CHECK_HIT_IN_CURR_SCOPE(BUCKET_INDEX_CACHE_PARTIAL);
+        runCacheTest(smallCacheSizeMB, checkPartialCacheSize,
+                     expectedCachedRatio);
+    }
 
     REQUIRE(cachedAccountEntries >
             totalAccountCount * (expectedCachedRatio - 0.15));

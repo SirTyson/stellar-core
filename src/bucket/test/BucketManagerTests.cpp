@@ -23,6 +23,7 @@
 #include "main/Application.h"
 #include "main/Config.h"
 #include "test/Catch2.h"
+#include "test/CovMark.h"
 #include "test/TestUtils.h"
 #include "test/test.h"
 #include "util/GlobalChecks.h"
@@ -221,6 +222,9 @@ TEST_CASE_VERSIONS("bucketmanager ownership", "[bucket][bucketmanager]")
             // Bucket is referenced by b1, b2 and the BucketManager.
             CHECK(b1.use_count() == 3);
 
+            // Creating fresh buckets with the same entries should find the
+            // existing bucket and adopt it (deleting the redundant file).
+            COVMARK_CHECK_HIT_IN_CURR_SCOPE(BUCKET_ADOPT_EXISTING);
             std::shared_ptr<LiveBucket> b3 = LiveBucket::fresh(
                 app->getBucketManager(), getAppLedgerVersion(app), {}, live,
                 dead, /*countMergeEvents=*/true, clock.getIOContext(),
@@ -441,6 +445,10 @@ TEST_CASE_VERSIONS("bucketmanager reattach to finished merge",
         has2.fromString(serialHas);
 
         // Reattach to _finished_ merge future on level.
+        // Both the BucketManager (finished-merge path) and FutureBucket
+        // (reattach path) covmarks should fire.
+        COVMARK_CHECK_HIT_IN_CURR_SCOPE(BUCKET_MANAGER_MERGE_REATTACH_FINISHED);
+        COVMARK_CHECK_HIT_IN_CURR_SCOPE(FUTURE_BUCKET_REATTACH_MERGE);
         has2.currentBuckets[level].next.makeLive(
             *app, vers, LiveBucketList::keepTombstoneEntries(level));
         REQUIRE(has2.currentBuckets[level].next.isMerging());
@@ -576,6 +584,10 @@ TEST_CASE_VERSIONS("bucketmanager reattach to running merge",
         // Deserialize and reactivate levels of HAS. Due to the artificial
         // delay, merges should still be running, so we should successfully
         // reattach to them.
+        // Both the BucketManager (running-merge path) and FutureBucket
+        // (reattach path) covmarks should fire.
+        COVMARK_CHECK_HIT_IN_CURR_SCOPE(BUCKET_MANAGER_MERGE_REATTACH_RUNNING);
+        COVMARK_CHECK_HIT_IN_CURR_SCOPE(FUTURE_BUCKET_REATTACH_MERGE);
         HistoryArchiveState has2;
         has2.fromString(serialHas);
         for (uint32_t level = 0; level < LiveBucketList::kNumLevels; ++level)
