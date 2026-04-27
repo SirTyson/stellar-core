@@ -84,3 +84,26 @@ The proposed fix is correctness-preserving if implemented as a sidecar builder t
 - **Change description**: Add an output-side index builder used by `BucketOutputIterator` for file-backed outputs. Feed the builder when a buffered entry is actually flushed to `XDROutputFileStream::writeOne`, using the current `mBytesPut` as that entry's file offset. Keep existing behavior for empty buckets, existing-bucket index reuse, caller-supplied `preBuiltIndex`, and shutdown/error fallback. The final index object must compare equal to one produced by `createIndex` for the same bucket file.
 - **Correctness check**: Use existing bucket index equality operators under `BUILD_TESTS` to compare output-built indexes against `createIndex` for live small/in-memory, live large/disk, and hot archive buckets. Exercise META entries, tombstone elision at bottom levels, adjacent same-key replacement, liquidity-pool INIT asset mappings, type range scans, page-boundary ranges, and persisted index loading.
 - **Benchmark focus**: Measure soroswap apply-load ledgers that spill BucketList levels. The expected win is lower `createIndex`/merge-task wall time and fewer or shorter `FutureBucket::resolve` stalls inside apply; a Medium PoC should show at least a 3% reproducible reduction in top-line apply time.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-04-27
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/bucket/BucketOutputIterator.h:28-67` and `src/bucket/BucketOutputIterator.cpp:25-371` — added output-side index builders, recorded each flushed entry at the pre-write file offset, built a live in-memory or disk index directly from the output stream, and preserved existing-bucket index reuse, caller-supplied prebuilt index reuse, empty-bucket handling, and fallback to `createIndex`.
+- `src/bucket/DiskIndex.h:70-151` and `src/bucket/DiskIndex.cpp:59-354` — factored disk-index construction into a reusable `DiskIndex::Builder` that reproduces the previous range-index, type-range, counter, asset-to-pool, and BinaryFuseFilter metadata logic and can persist indexes through the existing save path.
+- `src/bucket/LiveBucketIndex.h:100-117`, `src/bucket/LiveBucketIndex.cpp:41-103`, `src/bucket/HotArchiveBucketIndex.h:58-66`, and `src/bucket/HotArchiveBucketIndex.cpp:16-42` — added constructors that wrap output-built disk indexes in the existing public index types.
+- `src/bucket/BucketBase.cpp:392-395`, `src/bucket/LiveBucket.cpp:515-518,673-677`, `src/bucket/HotArchiveBucket.cpp:31-34`, `src/bucket/BucketManager.cpp:1670-1672`, `src/bucket/test/BucketTests.cpp:555-556`, `src/history/test/HistoryTestsUtils.h:113-117`, `src/history/test/HistoryTestsUtils.cpp:147-154,240-244`, and `src/invariant/test/BucketListIsConsistentWithDatabaseTests.cpp:185-189` — threaded `Config` into `BucketOutputIterator` construction so it can select the same live in-memory/disk cutoff and disk page size as `createIndex`.
+
+### Demonstration
+
+The optimization builds the bucket index from the exact stream of entries that `BucketOutputIterator` flushes to disk, using the current byte count as each entry's canonical file offset. This removes the normal post-write `createIndex` reopen-and-rescan pass for file-backed live and hot-archive bucket outputs while preserving a fallback path if online index construction cannot complete.
+
+### Test Results
+
+Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`. `make -j $(nproc)` passed using `ALL_SOROBAN_GIT_STATE_STAMPS=` because this worktree stores submodule gitdirs under the worktree gitdir rather than `.git/modules`. `./src/stellar-core test --ll fatal -r simple --abort --disable-dots "[bucket][bucketindex]"` passed all 12 bucket-index test cases, and `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check ALL_SOROBAN_GIT_STATE_STAMPS=` completed successfully with all tests passing.
