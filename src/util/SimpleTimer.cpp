@@ -26,7 +26,7 @@ SimpleTimer::SimpleTimer(MetricsRegistry& registry, SimpleTimerName const& name,
 void
 SimpleTimer::syncMax()
 {
-    MutexLocker lock{mLock};
+    std::lock_guard<std::mutex> lock{mLock};
     mMaxSampleValue.set_count(mMax);
     mMax = 0;
 }
@@ -44,7 +44,7 @@ SimpleTimer::Update(std::chrono::nanoseconds d)
     mSum.inc(converted);
     mSampleCount.inc(1);
     {
-        MutexLocker lock{mLock};
+        std::lock_guard<std::mutex> lock{mLock};
         mMax = std::max(mMax, converted);
     }
 }

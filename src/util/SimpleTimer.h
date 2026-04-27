@@ -3,6 +3,7 @@
 #include "util/ThreadAnnotations.h"
 #include <medida/counter.h>
 #include <medida/metric_name.h>
+#include <mutex>
 
 namespace stellar
 {
@@ -43,7 +44,11 @@ class SimpleTimer
     medida::Counter& mMaxSampleValue;
     std::int64_t mMax GUARDED_BY(mLock);
 
-    ANNOTATED_MUTEX(mLock);
+    // Plain std::mutex (not Tracy-tracked): SimpleTimer::Update is called from
+    // every thread that records a timing, so this lock exceeds Tracy's 64-thread
+    // per-lock tracking limit (waitList is a uint64_t bitmask) and crashes the
+    // capture process on long runs.
+    std::mutex mLock;
 
     std::chrono::nanoseconds const mDurationUnit;
 
