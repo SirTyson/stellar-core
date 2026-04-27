@@ -23,14 +23,31 @@ self-time zone in the apply path.
 
 ## Change Summary
 Replaced the polymorphic `unique_ptr<AbstractEntry>` wrapper in
-`src/bucket/InMemoryIndex.h` with a non-allocating value-only entry that
-stores the existing `IndexPtrT`, caches the entry hash once at insert
-time, and exposes transparent (heterogeneous) hash/equality functors so
-`unordered_set::find` can be called directly with a
-`LedgerKey const&`. Equality against stored entries uses direct
-identity comparison helpers built on `LedgerEntryIdCmp` /
-`BucketEntryIdCmp` (`src/bucket/InMemoryIndex.cpp`), removing the
-per-lookup `LedgerKey` deep-copy.
+`src/bucket/InMemoryIndex.h` with a non-allocating value-only
+`InternalInMemoryBucketEntry` that stores the existing `IndexPtrT`
+directly and caches the entry's `LedgerKey` hash once at construction
+time (`mHash`).
+
+`InternalInMemoryBucketEntryHash` and `InternalInMemoryBucketEntryEqual`
+are declared `is_transparent`, so the underlying
+`std::unordered_set<InternalInMemoryBucketEntry, …>` supports C++20
+heterogeneous lookup — `mEntries.find(searchKey)` is called with a
+`LedgerKey const&` directly, with no `QueryKey` wrapper, no heap
+allocation, and no virtual dispatch.
+
+Equality against stored entries goes through hand-rolled single-pass
+identity equality helpers in `src/bucket/InMemoryIndex.cpp`:
+`bucketEntryKeyEqual(BucketEntry const&, LedgerKey const&)` and
+`ledgerEntryDataKeyEqual(LedgerEntry::_data_t const&, LedgerKey const&)`.
+These compare only the identifying fields per `LedgerEntryType`,
+matching `LedgerEntryIdCmp`'s semantics in a single pass instead of the
+double-`!cmp(a,b) && !cmp(b,a)` pattern, and crucially without
+constructing an intermediate `LedgerKey` from the stored side. A
+`bucketEntriesKeyEqual(BucketEntry const&, BucketEntry const&)` helper
+covers the entry-vs-entry path used during set internals (insert/dedup).
+
+The stored-entry layout is unchanged — only the `IndexPtrT` is held —
+so the memory footprint of the in-memory bucket index is unaffected.
 
 Net effect on the lookup path:
 - No `make_unique<QueryKey>` per `find`.
@@ -73,10 +90,12 @@ prior final-review "needs revision" verdict is overridden.
   entry that stores `IndexPtrT` and caches the entry hash; added
   transparent hash/equality functors for `LedgerKey` heterogeneous
   lookup.
-- `src/bucket/InMemoryIndex.cpp` — added direct identity comparison
-  helpers (`LedgerEntryIdCmp` / `BucketEntryIdCmp`-based); changed
-  `InMemoryBucketState::insert` and `InMemoryBucketState::scan` to use
-  the new representation and call `mEntries.find(searchKey)` directly.
+- `src/bucket/InMemoryIndex.cpp` — added single-pass identity equality
+  helpers (`ledgerEntryDataKeyEqual`, `bucketEntryKeyEqual`,
+  `bucketEntriesKeyEqual`) that match `LedgerEntryIdCmp` semantics
+  without intermediate `LedgerKey` construction; implemented the new
+  entry / equality functor methods; changed `InMemoryBucketState::scan`
+  to call `mEntries.find(searchKey)` directly via heterogeneous lookup.
 
 ## Commit
 <to be filled after commit>
