@@ -177,3 +177,62 @@ The optimization removes the hot-path heap allocation, vtable dispatch, and temp
 ### Test Results
 
 Built successfully with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` and `make -j30`. Full regression suite completed successfully with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`; the test tail reported Rust tests passing and `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, `All 2 tests passed`.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-04-27
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The production change is correctness-safe enough to build and pass the full test
+suite, and the top-line apply-load results improved versus the single accepted
+baseline. However, the Tracy evidence does not confirm the claimed mechanism.
+The targeted `InMemoryBucketState::scan` zone did not move in the expected
+direction: the baseline soroswap trace reported `scan` self-time of
+3,139,848,749 ns across 1,445,421 calls, while the three optimized soroswap
+traces reported 3,531,403,280 ns, 3,325,316,325 ns, and 3,171,045,895 ns across
+roughly the same number of calls. A normalized `DiffTracyCSV.py` comparison of
+the baseline against the best optimized run showed median event time improving
+slightly (255 ns to 244 ns), but p90 worsening (4 us to 6 us) and total
+`scan` self-time worsening by 391 ms (+12%).
+
+Because the final-review objective requires Tracy to confirm the targeted zone
+improved, the current PoC cannot be confirmed. The observed top-line soroswap
+median improvement may be benchmark variance or improvement elsewhere in the
+run, but it is not explained by the implemented `scan` optimization.
+
+### Revision Instructions
+
+Revise the `InMemoryIndex` lookup change so the `scan` zone itself improves in
+Tracy. In particular, re-check the new equality path: replacing `LedgerKey`
+copy/equality with `LedgerEntryIdCmp` in both directions may be slower for the
+dominant account/trustline keys than the allocation it removed. Consider a
+direct type-specific identity equality helper rather than `!cmp(a, b) &&
+!cmp(b, a)`, and re-measure with the project benchmark.
+
+The next PoC attempt must include:
+
+1. Full `make check` success.
+2. At least three `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py --tracy` runs.
+3. Tracy aggregate and/or normalized `DiffTracyCSV.py` evidence showing
+   `bucket/InMemoryIndex.cpp:scan` total self-time decreases, not just top-line
+   apply time.
+4. An explanation if any top-line win comes from a different apply-path zone.
+
+### Checks Passed So Far
+
+- Build with Tracy-enabled final-review configuration passed.
+- Full regression suite passed with `env NUM_PARTITIONS=30
+  STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make
+  check`.
+- Three apply-load matrix runs completed successfully.
+- Source audit found no test edits and no obvious determinism, lifetime, or
+  thread-safety issue in the changed representation.
+
+### Checks Not Passed
+
+- Tracy did not confirm the targeted `InMemoryBucketState::scan` zone improved;
+  total self-time worsened in all three optimized soroswap traces.
