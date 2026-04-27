@@ -145,3 +145,22 @@ Revise the PoC before another final review:
 - The build succeeds with the configured Tracy flags when using the documented worktree stamp workaround: `make -j30 ALL_SOROBAN_GIT_STATE_STAMPS=`.
 - The full suite passes with `env NUM_PARTITIONS=30 make check ALL_SOROBAN_GIT_STATE_STAMPS=`.
 - Correctness risk from index metadata equivalence appears covered by existing bucket-index tests, but performance evidence is insufficient for confirmation.
+
+---
+
+## Failure Analysis
+
+**Verdict**: INVALID — wrong target path
+**Date**: 2026-04-27
+
+### Why This Hypothesis Failed
+
+The hypothesis targets `createIndex` work that happens inside `BucketOutputIterator::getBucket` after a file-based merge. But that work runs **lazily on the background `Merge task` thread**, not on the apply path. The apply path only synchronously waits on a merge future via `FutureBucket::resolve` when `BucketLevel::commit` promotes a *not-yet-finished* future — which is rare and typically only happens during BucketList level spills that overlap a slow prior merge.
+
+In the soroswap max-TPS workload, merges almost always complete well before the next spill needs them, so shifting `createIndex` work earlier in the same background task does not shorten any critical path that apply actually waits on. Reducing background work that is not on the critical path cannot improve top-line apply time. This is consistent with the benchmark results: across three runs the soroswap median improvement was 0.02% slower / 3.03% faster / 0.20% slower — i.e. noise around zero, with one lucky run.
+
+The trace evidence in the original hypothesis was misread. The 1.146s of `createIndex` and 1.743s of `Merge task` time are wall-clock totals on background threads; only the 296ms of `FutureBucket::resolve` time is actually on the apply path, and of that 296ms only the *unfinished* portion of any given merge is the optimizable surface — not the full `createIndex` cost. There is no mechanism by which removing the second-pass scan (which happens after the merge output is already written) shortens an apply-path wait that already started before the scan would have run.
+
+### Lesson
+
+Background-thread work only matters to apply latency to the extent that apply *blocks* on it. Before optimizing any zone whose Tracy events are not themselves inside `applyLedger` windows, verify the synchronous wait pattern: how often does the apply path actually find the future unresolved, and what fraction of the wait is attributable to the targeted sub-work vs. the rest of the merge? In this case both questions had to be answered before the hypothesis was worth pursuing, and neither was.
