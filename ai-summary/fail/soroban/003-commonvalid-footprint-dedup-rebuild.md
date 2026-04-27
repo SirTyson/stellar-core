@@ -105,7 +105,7 @@ the recoverable cost.
   pricing. The apply-path saving is therefore a fraction of the 4.94 s
   total — back-of-envelope: 4000 × ~7 µs of dedup work × ~1 measured
   ledger / 65 trace ledgers = single-digit-ms range per ledger,
-  potentially ~3–6% of the 620 ms median (right at the Medium
+  potentially ~3-6% of the 620 ms median (right at the Medium
   threshold). Empirical confirmation required.
 - The dedup also enforces RO/RW disjointness, which must continue to be
   enforced. A cache on the frame is fine as long as it is set only after
@@ -122,3 +122,38 @@ the recoverable cost.
   construction path (out of scope but a free speedup), so the change is
   net-positive even if the apply-path share is at the lower end of the
   estimate.
+
+---
+
+## Review
+
+**Verdict**: NOT_VIABLE
+**Date**: 2026-04-27
+**Reviewed by**: gpt-5.5, high
+**Novelty**: PASS
+**Failed At**: reviewer
+
+### Trace Summary
+
+The duplicate-footprint loop does exist in `commonValidPreSeqNum`, and it is reached once per Soroban transaction during sequential or parallel pre-apply. However, the proposed reuse mechanism is wrong for the ledger-apply frames used by the soroswap benchmark: tx-set construction/admission validates one set of `TransactionFrame` objects, then the tx set is round-tripped through XDR, and `LedgerManagerImpl::applyLedger` constructs fresh `TransactionFrame`s in `prepareForApply` before applying. A per-frame "dedup OK" flag populated by earlier validation therefore would not be present when `preParallelApplyReadOnly` calls `commonValid` during ledger apply. Hoisting dedup to the `TransactionFrame` constructor would only move the work into `prepareForApply`; because `run_apply_load_matrix.py` scenarios default to `APPLY_LOAD_TIME_WRITES = true`, the reported top-line `ledger.close` metric includes `prepareForApply`, so this does not eliminate the work from the objective metric.
+
+### Code Paths Examined
+
+- `src/transactions/TransactionFrame.cpp:1461-1489` - `commonValidPreSeqNum` creates a fresh `UnorderedSet<LedgerKey>` and inserts all read-only and read-write footprint keys to enforce uniqueness and RO/RW disjointness.
+- `src/transactions/TransactionFrame.cpp:1665-1695` - `commonValid` always calls `commonValidPreSeqNum`.
+- `src/transactions/TransactionFrame.cpp:1893-1969` - `checkValidWithOptionallyChargedFee` validates a transaction frame during tx admission/tx-set construction, including the common pre-sequence checks.
+- `src/transactions/TransactionFrame.cpp:2145-2187` and `src/transactions/TransactionFrame.cpp:2251-2312` - parallel pre-apply creates a `SignatureChecker` and calls `commonValid(... applying=true ...)`, so the duplicate check is executed during apply validation.
+- `src/transactions/ParallelApplyUtils.cpp:431-465` and `src/transactions/ParallelApplyUtils.cpp:526-583` - protocol-26 parallel pre-apply either calls `preParallelApply` sequentially for fallback cases or batches `preParallelApplyReadOnly` across workers, both using the freshly prepared apply tx frames.
+- `src/herder/TxSetFrame.cpp:1148-1177`, `src/herder/TxSetFrame.cpp:1382-1434`, and `src/herder/TxSetFrame.cpp:450-566` - tx-set preparation round-trips through XDR and creates new `TransactionFrame` objects via `TransactionFrameBase::makeTransactionFromWire`; earlier validation does not reuse the same frame instances.
+- `src/ledger/LedgerManagerImpl.cpp:1488-1586` - the `ledger.close` timer starts before `prepareForApply`, so constructor-time dedup work would still be counted by the default matrix top-line metric.
+- `src/ledger/LedgerManagerImpl.cpp:1668-1688` - the narrower `transaction.total-apply` timer starts after `prepareForApply`, so moving work to construction would improve only this narrower metric, not the default objective metric.
+- `src/simulation/ApplyLoad.cpp:2265-2308` and `scripts/run_apply_load_matrix.py:34-40,417-425` - apply-load uses `ledger.close` when `APPLY_LOAD_TIME_WRITES` is true, and matrix scenarios default `time_writes` to true.
+- `src/ledger/LedgerHashUtils.h:136-200` and `src/crypto/ShortHash.h:35-55` - `CONTRACT_DATA` hashing does archive the `SCVal` into SipHash, but current `xdrComputeHash` is explicitly non-allocating and equivalent to `computeHash(xdr_to_opaque(...))` without creating a temporary buffer.
+
+### Why It Failed
+
+The claimed redundancy is not available to a `TransactionFrame`-local cache on the frames that actually execute ledger apply: the validated/admitted frames are not the apply frames. A constructor-time cache is correctness-preserving, but it merely shifts the duplicate-detection cost from pre-apply into `prepareForApply`, which is still inside the default `ledger.close` measurement used by the objective. This may reduce the narrower `ledger.transaction.total-apply` timer, but it is not expected to produce the required 3-10% reduction in the top-line soroswap apply-load result, and the mechanism also overstates the hash cost by claiming `xdrComputeHash` allocates via `xdr_to_opaque`.
+
+### Lesson Learned
+
+For apply-load optimization hypotheses, distinguish per-frame validation reuse from per-XDR transaction reuse: tx-set construction and ledger apply commonly materialize different `TransactionFrame` instances. Optimizations that only move work from `preParallelApply` into `prepareForApply` can look beneficial in phase timings but will not improve the default `run_apply_load_matrix.py` top-line when `APPLY_LOAD_TIME_WRITES` is enabled.
