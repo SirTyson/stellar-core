@@ -107,3 +107,41 @@ The optimization builds the bucket index from the exact stream of entries that `
 ### Test Results
 
 Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`. `make -j $(nproc)` passed using `ALL_SOROBAN_GIT_STATE_STAMPS=` because this worktree stores submodule gitdirs under the worktree gitdir rather than `.git/modules`. `./src/stellar-core test --ll fatal -r simple --abort --disable-dots "[bucket][bucketindex]"` passed all 12 bucket-index test cases, and `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check ALL_SOROBAN_GIT_STATE_STAMPS=` completed successfully with all tests passing.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-04-27
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The implementation built and the full test suite passed, but the benchmark result is not reproducible enough to confirm. Using the accepted baseline from `ai-summary/CURRENT_STATE.md` (`soroswap` median apply time 620.996218 ms; `sac` median apply time 709.638870 ms), three independent optimized runs produced:
+
+| Run | sac median | sac delta | soroswap median | soroswap delta |
+|-----|------------|-----------|-----------------|----------------|
+| 1 | 696.704935 ms | 1.82% faster | 621.093128 ms | 0.02% slower |
+| 2 | 747.969470 ms | 5.40% slower | 602.205256 ms | 3.03% faster |
+| 3 | 756.642514 ms | 6.62% slower | 622.268604 ms | 0.20% slower |
+
+Only one of three runs clears the 3% Medium threshold, and the two non-winning runs are essentially flat-to-regressed for the soroswap headline metric. The only winning soroswap run also has a max-sac regression above the allowed tradeoff envelope. This fails the final-review requirement that soroswap apply-time improvement be consistent across multiple benchmark runs.
+
+The code audit also found a likely source of overhead that may be contributing to the inconsistent result: `BucketOutputIterator` constructs and feeds output-side index builders for all outputs, including paths that later use a caller-supplied `preBuiltIndex` or `inMemoryState` and discard the collected builder state. In particular, the level-0 live `mergeInMemory` path already builds a prebuilt index asynchronously, but the new iterator still collects duplicate in-memory/disk index metadata while serializing the bucket.
+
+### Revision Instructions
+
+Revise the PoC before another final review:
+
+1. Avoid output-side index collection on paths that will not use it, especially `LiveBucket::mergeInMemory` with `preBuiltIndex` and callers passing `inMemoryState`. If this requires an explicit constructor option or lazy builder initialization, keep the default behavior clear and deterministic.
+2. Reduce avoidable large-bucket overhead from accumulating `mInMemoryIndexEntries` up to the live in-memory cutoff when the final bucket will use a disk index, or demonstrate with Tracy that this overhead is below noise.
+3. Re-run the apply-load matrix at least 3 times, preferably 5, and require the soroswap median improvement to be consistent. A single good run among flat/regressed runs is not sufficient.
+4. Include a Tracy comparison against the accepted baseline showing that the targeted bucket zones (`createIndex`, merge task duration, and/or `FutureBucket::resolve`) moved in the expected direction and that no apparent win is coming from TX-set construction zones.
+5. Document the max-sac tradeoff explicitly. If max-sac regresses, the soroswap improvement must be consistently larger and the max-sac regression should stay under the envelope described in the final-review supplement.
+
+### Checks Passed So Far
+
+- Source diff is in scope for the bucket apply path and test edits are mechanical constructor-signature updates only.
+- The build succeeds with the configured Tracy flags when using the documented worktree stamp workaround: `make -j30 ALL_SOROBAN_GIT_STATE_STAMPS=`.
+- The full suite passes with `env NUM_PARTITIONS=30 make check ALL_SOROBAN_GIT_STATE_STAMPS=`.
+- Correctness risk from index metadata equivalence appears covered by existing bucket-index tests, but performance evidence is insufficient for confirmation.

@@ -201,3 +201,45 @@ will all `getTTLKey(lk)` derivations on the load-side path.
 - Concurrency is preserved: combined fetch reads the same per-thread
   / global / in-memory state with the same locking discipline as the
   current two-call version. No new shared state.
+
+---
+
+## Review
+
+**Verdict**: NOT_VIABLE
+**Date**: 2026-04-27
+**Reviewed by**: gpt-5.5, high
+**Novelty**: PASS — not previously investigated
+**Failed At**: reviewer
+
+### Trace Summary
+
+The apply path reaches `InvokeHostFunctionOpFrame::doParallelApply`, constructs `InvokeHostFunctionParallelApplyHelper`, and calls `InvokeHostFunctionApplyHelper::addFootprint`, which calls `addReads` for read-only and read-write footprint vectors. `addReads` does derive a TTL key and performs a TTL lookup before the data lookup for every live Soroban entry, so the local inefficiency exists. However, the current parallel-apply implementation already preloads Soroban read-only data and TTL entries into the global/thread maps, and the transaction/thread maps model TTL changes as separate ledger entries; a correct combined API cannot simply take the inline TTL from `InMemorySorobanState` for the common hot path without also checking the TTL-key maps for bumps/restores/deletes. The remaining avoidable work is therefore far below the claimed Medium impact.
+
+### Code Paths Examined
+
+- `src/ledger/LedgerManagerImpl.cpp:2483-2510` — worker threads call `txBundle.getTx()->parallelApply`, then commit successful transaction changes into the thread state.
+- `src/ledger/LedgerManagerImpl.cpp:2531-2554` — each cluster constructs a `ThreadParallelApplyLedgerState` before launching `applyThread`.
+- `src/ledger/LedgerManagerImpl.cpp:2673-2709` and `src/ledger/LedgerManagerImpl.cpp:2967-3029` — `applyParallelPhase` builds bundles and runs Soroban stages through `GlobalParallelApplyLedgerState`.
+- `src/transactions/InvokeHostFunctionOpFrame.cpp:386-498` — `addReads` derives `getTTLKey(lk)`, calls `getLedgerEntryOpt(ttlKey)`, then calls `getLedgerEntryOpt(lk)` for live Soroban entries.
+- `src/transactions/InvokeHostFunctionOpFrame.cpp:541-548` — `addFootprint` invokes `addReads` for both read-only and read-write footprints.
+- `src/transactions/InvokeHostFunctionOpFrame.cpp:1358-1377` — the parallel apply helper is the Soroswap/P23+ path that reaches `addReads`.
+- `src/transactions/ParallelApplyUtils.cpp:337-342` — `ParallelLedgerAccessHelper::getLedgerEntryOpt` delegates each lookup into `TxParallelApplyLedgerState::getLiveEntryOpt`.
+- `src/transactions/ParallelApplyUtils.cpp:646-718` — read-only Soroban entries and their TTL entries are already preloaded from `InMemorySorobanState`/snapshot into the global map once before parallel execution.
+- `src/transactions/ParallelApplyUtils.cpp:970-982` — thread construction copies both data keys and TTL keys from the global map into the thread map for every footprint key present globally.
+- `src/transactions/ParallelApplyUtils.cpp:1084-1120` — thread lookup checks the thread map first and only falls through to `InMemorySorobanState` or the LCL snapshot on a miss.
+- `src/transactions/ParallelApplyUtils.cpp:1294-1314` — transaction lookup checks the per-tx map before adopting from the thread state.
+- `src/transactions/ParallelApplyUtils.cpp:1010-1063` and `src/transactions/ParallelApplyUtils.cpp:1164-1195` — TTL bumps are represented and flushed as separate TTL-key entries, so correctness requires checking TTL-key state independently of the data key.
+- `src/ledger/InMemorySorobanState.h:46-86` and `src/ledger/InMemorySorobanState.cpp:206-238,412-446` — `InMemorySorobanState` stores TTL data inline and can reconstruct TTL entries, but this only applies after the parallel maps miss.
+- `src/ledger/LedgerTypeUtils.cpp:31-37` — `getTTLKey` performs the SHA256/XDR-derived key construction that `addReads` pays before the TTL lookup.
+- `src/simulation/ApplyLoad.cpp:3447-3475` — Soroswap footprints have five Soroban read-only keys and three Soroban read-write keys; the two user trustlines in the read-write footprint are classic entries, not Soroban entries.
+
+### Why It Failed
+
+The proposed optimization overstates both the call count and the recoverable cost. Soroswap has eight Soroban footprint keys per transaction, not ten, because two read-write footprint keys are classic trustlines. More importantly, the hottest read-only path does not perform two full fall-through lookups into `InMemorySorobanState` per transaction: `GlobalParallelApplyLedgerState` already preloads read-only Soroban entries and TTLs, and `ThreadParallelApplyLedgerState` copies those entries into `mThreadEntryMap`, so per-transaction reads mostly pay an empty tx-map probe plus a thread-map hit for each of the data and TTL keys.
+
+A correct combined fetch also cannot just use the inline TTL next to the data entry. In parallel apply, per-tx and per-thread state can contain TTL bumps or TTL deletes as distinct TTL-key ledger entries while the data entry is unchanged. Any combined accessor must either continue probing those TTL-key maps or redesign the parallel-entry representation to store data and TTL together. That makes the stated “one lookup at every layer” mechanism incorrect for the current data structures, and the remaining savings from avoiding a subset of `getTTLKey` derivations / map probes is below the optimize-soroswap Medium threshold.
+
+### Lesson Learned
+
+For Soroban footprint-loading optimizations, distinguish the persistent `InMemorySorobanState` representation from the parallel-apply overlay maps. Inline TTL storage helps only after the overlay maps miss; once data and TTL are materialized as separate overlay entries, a correctness-preserving optimization must account for independent TTL bumps and cannot assume the data-key lookup also observes the current TTL.
