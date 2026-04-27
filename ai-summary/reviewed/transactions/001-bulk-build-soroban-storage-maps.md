@@ -1,0 +1,77 @@
+# H001: Bulk-build Soroban storage maps instead of repeated persistent inserts
+
+**Date**: 2026-04-27
+**Subsystem**: transactions
+**Severity**: Medium
+**Impact**: Soroswap apply-time reduction by removing allocation/copy churn during host input construction
+**Hypothesis by**: gpt-5.5, high
+
+## Expected Behavior
+
+Before invoking a Soroban contract, Core should construct the host footprint and storage maps with the same entries, ordering, duplicate rejection, and metering as today, but should avoid repeatedly rebuilding whole immutable `MeteredOrdMap` values while decoding a single transaction's footprint. The resulting `Footprint` and `StorageMap` should be byte-for-byte semantically equivalent from the host's perspective, and all validation errors for unsupported keys, duplicates, and missing footprint entries should remain deterministic.
+
+## Mechanism
+
+`build_storage_footprint_from_xdr` and `build_storage_map_from_xdr_ledger_entries` both start with an empty `MeteredOrdMap` and call `insert` once per footprint or ledger entry. `MeteredOrdMap::insert` performs a binary search and then builds a new vector through `from_exact_iter`, copying the prefix, new pair, and suffix on every insert; this is allocation-heavy and becomes quadratic in the number of entries in a soroswap invocation footprint. A bulk builder that collects `(Rc<LedgerKey>, AccessType)` and `(Rc<LedgerKey>, Option<EntryWithLiveUntil>)` pairs, sorts/validates them once with the same `Compare` semantics, and constructs the `MeteredOrdMap` once should reduce map-construction CPU and allocation time without changing deterministic map order.
+
+## Trigger
+
+Run the current soroswap apply-load benchmark with Tracy and inspect the headline trace `/mnt/nvme2/apply-load/14571316dcdf-20260427-185013/logs/14571316dcdf-20260427-185013-02-soroswap-tx-4000-t-8.tracy`. In the hottest `applyLedger` interval, `new map` accounts for 185.088 ms across 55,636 calls, `map lookup` accounts for 616.494 ms across 330,392 calls, and these zones occur under `parallelApply` / `InvokeHostFunctionOpFrame doParallelApply`, not tx-set construction. A PoC should replace the repeated insert loops in the host input builders with one-shot construction and compare soroswap median apply time over repeated runs.
+
+## Target Code
+
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:933-956` — `build_storage_footprint_from_xdr` inserts every read-write and read-only footprint key into `FootprintMap` one at a time.
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:959-1052` — `build_storage_map_from_xdr_ledger_entries` inserts decoded ledger entries and footprint-only missing entries into `StorageMap` one at a time.
+- `src/rust/soroban/p26/soroban-env-host/src/host/metered_map.rs:196-222` — `MeteredOrdMap::insert` creates a new map via `from_exact_iter` for each insert.
+- `src/rust/soroban/p26/soroban-env-host/src/host/metered_map.rs:144-160` — `from_exact_iter` performs the allocation/copy and revalidates map order.
+
+## Evidence
+
+The target is in the apply path: `InvokeHostFunctionOpFrame doParallelApply` totals 4721.775 ms of worker time in the hottest `applyLedger` window, and `e2e_invoke::invoke_host_function` builds the footprint/storage maps before calling `Host::invoke_function`. The source shows repeated immutable-map inserts in both footprint and storage construction, and each insert delegates to a full `from_exact_iter` rebuild. The trace's `new map` call count is far larger than the 1458 successful invoke calls in the hottest apply window, which is consistent with per-entry map reconstruction rather than one map allocation per transaction.
+
+## Anti-Evidence
+
+`MeteredOrdMap::insert` currently centralizes duplicate/order validation and metered cloning, so a bulk builder must preserve error behavior and budget charges rather than bypassing them. If soroswap footprints are very small after setup, the optimization may only remove a fraction of the 185 ms aggregate worker self-time; the PoC must demonstrate at least a Medium-tier top-line apply-time reduction, not just a cleaner construction path.
+
+---
+
+## Review
+
+**Verdict**: VIABLE
+**Severity**: Medium
+**Date**: 2026-04-27
+**Reviewed by**: gpt-5.5, high
+**Novelty**: PASS — not previously investigated
+
+### Trace Summary
+
+The hypothesis target is on the measured Soroban apply path: `LedgerManagerImpl::applyThread` calls `TransactionFrame::parallelApply`, which dispatches to `InvokeHostFunctionOpFrame::doParallelApply`, builds C++ ledger-entry buffers for the footprint, and calls `rust_bridge::invoke_host_function`. The Rust host decodes `SorobanResources`, builds the `Footprint`, `StorageMap`, and `TtlEntryMap` before `Host::invoke_function`, and all three are currently constructed with repeated immutable `MeteredOrdMap::insert` calls. For the soroswap benchmark each swap transaction has 5 read-only and 5 read-write footprint keys, so the loops execute thousands of times per ledger; the log for the referenced run shows steady-state 4000-tx Soroban ledger apply around 628 ms median, making the traced 185 ms aggregate worker time in `new map` plus removable insert-time lookup work plausibly Medium-tier when spread across 8 clusters.
+
+### Code Paths Examined
+
+- `src/ledger/LedgerManagerImpl.cpp:2483-2574` — `applyThread` applies every tx in a cluster on an async worker, and `applySorobanStageClustersInParallel` waits for all cluster futures; this places worker-side map construction on the apply critical path.
+- `src/transactions/TransactionFrame.cpp:2385-2448` — `TransactionFrame::parallelApply` invokes the single Soroban operation and records successful effects; failed validation is skipped before this path.
+- `src/transactions/InvokeHostFunctionOpFrame.cpp:308-340,386-520,557-584,1358-1377` — the invoke helper reserves per-footprint CXX buffers, iterates footprint keys to load ledger/TTL entries, then calls the Rust bridge from `doParallelApply`.
+- `src/transactions/TransactionFrame.cpp:825-1043,1319-1490` — Soroban resource validation checks footprint size/type/key limits and rejects duplicate keys across read-only and read-write footprints before apply, so valid apply inputs are already unique.
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:408-451` — `invoke_host_function` builds the restored set, footprint, storage map, and initial TTL map before constructing `Storage` and invoking the host function.
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:933-1052` — `build_storage_footprint_from_xdr` inserts every footprint key into `FootprintMap`; `build_storage_map_from_xdr_ledger_entries` inserts decoded entries into `StorageMap`, inserts TTLs into `TtlEntryMap`, then performs a missing-footprint pass with `contains_key` and `insert`.
+- `src/rust/soroban/p26/soroban-env-host/src/host/metered_map.rs:117-160,196-222` — `from_map` validates sorted unique maps, `from_exact_iter` allocates/copies a vector and emits the `new map` Tracy zone, and `insert` performs `find` plus full map reconstruction on every entry.
+- `src/rust/soroban/p26/soroban-env-host/src/host/comparison.rs:397-430` — `Budget` provides the deterministic, metered `Compare<LedgerKey>` ordering that a bulk builder must use when sorting collected pairs.
+- `src/simulation/ApplyLoad.cpp:3382-3505` — the soroswap benchmark generates each swap with 5 read-only and 5 read-write footprint keys, making repeated map construction per transaction material at 4000 tx/ledger.
+
+### Findings
+
+The inefficiency exists exactly as claimed. `MeteredOrdMap::insert` is immutable: it binary-searches the existing vector and constructs a full replacement map through `from_exact_iter`, so using it in input-build loops creates repeated allocation/copy/order-validation work. The target loops are not setup-only or transaction-generation work; they execute inside the Rust invocation reached from `InvokeHostFunctionOpFrame::doParallelApply` during `closeLedger`.
+
+The proposed fix is correctness-preserving if implemented as a metered bulk construction path rather than by bypassing map invariants. A safe implementation should collect key/value pairs using the same `Rc::metered_new` and XDR decoding checks, sort with `Budget`'s `Compare<LedgerKey>` semantics, then call `MeteredOrdMap::from_map` once so sortedness, uniqueness, maximum length, and scan charges are still enforced. It must also handle the `TtlEntryMap` insert at `e2e_invoke.rs:1025`; otherwise a significant fraction of the repeated `new map` work remains.
+
+The main semantic edge case is duplicate behavior. The host builder's current `insert` would replace duplicate keys, but `TransactionFrame::commonValidPreSeqNum` rejects duplicates across the Soroban footprint before parallel apply, and the C++ buffers are derived from that validated footprint, so valid apply traffic should never depend on replacement semantics. For internal or malformed inputs, the bulk path should return deterministic `HostError`s from `from_map` or explicit validation rather than silently changing accepted inputs.
+
+Severity is Medium, not High. The referenced benchmark log has steady-state 4000-tx Soroban apply around 628 ms median with 8 configured clusters; removing most of 185 ms aggregate worker time in `new map` plus the insert-specific part of `map lookup` can plausibly save roughly 20-40 ms wall time, or about 3-6%, but it does not restructure a dominant phase enough to project >10%.
+
+### PoC Guidance
+
+- **Target code**: `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs::{build_storage_footprint_from_xdr, build_storage_map_from_xdr_ledger_entries}` and `src/rust/soroban/p26/soroban-env-host/src/host/metered_map.rs`.
+- **Change description**: Add a metered/fallible bulk construction helper for `MeteredOrdMap` keyed by `Rc<LedgerKey>` or local builder helpers in `e2e_invoke.rs`. Build `FootprintMap`, `StorageMap`, and `TtlEntryMap` from collected vectors, sort with `Budget::compare` on ledger keys, and construct each map once with `from_map`.
+- **Correctness check**: Preserve `Storage::check_supported_ledger_key_type`, `ledger_entry_to_ledger_key`, TTL expiration handling, ledger/TTL length mismatch handling, footprint membership checks, missing-entry insertion, and duplicate rejection/error behavior. Existing e2e host tests under `src/rust/soroban/p26/soroban-env-host/src/test/e2e_tests.rs` and C++ Soroban transaction tests cover host invocation, storage, TTL, restore, and footprint validation behavior.
+- **Benchmark focus**: Run the soroswap apply-load matrix repeatedly and compare median apply time, not just Tracy zone totals. Expected improvement should come from fewer `new map` calls and fewer insert-time `map lookup` calls, with a target top-line apply reduction in the 3-6% range to satisfy the objective threshold.
