@@ -198,3 +198,24 @@ The projected impact plausibly meets the objective's Medium floor but should be 
 - **Change description**: Launch each worker before constructing its `ThreadParallelApplyLedgerState`. The worker should construct `std::make_unique<ThreadParallelApplyLedgerState>(app, globalState, cluster, clusterIdx)` inside the async callable and then execute the existing per-transaction loop, returning the completed state. Keep `DeactivateScopeGuard globalStateDeactivateGuard(globalState)` alive across all worker construction and execution.
 - **Correctness check**: Preserve global-state deactivation during thread-state adoption, preserve deterministic cluster order when collecting returned `threadStates` and when `commitChangesFromThreads` iterates them, and ensure no async lambda captures the loop variable `i` or `cluster` by dangling reference.
 - **Benchmark focus**: Compare `scripts/run_apply_load_matrix.py` for the active `soroswap,TX=4000,T=8` scenario over repeated runs. The expected improvement should show up in top-line close/apply time and in the phase table's `soroban_parallel` / `parallel_total` rows; adding a temporary Tracy zone around thread-state construction can split constructor time from `future.get()` wait if the result is ambiguous.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-04-27
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/ledger/LedgerManagerImpl.h:372-377` and `src/ledger/LedgerManagerImpl.cpp:2483-2553`: changed `applyThread` to receive `GlobalParallelApplyLedgerState`, `Cluster`, and `clusterIdx`, construct its own `ThreadParallelApplyLedgerState` on the async worker, and launch futures without doing per-cluster thread-state construction on the apply thread.
+- `src/transactions/ParallelApplyUtils.h:114-116` and `src/transactions/ParallelApplyUtils.cpp:924-996`: removed the now-invalid main/apply-thread registration assertion from `collectClusterFootprintEntriesFromGlobal`, since the helper is private to thread-state construction and now intentionally runs on unregistered `std::async` worker threads while reading immutable global state.
+
+### Demonstration
+
+The launch loop in `applySorobanStageClustersInParallel` now starts each async worker immediately and passes only stable references plus the cluster index into the future. Each worker overlaps `ThreadParallelApplyLedgerState` construction, including restored-entry copying, module-cache shallow clone, cluster footprint reservation, global-entry lookups, TTL-key derivation, and global-to-thread scoped-entry adoption, with the other clusters instead of serializing that setup on the apply thread. `DeactivateScopeGuard globalStateDeactivateGuard(globalState)` remains alive across worker construction and execution, and futures are collected in launch order, preserving deterministic merge order.
+
+### Test Results
+
+Configured and built with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` and `make -j30`. Ran the full suite with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make -j30 check`; it completed with exit code 0. The final summaries included `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and Rust unit-test summaries with zero failures, including `test result: ok. 750 passed; 0 failed; 2 ignored; 0 measured; 1 filtered out`.
