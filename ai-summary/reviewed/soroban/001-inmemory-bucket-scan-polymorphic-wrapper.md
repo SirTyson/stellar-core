@@ -112,3 +112,46 @@ CPU outside the Soroban host.
   embedded key). For very large in-memory bucket caches this could
   matter; mitigation is a transparent-hash design that keeps the
   current single-stored-key layout but skips the wrapper on lookup.
+
+---
+
+## Review
+
+**Verdict**: VIABLE
+**Severity**: Medium
+**Date**: 2026-04-27
+**Reviewed by**: gpt-5.5, high
+**Novelty**: PASS — no prior Soroban or cross-subsystem fail/success records found
+
+### Trace Summary
+
+The claimed inefficiency exists exactly as described: `InMemoryBucketState::scan` constructs an `InternalInMemoryBucketEntry(searchKey)`, which heap-allocates a `QueryKey`, then `unordered_set::find` calls virtual hash/equality methods that materialize `LedgerKey` values through `copyKey()`. The call is on the apply hot path through `LedgerTxnRoot::Impl::getNewestVersion` and `LedgerStateSnapshot::loadLiveEntry`, then `SearchableBucketListSnapshot::load/getBucketEntry`, and the bulk prefetch path also reaches `SearchableBucketListSnapshot::loadKeysFromBucket` and `LiveBucketIndex::scan`. Small live buckets use `InMemoryIndex` by design under the default 20 MB cutoff, so the wrapper is exercised repeatedly during soroswap apply fan-out rather than being a one-time setup cost.
+
+### Code Paths Examined
+
+- `src/ledger/LedgerManagerImpl.cpp:2303-2440` — fee/sequence processing calls per-transaction ledger loads during `closeLedger`.
+- `src/ledger/LedgerManagerImpl.cpp:2784-2915` — transaction apply performs prefetching, loads Soroban config, then applies classic/sequential and Soroban/parallel phases inside `closeLedger`.
+- `src/ledger/LedgerTxn.cpp:3669-3724` — `LedgerTxnRoot::Impl::getNewestVersion` checks the root entry cache, then loads non-offer entries via `getLedgerStateSnapshot().loadLiveEntry(key)` and caches the result.
+- `src/ledger/LedgerTxn.cpp:3100-3155` — `LedgerTxnRoot::Impl::prefetch` bulk-loads keys with `getLedgerStateSnapshot().loadLiveKeys`, so prefetched apply keys also traverse the bucket snapshot indexes.
+- `src/ledger/LedgerStateSnapshot.cpp:438-449` — `LedgerStateSnapshot::loadLiveEntry` and `loadLiveKeys` delegate to `SearchableLiveBucketListSnapshot`.
+- `src/bucket/BucketListSnapshot.cpp:170-201` — `getBucketEntry` calls `bucket->getIndex().lookup(k)` and returns in-memory cache hits directly for live buckets.
+- `src/bucket/BucketListSnapshot.cpp:210-276` — bulk loads call `index.scan(indexIter, *currKeyIt)` for each requested key/bucket pair.
+- `src/bucket/BucketListSnapshot.cpp:313-345` — point loads loop newest-to-oldest over all live buckets until a key is found.
+- `src/bucket/LiveBucketIndex.cpp:28-60` — buckets below `BUCKETLIST_DB_INDEX_CUTOFF` use `InMemoryIndex`; default config sets the cutoff to 20 MB.
+- `src/bucket/LiveBucketIndex.cpp:223-257` — both `lookup` and `scan` route in-memory-index buckets to `InMemoryIndex::scan`.
+- `src/bucket/InMemoryIndex.h:26-142` — `InternalInMemoryBucketEntry` stores a `std::unique_ptr<AbstractEntry>`; `QueryKey` and `ValueEntry` use virtual `hash`, `copyKey`, and equality.
+- `src/bucket/InMemoryIndex.cpp:55-76` — `insert` pays the stored-entry wrapper once, while every `scan` pays `InternalInMemoryBucketEntry(searchKey)` and `mEntries.find(...)`.
+- `configure.ac:52` — the project requires C++20, so a heterogeneous `unordered_set` design is a plausible fix rather than a future-toolchain-only idea.
+
+### Findings
+
+The inefficiency is real and hot. There is no cache layer that removes it for in-memory buckets: the live bucket random-eviction cache is intentionally skipped when `mInMemoryIndex` is present, and `LedgerTxnRoot` caching only prevents repeat loads of the same key after an entry-cache hit, not the initial fan-out across bucket levels. `InMemoryBucketState::scan` ignores the `start` iterator and performs an unordered lookup, so for in-memory buckets the returned iterator contract is already degenerate and can be preserved while changing the lookup representation.
+
+The proposed optimization is correctness-preserving if it keeps the same key identity semantics as `getBucketLedgerKey`/`std::hash<LedgerKey>` and continues returning the stored `shared_ptr<BucketEntry const>` on hits. A transparent lookup that stores the existing bucket entry pointer and compares/hashes against a `LedgerKey const&` avoids the hot allocation and virtual dispatch without duplicating all stored keys; an `unordered_map<LedgerKey, IndexPtrT>` would also work functionally but has a higher memory tradeoff. Given the supplied trace attributes 3.14 s of self-time and 1.45 M calls to this function during a soroswap run, even a partial reduction of the per-call cost is projected to clear the objective's 3% Medium threshold.
+
+### PoC Guidance
+
+- **Target code**: `src/bucket/InMemoryIndex.h` and `src/bucket/InMemoryIndex.cpp`, specifically `InternalInMemoryBucketEntry`, `InternalInMemoryBucketEntryHash`, `InMemoryBucketState::insert`, and `InMemoryBucketState::scan`.
+- **Change description**: replace the polymorphic `unique_ptr<AbstractEntry>` wrapper with a non-allocating representation that stores the existing `IndexPtrT` for values and supports heterogeneous `unordered_set::find(LedgerKey const&)`. Define transparent hash/equality functors that hash/compare `LedgerKey const&` directly against `getBucketLedgerKey(*entry)` so query lookup does not allocate and does not virtual-dispatch.
+- **Correctness check**: existing bucket index tests in `src/bucket/test/BucketIndexTests.cpp` cover in-memory index lookup behavior, cutoff behavior, equality, and bucket index construction. The PoC should also run a Soroban/apply-load smoke benchmark because the optimization is performance-only and should not change bucket contents or lookup results.
+- **Benchmark focus**: run `scripts/run_apply_load_matrix.py` for the soroswap scenario and compare top-line apply time plus Tracy/self-time for `InMemoryBucketState::scan`; the expected improvement is a substantial drop in `scan` self-time and at least a reproducible 3% apply-time reduction.
