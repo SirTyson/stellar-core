@@ -79,7 +79,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     # ),
     Scenario(
         model_tx="sac",
-        tx_count=6000,
+        tx_count=12000,
         thread_count=8,
     ),
     # Scenario(
@@ -119,7 +119,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     # ),
     Scenario(
         model_tx="soroswap",
-        tx_count=2000,
+        tx_count=4000,
         thread_count=8,
     ),
 )
