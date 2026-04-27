@@ -1,8 +1,8 @@
 {
-  "hypothesis_viable": 0,
-  "hypothesis_not_viable": 0,
-  "review_viable": 2,
-  "review_not_viable": 0,
+  "hypothesis_viable": 2,
+  "hypothesis_not_viable": 1,
+  "review_viable": 3,
+  "review_not_viable": 1,
   "poc_viable": 0,
   "poc_not_viable": 0,
   "final_review_viable": 0,
@@ -12,47 +12,71 @@
   "publishes": 0,
   "agent_failures": 0,
   "agent_timeouts": 0,
-  "total_spawned": 4,
+  "total_spawned": 7,
   "input_tokens": 0,
-  "output_tokens": 16415,
+  "output_tokens": 54321,
   "cache_read_tokens": 0,
   "per_subsystem": {
     "bucket": {
       "review_viable": 1
     },
     "soroban": {
-      "review_viable": 1
+      "review_viable": 2
+    },
+    "soroban-env": {
+      "hypothesis_viable": 2,
+      "hypothesis_not_viable": 1,
+      "review_not_viable": 1
     }
   },
   "per_model": {
     "gpt-5.5": {
-      "review_viable": 2
+      "review_viable": 3,
+      "hypothesis_viable": 2,
+      "review_not_viable": 1
     }
   },
   "tokens_by_stage": {
     "reviewer": {
       "input": 0,
-      "output": 16415,
+      "output": 39554,
+      "cache_read": 0
+    },
+    "hypothesis": {
+      "input": 0,
+      "output": 14767,
       "cache_read": 0
     }
   },
   "tokens_by_model": {
     "gpt-5.5": {
       "input": 0,
-      "output": 16415,
+      "output": 54321,
       "cache_read": 0
     }
   },
   "by_phase": {
     "reviewer": {
       "gpt-5.5": {
-        "viable": 2,
-        "not_viable": 0,
+        "viable": 3,
+        "not_viable": 1,
         "needs_revision": 0,
         "error": 0,
         "timeout": 0,
         "input_tokens": 0,
-        "output_tokens": 16415,
+        "output_tokens": 39554,
+        "cache_read_tokens": 0
+      }
+    },
+    "hypothesis": {
+      "gpt-5.5": {
+        "viable": 2,
+        "not_viable": 1,
+        "needs_revision": 0,
+        "error": 0,
+        "timeout": 0,
+        "input_tokens": 0,
+        "output_tokens": 14767,
         "cache_read_tokens": 0
       }
     }
@@ -67,6 +91,21 @@
       "reviewer",
       "gpt-5.5",
       335.5
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      213.5
+    ],
+    [
+      "hypothesis",
+      "gpt-5.5",
+      318.8
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      225.9
     ]
   ],
   "costs": {
@@ -75,22 +114,29 @@
         "models": {
           "gpt-5.5": {
             "input_tokens": 0,
-            "output_tokens": 16415,
+            "output_tokens": 54321,
             "cache_read_tokens": 0,
-            "total_cost": 0.45,
-            "premium_requests": 15.0
+            "total_cost": 1.125,
+            "premium_requests": 37.5
           }
         },
-        "provider_cost": 0.45
+        "provider_cost": 1.125
       }
     },
-    "total_cost": 0.45,
+    "total_cost": 1.125,
     "stages": {
       "reviewer": {
         "copilot": {
           "input_tokens": 0,
-          "output_tokens": 16415,
-          "premium_requests": 15.0
+          "output_tokens": 39554,
+          "premium_requests": 30.0
+        }
+      },
+      "hypothesis": {
+        "copilot": {
+          "input_tokens": 0,
+          "output_tokens": 14767,
+          "premium_requests": 7.5
         }
       }
     }
