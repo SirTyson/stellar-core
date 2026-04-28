@@ -75,3 +75,26 @@ Severity is assessed as Medium rather than High. The serial work is real and exe
 - **Change description**: Launch one async task per cluster without first constructing `ThreadParallelApplyLedgerState` on the apply thread. The async task should construct its own `ThreadParallelApplyLedgerState` from `(app, globalState, cluster, clusterIdx)`, then run the existing per-cluster apply loop and return the state. Keep `DeactivateScopeGuard globalStateDeactivateGuard(globalState)` in the parent function until all futures have been joined, and keep collecting futures in cluster-index order before `commitChangesFromThreads`.
 - **Correctness check**: Existing parallel Soroban tests should cover ordering, scope adoption, TTL bumps, restored entries, and deterministic merge behavior (`src/transactions/test/ParallelApplyTest.cpp` and Soroban invoke-host tests). Also verify invariant checks still run after future completion and before global merge.
 - **Benchmark focus**: Run `scripts/run_apply_load_matrix.py --tracy` for the active soroswap `TX=4000, T=8` scenario and compare top-line apply time across repeated runs. Add a temporary Tracy zone or timing split around `ThreadParallelApplyLedgerState` construction in the PoC branch to confirm the constructor setup component moves from serialized per-stage time into worker time; expected accepted impact is a reproducible 3-10% apply-time reduction unless constructor setup proves to dominate enough for High.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-04-28
+**PoC by**: claude-opus-4.7, high
+
+### Changes Made
+
+- `src/ledger/LedgerManagerImpl.h:372-377` — Changed `applyThread` signature to take `(GlobalParallelApplyLedgerState const& globalState, Cluster const& cluster, size_t clusterIdx, ...)` instead of a pre-built `std::unique_ptr<ThreadParallelApplyLedgerState>`.
+- `src/ledger/LedgerManagerImpl.cpp:2483-2497` — `applyThread` now constructs its own `ThreadParallelApplyLedgerState(app, globalState, cluster, clusterIdx)` as the first step, so per-cluster setup work runs on the worker thread. Added `ZoneScoped` to make the worker-side construction visible in Tracy.
+- `src/ledger/LedgerManagerImpl.cpp:2545-2554` — `applySorobanStageClustersInParallel` no longer calls `std::make_unique<ThreadParallelApplyLedgerState>` on the apply thread; it just launches one `std::async` per cluster, passing the global state and cluster index. The `DeactivateScopeGuard` covering the global scope still wraps both launch and future join, so worker-side scope adoption sees `global.mActive == false` as required, and futures are still collected in cluster-index order before `commitChangesFromThreads` for deterministic merge.
+- `src/transactions/ParallelApplyUtils.cpp:924-933` — Removed the `releaseAssert(threadIsMain() || app.threadIsType(APPLY))` at the top of `collectClusterFootprintEntriesFromGlobal`. The async worker threads launched by `std::async` are not registered in `ApplicationImpl::mThreadTypes`, so calling `app.threadIsType(...)` on them would fire the inner `releaseAssert(it != mThreadTypes.end())` in `ApplicationImpl::threadIsType`. Replaced with a comment documenting the new caller-side guarantees (deactivated global scope + no concurrent global mutation until futures join).
+
+### Demonstration
+
+Per-cluster setup work — copying snapshot/config/module-cache handles, scanning every TX footprint in the cluster, and copying matching entries (plus TTL keys) from the global entry map into the new thread map — now runs inside each `std::async` task instead of serially on the apply thread before each launch. With `T=8` soroswap clusters per stage and 37 stages observed in the reference trace, this overlaps the previously-serial setup across up to 8 workers, reducing the per-stage critical path from sum-of-cluster-setup to max-of-cluster-setup. Determinism is preserved because (a) merge order is unchanged (futures collected in cluster index order, then `commitChangesFromThreads` runs sequentially), (b) global-scope deactivation still spans both launch and join, and (c) the constructor only reads immutable global maps and writes its own thread-private maps.
+
+### Test Results
+
+`env NUM_PARTITIONS=$(nproc) STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` passed end-to-end: `All 2 tests passed` for the C++ side (selftest-nopg, check-nondet), and all Rust unit/integration tests for soroban-env-host (p21–p26), soroban-env-common, and the rest of the workspace passed (e.g., 750/750 host tests). No partition log contains a FAILED/assertion/Aborted line attributable to the change.
