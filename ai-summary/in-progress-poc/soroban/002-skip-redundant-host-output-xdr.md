@@ -98,3 +98,33 @@ The PoC removes redundant `metered_write_xdr` calls for data discarded by stella
 ### Test Results
 
 Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`; `make -j $(nproc)` completed successfully. Full regression run `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` completed successfully with `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and all Soroban p26 host checks passing, including `750 passed; 0 failed; 2 ignored; 1 filtered out` for the main p26 host test binary.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-04-28
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The optimization still appears to target a real apply-path inefficiency, but this PoC is not confirmable as written because the implementation changes observable host output and metering semantics instead of adding a core-only output path.
+
+1. `LedgerEntryChange::encoded_key` is a documented public field of `InvokeHostFunctionResult`, but the optimized non-test/non-recording build now leaves it empty for normal `invoke_host_function` results. Unit tests still compile with `cfg(test)` and therefore continue to see populated keys, so the test suite does not exercise the release behavior that downstream embedders would get. This is not the narrow "core-only" optimization described in the review notes.
+2. The PoC removes `metered_write_xdr` calls for old entries and most keys without preserving or explicitly justifying the resulting host-budget change. `InvokeHostFunctionOpFrame` records `out.cpu_insns`/`out.mem_bytes` and enforces declared resource limits against those values, so changing the metering of output materialization can alter transaction success/failure at resource-limit boundaries. The PoC notes say test/recording builds continue to compute old-entry size through the existing path, but the default `invoke_host_function` path passes `Some(&init_entry_xdr_sizes)` even under `cfg(test)`, so old-entry serialization metering is skipped there as well.
+3. Because the release-output and metering behavior differ from both the existing public API contract and the PoC's own safety claims, benchmarking the current patch would not be sufficient for confirmation. The source-level safety check fails before the benchmark gate.
+
+### Revision Instructions
+
+Revise the PoC so the optimization is actually core-only and behavior-safe:
+
+1. Preserve `LedgerEntryChange::encoded_key` semantics for the public `soroban-env-host::e2e_invoke::invoke_host_function` API in all build modes, or introduce a separate internal/core-specific result path that computes only `modified_ledger_entries` and `rent_changes` without exposing partially-populated `LedgerEntryChange` values.
+2. Decide and document the intended metering behavior. If resource-limit semantics must remain unchanged within the same protocol, replace skipped `metered_write_xdr` calls with equivalent budget charges that do not allocate/serialize. If lower metering is intended because the work is no longer performed, add explicit tests covering CPU/memory/resource-limit boundary behavior and explain why this protocol-visible change is acceptable.
+3. Add or adjust tests so the optimized release-like core path is exercised, including checks for existing entries, created TTL-bearing entries, restored persistent entries, and contract-code rent sizing. Tests should not rely on `cfg(test)` preserving behavior that optimized builds do not preserve.
+4. After the source-level issues are fixed, rerun the required final-review gate: full `env NUM_PARTITIONS=30 make check`, then at least three `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py --tracy` runs compared against `ai-summary/CURRENT_STATE.md`.
+
+### Checks Passed So Far
+
+1. The changed code path was traced from C++ `InvokeHostFunctionOpFrame::invokeHostFunction` through the Rust bridge into p26 `e2e_invoke::invoke_host_function`, `get_ledger_changes`, `extract_rent_changes`, and back through `extract_ledger_effects`/`recordStorageChanges`.
+2. The root inefficiency is plausible and in scope: old-entry XDR serialization and discarded key serialization occur during successful Soroban enforcing invocations on the `closeLedger` apply path, while C++ only consumes encoded new values plus synthesized TTL entries.
+3. Preserving input XDR sizes can be a valid mechanism for rent sizing, including contract-code entries, provided the public API and metering behavior are kept consistent.
