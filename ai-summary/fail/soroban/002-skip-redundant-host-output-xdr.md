@@ -261,3 +261,39 @@ The optimization removes redundant allocation and materialization of old-entry X
 ### Test Results
 
 Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`; `make -j $(nproc)` completed successfully. Full regression run `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` completed successfully, including `751 passed; 0 failed; 2 ignored; 1 filtered out` for the p26 host test binary and `PASS: test/selftest-nopg`, `PASS: test/check-nondet`.
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-04-28
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** PARTIAL — the final patch no longer skips old-entry XDR traversal. It preserves exact `ValSer` metering by writing old entries through `MeteredWrite` into a counting sink, so it only avoids allocation/materialization of the discarded old-entry `Vec<u8>` while leaving key serialization and old-entry XDR walking in place.
+2. **Are the preconditions realistic?** YES — successful p26 enforcing Soroban invocations in the apply path do build ledger changes and do not consume old-entry output buffers in C++.
+3. **Is the original code inefficient or working as designed?** INEFFICIENCY — materializing an old-entry output buffer solely to compute rent size is unnecessary when the input entry length is available. However, exact metering preservation substantially reduces the optimization to avoiding buffer storage rather than avoiding serialization work.
+4. **Does the benchmark improvement match the claimed severity?** NO — independent repeated benchmark runs did not improve the headline soroswap apply-time metric. Baseline from `ai-summary/CURRENT_STATE.md` is 596.3813549999923 ms for the accepted best soroswap median. Optimized runs measured 598.2339145000005 ms, 601.086302499998 ms, and 598.5664009999964 ms, all slower than the headline baseline and below the objective's 1% minimum valid-improvement threshold.
+5. **Is the optimization in scope?** YES — the changed code is in p26 Soroban host output processing invoked from `closeLedger` apply.
+6. **Is the benchmark methodology correct?** YES — the patch was built with Tracy enabled, the full regression gate passed, and the required `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py --tracy` workflow was run three times against the accepted baseline in `ai-summary/CURRENT_STATE.md`.
+7. **Can the improvement be explained without the optimization?** YES / NO SIGNAL — there is no confirmed improvement to explain. Any average comparison against older non-headline baseline runs would be within prior run-to-run variance and is not sufficient under the objective's accepted-baseline rule.
+8. **Is this optimization novel?** YES — the exact counting-writer approach is distinct from prior accepted/rejected findings, but novelty does not compensate for missing top-line performance evidence.
+
+### Rejection Reason
+
+The PoC is behaviorally plausible and passes correctness gates, but it fails the performance gate: the independent apply-load benchmark did not show a reproducible soroswap apply-time reduction, and all three optimized soroswap medians were slower than the accepted headline baseline. Because the objective rejects findings below a 1% reproducible improvement, this optimization is not valid for confirmation.
+
+### Failed Checks
+
+- Performance final-review Step 5: benchmark improvement not demonstrated.
+- Adversarial check 4: measured improvement does not match even Low severity and is below the 1% validity threshold.
+- Adversarial check 7: no positive signal beyond benchmark variance.
+
+### Independent Verification Notes
+
+- Build command completed: `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres && make -j30 ALL_SOROBAN_GIT_STATE_STAMPS=`.
+- Regression command completed: `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make -j30 check ALL_SOROBAN_GIT_STATE_STAMPS=`.
+- Benchmark run IDs: `855954a73d28-20260428-181543`, `855954a73d28-20260428-182906`, `855954a73d28-20260428-184254`.
