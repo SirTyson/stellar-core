@@ -43,3 +43,41 @@ Run the current soroswap apply-load benchmark (`soroswap, TX=4000, T=8`) using `
 - Insertions for missing entries, deletions, recording-mode access, and maps not owned by `Storage` may still need the persistent `insert` API. The safe first target is enforcing-mode existing-key replacement in `Storage::put_opt_helper` and `apply_ttl_extension`.
 - Metering is observable. The fast path must either preserve exact current budget totals with batched equivalent charges or be protocol-gated with tests proving intended metering changes. Skipping clone/scan charges silently could alter resource-limit-boundary transactions.
 - `new map` is shared by other host structures, so the PoC must isolate the share caused by storage writes. If storage-write insertions are a small subset of `new map`, the standalone improvement could fall below the 3% objective floor.
+
+---
+
+## Review
+
+**Verdict**: NOT_VIABLE
+**Date**: 2026-04-28
+**Reviewed by**: gpt-5.5, high
+**Novelty**: PASS — no fail/success entry investigated this exact in-place existing-key storage update; related failures cover rollback snapshots, TTL-call coalescing, and last-position lookup caching but not vector-rebuild elimination for storage writes
+**Failed At**: reviewer
+
+### Trace Summary
+
+The core inefficiency exists: enforcing-mode storage writes and TTL extensions route through `Storage::put_opt_helper` / `Storage::apply_ttl_extension`, both of which replace `self.map` with `MeteredOrdMap::insert`, and `insert` rebuilds a complete vector through `from_exact_iter` even when the key already exists. SAC balance updates on the soroswap path call `put_contract_data` and then `extend_contract_data_ttl`, so this code is reached during each swap transaction. The proposed in-place replacement is structurally safe for successful execution and failed-frame rollback because `Storage` owns its current `Vec` and `RollbackPoint` / initial snapshots hold separately cloned `StorageMap` vectors. However, the quantified cost is aggregate worker time in a `T=8` parallel run, and after normalizing to apply critical-path wall time the standalone storage-map rebuild savings are below the objective's Medium threshold.
+
+### Code Paths Examined
+
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:408-505` — each invoke builds the enforcing footprint/storage map, clones an initial storage snapshot, runs `Host::invoke_function`, then diffs final storage against the initial snapshot.
+- `src/rust/soroban/p26/soroban-env-host/src/storage.rs:25-27` and `179-183` — durable host storage is a per-host `MeteredOrdMap<Rc<LedgerKey>, Option<EntryWithLiveUntil>, Budget>` owned by `Storage`.
+- `src/rust/soroban/p26/soroban-env-host/src/storage.rs:332-389` — `put` checks footprint access and assigns `self.map = self.map.insert(...)` for writes and deletions.
+- `src/rust/soroban/p26/soroban-env-host/src/storage.rs:431-515` and `532-573` — `extend_ttl` reads the current entry/live-until and `apply_ttl_extension` rebuilds the storage map with `insert` only when the new TTL actually extends the old one.
+- `src/rust/soroban/p26/soroban-env-host/src/host/metered_map.rs:144-160` and `196-224` — `insert` performs a binary search, chains cloned prefix/replacement/suffix iterators, collects a fresh `Vec`, charges clone work, and revalidates the rebuilt map.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:190-229` — `push_context` snapshots `storage.map` into `RollbackPoint`, and `pop_context(Some(...))` restores that separate map on failed frames.
+- `src/rust/soroban/p26/soroban-env-host/src/host/data_helper.rs:509-563` and `src/rust/soroban/p26/soroban-env-host/src/host.rs:2190-2317` — persistent/temporary contract-data Env calls construct ledger keys and reach `Storage::{has,get_with_live_until_ledger,put,extend_ttl}`.
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/balance.rs:73-97`, `100-145`, and `156-229` — SAC balance receive/spend paths write balances through `put_contract_data` and extend the same balance key's TTL.
+- `scripts/run_apply_load_matrix.py:120-124` and `417-424` — the reviewed scenario is `soroswap, TX=4000, T=8`, and `T` configures `APPLY_LOAD_LEDGER_MAX_DEPENDENT_TX_CLUSTERS`.
+- `src/simulation/ApplyLoad.cpp:2323-2332`, `2672-2678`, and `3389-3393` — the benchmark creates one pair per configured cluster, asserts max cluster parallelism, and round-robins swaps across pairs.
+- `src/ledger/LedgerManagerImpl.cpp:2484-2520` and `2531-2574` — Soroban clusters execute on `std::async` workers and the apply path waits for worker futures, so worker-zone totals must be normalized to critical-path wall time.
+
+### Why It Failed
+
+This is a real local optimization, but it does not meet the optimize-soroswap objective's Medium severity floor. The strongest cited number is `new map` at 130.563 ms self-time over all traced calls; the hypothesis says 58,761 of 64,552 calls fall inside `applyLedger`, so the in-apply share is about 119 ms of aggregate worker self-time. In the benchmark under review, soroswap uses 8 independent clusters and distributes swaps round-robin across them, making the critical-path upper bound roughly 119 / 8 = 15 ms; even using the full unfiltered 130.563 ms gives only about 16.3 ms. Against the stated ~596 ms soroswap apply baseline this is roughly 2.5-2.7%, below the 3% Medium threshold.
+
+The realistic standalone win is smaller than that upper bound. Not every `new map` call belongs to `Storage::put` or `apply_ttl_extension`, TTL extension only inserts when the live-until value actually increases, and a correct fast path must preserve deterministic budget effects for clone/scan-style charges rather than simply deleting all associated metering work. Under the objective-specific rules, Low-tier projections are rejected rather than accepted with a downgraded severity.
+
+### Lesson Learned
+
+For Soroban host storage optimizations in the parallel apply path, separate real CPU waste from objective-level impact. `MeteredOrdMap::insert` rebuilds are wasteful for existing-key storage updates, but aggregate worker self-time must be divided by active cluster count before comparing with apply-wall-clock thresholds, and shared `new map` zones must be attributed to the specific storage-write subset before claiming Medium severity.
