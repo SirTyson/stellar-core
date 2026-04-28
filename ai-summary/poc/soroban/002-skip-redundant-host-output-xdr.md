@@ -238,3 +238,26 @@ explicitly accepted with a protocol/resource-accounting justification:
 3. Recording mode correctly passes `None` and keeps the old serialization path
    because its snapshot source is not a one-to-one map of the encoded input
    entries.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-04-28
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/host/metered_xdr.rs:11-24,85-100` — added a counting `Write` sink and `metered_count_write_xdr`, which runs the existing `MeteredWrite`/`Limited` XDR writer without allocating or retaining output bytes.
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:5-46,187-278` — carried input ledger-entry XDR sizes into `get_ledger_changes`; for old entries on the enforcing path, the code now uses the preserved input size for rent sizing while writing to the metered counting sink to preserve exact `ValSer` CPU/memory accounting.
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:483-557,831-876,1014-1110` — plumbed the XDR size map through normal enforcing invocations and kept recording mode on the original `None` path because its snapshot source is not the encoded input entry set.
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:1143-1347` — added a p26 host unit test comparing optimized and unoptimized ledger-change extraction, including identical public outputs, rent sizes, total CPU/memory budget, and `ValSer` tracker values.
+
+### Demonstration
+
+The optimization removes redundant allocation and materialization of old-entry XDR buffers in successful p26 enforcing Soroban invocations while preserving the public `LedgerEntryChange` shape and exact metered serialization accounting. Required output bytes are unchanged: encoded keys remain populated, new ledger-entry buffers are still returned to C++, TTL/rent changes are preserved, and contract-code rent sizing still applies `wasm_module_memory_cost` on top of the preserved input XDR length.
+
+### Test Results
+
+Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`; `make -j $(nproc)` completed successfully. Full regression run `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` completed successfully, including `751 passed; 0 failed; 2 ignored; 1 filtered out` for the p26 host test binary and `PASS: test/selftest-nopg`, `PASS: test/check-nondet`.
