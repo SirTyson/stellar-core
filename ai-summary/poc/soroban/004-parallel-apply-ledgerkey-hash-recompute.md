@@ -209,3 +209,29 @@ The expected impact is Medium rather than High. The hypothesis's 50-100 ms estim
 - **Change description**: precompute `ParallelApplyLedgerKey` for every RO/RW footprint key and for every corresponding TTL key once per `TxBundle`, prime `hash()` on those objects before `applySorobanStageClustersInParallel` launches workers, and use those cached objects for map probes. Avoid building an unordered `LedgerKey -> cached-key` lookup unless it can be proven not to reintroduce the same hash cost; prefer footprint-index-based access and the existing small-footprint linear scans where possible.
 - **Correctness check**: preserve existing `LedgerKey const&` fallbacks for non-footprint/synthesized keys, ensure `LedgerKey` equality and observable ledger/meta ordering are unchanged, and verify protocol-26 parallel apply, invoke-host-function, restore-footprint, TTL bump, and invariant-delta paths still use the same ledger entries and result codes.
 - **Benchmark focus**: run the soroswap apply-load matrix with the default 4000 swaps / 8 clusters and compare top-line `ledger.close` apply time across repeated runs. Secondary phase timers to inspect are `build_tx_bundles`, cluster setup/thread-state construction, `transaction.apply`, and any Tracy zones around `getTTLKey`, `std::hash<LedgerKey>`, `TxParallelApplyLedgerState::getLiveEntryOpt`, and `ThreadParallelApplyLedgerState::getLiveEntryOpt`; the expected improvement target is 3-10% if both cached hashes and cached TTL keys are threaded through the hot paths.
+
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-04-28
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/transactions/ParallelApplyStage.h:18-245` — added `CachedTxFootprintKeys`, precomputing and priming `ParallelApplyLedgerKey` values for RO/RW footprint keys and their TTL keys during `TxBundle` construction.
+- `src/transactions/ParallelApplyUtils.h:118-126,162-175,319-407` and `src/transactions/ParallelApplyUtils.cpp:104-132,238-263,328-425,706-776,991-1457` — added `ParallelApplyLedgerKey const&` overloads for transaction/thread/ledger-access helpers, reused cached keys in stage RW sets, RO TTL sets, global/thread preload, RO-TTL flushing, successful-tx commit, and map probes while preserving `LedgerKey const&` fallbacks.
+- `src/transactions/InvokeHostFunctionOpFrame.cpp:352-508,661-824,1151-1475` and `src/transactions/InvokeHostFunctionOpFrame.h:58-66` — routed cached footprint and TTL keys through invoke-host add-footprint, host-output writeback, erases, autorestore updates, and parallel helper construction.
+- `src/transactions/OperationFrame.h:66-74,121-127`, `src/transactions/OperationFrame.cpp:175-200`, `src/transactions/TransactionFrameBase.h:248-254`, `src/transactions/TransactionFrame.h:345-350`, `src/transactions/TransactionFrame.cpp:2385-2430`, `src/transactions/FeeBumpTransactionFrame.h:100-105`, `src/transactions/FeeBumpTransactionFrame.cpp:157-173`, `src/transactions/test/TransactionTestFrame.h:170-175`, `src/transactions/test/TransactionTestFrame.cpp:397-406`, and `src/ledger/LedgerManagerImpl.cpp:2504-2506` — threaded `TxBundle const&` through parallel apply so operation helpers can access the per-transaction cached keys.
+- `src/transactions/RestoreFootprintOpFrame.cpp:294-385`, `src/transactions/RestoreFootprintOpFrame.h:42-50`, `src/transactions/ExtendFootprintTTLOpFrame.cpp:240-278`, and `src/transactions/ExtendFootprintTTLOpFrame.h:43-51` — updated parallel helper construction to carry the same cached-footprint context through restore and TTL-extension paths.
+
+### Demonstration
+
+The optimization computes each declared footprint key and deterministic TTL key as a primed `ParallelApplyLedgerKey` once per `TxBundle`, before worker threads consume the bundle. Hot parallel-apply paths now probe `mTxEntryMap`, `mThreadEntryMap`, `mGlobalEntryMap`, `mRoTTLBumps`, and RO/RW TTL sets with those cached keys instead of reconstructing stack-local lookup keys and re-running expensive `LedgerKey` hashing or repeated `getTTLKey` derivation. Fallback overloads preserve behavior for synthesized or non-footprint keys.
+
+### Test Results
+
+- Tracy-enabled build completed: `./autogen.sh && ./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres && make -j30`.
+- Full suite completed successfully: `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make -j30 check ALL_SOROBAN_GIT_STATE_STAMPS=`. The `ALL_SOROBAN_GIT_STATE_STAMPS=` override was needed only because this linked worktree has a `.git` file while the generated Makefile prerequisite expects `.git/modules` under `top_srcdir`; the suite reported `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`, with Soroban submodule checks completing successfully.
