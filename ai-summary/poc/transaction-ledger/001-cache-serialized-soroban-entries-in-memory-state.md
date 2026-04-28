@@ -239,3 +239,27 @@ The impact plausibly meets the objective's Medium threshold. Even if the cache o
 - **Change description**: cache immutable serialized bytes for resident `CONTRACT_DATA` entries, and optionally their synthesized TTL entries, when `InMemorySorobanState` creates or replaces map entries. Thread those cached bytes through `GlobalParallelApplyEntry`, `ThreadParallelApplyEntry`, and `TxParallelApplyLedgerState::getLiveEntryOpt` for clean entries sourced from in-memory state. Use the cached buffer in `addReads` only when it corresponds to the exact entry selected by the tx/thread/global lookup; otherwise keep `toCxxBuf`.
 - **Correctness check**: preserve tx-local and thread/global override ordering, TTL liveness behavior, autorestore handling, and exact `xdr::xdr_to_opaque(LedgerEntry)` byte identity. Do not cache or reuse bytes for entries returned by the Rust host unless the PoC deliberately carries those RustBuf bytes through the dirty-entry maps with the decoded `LedgerEntry`.
 - **Benchmark focus**: measure soroswap apply-load top-line apply time and Tracy self-time under `applyParallelPhase` / `applyThread` / `addReads`; the expected win is disappearance of most `toCxxBuf(LedgerEntry)` allocator/XDR-serializer time for unchanged read-only Soroban footprint entries, with a Medium target of 3-10% apply-time reduction.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-04-28
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/util/types.h:16-18` — added shared aliases for immutable serialized XDR byte buffers.
+- `src/ledger/InMemorySorobanState.h:46-66,146-259,435-455` and `src/ledger/InMemorySorobanState.cpp:38-43,68-75,104-156,239-276` — cached `xdr::xdr_to_opaque(LedgerEntry)` bytes for resident `CONTRACT_DATA` entries when they are created or replaced, preserved cached bytes across TTL-only updates, and exposed a `getSerialized` accessor. The PoC intentionally does not cache `CONTRACT_CODE` or synthesized TTL bytes to avoid duplicating wasm blobs or changing TTL initialization behavior.
+- `src/transactions/TransactionFrameBase.h:110-150` — threaded an optional cached serialized buffer through clean/dirty `ParallelApplyEntry` state and scope rescoping.
+- `src/transactions/ParallelApplyUtils.h:162-163,319-320,342-347,365-390` and `src/transactions/ParallelApplyUtils.cpp:278-356,685-729,854-890,952-967,1084-1164,1294-1324` — propagated cached serialized bytes only for clean entries selected by the normal tx/thread/global lookup path, cleared the cache on dirty merges or tx-local writes, and exposed the cached bytes through `LedgerAccessHelper`.
+- `src/transactions/TransactionUtils.h:370-383` and `src/transactions/InvokeHostFunctionOpFrame.cpp:474-499` — added a `toCxxBuf(SerializedXDR const&)` overload and used cached bytes in `addReads` when they correspond to the exact selected ledger entry.
+
+### Demonstration
+
+The optimization serializes each immutable resident `CONTRACT_DATA` `LedgerEntry` once when it enters `InMemorySorobanState`, then reuses those bytes for clean parallel-apply reads. This removes repeated XDR encoder walks for unchanged Soroban read-only footprint entries while preserving tx-local/thread/global override ordering by carrying the cache alongside the scoped entry selected by the existing ledger access path.
+
+### Test Results
+
+Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`, built with `make -j30`, and ran the full unit suite with `NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make -j30 check`. Final result: `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, `All 2 tests passed`.
