@@ -1,0 +1,25 @@
+# Failed Investigations: Ledger Subsystem
+
+Condensed failure summaries for investigations targeting the ledger subsystem (LedgerTxn, LedgerTxnRoot, InMemorySorobanState, prefetch, BucketList commit, and validation paths). Last updated 2026-04-28.
+
+## Summary Table
+
+| File | Hypothesis | Why Failed | Stage | Key Lesson |
+|------|-----------|------------|-------|------------|
+| 001-cache-thread-clean-rw-lookups.md | Cache thread-local clean RW lookups during Soroban result commit | Wrong mechanism — the repeated-clean-lookup pattern is only real for first-touch clean RW keys; once a tx modifies a key it becomes dirty and subsequent lookups on the same key skip the clean path entirely | reviewer | Soroswap updates the same storage keys on every swap tx; the "clean" lookup path is not the dominant pattern at high TPS |
+| 001-inmemory-bucket-entry-virtual-wrapper.md | Replace `InMemoryBucketEntry` virtual wrapper with direct keyed storage | Previously tried and reverted multiple times on this branch; a new hypothesis would need a materially different approach or evidence that prior blockers are resolved | hypothesis | This specific structural refactor has been attempted and rejected multiple times; the virtual dispatch overhead is not the bottleneck on the current architecture |
+| 002-avoid-ledgertxnroot-cache-hit-relookup.md | Avoid `LedgerTxnRoot` cache-hit relookup and per-hit entry allocation | Below threshold — `getNewestVersion` overlap is only ~4.3% of `applyLedger`; a Medium result would need the fix to recover most of that fraction, which is not achievable | reviewer | `LedgerTxnRoot` cache-hit relookup overhead is real but insufficient; the cache layer is not the dominant cost in the Soroban parallel apply path |
+| 002-futurebucket-resolve-wait.md | Reduce blocking `FutureBucket` resolve waits during bucket commit | Below threshold — the only directly measured in-scope portion is the occasional wait for unfinished background work, and the nonblocking cleanup for the common case is already present | hypothesis | `FutureBucket::resolve` waits are rare in steady-state soroswap; the existing nonblocking fast path already handles the common case |
+| 002-stream-level0-bucket-merge-output.md | Stream level-0 in-memory bucket merge output without a second full pass | Wrong optimization target — bucket file creation still requires every output entry to be XDR-sized, serialized, written, and hashed regardless of streaming; the "second pass" is not an extra pass but a necessary write pass | reviewer | Level-0 bucket merge streaming cannot eliminate file I/O; the serialization and hashing costs are inherent to producing a valid bucket file |
+| 003-skip-empty-soroban-prefetch-transaction-data.md | Skip empty Soroban transaction-data prefetch | Below threshold — the optimization is plausible but projects at Low severity; the objective requires at least Medium | hypothesis | Skipping no-op prefetch calls for Soroban-only ledgers is correct but negligible; the prefetch path is not on the critical execution path for soroswap TPS |
+| 004-validation-hotspots-out-of-scope.md | Apply-path signature validation aggregate hotspots | Out of scope — validation hotspots are mostly aggregate process-level hotspots, not measured `applyLedger` descendants; the in-apply fee/sequence processing path is also below the Medium threshold | hypothesis | Aggregate process profiles include validation, catchup, and gossip work outside `applyLedger`; always filter to in-scope descendants before estimating impact |
+
+## Meta-Patterns
+
+1. **Already-Tried Paths**: `InMemoryBucketEntry` virtual wrapper replacement has been attempted multiple times on this branch. Do not re-propose the same structural refactor without evidence that the underlying blocker has changed.
+
+2. **Background Commit Work**: `FutureBucket::resolve` and bucket-index creation run on background threads. Improvements to background latency cannot reduce apply time unless there is a confirmed synchronous apply-thread wait on that background work.
+
+3. **Scope Filter First**: Before writing a ledger-subsystem hypothesis, confirm the target zone is a descendant of `applyLedger` in the Tracy trace, not an aggregate process-level hotspot that includes pre-apply or post-apply phases.
+
+4. **Prefetch Path Triviality**: The `prefetchTransactionData` and `prefetchTxSourceIds` paths are no-ops or near-no-ops for Soroban-only ledgers; hypotheses that skip or combine them cannot yield Medium-severity improvements.

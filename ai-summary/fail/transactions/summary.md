@@ -1,0 +1,23 @@
+# Failed Investigations: Transactions Subsystem
+
+Condensed failure summaries for investigations targeting the transactions subsystem (parallel apply setup, Soroban footprint processing, host object budget, XDR rent sizing, and fee processing paths). Last updated 2026-04-28.
+
+## Summary Table
+
+| File | Hypothesis | Why Failed | Stage | Key Lesson |
+|------|-----------|------------|-------|------------|
+| 001-cluster-shared-readonly-footprint-prebuild.md | Share read-only footprint `LedgerEntry`/TTL `CxxBuf`s across all txs in a soroswap cluster | Below threshold — the cited `read xdr with budget` cost is ~2% of `applySorobanStages` wall time before any fix, and a complete shared-buffer implementation could recover only a fraction of that | reviewer | Sharing CxxBufs for read-only footprint entries across a cluster is architecturally sound but the absolute savings are below the 3% Medium floor; the XDR read-with-budget path is not the dominant per-tx cost |
+| 001-parallelize-thread-state-setup.md | Parallelize per-cluster `ThreadParallelApplyLedgerState` setup | Below threshold — the serial setup is on the apply path but the hypothesis over-attributes `applySorobanStageClustersInParallel` self-time to setup; direct profiling shows setup is a small fraction of the zone self-time | reviewer | `applySorobanStageClustersInParallel` self-time is dominated by `future.get()` worker waits; setup serialization is real but insufficient to reach Medium severity without a dedicated isolated measurement |
+| 002-batch-host-object-budget-visits.md | Batch Soroban host object visit budget charging in soroswap map-heavy calls | Not viable at the required severity — a general "batch `VisitObject` charges" optimization would either charge before validating all objects (risk of charging on error) or validate objects before charging (changes metering observable by contracts); neither variant is safe | reviewer | Host object budget charging must interleave with validation; batching is not compatible with the Soroban metering contract because partial-success semantics require per-object charging in order |
+| 002-metered-xdr-size-for-rent.md | Replace temporary old-entry XDR buffers in rent computation with a metered counting writer | Below threshold — projected savings are below the 3% Medium floor; a counting writer would preserve rent sizes and budget inputs but the total recoverable cost is too small | reviewer | Temporary XDR buffer allocation for rent size computation is a real inefficiency, but the aggregate cost across soroswap footprint entries is sub-threshold |
+| 002-parallel-process-fees-disjoint-sources.md | Parallelize `processFeesSeqNums` over disjoint fee-source accounts for Soroban-only ledger fast path | Wrong mechanism — `processFeesSeqNums` uses a single `LedgerTxn` across all txs; sequence number updates are separated into `preParallelApplyWrite` for Soroban; the proposed parallelism model does not match the actual per-tx `LedgerTxn` nesting semantics | reviewer | Fee processing creates one `LedgerTxn` per tx, but the fee pool (in the ledger header) is a shared mutable resource; disjoint fee-source parallelism cannot be achieved without a header-level concurrency mechanism |
+
+## Meta-Patterns
+
+1. **Host Object Budget Charging Is Order-Sensitive**: `VisitObject` budget charging is interleaved with object validation in the Soroban host. Batching charges breaks the metering contract because it would either over-charge on error or under-charge before validation. Do not propose batch-charging patterns for host object visits.
+
+2. **Parallel Thread State Setup Is Sub-Threshold (Transactions View)**: Like the soroban subsystem finding, serial `ThreadParallelApplyLedgerState` construction has been evaluated from the transactions subsystem angle and also found below threshold. The dominant cost in the parallel apply zone is worker execution, not setup.
+
+3. **Fee Pool Is a Shared Mutable Resource**: The ledger header `feePool` field is incremented by every fee-processing call. Any parallelism in `processFeesSeqNums` requires either atomic header mutations or a reduce step, which adds complexity and likely more overhead than the saving. Fee processing parallelism is architecturally constrained.
+
+4. **XDR Buffer Costs Are Distributed Below Threshold**: Multiple hypotheses have targeted XDR buffer allocation for footprint entries, rent computation, and bridge serialization. Each targets a different call site and each is individually sub-threshold (1–2.5%). These do not combine linearly since they are in different phases; a single combined refactor covering all of them might reach Medium but no single-site fix does.
