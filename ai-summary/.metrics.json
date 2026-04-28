@@ -1,20 +1,20 @@
 {
-  "hypothesis_viable": 52,
-  "hypothesis_not_viable": 22,
+  "hypothesis_viable": 56,
+  "hypothesis_not_viable": 27,
   "review_viable": 8,
-  "review_not_viable": 44,
-  "poc_viable": 5,
+  "review_not_viable": 47,
+  "poc_viable": 6,
   "poc_not_viable": 2,
   "final_review_viable": 1,
-  "final_review_not_viable": 2,
+  "final_review_not_viable": 3,
   "final_review_revisions": 2,
   "condensations": 1,
   "publishes": 0,
-  "agent_failures": 2,
+  "agent_failures": 10993,
   "agent_timeouts": 1,
-  "total_spawned": 101,
+  "total_spawned": 11101,
   "input_tokens": 0,
-  "output_tokens": 1719751,
+  "output_tokens": 1946444,
   "cache_read_tokens": 0,
   "per_subsystem": {
     "ledger": {
@@ -26,13 +26,13 @@
       "hypothesis_viable": 10,
       "hypothesis_not_viable": 2,
       "review_viable": 2,
-      "review_not_viable": 7
+      "review_not_viable": 8
     },
     "soroban": {
-      "hypothesis_viable": 18,
+      "hypothesis_viable": 20,
       "hypothesis_not_viable": 12,
       "poc_viable": 5,
-      "review_not_viable": 16,
+      "review_not_viable": 18,
       "final_review_revisions": 2,
       "final_review_not_viable": 2,
       "review_viable": 2,
@@ -41,14 +41,16 @@
     },
     "crypto": {
       "hypothesis_viable": 6,
-      "hypothesis_not_viable": 3,
+      "hypothesis_not_viable": 5,
       "review_not_viable": 6
     },
     "transaction-ledger": {
-      "hypothesis_viable": 10,
-      "hypothesis_not_viable": 4,
+      "hypothesis_viable": 12,
+      "hypothesis_not_viable": 7,
       "review_viable": 3,
-      "review_not_viable": 7
+      "review_not_viable": 7,
+      "poc_viable": 1,
+      "final_review_not_viable": 1
     },
     "soroban-env": {
       "hypothesis_viable": 4,
@@ -60,19 +62,21 @@
   },
   "per_model": {
     "gpt-5.5": {
-      "review_not_viable": 44,
-      "hypothesis_viable": 32,
+      "review_not_viable": 47,
+      "hypothesis_viable": 34,
       "review_viable": 8,
-      "poc_viable": 3,
+      "poc_viable": 4,
       "final_review_revisions": 2,
-      "final_review_not_viable": 2,
+      "final_review_not_viable": 3,
       "timeouts": 1,
-      "final_review_viable": 1
+      "final_review_viable": 1,
+      "agent_failures": 8452
     },
     "claude-opus-4.7": {
-      "hypothesis_viable": 20,
+      "hypothesis_viable": 22,
       "poc_viable": 2,
-      "poc_not_viable": 2
+      "poc_not_viable": 2,
+      "agent_failures": 2539
     },
     "claude-sonnet-4-6": {
       "agent_failures": 2
@@ -81,22 +85,22 @@
   "tokens_by_stage": {
     "reviewer": {
       "input": 0,
-      "output": 524088,
+      "output": 557816,
       "cache_read": 0
     },
     "hypothesis": {
       "input": 0,
-      "output": 1013152,
+      "output": 1159992,
       "cache_read": 0
     },
     "poc": {
       "input": 0,
-      "output": 109254,
+      "output": 148123,
       "cache_read": 0
     },
     "final_review": {
       "input": 0,
-      "output": 47826,
+      "output": 55082,
       "cache_read": 0
     },
     "condensation": {
@@ -108,12 +112,12 @@
   "tokens_by_model": {
     "gpt-5.5": {
       "input": 0,
-      "output": 949428,
+      "output": 1066084,
       "cache_read": 0
     },
     "claude-opus-4.7": {
       "input": 0,
-      "output": 744892,
+      "output": 854929,
       "cache_read": 0
     },
     "claude-sonnet-4-6": {
@@ -126,53 +130,53 @@
     "reviewer": {
       "gpt-5.5": {
         "viable": 8,
-        "not_viable": 44,
+        "not_viable": 47,
         "needs_revision": 0,
-        "error": 0,
+        "error": 5914,
         "timeout": 0,
         "input_tokens": 0,
-        "output_tokens": 524088,
+        "output_tokens": 557816,
         "cache_read_tokens": 0
       }
     },
     "hypothesis": {
       "gpt-5.5": {
-        "viable": 32,
-        "not_viable": 5,
+        "viable": 34,
+        "not_viable": 8,
         "needs_revision": 0,
         "error": 0,
         "timeout": 0,
         "input_tokens": 0,
-        "output_tokens": 320032,
+        "output_tokens": 356835,
         "cache_read_tokens": 0
       },
       "claude-opus-4.7": {
-        "viable": 20,
-        "not_viable": 17,
+        "viable": 22,
+        "not_viable": 19,
         "needs_revision": 0,
         "error": 0,
         "timeout": 0,
         "input_tokens": 0,
-        "output_tokens": 693120,
+        "output_tokens": 803157,
         "cache_read_tokens": 0
       }
     },
     "poc": {
       "gpt-5.5": {
-        "viable": 3,
+        "viable": 4,
         "not_viable": 0,
         "needs_revision": 0,
-        "error": 0,
+        "error": 2538,
         "timeout": 1,
         "input_tokens": 0,
-        "output_tokens": 57482,
+        "output_tokens": 96351,
         "cache_read_tokens": 0
       },
       "claude-opus-4.7": {
         "viable": 2,
         "not_viable": 2,
         "needs_revision": 0,
-        "error": 0,
+        "error": 2539,
         "timeout": 0,
         "input_tokens": 0,
         "output_tokens": 51772,
@@ -182,12 +186,12 @@
     "final_review": {
       "gpt-5.5": {
         "viable": 1,
-        "not_viable": 2,
+        "not_viable": 3,
         "needs_revision": 2,
         "error": 0,
         "timeout": 0,
         "input_tokens": 0,
-        "output_tokens": 47826,
+        "output_tokens": 55082,
         "cache_read_tokens": 0
       }
     },
@@ -206,499 +210,1004 @@
   },
   "agent_durations": [
     [
-      "reviewer",
-      "gpt-5.5",
-      160.4
-    ],
-    [
-      "hypothesis",
-      "gpt-5.5",
-      509.4
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      170.9
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      120.3
-    ],
-    [
-      "hypothesis",
-      "claude-opus-4.7",
-      726.4
-    ],
-    [
-      "hypothesis",
-      "gpt-5.5",
-      252.5
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      179.3
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      146.1
-    ],
-    [
       "poc",
       "gpt-5.5",
-      2654.2
-    ],
-    [
-      "hypothesis",
-      "claude-opus-4.7",
-      883.6
+      11.8
     ],
     [
       "reviewer",
       "gpt-5.5",
-      150.9
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      141.6
-    ],
-    [
-      "hypothesis",
-      "gpt-5.5",
-      527.7
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      160.3
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      115.2
-    ],
-    [
-      "hypothesis",
-      "claude-opus-4.7",
-      1038.4
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      138.0
-    ],
-    [
-      "final_review",
-      "gpt-5.5",
-      2856.7
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      167.9
+      4.2
     ],
     [
       "poc",
       "claude-opus-4.7",
-      403.8
-    ],
-    [
-      "hypothesis",
-      "gpt-5.5",
-      702.6
+      4.7
     ],
     [
       "reviewer",
       "gpt-5.5",
-      206.2
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      190.3
-    ],
-    [
-      "hypothesis",
-      "claude-opus-4.7",
-      228.5
-    ],
-    [
-      "hypothesis",
-      "gpt-5.5",
-      329.2
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      144.4
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      131.2
-    ],
-    [
-      "hypothesis",
-      "claude-opus-4.7",
-      818.7
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      148.9
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      166.6
-    ],
-    [
-      "final_review",
-      "gpt-5.5",
-      2983.6
-    ],
-    [
-      "hypothesis",
-      "gpt-5.5",
-      290.6
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      60.4
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      253.3
-    ],
-    [
-      "hypothesis",
-      "claude-opus-4.7",
-      646.8
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      164.6
-    ],
-    [
-      "hypothesis",
-      "gpt-5.5",
-      493.0
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      212.6
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      179.7
-    ],
-    [
-      "hypothesis",
-      "claude-opus-4.7",
-      801.7
-    ],
-    [
-      "hypothesis",
-      "gpt-5.5",
-      595.1
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      202.8
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      133.6
-    ],
-    [
-      "hypothesis",
-      "claude-opus-4.7",
-      662.5
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      158.5
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      176.8
-    ],
-    [
-      "hypothesis",
-      "gpt-5.5",
-      588.4
+      4.3
     ],
     [
       "poc",
       "gpt-5.5",
-      5405.4
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      157.4
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      122.9
+      4.8
     ],
     [
       "poc",
       "claude-opus-4.7",
-      447.4
-    ],
-    [
-      "hypothesis",
-      "claude-opus-4.7",
-      1014.2
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      132.8
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      102.1
-    ],
-    [
-      "hypothesis",
-      "gpt-5.5",
-      267.2
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      190.3
-    ],
-    [
-      "condensation",
-      "claude-sonnet-4-6",
-      106.0
-    ],
-    [
-      "condensation",
-      "claude-sonnet-4-6",
-      12.5
-    ],
-    [
-      "condensation",
-      "claude-sonnet-4-6",
-      448.1
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      135.6
+      4.6
     ],
     [
       "poc",
       "gpt-5.5",
-      2788.8
-    ],
-    [
-      "hypothesis",
-      "claude-opus-4.7",
-      1098.9
+      11.6
     ],
     [
       "reviewer",
       "gpt-5.5",
-      191.2
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      114.5
-    ],
-    [
-      "hypothesis",
-      "gpt-5.5",
-      359.9
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      237.7
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      122.1
-    ],
-    [
-      "hypothesis",
-      "claude-opus-4.7",
-      747.6
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      235.0
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      144.7
-    ],
-    [
-      "final_review",
-      "gpt-5.5",
-      3005.3
-    ],
-    [
-      "hypothesis",
-      "gpt-5.5",
-      469.2
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      195.8
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      155.3
+      20.0
     ],
     [
       "poc",
       "claude-opus-4.7",
-      852.6
+      4.9
     ],
     [
-      "final_review",
+      "reviewer",
       "gpt-5.5",
-      87.2
+      4.5
     ],
     [
-      "hypothesis",
-      "claude-opus-4.7",
-      756.9
+      "reviewer",
+      "gpt-5.5",
+      4.3
     ],
     [
       "poc",
       "gpt-5.5",
-      1797.3
-    ],
-    [
-      "hypothesis",
-      "gpt-5.5",
-      1523.3
+      4.9
     ],
     [
       "reviewer",
       "gpt-5.5",
-      97.0
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      138.1
-    ],
-    [
-      "hypothesis",
-      "claude-opus-4.7",
-      1168.2
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      136.7
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      144.9
-    ],
-    [
-      "hypothesis",
-      "gpt-5.5",
-      453.7
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      125.7
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      217.9
-    ],
-    [
-      "final_review",
-      "gpt-5.5",
-      2880.6
+      4.1
     ],
     [
       "poc",
       "claude-opus-4.7",
-      91.1
+      4.8
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      5.1
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      10.8
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      5.1
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.3
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      4.7
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.4
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      4.5
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.0
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      4.8
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.3
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      4.8
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.3
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      5.0
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.4
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      4.9
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.4
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.4
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      4.7
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      5.5
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      5.4
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.8
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      4.8
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.2
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      4.9
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.4
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      4.8
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.2
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      4.7
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.4
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      5.0
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.5
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      4.7
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.9
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      5.7
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      5.0
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      4.8
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.7
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      5.1
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.5
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.4
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      5.1
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.5
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      4.7
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.5
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      4.9
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.4
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      4.9
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.6
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      4.7
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.4
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      4.8
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      4.7
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      11.1
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      4.9
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.5
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      4.7
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.3
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      7.4
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.7
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      5.4
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      6.5
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      5.2
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      5.1
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      5.0
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      5.2
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      10.9
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.3
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      4.6
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.5
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      5.8
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.9
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      4.8
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.6
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      4.7
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.4
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      4.8
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.3
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.7
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.3
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.2
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.4
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      19.6
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      4.6
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      4.8
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      4.8
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      19.2
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      4.7
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      5.5
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      10.9
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      4.9
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.2
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      4.6
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.4
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      4.9
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.4
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      4.7
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.2
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      4.7
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.4
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      4.8
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.3
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.1
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      5.0
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.6
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      4.8
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.5
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      4.5
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.4
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      5.0
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.3
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      4.7
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.1
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      4.7
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.9
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      5.0
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.6
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      4.6
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.2
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.2
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.2
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      12.1
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.3
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.7
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.3
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      12.8
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      4.8
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      11.1
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      5.3
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      4.7
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      4.8
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      11.1
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      4.5
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.2
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      4.9
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      4.5
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      10.4
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      4.6
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.5
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      11.3
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.3
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      19.6
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.1
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      4.7
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.2
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      4.6
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.5
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      4.5
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.3
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.4
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      4.9
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.5
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      5.2
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.4
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      4.7
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.4
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      4.6
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.5
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      4.8
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.4
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      4.6
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.4
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      4.7
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.2
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      4.7
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      5.1
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.8
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.4
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      11.3
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.4
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      4.9
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.2
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      4.9
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.8
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      4.7
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.3
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      4.7
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.3
+    ],
+    [
+      "poc",
+      "gpt-5.5",
+      4.8
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      6.2
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      4.4
+    ],
+    [
+      "poc",
+      "claude-opus-4.7",
+      11.1
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      328.8
+    ],
+    [
+      "reviewer",
+      "gpt-5.5",
+      172.9
+    ],
+    [
+      "hypothesis",
+      "gpt-5.5",
+      674.6
     ],
     [
       "hypothesis",
       "claude-opus-4.7",
-      1666.2
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      259.4
+      877.3
     ],
     [
       "hypothesis",
       "gpt-5.5",
-      529.7
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      211.7
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      213.7
-    ],
-    [
-      "hypothesis",
-      "claude-opus-4.7",
-      621.1
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      175.8
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      216.8
-    ],
-    [
-      "hypothesis",
-      "gpt-5.5",
-      680.3
-    ],
-    [
-      "reviewer",
-      "gpt-5.5",
-      336.4
+      466.9
     ]
   ],
   "costs": {
@@ -707,10 +1216,10 @@
         "models": {
           "claude-opus-4.7": {
             "input_tokens": 0,
-            "output_tokens": 744892,
+            "output_tokens": 854929,
             "cache_read_tokens": 0,
-            "total_cost": 4.275,
-            "premium_requests": 142.5
+            "total_cost": 4.725,
+            "premium_requests": 157.5
           },
           "claude-sonnet-4-6": {
             "input_tokens": 0,
@@ -721,43 +1230,43 @@
           },
           "gpt-5.5": {
             "input_tokens": 0,
-            "output_tokens": 949428,
+            "output_tokens": 1066084,
             "cache_read_tokens": 0,
-            "total_cost": 17.1,
-            "premium_requests": 570.0
+            "total_cost": 18.675,
+            "premium_requests": 622.5
           }
         },
-        "provider_cost": 21.465
+        "provider_cost": 23.49
       }
     },
-    "total_cost": 21.465,
+    "total_cost": 23.49,
     "stages": {
       "reviewer": {
         "copilot": {
           "input_tokens": 0,
-          "output_tokens": 524088,
-          "premium_requests": 390.0
+          "output_tokens": 557816,
+          "premium_requests": 412.5
         }
       },
       "hypothesis": {
         "copilot": {
           "input_tokens": 0,
-          "output_tokens": 1013152,
-          "premium_requests": 232.5
+          "output_tokens": 1159992,
+          "premium_requests": 262.5
         }
       },
       "poc": {
         "copilot": {
           "input_tokens": 0,
-          "output_tokens": 109254,
-          "premium_requests": 52.5
+          "output_tokens": 148123,
+          "premium_requests": 60.0
         }
       },
       "final_review": {
         "copilot": {
           "input_tokens": 0,
-          "output_tokens": 47826,
-          "premium_requests": 37.5
+          "output_tokens": 55082,
+          "premium_requests": 45.0
         }
       },
       "condensation": {

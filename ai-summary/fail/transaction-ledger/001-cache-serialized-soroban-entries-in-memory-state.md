@@ -263,3 +263,42 @@ The optimization serializes each immutable resident `CONTRACT_DATA` `LedgerEntry
 ### Test Results
 
 Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`, built with `make -j30`, and ran the full unit suite with `NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make -j30 check`. Final result: `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, `All 2 tests passed`.
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-04-28
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change address the claimed inefficiency?** YES — the source diff cached immutable `CONTRACT_DATA` XDR bytes in `InMemorySorobanState` and propagated the cache through clean parallel-apply entry state to `InvokeHostFunctionApplyHelper::addReads`.
+2. **Are the preconditions realistic?** YES — soroswap performs many clean `CONTRACT_DATA` footprint reads during `closeLedger`, so this is an exercised path.
+3. **Is the original code inefficient or by-design?** INEFFICIENT BUT NOT SUFFICIENT — repeated `xdr::xdr_to_opaque(LedgerEntry)` walks are real waste, but the PoC still copies cached bytes into a fresh `CxxBuf` vector for the Rust bridge, preserving allocation/copy overhead and adding memory/cache pressure to in-memory state.
+4. **Does the benchmark improvement match the claimed severity?** NO — independent benchmark runs showed soroswap median apply time regressed in every run versus the accepted baseline best run of 596.381 ms from `ai-summary/CURRENT_STATE.md`.
+5. **Is the optimization in scope?** YES — the modified path is inside Soroban parallel apply / `closeLedger` and not TX-set construction.
+6. **Is the benchmark methodology correct?** YES — built with Tracy enabled, full unit suite passed, and ran `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py --tracy` three times against the local optimized binary.
+7. **Can the result be explained without the optimization?** The observed result is not a confirmed improvement: all three optimized soroswap medians were worse than the accepted baseline, so variance cannot support the PoC claim.
+8. **Is this optimization novel?** NOVEL, but novelty does not overcome the measured soroswap regression.
+
+Independent validation details:
+
+- Build: `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` and `make -j30 ALL_SOROBAN_GIT_STATE_STAMPS=` passed.
+- Tests: `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make -j30 check ALL_SOROBAN_GIT_STATE_STAMPS=` passed (`PASS: test/selftest-nopg`, `PASS: test/check-nondet`).
+- Accepted baseline from `ai-summary/CURRENT_STATE.md`: soroswap median apply time 596.381 ms from run `729423c9f1a5-20260428-041610`; baseline sac medians were 692.552 ms, 668.857 ms, and 679.485 ms.
+- Optimized run 1 (`c82ebb6727f1-20260428-073113`): sac median 661.128 ms; soroswap median 623.604 ms.
+- Optimized run 2 (`c82ebb6727f1-20260428-074445`): sac median 692.196 ms; soroswap median 655.770 ms.
+- Optimized run 3 (`c82ebb6727f1-20260428-075849`): sac median 714.774 ms; soroswap median 635.140 ms.
+
+### Rejection Reason
+
+The headline objective metric is soroswap apply time, and the optimized code regressed it in all three independent benchmark runs. Although the code targets a real inefficiency and preserves correctness in the unit suite, it does not produce the required measurable apply-time improvement; therefore it fails the performance final-review verdict criteria.
+
+### Failed Checks
+
+- Performance final-review Step 5: benchmark improvement not demonstrated.
+- Adversarial check 4: measured improvement/severity unsupported; soroswap regressed.
+- Verdict criteria: soroswap regression blocks CONFIRMED.

@@ -76,3 +76,25 @@ The PoC must preserve observable outputs and metering semantics. If skipped `met
 - **Change description**: Carry old encoded entry sizes from `build_storage_map_from_xdr_ledger_entries` into the initial snapshot/change computation, avoid filling `LedgerEntryChange::encoded_key` on the core enforcing path except when a missing TTL-map entry requires hashing the key for a newly created TTL-bearing entry, and compute rent changes plus modified-entry buffers directly without allocating/storing discarded fields. Keep current recording-mode and simulation-facing `LedgerEntryChange` behavior unchanged unless all callers are updated.
 - **Correctness check**: Existing Soroban invoke-host-function, rent, restore/autorestore, TTL-extension, contract-code, event, and transaction-meta tests should continue to pass with identical ledger effects and transaction results. Pay special attention to created entries, restored persistent entries, expired temporary entries, contract-code rent sizing, diagnostic-event CPU/memory metrics, and any tests that compare host metering.
 - **Benchmark focus**: Run repeated soroswap apply-load matrix measurements, especially `soroswap, TX=4000, T=8`, and require at least a reproducible 3% reduction in the top-line apply-time metric. Secondary Tracy validation should show reduced `write xdr` self-time/call count in the Soroban invoke output path while `recordStorageChanges` still receives identical modified ledger-entry bytes and synthesized TTL entries.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-04-28
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:5-40` — added an internal `BTreeMap` metadata type for unmetered preservation of input ledger-entry XDR sizes keyed by `LedgerKey`.
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:184-292` — changed enforcing-path ledger-change construction to skip populating discarded `encoded_key` bytes outside test/recording builds, reuse input TTL key hashes when present, serialize keys only for newly-created TTL-bearing entries that still need a hash, and use preserved old-entry XDR sizes for rent sizing instead of reserializing old entries.
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:461-530, 809-854, 985-1081` — carried input XDR sizes out of `build_storage_map_from_xdr_ledger_entries`, passed them only to the normal enforcing invocation path, and left recording-mode ledger-change behavior unchanged by passing `None`.
+
+### Demonstration
+
+The PoC removes redundant `metered_write_xdr` calls for data discarded by stellar-core's C++ apply path: most ledger keys and all existing old ledger entries in successful p26 enforcing invocations. It preserves required output bytes for result values, contract events, modified ledger entries, and synthesized TTL entries; contract-code rent sizing still adds `wasm_module_memory_cost` on top of the preserved input XDR length. Recording-mode/test builds continue to fill `encoded_key` and compute old-entry size through the existing path so simulation-facing metering expectations stay stable.
+
+### Test Results
+
+Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`; `make -j $(nproc)` completed successfully. Full regression run `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` completed successfully with `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and all Soroban p26 host checks passing, including `750 passed; 0 failed; 2 ignored; 1 filtered out` for the main p26 host test binary.
