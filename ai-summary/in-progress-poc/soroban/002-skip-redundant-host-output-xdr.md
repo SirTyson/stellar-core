@@ -168,3 +168,73 @@ Test runs (from repo root):
 
 - `cargo test --release -p soroban-env-host --lib` — **750 passed; 0 failed** (includes the new `optimized_get_ledger_changes_matches_unoptimized` test).
 - `env NUM_PARTITIONS=$(nproc) STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` — full stellar-core unit test suite **passes** with the production change in place across all parallel partitions; `PASS: test/selftest-nopg`, `PASS: test/check-nondet`.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-04-28
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The revised patch fixes the previous public-output issue by always populating
+`LedgerEntryChange::encoded_key`, and preserving the input XDR byte length is a
+valid way to compute rent size for old entries. However, the patch is still not
+confirmable because its replacement budget charge is not equivalent to the
+skipped `metered_write_xdr` work and the PoC explicitly allows lower
+protocol-visible CPU/memory accounting.
+
+`metered_write_xdr` wraps the XDR writer in `MeteredWrite`, whose `write` method
+charges `ContractCostType::ValSer` on every `Write::write` call. The p26 budget
+model gives `ValSer` nonzero CPU and memory constant terms (`const_term_cpu =
+230`, `const_term_mem = 242`) in addition to linear byte terms. Replacing a
+whole old-entry serialization with a single `budget.charge(ValSer, Some(total_xdr_size))`
+therefore drops `(write_count - 1)` constant charges for every skipped entry.
+The code comment acknowledges this undercharge, and the new test only asserts
+`cpu_opt <= cpu_unopt` / `mem_opt <= mem_unopt`, documenting a metering change
+rather than preserving previous behavior.
+
+This matters because `soroban_proto_any::invoke_host_function` returns
+`cpu_insns` and `mem_bytes` from the host budget to C++, and
+`InvokeHostFunctionOpFrame` uses those values for Soroban resource accounting.
+Changing them can alter resource-limit behavior, fee refunds, transaction
+metadata, and success/failure at boundaries. A "small" per-entry delta is still
+observable and consensus-relevant if a transaction is constructed near the
+declared resource limits.
+
+### Revision Instructions
+
+Revise the optimization so the metering behavior is either exactly preserved or
+explicitly accepted with a protocol/resource-accounting justification:
+
+1. If the intent is behavior preservation, replace the skipped serialization
+   with an exact metering path. For example, run `old_entry.write_xdr` into a
+   no-op/counting writer that charges through the same `MeteredWrite` logic
+   without allocating or storing the old-entry buffer, then use the preserved
+   input XDR length only for rent sizing. The replacement must match the old
+   `ValSer` tracker iterations/input, CPU, and memory, not just total bytes.
+2. If the intent is to lower host CPU/memory accounting because the old-entry
+   output buffer is no longer materialized, add explicit tests for
+   resource-limit boundary behavior and update the PoC framing to explain why a
+   protocol-visible metering change is acceptable for p26. The current
+   "close enough" bulk charge is not sufficient.
+3. Strengthen the optimized-vs-unoptimized test to compare budget tracker
+   values when behavior preservation is claimed, including `ValSer`
+   iterations/input/cpu/mem and returned `cpu_insns`/`mem_bytes`.
+4. After the metering issue is resolved, rerun the final-review gates: full
+   `env NUM_PARTITIONS=30 make check`, then at least three
+   `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py --tracy`
+   runs compared against `ai-summary/CURRENT_STATE.md`.
+
+### Checks Passed So Far
+
+1. The revised source change is limited to the p26 `e2e_invoke.rs` host-output
+   path and still returns populated `encoded_key` values.
+2. Carrying input XDR lengths through
+   `build_storage_map_from_xdr_ledger_entries` is sound for old-entry rent
+   sizing on the enforcing path, assuming the input buffers are canonical
+   `LedgerEntry` XDR.
+3. Recording mode correctly passes `None` and keeps the old serialization path
+   because its snapshot source is not a one-to-one map of the encoded input
+   entries.
