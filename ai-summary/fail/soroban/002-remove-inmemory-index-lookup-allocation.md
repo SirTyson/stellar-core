@@ -79,3 +79,61 @@ Severity is Medium rather than High. The trace makes this a credible 3-10% apply
 - **Change description**: Replace `std::unique_ptr<AbstractEntry>` plus `ValueEntry`/`QueryKey` polymorphism with a non-allocating representation. A safe shape is an entry object tagged as either stored value (`IndexPtrT`) or query view (`LedgerKey const*` valid only for the `find` call), with `hash()` and equality dispatching via `switch`/helpers rather than virtual calls. Preserve the existing set storage layout and the `get()` behavior for stored entries; query entries must never be returned from the set.
 - **Correctness check**: Existing bucket-index coverage should still pass, especially `src/bucket/test/BucketIndexTests.cpp` point-lookup and in-memory-index cases, plus `src/bucket/test/BucketListTests.cpp` snapshot lookup coverage. Soroban parallel apply behavior is covered through existing invoke-host-function and parallel apply tests that exercise footprint loading.
 - **Benchmark focus**: Measure allocation count and self-time in `InMemoryBucketState::scan`, then run the soroswap apply-load matrix repeatedly. The expected improvement is reduced scan self-time and a 3-10% reduction in top-line soroswap apply time if the allocator/virtual wrapper is indeed the dominant component of the observed scan cost.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_FAIL
+**Date**: 2026-04-28
+**PoC by**: claude-opus-4.7, high
+**Failed At**: poc
+**Iterations**: 0 (no build/test cycles required)
+
+### Failure Reason
+
+The proposed optimization is already implemented in the current tree. The
+hypothesis was filed against a stale view of `src/bucket/InMemoryIndex.{h,cpp}`
+that referenced `std::unique_ptr<AbstractEntry>` plus `ValueEntry`/`QueryKey`
+polymorphism with virtual `hash()` / `operator==`. That representation no
+longer exists.
+
+The relevant change has already landed as commit
+`d16dd3571 "perf: eliminate InMemoryBucketState scan polymorphic wrapper"`,
+and is documented as a previously-passed PoC at
+`ai-summary/success/soroban/001-inmemory-bucket-scan-polymorphic-wrapper.md`
+(hypothesis H001), which targets the same code path with the same fix.
+
+Current state of the lookup path (verified by reading the source):
+
+- `src/bucket/InMemoryIndex.h:22-74` — `InternalInMemoryBucketEntry` now holds
+  only `IndexPtrT mEntry` and a cached `size_t mHash`. No `unique_ptr` to a
+  polymorphic base, no `QueryKey` type. Hash and equality are non-virtual.
+  `InternalInMemoryBucketEntryHash` and `InternalInMemoryBucketEntryEqual`
+  declare `using is_transparent = void;` and provide overloads for both
+  `InternalInMemoryBucketEntry` and `LedgerKey`.
+- `src/bucket/InMemoryIndex.cpp:250-262` — `InMemoryBucketState::scan` calls
+  `mEntries.find(searchKey)` directly with the `LedgerKey`, exercising C++20
+  heterogeneous lookup. No wrapper is constructed and nothing is allocated on
+  the lookup path.
+- `src/bucket/InMemoryIndex.cpp:28-95` — Equality between a stored
+  `BucketEntry` and a query `LedgerKey` uses a single switch on
+  `LedgerEntryType` comparing identifying fields directly
+  (`ledgerEntryDataKeyEqual` / `bucketEntryKeyEqual`). No `LedgerKey`
+  materialization or copy from the stored entry.
+- `src/bucket/InMemoryIndex.cpp:198-204` — Stored entries cache their hash at
+  insert time; lookup hash is computed once via
+  `std::hash<LedgerKey>{}(searchKey)`.
+
+There is therefore no per-lookup heap allocation and no virtual dispatch on
+this path, which were the two specific costs the hypothesis proposed to
+remove. Re-implementing the same change is not possible without first
+reverting the existing optimization, and benchmarking would be a duplicate of
+the work already captured under H001.
+
+### Changes Attempted
+
+None. After inspecting `src/bucket/InMemoryIndex.{h,cpp}` and the git history
+(`git log --oneline src/bucket/InMemoryIndex.{h,cpp}`), it was clear that the
+proposed change is already in place. No source modifications were made, so
+there is nothing to revert.

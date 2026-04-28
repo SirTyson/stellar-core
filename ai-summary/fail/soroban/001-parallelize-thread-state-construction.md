@@ -158,3 +158,32 @@ This preserves observable ledger behavior because the global scope remains deact
 - `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` completed successfully.
 - `make -j $(nproc)` completed successfully after creating ignored `src/rust/soroban/p*/target/git-state.txt` build-state files from each submodule revision; this workaround was needed because the linked worktree's submodule gitdir layout does not provide the `.git/modules/...` prerequisites expected by the generated Makefile rule.
 - `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` passed end-to-end. The C++ test harness reported `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`; the Rust/Soroban host suites also completed successfully, including the p26 host suite with `750 passed; 0 failed; 2 ignored`.
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-04-28
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change address the claimed inefficiency?** YES — the source diff moves `ThreadParallelApplyLedgerState` construction from the apply thread into each `std::async` worker while preserving cluster-index future collection.
+2. **Are the preconditions realistic?** PLAUSIBLE — soroswap uses multiple independent clusters, so per-cluster setup could matter if it is on the critical path.
+3. **Is the original code inefficient or by design?** INCONCLUSIVE BUT PLAUSIBLE INEFFICIENCY — the serial construction is not required for deterministic merge order, but the final-review benchmark did not show a top-line win from moving it.
+4. **Does the benchmark improvement match the claimed severity?** NO — independent runs showed no reproducible soroswap apply-time reduction. Optimized soroswap medians were 608.166622 ms, 612.736979 ms, and 600.230686 ms versus the accepted baseline runs of 603.400217 ms, 613.577685 ms, and 596.381355 ms, with the accepted headline baseline at 596.381 ms.
+5. **Is the optimization in scope?** YES — the changed path is under `applyLedger` -> `applyTransactions` -> `applyParallelPhase` -> `applySorobanStages`.
+6. **Is the benchmark methodology correct?** YES — final review used the required Tracy-enabled build and ran `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py --tracy` three times against the optimized binary, comparing against `ai-summary/CURRENT_STATE.md`.
+7. **Can the improvement be explained without the optimization?** NOT APPLICABLE — no improvement was measured; observed variation is consistent with benchmark noise and normal run-to-run variance.
+8. **Is this optimization novel?** NOT DISPROVEN — novelty is not the blocker.
+
+### Rejection Reason
+
+The optimization is correctness-plausible and the full unit suite passed, but it does not produce the required measurable soroswap apply-time improvement. The best optimized soroswap median from final review was 600.230686 ms, still slower than the accepted 596.381355 ms headline baseline, and all three optimized runs missed the accepted best baseline. Findings below 1% or without reproducible top-line improvement are not valid for this objective.
+
+### Failed Checks
+
+- Performance verdict criterion: soroswap apply time must improve consistently across multiple benchmark runs.
+- Adversarial check 4: benchmark improvement must support the claimed severity or at least a valid >1% performance finding.
