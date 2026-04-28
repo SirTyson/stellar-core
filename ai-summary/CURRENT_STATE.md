@@ -1,69 +1,54 @@
 # CURRENT_STATE — Soroswap Optimization Baseline
 
-This is the bootstrap baseline established before any optimization
-hypothesis has been evaluated. It was produced by a single
-`run_apply_load_matrix.py --tracy` invocation on the unmodified
-`soroswap-perf` branch HEAD.
+This is the accepted optimized baseline after confirming
+`004-parallel-apply-ledgerkey-hash-recompute`.
 
 ## Commit
 
-- SHA: `51a6d449b595eaf69f1a8c9219ec699c45043309`
-- Branch: `soroswap-perf`
-- Subject: `Bump lib/tracy submodule to pick up tracy-capture segfault fixes`
-
-(The two most recent commits — `ae7078058` untracking `SimpleTimer::mLock`
-from Tracy and `51a6d449b` bumping the tracy submodule — exist solely
-to make Tracy capture work on this workload. Neither touches
-stellar-core hot-path timing, so the numbers below are valid as the
-unoptimized baseline against which hypotheses are compared.)
+- SHA: `2133b4a98741b6b811a5cdcf74a38587220f90ca`
+- Subject: `perf(soroban): cache parallel apply footprint keys`
 
 ## Timestamp
 
-- Run timestamp: 2026-04-27T18:50:13Z
-- Recorded: 2026-04-27T19:04:28Z
+- Optimized benchmark runs: 2026-04-28T03:48:39Z through 2026-04-28T04:29:28Z
+- Recorded: 2026-04-28T04:29:28Z
 
-## Apply-time results (per-run, 1 run)
+## Apply-time results (per-run, 3 runs)
 
-| scenario              | median_ms          | p95_ms             | p99_ms             |
-|-----------------------|--------------------|--------------------|--------------------|
-| sac, TX=12000, T=8    | 709.6388700000025  | 759.4978862000025  | 912.7892176300072  |
-| soroswap, TX=4000, T=8| 620.9962180000002  | 631.9992041999922  | 641.8652729899914  |
+| run | run id | scenario | median_ms | p95_ms | p99_ms |
+|-----|--------|----------|-----------|--------|--------|
+| 1 | `729423c9f1a5-20260428-034840` | sac, TX=12000, T=8 | 692.5523475000009 | 826.2431193000072 | 1034.150116329996 |
+| 1 | `729423c9f1a5-20260428-034840` | soroswap, TX=4000, T=8 | 603.400216500002 | 711.4591699999934 | 769.5354233200034 |
+| 2 | `729423c9f1a5-20260428-040245` | sac, TX=12000, T=8 | 668.8567534999984 | 723.25062160001 | 851.497942500007 |
+| 2 | `729423c9f1a5-20260428-040245` | soroswap, TX=4000, T=8 | 613.5776854999931 | 624.0815708500011 | 637.7503740399867 |
+| 3 | `729423c9f1a5-20260428-041610` | sac, TX=12000, T=8 | 679.484763000004 | 716.0496663000064 | 863.0642700399967 |
+| 3 | `729423c9f1a5-20260428-041610` | soroswap, TX=4000, T=8 | 596.3813549999923 | 615.4794212499918 | 656.2239895100065 |
 
-Headline metric (per the final-review skill): **soroswap median apply
-time = 620.996 ms**.
-
-Only one run was performed because this is the very first bootstrap
-baseline. Future hypothesis evaluations should run the matrix multiple
-times (3 minimum, 5 preferred) for statistical confidence.
+Headline metric for the next hypothesis round: **soroswap median apply
+time = 596.381 ms** from the chosen best optimized run.
 
 ## Artifact paths
 
-- Run artifact directory:
-  `/mnt/nvme2/apply-load/14571316dcdf-20260427-185013`
-- Tracy trace (sac), full and valid (~436 MB, 48.7M+ zones):
-  `/mnt/nvme2/apply-load/14571316dcdf-20260427-185013/logs/14571316dcdf-20260427-185013-01-sac-tx-12000-t-8.tracy`
-- Tracy trace (soroswap), full and valid (~291 MB, 36.3M zones):
-  `/mnt/nvme2/apply-load/14571316dcdf-20260427-185013/logs/14571316dcdf-20260427-185013-02-soroswap-tx-4000-t-8.tracy`
+- Chosen run artifact directory:
+  `/mnt/nvme2/apply-load/729423c9f1a5-20260428-041610`
+- Tracy trace (sac):
+  `/mnt/nvme2/apply-load/729423c9f1a5-20260428-041610/logs/729423c9f1a5-20260428-041610-01-sac-tx-12000-t-8.tracy`
+- Tracy trace (soroswap):
+  `/mnt/nvme2/apply-load/729423c9f1a5-20260428-041610/logs/729423c9f1a5-20260428-041610-02-soroswap-tx-4000-t-8.tracy`
 
-Both traces saved cleanly ("Saving trace... done!"). The soroswap
-trace is the headline reference for hypothesis-round Tracy diffs
-(use `scripts/DiffTracyCSV.py` per the analyzing-tracy-profiles skill).
-
+The soroswap trace is the headline reference for future hypothesis-round
+Tracy diffs.
 
 ## Build configuration
 
-```
+```sh
 ./configure --enable-ccache --enable-sdfprefs --enable-tracy \
             --enable-tracy-capture --disable-postgres
-make -j30
-# tracy-capture rebuilt:
-( cd lib/tracy/capture/build/unix && make clean && make release \
-    CC="ccache clang-20" CXX="ccache clang++-20 -std=c++20" \
-    CXXFLAGS="-O3 -g1 -fno-omit-frame-pointer -stdlib=libc++ -pthread -DFMT_HEADER_ONLY=1 -DNO_PARALLEL_SORT=1" \
-    CFLAGS="-O3 -g1 -fno-omit-frame-pointer" \
-    TRACY_NO_ISA_EXTENSIONS=1 TRACY_NO_LTO=1 LEGACY=1 -j30 )
-cp lib/tracy/capture/build/unix/capture-release tracy-capture
+make -j30 ALL_SOROBAN_GIT_STATE_STAMPS=
+env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' \
+    make -j30 check ALL_SOROBAN_GIT_STATE_STAMPS=
+PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py --tracy
 ```
 
-stellar-core binary: `./src/stellar-core` reporting `v26.0.0-165-g51a6d449b`.
-
+The benchmark binary was built from the source tree that was subsequently
+committed as `2133b4a98741b6b811a5cdcf74a38587220f90ca`.
