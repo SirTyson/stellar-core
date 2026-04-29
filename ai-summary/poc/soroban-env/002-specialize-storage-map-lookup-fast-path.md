@@ -79,3 +79,26 @@ The proposed fix is correctness-preserving if it is narrowly scoped. It must not
 - **Change description**: Add specialized inherent methods for `MeteredOrdMap<Rc<LedgerKey>, V, Budget>` (or an equivalent private helper) that perform the same pre-1.82 binary-search loop directly over the map, return `Result<Result<usize, usize>, HostError>` without the `Option<HostError>` side channel, use unchecked element access only under the documented loop invariants, and compare supported `LedgerKey` variants without repeating `Storage::check_supported_ledger_key_type` on every probe. Wire those methods into enforcing storage/footprint/TTL/restored-key `get`, `contains_key`, and hot `insert` call sites only after keys have been validated.
 - **Correctness check**: Existing Soroban host e2e and budget-metering tests should continue to report identical result XDR, ledger changes, diagnostic behavior, and exact budget trackers. Add focused assertions if needed around invalid unsupported footprint/restored-key input so the specialized path still returns the same error type/code as the generic path.
 - **Benchmark focus**: Measure non-Tracy soroswap apply time with `scripts/run_apply_load_matrix.py` over repeated runs; the acceptance metric is at least a 3% median apply-time reduction. Also compare budget tracker output before/after on representative invocations and, when profiling with Tracy, verify that `map lookup` self-time under `applyLedger` falls by at least the ~130 ms needed to clear the Medium threshold.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-04-29
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/host/comparison.rs` lines 397-440: extracted `Budget::compare_validated_ledger_keys` so validated `LedgerKey` map lookups can reuse the same variant-specific metered comparisons without re-running supported-key validation on every binary-search probe; the public `Compare<LedgerKey>` implementation still performs validation first.
+- `src/rust/soroban/p26/soroban-env-host/src/host/metered_map.rs` lines 86-217: added specialized inherent lookup/insert helpers for `MeteredOrdMap<Rc<LedgerKey>, V, Budget>` that keep the existing `map lookup` Tracy span, `charge_binsearch`, comparison order, insertion semantics, and access charges, while avoiding the generic fallible-search side channel and using unchecked probe access under the same binary-search invariants.
+- `src/rust/soroban/p26/soroban-env-host/src/storage.rs` lines 139-143, 261-264, 359-361, 514-518, 692-695, 713-720, and 740-776: routed enforcing storage/footprint and recording-mode storage-map accesses that follow explicit key validation through the validated `LedgerKey` helpers.
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs` lines 150-164, 203-210, 248-257, 267-274, 305-313, 749-756, 939-953, 1023-1052, and 1077-1081: routed footprint, storage, TTL, restored-key, ledger-change, and snapshot lookups/inserts through the validated fast path, adding explicit restored-footprint-key validation before using the restored-key insertion fast path.
+
+### Demonstration
+
+The optimization specializes the hot Soroban storage/footprint/TTL/restored-key map operations for maps whose `LedgerKey`s have already been checked at ingress or derived from supported ledger entries. It preserves all existing explicit metering and binary-search control flow while reducing physical CPU overhead from the generic error side channel, safe per-probe bounds checks, and repeated supported-key discriminant validation in apply-path map lookups.
+
+### Test Results
+
+Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`, built successfully with `make -j30`, and ran the full suite successfully with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`; the final output reported `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.
