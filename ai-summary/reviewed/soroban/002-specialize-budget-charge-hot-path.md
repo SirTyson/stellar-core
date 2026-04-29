@@ -1,0 +1,92 @@
+# H002: Specialize the Soroban Budget Charge Hot Path
+
+**Date**: 2026-04-29
+**Subsystem**: soroban-env
+**Severity**: Medium
+**Impact**: Soroswap apply-time reduction in ubiquitous host metering
+**Hypothesis by**: gpt-5.5, high
+
+## Expected Behavior
+
+Every Soroban host operation must charge the exact same CPU and memory budget totals, tracker fields, shadow-mode totals, and limit errors as today, but the act of charging should be a low-overhead inlined arithmetic update. A valid `ContractCostType` enum should not pay repeated fallible array lookups, error-construction branches, and duplicated cost-model dispatch on every metering call in the production enforcing path.
+
+## Mechanism
+
+`Budget::charge` borrows the `BudgetImpl` and calls `BudgetImpl::charge`; `BudgetImpl::charge` then performs a fallible `get_mut` into the tracker array, updates tracker fields, separately calls `BudgetDimension::charge` for CPU and memory, and each dimension performs another fallible cost-model lookup plus model evaluation and limit accounting. The enum value already indexes fixed-size arrays initialized from `ContractCostType::variants()`, so the hot path can be split into an infallible/specialized charge routine using direct indexing, prevalidated model shape, and combined CPU/memory accounting while keeping the public fallible API for tests/config mutation. This removes repeated control-flow and bounds-check overhead from millions of charges without changing deterministic budget totals.
+
+## Trigger
+
+Run the current soroswap apply-load benchmark. SAC-heavy swaps and host invocation repeatedly call `Host::charge_budget`, `MeteredOrdMap` charge helpers, object visits, XDR conversion, and storage access. A PoC should introduce a production fast path for `BudgetImpl::charge(ty, 1, input)` that preserves all tracker and limit results exactly, then compare repeated soroswap medians and Tracy `charge` self-time.
+
+## Target Code
+
+- `src/rust/soroban/p26/soroban-env-host/src/budget.rs:1320-1325` — public `Budget::charge` takes a mutable `RefCell` borrow for every single-unit charge.
+- `src/rust/soroban/p26/soroban-env-host/src/budget.rs:235-284` — `BudgetImpl::charge` performs tracker lookup/update, CPU charge, CPU limit check, memory charge, and memory limit check for every metered operation.
+- `src/rust/soroban/p26/soroban-env-host/src/budget/dimension.rs:163-187` — each dimension charge performs a cost-model lookup and model evaluation before adding to totals.
+- `src/rust/soroban/p26/soroban-env-host/src/host.rs:634-635` — `Host::charge_budget` is the common host entry point used by object visits and many built-in helpers.
+- `src/rust/soroban/p26/soroban-env-host/src/host_object.rs:468-476`, `storage.rs:258-388`, and `host/metered_map.rs:173-194` — high-frequency callers that multiply the per-charge overhead in soroswap.
+
+## Evidence
+
+The current soroswap diagnostic trace shows `charge,soroban-env-host/src/budget/dimension.rs,176` entirely inside `applyLedger`: **2,043.955 ms self-time** across **18,721,841 calls**. The same apply-contained trace shows callers that are dominated by metering fan-out: `visit host object` has **2,372.465 ms** across **2,689,616 calls**, `map lookup` has **1,321.581 ms** across **754,812 calls**, `storage get` has **847.123 ms** across **176,910 calls**, and `write xdr` has **1,071.529 ms** across **132,907 calls**. The path is a descendant of `applyLedger` via parallel Soroban worker execution, and the zone's call count is high enough that even shaving tens of nanoseconds per charge can be measurable across a ledger.
+
+The optimization is not a metering reduction. The PoC should assert identical `get_cpu_insns_consumed`, `get_mem_bytes_consumed`, `CostTracker` values for representative charges, and identical budget-exceeded behavior at boundaries. The intended saving is only wall-clock overhead from generic fallible dispatch and repeated indexing in a code path where the cost-type enum and array layout are already validated.
+
+## Anti-Evidence
+
+The Tracy `charge` span itself adds instrumentation overhead in diagnostic builds, so the PoC must prove a top-line non-Tracy apply-load improvement and not rely solely on the Tracy self-time drop. Some bounds checks may already compile away under optimization, and replacing safe indexing with unchecked indexing would be unacceptable unless the invariant is tightly encapsulated and tested. Because charges execute on parallel worker threads, aggregate worker self-time does not translate one-for-one into apply-thread wall-clock; the win must survive repeated benchmark runs to remain Medium.
+
+---
+
+## Review
+
+**Verdict**: VIABLE
+**Severity**: Medium
+**Date**: 2026-04-29
+**Reviewed by**: gpt-5.5, high
+**Novelty**: PASS — not previously investigated
+
+### Trace Summary
+
+The Soroban parallel apply path reaches Rust host execution through `LedgerManagerImpl::applySorobanStageClustersInParallel`, `InvokeHostFunctionOpFrame::doParallelApply`, the C++/Rust bridge, and `e2e_invoke::invoke_host_function`. Inside host execution, VM dispatch, object visits, metered maps, metered XDR, storage preparation, and built-in SAC helpers all funnel through `Budget::charge(ty, input)`, which takes a `RefCell` mutable borrow and calls the generic bulk `BudgetImpl::charge(ty, 1, input)`. The claimed repeated work exists: every single-unit charge updates tracker state, performs fallible tracker/model lookups, evaluates separate CPU and memory cost models, and checks limits in two dimensions. The quoted Tracy `charge` zone is partly diagnostic instrumentation rather than pure production charge cost, so the PoC must validate non-Tracy apply time; however the call count and centrality of the path make a specialized exact-equivalence fast path a plausible Medium candidate.
+
+### Code Paths Examined
+
+- `src/ledger/LedgerManagerImpl.cpp:2531-2574` — Soroban stage clusters are executed on async apply threads and synchronously joined before stage commit, so per-invocation host metering is in the `closeLedger` critical path.
+- `src/ledger/LedgerManagerImpl.cpp:2623-2709` — `applySorobanStage` and `applySorobanStages` run parallel Soroban apply, invariants, per-thread commit, and final ledger commit within apply.
+- `src/transactions/InvokeHostFunctionOpFrame.cpp:575-590` — each Soroban operation crosses into `rust_bridge::invoke_host_function` and records returned CPU/memory metrics, making budget totals observable.
+- `src/transactions/InvokeHostFunctionOpFrame.cpp:1360-1377` — parallel Soroban apply invokes the helper that executes the host function on the worker thread.
+- `src/rust/src/soroban_invoke.rs:7-60` — the bridge dispatches to the protocol-specific Soroban host implementation.
+- `src/rust/src/soroban_proto_any.rs:391-466` — the protocol-agnostic wrapper constructs `Budget`, calls the p26 host invocation, and reads final CPU/memory/time metrics from the same budget.
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:408-520` — enforcing-mode invocation decodes resources, builds footprint/storage maps, constructs the `Host`, invokes the host function, and serializes result/ledger changes with metered operations.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:1125-1194` — `Host::invoke_function` enters a top-level `Frame::HostFunction`, invokes contracts/SACs, and converts the result back to XDR values.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:749-785` — contract calls instantiate Wasm or enter the Stellar Asset Contract frame; SAC-heavy soroswap therefore exercises host helpers directly.
+- `src/rust/soroban/p26/soroban-env-host/src/vm/dispatch.rs:206-253` — every Wasm host-function dispatch returns fuel to the host, charges `DispatchHostFunction`, converts relative objects, then calls the concrete host method.
+- `src/rust/soroban/p26/soroban-env-host/src/host.rs:626-635` — `Host::charge_budget` is a thin wrapper over `Budget::charge`, so object/storage/conversion helpers share the same hot charging path.
+- `src/rust/soroban/p26/soroban-env-host/src/budget.rs:235-284` — `BudgetImpl::charge` performs fallible tracker lookup, tracker input-shape validation, separate CPU/memory dimension charges, tracker accounting, and limit checks.
+- `src/rust/soroban/p26/soroban-env-host/src/budget.rs:1301-1325` — public `bulk_charge` and `charge` both route through the same `BudgetImpl::charge`; the ubiquitous `charge` path is always `iterations == 1`.
+- `src/rust/soroban/p26/soroban-env-host/src/budget/dimension.rs:96-122` — cost-model access is fallible even though the fixed array is sized by `ContractCostType::variants().len()`.
+- `src/rust/soroban/p26/soroban-env-host/src/budget/dimension.rs:163-187` — each dimension charge re-fetches the cost model, evaluates it, optionally emits the Tracy `charge` span, and adds to either normal or shadow totals.
+- `src/rust/soroban/p26/soroban-env-host/src/budget/model.rs:116-133` — model evaluation is deterministic saturating arithmetic over the same `(iterations, input)` tuple and can be specialized for `iterations == 1` without changing totals.
+- `src/rust/soroban/p26/soroban-env-host/src/host_object.rs:460-490` — every host-object visit charges `VisitObject` before borrowing and indexing the object table.
+- `src/rust/soroban/p26/soroban-env-host/src/host/metered_map.rs:63-83,168-194` — map access charges `MemCpy` for binary-search work before every lookup.
+- `src/rust/soroban/p26/soroban-env-host/src/host/metered_clone.rs:53-94` — shallow-copy and heap-allocation charges route common memory metering through `Budget::charge`.
+- `src/rust/soroban/p26/soroban-env-host/src/host/metered_xdr.rs:16-24,56-82` — metered XDR write/read paths charge `ValSer` and `ValDeser` frequently during invoke setup/output.
+- `src/rust/soroban/p26/soroban-env-host/src/storage.rs:252-388` — storage get/put paths perform metered footprint/map access and are repeatedly exercised by SAC storage helpers.
+
+### Findings
+
+The inefficiency exists and is on the soroswap apply path. `Budget::charge` is not just an occasional API boundary: it is called by VM dispatch, object visits, map searches, XDR conversion, metered clones, storage reads/writes, cryptographic helpers, and SAC built-in logic. For the dominant single-unit path, the code currently pays the generic bulk-charge structure on every call, including three fallible fixed-array accesses (`tracker`, CPU model, memory model), two model-dispatch calls, shadow-mode branching in multiple places, and repeated limit-check wrappers.
+
+The proposed fix is correctness-preserving in principle, but only if it preserves the exact side-effect ordering of the current code. In non-shadow mode, tracker lookup and input-shape validation happen before any dimension totals are charged; CPU is charged and `tracker.cpu` is updated before CPU limit checking; memory is not charged if CPU limit checking fails; memory limit failure occurs after both memory totals and `tracker.mem` have been updated. Shadow mode skips tracker updates and uses the shadow totals/limits, so a specialized path must retain that behavior rather than treating shadow mode as a debug-only afterthought.
+
+There are no existing pools, caches, or batching layers that remove this per-charge overhead for the hot callers. `bulk_charge` already amortizes callers that can batch identical work, but high-frequency paths such as `VisitObject`, `DispatchHostFunction`, map binary-search charging, `ValSer` leaf writes, and `ValDeser` top-level reads are inherently issued as many single-unit charges. The fixed-array invariant is already embedded in the implementation (`ContractCostType::variants().len()` arrays and direct indexing in debug formatting), so a safe direct-index helper with narrow invariant tests is a reasonable implementation target.
+
+The main caveat is measurement quality. The cited `charge,soroban-env-host/src/budget/dimension.rs,176` span is compiled only with the Tracy feature and wraps the instrumentation block inside CPU dimension charging, so it overstates production charge arithmetic and must not be used as the acceptance metric. Nonetheless the trace demonstrates millions of apply-contained charge events, and the current authoritative non-Tracy soroswap baseline is roughly 300 ms per ledger; after accounting for 8-way worker parallelism, saving even low-double-digit nanoseconds per single-unit charge can plausibly reach the 3% Medium threshold. This should proceed to PoC, with the expectation that the benchmark gate may still reject it if LLVM has already optimized most of the apparent control-flow cost away.
+
+### PoC Guidance
+
+- **Target code**: `src/rust/soroban/p26/soroban-env-host/src/budget.rs`, `src/rust/soroban/p26/soroban-env-host/src/budget/dimension.rs`, and `src/rust/soroban/p26/soroban-env-host/src/budget/model.rs`. Keep caller changes minimal; the public `Budget::charge` should transparently use the single-unit fast path.
+- **Change description**: Add a specialized `BudgetImpl::charge_one(ty, input)` path for `iterations == 1` that directly indexes the tracker and both cost-model arrays, evaluates CPU and memory costs with `iterations` folded out, updates normal/shadow totals, and preserves the exact current error and side-effect ordering. Keep `BudgetImpl::charge(ty, iterations, input)` for true bulk charges and route `bulk_charge` through it.
+- **Correctness check**: Compare old vs new behavior for constant and linear cost types, `Some`/`None` input mismatch, CPU-limit failure, memory-limit failure, shadow mode, `meter_count`, per-type `CostTracker::{iterations,inputs,cpu,mem}`, `get_cpu_insns_consumed`, and `get_mem_bytes_consumed`. Existing Soroban host budget/metering, invoke-host-function, XDR, map/vector, storage, SAC, and transaction resource-limit tests should continue to pass without weakening assertions.
+- **Benchmark focus**: Use the objective's non-Tracy `scripts/run_apply_load_matrix.py` workflow for the acceptance metric, repeated against `ai-summary/CURRENT_STATE.md` baselines. Tracy may be used only diagnostically to confirm charge-event counts and reduced instrumentation/self-time; a `charge` span drop alone is not sufficient because that line measures Tracy-only instrumentation.
