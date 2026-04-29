@@ -34,3 +34,35 @@ The Medida update zones are descendants of the measured apply path by timestamp 
 ## Anti-Evidence
 
 Exact Medida histogram reservoir semantics may depend on one sample per transaction and update order, so a PoC must decide whether exact sample preservation is required. If exact preservation is required, batching only moves the updates to the main thread and may reduce contention but not total apply work; if approximate aggregate metrics are acceptable, the observability change must be explicitly reviewed. The `DISABLE_SOROBAN_METRICS_FOR_TESTING` flag already removes some metric work in test configurations, so the PoC must verify the benchmark's production-like configuration still has these updates enabled and that repeated non-Tracy apply-load runs show a stable 3-10% median improvement.
+
+---
+
+## Review
+
+**Verdict**: NOT_VIABLE
+**Date**: 2026-04-29
+**Reviewed by**: gpt-5.5, high
+**Novelty**: PASS — not previously investigated in `fail/transactions`, `success/transactions`, or the cross-subsystem fail/success records
+**Failed At**: reviewer
+
+### Trace Summary
+
+The code path exists: parallel Soroban workers enter `LedgerManagerImpl::applyThread`, call `TransactionFrame::parallelApply`, then `OperationFrame::parallelApply`, then `InvokeHostFunctionOpFrame::doParallelApply`, which constructs an `InvokeHostFunctionParallelApplyHelper` containing `HostFunctionMetrics`. `HostFunctionMetrics::~HostFunctionMetrics` would publish many Medida meters, timers, and histograms on helper destruction, and Medida `Timer::Update`, `Histogram::Update`, and `Meter::Mark` all take locks and update CKMS/EWMA state. However, the authoritative `scripts/run_apply_load_matrix.py` soroswap scenario uses `Scenario.disable_metrics = True` by default and writes `DISABLE_SOROBAN_METRICS_FOR_TESTING = true`, so the targeted destructor returns before every Medida call and the host-function execution timer is not created in the measured benchmark.
+
+### Code Paths Examined
+
+- `scripts/run_apply_load_matrix.py:34-42,120-124,417-424` — the active soroswap scenario does not override `disable_metrics`, so the default `True` is rendered into the benchmark config as `DISABLE_SOROBAN_METRICS_FOR_TESTING = true`.
+- `ai-summary/CURRENT_STATE.md:60-73` — the accepted baseline and diagnostic trace were produced by `scripts/run_apply_load_matrix.py`, making that generated config the objective's measured path.
+- `src/transactions/InvokeHostFunctionOpFrame.cpp:170-230` — `HostFunctionMetrics::~HostFunctionMetrics` performs the claimed `Mark` and `Update` calls only after checking `mDisableMetrics`; when the benchmark flag is true it returns immediately.
+- `src/transactions/InvokeHostFunctionOpFrame.cpp:269-277,982-987` — the host-function execution timer is also gated by the same `mDisableMetrics` flag, so this timer update is absent from the benchmark path.
+- `src/transactions/InvokeHostFunctionOpFrame.cpp:308-328,1270-1280,1358-1378` — every parallel invoke helper constructs `HostFunctionMetrics` from `app.getConfig().DISABLE_SOROBAN_METRICS_FOR_TESTING`; `doParallelApply` does not use the passed `SorobanMetrics&` to bypass that gate.
+- `src/ledger/LedgerManagerImpl.cpp:2483-2520` and `src/transactions/TransactionFrame.cpp:2385-2430` — the worker-thread apply path has additional transaction/operation timers, but these are separate from the proposed `HostFunctionMetrics` batching target and are also disabled by the same benchmark flag.
+- `lib/libmedida/src/medida/timer.cc:154-157,273-279`, `lib/libmedida/src/medida/histogram.cc:237-258`, `lib/libmedida/src/medida/meter.cc:186-193`, and `lib/libmedida/src/medida/stats/ckms_sample.cc:151-160` — Medida updates are synchronized and nontrivial when enabled, confirming the mechanism in production-like metrics-on runs but not in the measured soroswap objective run.
+
+### Why It Failed
+
+The inefficiency is real only when Soroban metrics are enabled, but the optimization objective is tied to the apply time reported by `scripts/run_apply_load_matrix.py`, whose active soroswap scenario disables Soroban metrics. In that measured configuration, the proposed host-function metric aggregation removes no worker-path work because `HostFunctionMetrics` already early-returns and the related timers are not started. This is therefore not on the objective's measured hot path and cannot produce the required 3-10% Medium improvement in the authoritative benchmark.
+
+### Lesson Learned
+
+For this objective, Medida traces must be reconciled with the generated apply-load config before promotion. `DISABLE_SOROBAN_METRICS_FOR_TESTING=true` removes `HostFunctionMetrics` destructor publication from the benchmark, so host-function metric batching is not a viable soroswap apply-time optimization unless the objective explicitly changes to a metrics-enabled scenario.
