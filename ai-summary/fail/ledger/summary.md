@@ -1,6 +1,6 @@
 # Failed Investigations: Ledger Subsystem
 
-Condensed failure summaries for investigations targeting the ledger subsystem (LedgerTxn, LedgerTxnRoot, InMemorySorobanState, prefetch, BucketList commit, and validation paths). Last updated 2026-04-28.
+Condensed failure summaries for investigations targeting the ledger subsystem (LedgerTxn, LedgerTxnRoot, InMemorySorobanState, prefetch, BucketList commit, validation paths, and fee/seqnum processing). Last updated 2026-04-29.
 
 ## Summary Table
 
@@ -13,6 +13,7 @@ Condensed failure summaries for investigations targeting the ledger subsystem (L
 | 002-stream-level0-bucket-merge-output.md | Stream level-0 in-memory bucket merge output without a second full pass | Wrong optimization target — bucket file creation still requires every output entry to be XDR-sized, serialized, written, and hashed regardless of streaming; the "second pass" is not an extra pass but a necessary write pass | reviewer | Level-0 bucket merge streaming cannot eliminate file I/O; the serialization and hashing costs are inherent to producing a valid bucket file |
 | 003-skip-empty-soroban-prefetch-transaction-data.md | Skip empty Soroban transaction-data prefetch | Below threshold — the optimization is plausible but projects at Low severity; the objective requires at least Medium | hypothesis | Skipping no-op prefetch calls for Soroban-only ledgers is correct but negligible; the prefetch path is not on the critical execution path for soroswap TPS |
 | 004-validation-hotspots-out-of-scope.md | Apply-path signature validation aggregate hotspots | Out of scope — validation hotspots are mostly aggregate process-level hotspots, not measured `applyLedger` descendants; the in-apply fee/sequence processing path is also below the Medium threshold | hypothesis | Aggregate process profiles include validation, catchup, and gossip work outside `applyLedger`; always filter to in-scope descendants before estimating impact |
+| 001-parallelize-process-fees-seq-nums.md | Parallelize `processFeesSeqNums` per cluster for Soroban-only ledgers | Wrong mechanism — `LedgerTxn::Impl::addChild` calls `throwIfChild()` enforcing a single active child; concurrent cluster-local `LedgerTxn` children on the same parent are architecturally impossible without redesigning the LedgerTxn nesting model | reviewer | `LedgerTxn` allows exactly one active child at a time; fee processing parallelism requires a different state isolation mechanism entirely (see the parallel apply state system, which does not use nested `LedgerTxn`s for Soroban) |
 
 ## Meta-Patterns
 
@@ -23,3 +24,5 @@ Condensed failure summaries for investigations targeting the ledger subsystem (L
 3. **Scope Filter First**: Before writing a ledger-subsystem hypothesis, confirm the target zone is a descendant of `applyLedger` in the Tracy trace, not an aggregate process-level hotspot that includes pre-apply or post-apply phases.
 
 4. **Prefetch Path Triviality**: The `prefetchTransactionData` and `prefetchTxSourceIds` paths are no-ops or near-no-ops for Soroban-only ledgers; hypotheses that skip or combine them cannot yield Medium-severity improvements.
+
+5. **Single-Child LedgerTxn Constraint**: `LedgerTxn::Impl::addChild` calls `throwIfChild()` and records a single `mChild`; exactly one active child `LedgerTxn` can exist on any parent at a time. Any fee processing or apply parallelism scheme that requires concurrent sibling `LedgerTxn` instances is architecturally blocked and requires a different state isolation approach.
