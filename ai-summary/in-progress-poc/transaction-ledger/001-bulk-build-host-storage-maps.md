@@ -296,3 +296,37 @@ The enforcing invoke setup path no longer allocates and rebuilds a fresh `Metere
 ### Test Results
 
 Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` and built with `make -j30 ALL_SOROBAN_GIT_STATE_STAMPS=`. Full existing test suite passed with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check ALL_SOROBAN_GIT_STATE_STAMPS=`; output ended with `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-04-29
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The revised source change passes independent source review, the Tracy-enabled build, and the full unit-test gate, but the independent non-Tracy benchmark signal is too marginal and inconsistent to confirm under the optimize-soroswap objective. The accepted `CURRENT_STATE.md` baseline soroswap medians are `313.2552390000019`, `297.3798060000008`, and `304.8911174999994` ms (average `305.1753875000007` ms). This final review measured optimized soroswap medians of `298.52615099999946`, `296.80311699999857`, and `310.5511379999989` ms (average `301.9601353333323` ms), only a `1.05%` average improvement, with the third optimized run slower than the third baseline run by `5.66` ms.
+
+Independent benchmark results from this final review, using `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` without `--tracy`, were:
+
+| run | run id | sac median_ms | soroswap median_ms |
+|-----|--------|---------------|--------------------|
+| 1 | `3259abf99f36-20260429-153333` | 320.0787255000006 | 298.52615099999946 |
+| 2 | `3259abf99f36-20260429-153956` | 319.7063380000018 | 296.80311699999857 |
+| 3 | `3259abf99f36-20260429-154620` | 326.3812419999995 | 310.5511379999989 |
+
+Max-sac improved on average (`333.9292416666661` ms baseline to `322.0554351666673` ms optimized), but the headline objective is soroswap apply time. Because the soroswap improvement barely clears the 1% Low threshold on average and is not supported by all three runs, I did not run the diagnostic `--tracy` matrix and cannot confirm the change.
+
+### Revision Instructions
+
+Keep the current correctness-preserving `insert_for_bulk_init` direction, but find additional in-scope savings or reduce remaining variance enough that three non-Tracy matrix runs show a reproducible soroswap improvement of at least 1% across the run set, preferably with every optimized run below the accepted baseline distribution. Re-run the full gate after revision: Tracy-enabled configure/build, `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check ALL_SOROBAN_GIT_STATE_STAMPS=`, then exactly three `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` runs. Only run diagnostic `--tracy` after the three non-Tracy runs show an eligible, consistent soroswap improvement.
+
+### Checks Passed So Far
+
+- Source path is in scope: enforcing Soroban invoke setup under `closeLedger`.
+- No existing test logic was modified.
+- Safety review did not find a determinism, threading, expired-entry, duplicate-key, or resource-metering blocker in revision 2.
+- Build passed with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` followed by `make -j $(nproc) ALL_SOROBAN_GIT_STATE_STAMPS=`.
+- Full test suite passed with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check ALL_SOROBAN_GIT_STATE_STAMPS=`.
+- Three independent non-Tracy benchmark runs completed; confirmation is blocked only by marginal/inconsistent soroswap top-line improvement.
