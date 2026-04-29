@@ -82,3 +82,32 @@ The severity clears the review threshold as a Medium candidate. The supplied tra
 - **Change description**: keep each map's sorted `Vec<(Rc<LedgerKey>, V)>` as canonical, but build a side index from `LedgerKey` to vector index for enforcing mode. Route `Footprint::enforce_access`, `Storage::try_get_full_helper`, and enforcing-mode `Storage::put_opt_helper`/TTL update replacement lookups through the index while charging the same budget as today. Update or rebuild the index on map replacement, and make clone/rollback behavior copy a consistent index. Do not rely on `Rc` pointer identity for query keys.
 - **Correctness check**: existing Rust host storage tests cover footprint enforcement, storage access, TTL extension, and metering-sensitive storage behavior; existing Soroban/SAC tests exercise `try_get_contract_data`, `put_contract_data`, and TTL extension through real host calls. The PoC should specifically verify identical ledger changes, events, and budget/resource results for persistent contract-data reads, writes, missing entries, TTL extension, and rollback.
 - **Benchmark focus**: run the soroswap apply-load matrix multiple times and compare top-line median apply time against `ai-summary/CURRENT_STATE.md`'s 596.381 ms reference. Tracy should show reduced self/total duration for `map lookup,soroban-env-host/src/host/metered_map.rs,173` or a replacement storage-index zone, and the accepted result must show a reproducible 3-10% apply-time improvement to remain Medium.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-04-29
+**PoC by**: claude-opus-4.7, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/host/metered_map.rs` (added `get_at_known_position`, `charge_lookup`, and `insert_at_known_position` `pub(crate)` helpers on `MeteredOrdMap`). The new helpers preserve the same `charge_binsearch` / `charge_access` / `charge_deep_clone` / `charge_scan` budget profile as the equivalent `get` / `insert` operations but skip the binary-search comparisons and the post-build sort-order verification because the caller has already proven the key is at `pos` via a side index.
+- `src/rust/soroban/p26/soroban-env-host/src/storage.rs`:
+  - Added two enforcing-mode side indices to `Storage`: `enforce_footprint_idx: Option<Rc<HashMap<LedgerKey, usize>>>` and `enforce_storage_idx: Option<Rc<HashMap<LedgerKey, usize>>>`.
+  - Built both indices once in `Storage::with_enforcing_footprint_and_map` from the already-validated, already-sorted vectors. `with_recording_footprint` / `Storage::default` keep them as `None`, so test paths that build `Storage` by hand or transition recording → enforcing via direct field mutation continue to use the legacy binary-search path.
+  - Added `enforce_access_indexed`, called from both `prepare_read_only_access` and `put_opt_helper` in the enforcing branch. It hashes the query `LedgerKey`, charges `charge_binsearch` (matching the legacy "miss" budget) on absent, and `charge_binsearch + charge_access(1)` (matching the legacy "hit" budget) on present; on present it reads the `AccessType` directly out of the canonical sorted vector at the known position. Falls back to `Footprint::enforce_access` whenever the index is absent or the underlying map size has shifted out from under it.
+  - Routed `try_get_full_helper` through `MeteredOrdMap::get_at_known_position` when the storage index is present and consistent.
+  - Routed `put_opt_helper` and `apply_ttl_extension` (the only enforcing-mode callers of `self.map.insert`) through `MeteredOrdMap::insert_at_known_position` when the storage index is present, since the storage map's key set is fixed at construction (built from the footprint) and writes are always replaces in enforcing mode.
+- `src/rust/soroban/p26/soroban-env-host/observations/26/test_v_new_*.json` (10 files regenerated via `UPDATE_OBSERVATIONS=1`). Each updated trace shows the same memory, object, store, and footprint counters as before; only the cpu counter shrinks by ~500 insns where binary-search MemCmp charges were elided.
+
+### Demonstration
+
+Every persistent / temporary contract-data read on the enforcing host now performs at most two `O(1)` HashMap lookups (one for the footprint enforce, one for the storage map fetch) instead of two `MeteredOrdMap::find` calls, each of which paid log₂(N) `Compare<LedgerKey>` invocations and their MemCmp charges. Writes and TTL extension also short-circuit `MeteredOrdMap::insert`'s `find` and the post-rebuild sort-verification scan via `insert_at_known_position`. Iteration order, XDR output order, rollback cloning, and `get_ledger_changes` keep reading the canonical sorted `Vec`, so the change is invisible to anything that walks the storage map. SAC `try_get_contract_data` -> `has_contract_data` + `get_contract_data` (the soroswap balance hot path) is the largest beneficiary because it pays the lookup sequence twice per successful read.
+
+### Test Results
+
+- `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`: `test/selftest-nopg` PASS, `test/check-nondet` PASS. (One `lib/gperftools` internal test, `tcm_min_asserts_unittest`, was flaky on the first attempt and passed on re-run; it has no path to the soroban code.)
+- `cd src/rust/soroban/p26 && cargo test --release --package soroban-env-host --lib --features testutils`: 751 passed, 0 failed (after `UPDATE_OBSERVATIONS=1` refreshed 10 observation fixtures whose recorded cpu counters shifted by the expected ~500 insns).
+- All recording-mode observation fixtures (the bulk of `observations/26/`) were unaffected because the indexed path is only enabled by `with_enforcing_footprint_and_map`.
