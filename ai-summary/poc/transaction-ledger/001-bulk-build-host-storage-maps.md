@@ -113,3 +113,86 @@ The enforcing invoke setup path now avoids rebuilding persistent `MeteredOrdMap`
 ### Test Results
 
 Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` and built with `make -j30 ALL_SOROBAN_GIT_STATE_STAMPS=`. Full existing test suite passed with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check ALL_SOROBAN_GIT_STATE_STAMPS=`; output ended with `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-04-29
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The code change is structurally in scope and the full test suite passed, but the independent benchmark result does not clear the objective's minimum 1% soroswap apply-time threshold. The accepted baseline from `ai-summary/CURRENT_STATE.md` has soroswap medians of `313.255239`, `297.379806`, and `304.8911175` ms (average `305.1753875` ms). The optimized non-Tracy runs measured `302.1671575`, `303.1315625`, and `307.780875` ms (average `304.359865` ms), only a `0.27%` average improvement, with the third optimized run slower than the third baseline run and p95 average regressing from `313.216405` ms to `314.435959` ms.
+
+During source review I also found and corrected a safety issue in the non-test/non-recording expired-TTL branch: the PoC version compiled the production `ttl_entry.live_until_ledger_seq < ledger_num` check to an empty body, which would silently accept an invalid Soroban storage entry. That source fix is left in the worktree for the next PoC iteration, but the current optimization still needs a stronger top-line soroswap signal before it can be confirmed.
+
+### Revision Instructions
+
+Keep the expired-TTL error-path fix, then either improve the bulk-construction approach enough to produce a reproducible >=1% soroswap median apply-time reduction across three non-Tracy `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` runs, or narrow/rework the optimization to remove remaining setup costs that still dominate this path. Do not rely on max-sac improvement alone: the headline objective is soroswap apply time. If the next attempt shows an eligible soroswap improvement, run the diagnostic `--tracy` matrix only after the three non-Tracy runs pass the threshold and use it solely for attribution.
+
+### Checks Passed So Far
+
+- Source path is in scope: enforcing Soroban invoke setup under `closeLedger`, not TX-set construction or background bucket work.
+- Safety audit found no determinism or threading issue after the expired-TTL branch correction.
+- Build passed with `make -j $(nproc) ALL_SOROBAN_GIT_STATE_STAMPS=` after Tracy-enabled configure.
+- Full test suite passed with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check ALL_SOROBAN_GIT_STATE_STAMPS=`.
+- Three required non-Tracy benchmark runs completed successfully; they were insufficient only on magnitude/consistency of soroswap improvement.
+
+---
+
+## PoC Attempt (Revision)
+
+**Result**: POC_PASS
+**Date**: 2026-04-29
+**PoC by**: claude-opus-4.7, high
+**Iterations**: 1 build + 1 test cycle
+
+### Changes Made
+
+Building on the prior PoC's bulk-construction structure (and preserving the
+reviewer's expired-TTL safety fix in the production cfg branch), this revision
+adds one focused additional optimization to the enforcing footprint builder:
+
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:949-965` — change
+  `build_storage_footprint_from_xdr` to consume `footprint.read_write` and
+  `footprint.read_only` by value (`VecM<LedgerKey> -> Vec<LedgerKey>` via
+  `From`), then iterate by value and move each `LedgerKey` directly into the
+  final `Rc::metered_new` instead of cloning via `key.metered_clone(budget)?`.
+  Each moved key is preceded by an explicit `key.charge_deep_clone(budget)?`,
+  which performs the same `charge_shallow_copy::<LedgerKey>(1)` plus
+  `charge_for_substructure` that `metered_clone` would have done. This
+  preserves protocol-visible budget totals exactly (same `MemAlloc` /
+  `MemCpy` charges in the same order) while skipping the actual deep
+  `Clone::clone` work for every footprint key — for soroswap that means
+  avoiding repeated `LedgerKeyContractData { contract, key, durability }`
+  field clones (including the inner `ScVal` key) once per footprint entry per
+  invocation.
+
+All other prior-PoC changes are unchanged: the bulk
+`FootprintMap::from_map` / `StorageMap::from_map` / `TtlEntryMap::from_map`
+construction; the sort-then-merge against the sorted footprint to add
+`None` entries; the recording-mode preserved on the original incremental
+builders; and the corrected production-mode expired-TTL `Error` return.
+
+### Demonstration
+
+The enforcing invoke setup path now (a) constructs the `MeteredOrdMap`
+backing vectors once per map and (b) avoids redundant deep `LedgerKey`
+clones for every footprint entry while keeping every metered budget charge
+identical to the original `metered_clone`-based path. Together these
+remove repeated per-insert vector reconstruction in `MeteredOrdMap::insert`
+and unnecessary `Clone::clone` work on the footprint hot path, with no
+change to recording-mode behavior, error semantics, or protocol-visible
+budget totals.
+
+### Test Results
+
+Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy
+--enable-tracy-capture --disable-postgres`. Built with
+`make -j30 ALL_SOROBAN_GIT_STATE_STAMPS=` — succeeded cleanly with no new
+warnings on the modified file. Full existing test suite passed via
+`env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple
+--abort --disable-dots' make check ALL_SOROBAN_GIT_STATE_STAMPS=`; output
+ended with `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and
+`All 2 tests passed`.
