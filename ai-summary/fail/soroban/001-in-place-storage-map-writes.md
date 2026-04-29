@@ -129,3 +129,40 @@ the underlying `MeteredOrdMap::insert` rebuild — its PoC guidance routes
 `put_opt_helper` lookups through the index but keeps the canonical map's
 mutation strategy intact. This hypothesis is complementary, targeting the
 distinct rebuild-on-insert cost.
+
+---
+
+## Review
+
+**Verdict**: NOT_VIABLE
+**Date**: 2026-04-29
+**Reviewed by**: gpt-5.5, high
+**Novelty**: PASS — not previously investigated in Soroban fail/success records
+**Failed At**: reviewer
+
+### Trace Summary
+
+The code does rebuild a full `Vec<(K, V)>` when `MeteredOrdMap::insert` replaces an existing key, and both durable storage writes and TTL extensions can reach that path during enforcing Soroban execution. Enforcing storage construction also does populate the map for every footprint key, so a storage-specific replacement path could avoid the rebuild for writes whose key is already present. However, the hypothesis's own timing evidence bounds the generic `from_exact_iter` zone below the objective's Medium threshold before excluding non-target map rebuilds, and the target work runs on parallel Soroban worker threads rather than as serialized apply-thread work.
+
+### Code Paths Examined
+
+- `src/rust/soroban/p26/soroban-env-host/src/host/metered_map.rs:144-160` — `from_exact_iter` collects a new `Vec`, charges a deep clone over the whole map, then revalidates sorted order.
+- `src/rust/soroban/p26/soroban-env-host/src/host/metered_map.rs:196-209` — replacement in `insert` clones the prefix and suffix around the replaced slot and calls `from_exact_iter`, so the O(n) rebuild is real.
+- `src/rust/soroban/p26/soroban-env-host/src/storage.rs:332-357` — `put_opt_helper` checks/enforces RW footprint access and writes by assigning `self.map = self.map.insert(...)`.
+- `src/rust/soroban/p26/soroban-env-host/src/storage.rs:500-514` — TTL extension updates also assign through `self.map.insert(...)` when the live-until value increases.
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:959-1052` — enforcing map construction inserts all encoded entries and then inserts `None` for missing footprint keys, so subsequent in-footprint writes should find an existing key.
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:439-451` — the enforcing invocation builds the storage map, clones it for initial-state diffing, then installs it in `Storage::with_enforcing_footprint_and_map`.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:190-225` — frame rollback points clone the current storage map and restore it on error; an in-place storage-only mutation would need to preserve this snapshot behavior.
+- `src/rust/soroban/p26/soroban-env-host/src/host/data_helper.rs:509-560` — `put_contract_data_into_ledger` updates or creates a `ContractData` ledger entry and funnels the durable write into `Storage::put`.
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/balance.rs:73-199` — SAC contract-address balance receive/spend paths call `put_contract_data`, so soroswap can exercise durable storage writes.
+- `ai-summary/CURRENT_STATE.md:18-30` — the accepted baseline is the `soroswap, TX=2000, T=8` apply-load matrix, with authoritative non-Tracy medians around 297-313 ms per ledger.
+
+### Why It Failed
+
+The inefficiency is real, but it is below the objective severity threshold. The cited `new map` Tracy zone is 228.4 ms over the diagnostic trace, about 2.2% even under the hypothesis's own 10.2 s denominator. That is an absolute upper bound for eliminating every `from_exact_iter` call, but the proposed storage-write specialization would only remove the replacement subset: the same generic zone also covers footprint/storage-map construction inserts, TTL maps, host/instance maps, and other `MeteredOrdMap` uses that would still rebuild.
+
+The wall-clock bound is lower still because these Rust host invocations execute inside 8-way parallel Soroban worker clusters. Aggregated worker self-time does not translate one-for-one into top-line apply-time reduction; in a balanced workload the critical-path savings are closer to the per-worker share of the removed work. Finally, consensus/resource semantics require preserving the current metering inputs (`charge_access`, `charge_binsearch`, and the full-map clone charge), so the PoC cannot claim savings from eliminating budget charges themselves. After excluding non-target calls and accounting for parallelism, the projected top-line improvement is Low or sub-1%, not the required 3-10% Medium range.
+
+### Lesson Learned
+
+A generic Tracy zone in `MeteredOrdMap` must be partitioned by caller before projecting an optimization that only targets one map use. For parallel Soroban apply, aggregate worker self-time is also not the same as apply-thread wall-clock savings; a Medium hypothesis needs either per-critical-worker timing or a zone already proven to sit on the top-line close-ledger critical path.

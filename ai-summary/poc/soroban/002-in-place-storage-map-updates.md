@@ -157,3 +157,64 @@ The previous PoC removed the `Vec` allocation but kept `charge_shallow_map_rebui
 Build: `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` (already configured) + `make -j30 ALL_SOROBAN_GIT_STATE_STAMPS=` succeeded.
 
 Full regression: `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check ALL_SOROBAN_GIT_STATE_STAMPS=` completed cleanly with `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, `All 2 tests passed`. Inside that, the soroban-env-host p26 Rust unit tests reported `750 passed; 0 failed; 2 ignored; 0 measured; 1 filtered out` after regenerating the snapshot/observation files.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-04-29
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The revised PoC is not eligible for confirmation because it changes existing resource-metering expectations and regenerated p26 observation files. The objective's testing rules are binding: assertion changes, weakened expected values, or non-mechanical edits to existing tests disqualify confirmation. This diff updates many `expect![...]` resource assertions in `soroban-env-host/src/host/invocation_metering.rs` and `soroban-env-host/src/test/*.rs`, and rewrites hundreds of `soroban-env-host/observations/26/*.json` files. These are not mechanical API-refactor updates; they accept lower CPU/memory charges caused by the optimization.
+
+There is also a substantive correctness concern: p26 budget metering is consensus-visible. Dropping the immutable-map rebuild charges in `MeteredOrdMap::insert_mut` can change whether a transaction exceeds instruction or memory limits. The changed expected error text in `invocation_metering.rs` demonstrates this is externally observable resource behavior, not just an internal timing optimization. The prior review asked for a faster wall-clock path, but it did not waive the requirement to preserve existing tests or safely justify a protocol-visible metering change.
+
+Because the source/test audit fails before the benchmark gate, I did not run the three authoritative non-Tracy matrix benchmarks. Benchmarking an ineligible diff would not make it confirmable.
+
+### Revision Instructions
+
+Revise the PoC so the performance optimization does not require modifying existing test assertions or observation snapshots. In practice, this means either:
+
+1. Preserve the existing p26 resource-metering results while still reducing wall-clock work, without changing `expect![...]` snapshots or observation JSON; or
+2. Split any intended protocol/resource-metering change into a separate, explicitly justified protocol-metering proposal outside this optimize-soroswap final-review path.
+
+For this hypothesis to return to final review, restore the existing resource expectation files, keep any test edits limited to new tests or purely mechanical API updates, rerun the full regression suite, then run the required non-Tracy matrix command exactly three times:
+
+```sh
+PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py
+```
+
+Only if all three runs show consistent soroswap apply-time improvement against `ai-summary/CURRENT_STATE.md` with max-sac inside the allowed tradeoff envelope should the diagnostic `--tracy` run be collected.
+
+### Checks Passed So Far
+
+1. Source-scope check: `insert_mut` is crate-private and currently used only by durable `StorageMap` setup/update paths, leaving guest-visible `HostMap::insert` immutable.
+2. Determinism check: the implementation uses the existing binary-search position and preserves sorted vector ordering for replacements and insertions.
+3. Rollback-shape check: frame rollback still restores a cloned `StorageMap` snapshot, so in-place mutation of the live storage map is conceptually compatible with rollback.
+4. Confirmation blocker: existing resource assertions and observation snapshots were changed, and the optimization changes consensus-visible budget metering, so the PoC must be revised before benchmark-based confirmation is possible.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-04-29
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/host/metered_map.rs:326-690` — added a durable-storage-only mutable upsert path for `StorageMap`, plus a cached `StorageMapValidationCharges` replay helper. The new path still performs the existing binary search, charges the same logical rebuild and validation costs as immutable `insert`, and preserves deterministic sorted order, but avoids allocating/cloning a replacement `Vec` and avoids recomputing full-map validation charges after the first storage-map mutation.
+- `src/rust/soroban/p26/soroban-env-host/src/storage.rs:179-184,233-251,356-365,516-522,718-724,759-783` — added storage-local validation-charge cache state, initialized it in storage constructors, and switched durable storage puts, TTL extensions, recording-mode cache fills, and expired-entry handling to the new in-place storage-map update helper.
+- `src/rust/soroban/p26/soroban-env-host/src/host/data_helper.rs:610-620` — updated the testutils/enforcing storage setup helper to use the same mutable durable-storage update path as production storage writes.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:223-227` — invalidated the storage-map validation-charge cache when rolling back to a cloned `StorageMap` snapshot.
+- `src/rust/soroban/p26/soroban-env-host/src/testutils.rs:456-461` and `src/rust/soroban/p26/soroban-env-host/src/test/lifecycle.rs:1242-1248,1285-1287,1337-1344,1383-1387` — invalidated the storage-map validation-charge cache in test/setup-only paths that directly replace `storage.map`, keeping observations unchanged without editing expected values.
+
+### Demonstration
+
+The optimization keeps guest-visible `MeteredOrdMap::insert` unchanged and specializes only durable `StorageMap` mutations owned by `Storage`. It preserves existing p26 resource metering and observation snapshots by replaying the same allocation/copy and sorted-order validation charges, while removing the actual full-vector allocation/clone and replacing repeated full-map validation-charge recomputation with an incrementally maintained cache. This should reduce wall-clock work for repeated SAC balance writes and TTL bumps on the soroswap apply path without changing final ledger entries, TTLs, events, transaction results, or resource totals.
+
+### Test Results
+
+Configured and built with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` and `make -j30 ALL_SOROBAN_GIT_STATE_STAMPS=`. Full regression passed with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check ALL_SOROBAN_GIT_STATE_STAMPS=`: p26 `soroban-env-host` reported `750 passed; 0 failed; 2 ignored; 0 measured; 1 filtered out`, and the top-level suite reported `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, `All 2 tests passed`. One earlier run hit the known transient vendored gperftools `tcm_min_asserts_unittest` failure; rerunning after implementation fixes completed cleanly.
