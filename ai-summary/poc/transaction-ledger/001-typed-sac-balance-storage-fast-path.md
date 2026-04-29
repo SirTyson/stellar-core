@@ -93,3 +93,27 @@ The impact clears the objective's Medium threshold plausibly enough for PoC. The
 - **Change description**: Construct the SAC balance `ScVal` key directly as the same `Vec["Balance", address]` representation, construct/decode `BalanceValue` directly as the same sorted-field map representation, build one `LedgerKey::ContractData` per logical key, and call the same `Storage` get/put/extend primitives with equivalent error decoration. Avoid routing through `key.try_into_val(e)?`, `balance.try_into_val(e)?`, `storage_key_from_val`, and generic `from_host_val`/`to_host_val` where the value is already typed.
 - **Correctness check**: Existing SAC host coverage in `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/test_stellar_asset_contract.rs` exercises balance, authorization, transfer, transfer_from, mint, clawback, and set_authorized helpers; transaction-level SAC scenarios and resource-limit behavior are covered in `src/transactions/test/InvokeHostFunctionTests.cpp` (including SAC payment cases and `INVOKE_HOST_FUNCTION_RESOURCE_LIMIT_EXCEEDED` checks). Add or update focused tests only if the helper changes observable metering/error behavior.
 - **Benchmark focus**: Run the soroswap apply-load matrix and compare top-line apply time across repeated runs. Tracy should show lower `visit host object`, `Val to ScVal`, `ScVal to Val`, and possibly `storage get`/`storage put` self-time under `SAC transfer`; target at least a reproducible 3% apply-time reduction, with budget CPU/memory consumption for equivalent transactions intentionally unchanged or explicitly justified.
+
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-04-29
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/balance.rs:13-178` — added internal typed SAC balance helpers that directly construct `ScVal` balance keys and `BalanceValue` maps, decode stored balance values, and call `Storage` get/extend primitives without routing through host `Val` conversion.
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/balance.rs:191-276` — rewired contract-balance reads and writes to construct one typed `LedgerKey::ContractData`, update existing `ContractDataEntry` values directly, create missing entries with the same persistent durability/min-live-until semantics, and extend TTL through `Storage::extend_ttl`.
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/balance.rs:301-355,412-447,499-501` — switched SAC receive, spend, authorization, and clawback balance access to the typed helper path while preserving classic-account behavior and existing contract-balance error paths.
+- `src/rust/soroban/p26/soroban-env-host/observations/26/test__stellar_asset_contract__*.json` — refreshed the nine affected p26 SAC observation goldens after the intentional removal of generic `vec_new_from_slice`/host-object conversion trace events.
+
+### Demonstration
+
+The optimization keeps SAC balance storage on typed XDR values that the built-in contract already has: `DataKey::Balance(Address)` is built directly as the canonical `Vec["Balance", address]`, and `BalanceValue` is built/decoded directly as the canonical sorted map. Contract balance reads now use a single typed storage lookup, writes avoid `balance.try_into_val`, `put_contract_data`, `storage_key_from_val`, and `from_host_val`, and TTL extension reuses the already-built `LedgerKey`, reducing the hot SAC transfer conversion/object-visit work exercised by soroswap token legs.
+
+### Test Results
+
+Configured with Tracy-enabled PoC flags and built via `make -j30`. Refreshed intentional p26 SAC observation changes with `UPDATE_OBSERVATIONS=1` through the repository `check-sorobans` script, then ran `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check ALL_SOROBAN_GIT_STATE_STAMPS=`; the full suite completed with `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.
