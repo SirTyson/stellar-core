@@ -131,3 +131,32 @@ The trailing `check-sorobans` step (which re-runs Rust submodule tests
 under the host toolchain) is unaffected by this C++-only change and was
 skipped because `RUST_TOOLCHAIN_CHANNEL` was not exported in this
 environment.
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-04-29
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** YES — the diff moves `ThreadParallelApplyLedgerState` construction from the primary apply thread into each indexed `std::async` task, so the targeted setup work is no longer performed serially before worker launch.
+2. **Are the preconditions realistic?** YES — the soroswap apply-load benchmark uses 8 dependent clusters and exercises this Soroban parallel-apply path.
+3. **Is the original code inefficient or working as designed?** PLAUSIBLE INEFFICIENCY — merge order remains deterministic because futures are stored and consumed by cluster index, and `commitChangesFromThreads` still merges the returned thread-state vector in order.
+4. **Does the benchmark improvement match the claimed severity?** NO — the authoritative three-run non-Tracy matrix showed a soroswap regression, not an improvement. Baseline soroswap medians from `ai-summary/CURRENT_STATE.md` were 313.255239 ms, 297.379806 ms, and 304.8911175 ms. Optimized medians were 314.542769 ms, 312.752749 ms, and 326.2805885 ms.
+5. **Is the optimization in scope?** YES — the modified code is under `applyLedger` / parallel Soroban apply, not TX-set construction or background bucket work.
+6. **Is the benchmark methodology correct?** YES — final review used the required local-build `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` command three times without `--tracy`, and compared against the accepted `CURRENT_STATE.md` baseline.
+7. **Can the improvement be explained without the optimization?** NOT APPLICABLE — there was no measured improvement to explain.
+8. **Is this optimization novel?** YES — no duplicate-finalized finding was identified during this review.
+
+### Rejection Reason
+
+The optimization is structurally plausible and passed the required full test command, but it failed the headline performance gate. Soroswap median apply time regressed across the three authoritative non-Tracy benchmark runs, so the finding does not meet the objective's minimum 1% reproducible improvement bar and is not eligible for confirmation.
+
+### Failed Checks
+
+- Final-review performance check 4: benchmark improvement did not match the claimed severity or any valid severity tier.
+- Objective verdict criterion: soroswap apply time must improve consistently across all three non-Tracy runs; instead it regressed.

@@ -79,3 +79,25 @@ The proposed fix is plausible if it remains storage-specific and metering-compat
 - **Change description**: add a mutable storage-map update helper that performs the same key comparison/binary-search ordering as `MeteredOrdMap::insert`, then replaces an existing value or inserts into the backing `Vec` at the sorted position. Keep the immutable `MeteredOrdMap::insert` behavior for guest-visible `HostMap` and instance-storage maps unless a separate analysis proves they are safe and worthwhile.
 - **Correctness check**: existing Soroban host storage, SAC, rollback, and ledger-change tests cover the behavior that must remain identical: storage footprint enforcement, contract-data writes/deletes, TTL extension, nested rollback, and final ledger changes. Pay special attention to tests under `src/rust/soroban/p26/soroban-env-host/src/test/storage.rs`, `test/stellar_asset_contract.rs`, `test/lifecycle.rs`, and rollback-focused auth/invoker tests.
 - **Benchmark focus**: run repeated soroswap apply-load measurements and compare top-line apply time plus Tracy zones for `new map`, `storage put`, `extend key`, and `put_contract_data`. The PoC should separately instrument or attribute durable `StorageMap` mutable updates so it does not claim guest `MapObject` or instance-storage `new map` time as recoverable.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-04-29
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/host/metered_map.rs:1-10,231-345` — added `MeteredOrdMap::insert_mut`, a crate-private mutable upsert path that reuses the existing binary-search position, charges the same shallow map rebuild costs, replays the same final sorted-order comparisons for metering/resource equivalence, and then replaces or inserts in the backing `Vec`.
+- `src/rust/soroban/p26/soroban-env-host/src/storage.rs:356-357,510-514,711-712,747,762-766` — switched durable `StorageMap` writes, TTL extensions, recording-mode read-through caching, and expired-entry handling from immutable map rebuild assignment to `insert_mut`.
+- `src/rust/soroban/p26/soroban-env-host/src/host/data_helper.rs:610-615` — switched the testutils/enforcing storage setup helper to the mutable storage-map path so production-style storage setup no longer rebuilds the map.
+
+### Demonstration
+
+The optimization keeps guest-visible `MeteredOrdMap::insert` unchanged while giving the transaction-local durable `StorageMap` an in-place replacement/insertion path. It preserves sorted key order and existing resource observations by replaying the same sorted-order validation comparisons and bulk allocation/copy charges, but removes the actual allocation, full-vector clone, and `new map` construction work from storage puts and TTL bumps.
+
+### Test Results
+
+Configured and built with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` and `make -j30` using a worktree-only `ALL_SOROBAN_GIT_STATE_STAMPS=` override for this checkout's submodule git-dir layout. Full regression passed with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check ALL_SOROBAN_GIT_STATE_STAMPS=`: `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.
