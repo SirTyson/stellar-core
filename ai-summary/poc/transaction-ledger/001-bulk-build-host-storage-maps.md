@@ -89,3 +89,27 @@ Existing optimizations do not cover this setup path. `MeteredOrdMap::from_map` a
 - **Change description**: Build vectors for `FootprintMap`, `StorageMap`, and `TtlEntryMap` once, sort them with the same `Budget` comparator used by `MeteredOrdMap`, validate uniqueness/order, then call `MeteredOrdMap::from_map` once per map. Avoid changing recording-mode storage behavior; this review only supports the enforcing invoke setup path.
 - **Correctness check**: Preserve supported-key checks, footprint membership checks, TTL/ledger-entry pairing errors, expired-entry handling, missing-key insertion as `None`, and the final ledger-change behavior that relies on `init_storage_map`. Add temporary or test-only budget assertions if needed to compare old and new CPU/memory trackers for representative invoke cases.
 - **Benchmark focus**: Add temporary narrow Tracy spans or counters around the setup builders to isolate constructor-only `new map` and `map lookup` events. The PoC should show reduced apply time in `scripts/run_apply_load_matrix.py` for soroswap `TX=4000, T=8`, with the constructor share translating to a reproducible 3-10% top-line apply-time reduction.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-04-29
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:5-34` — imported `Ordering` and the `Compare` trait so the setup builders can sort ledger-key pairs using the same budgeted comparator as `MeteredOrdMap`.
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:724-728` — kept recording-mode footprint roundtrip validation on the original incremental construction path to preserve existing resource expectation tests.
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:936-998` — changed enforcing footprint construction to collect all read-write and read-only keys into one vector, sort once, and call `FootprintMap::from_map`; retained an incremental helper for recording mode only.
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:1001-1224` — changed enforcing storage and TTL map construction to collect decoded entries once, sort them, validate duplicate storage keys, merge against the sorted footprint to add missing `None` entries, and call `StorageMap::from_map` / `TtlEntryMap::from_map` once; retained the prior insertion-based behavior for recording mode.
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:1227-1263` — added local helper functions to sort `(Rc<LedgerKey>, V)` pairs through `Budget::compare` and validate uniqueness.
+
+### Demonstration
+
+The enforcing invoke setup path now avoids rebuilding persistent `MeteredOrdMap` vectors after every footprint, storage, and TTL insertion. It constructs the complete sorted vectors once per map, validates membership and uniqueness before creating the final metered maps, and leaves recording-mode resource accounting unchanged so the existing budget expectation tests remain stable.
+
+### Test Results
+
+Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` and built with `make -j30 ALL_SOROBAN_GIT_STATE_STAMPS=`. Full existing test suite passed with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check ALL_SOROBAN_GIT_STATE_STAMPS=`; output ended with `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.

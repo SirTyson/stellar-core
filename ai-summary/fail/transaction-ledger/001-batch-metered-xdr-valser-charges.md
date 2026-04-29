@@ -254,3 +254,48 @@ tests in `soroban-env-host` that directly exercise the modified code path
 (asserting `tracker.inputs == w.len()` after `metered_write_xdr` and
 `(Budget, ExceededLimit)` propagation when the budget is exhausted mid-write).
 Both `test/selftest-nopg` and `test/check-nondet` PASS.
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-04-29
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** YES — the modified p26 Soroban host code targets `metered_write_xdr` and replaces per-leaf `Budget::charge(ValSer, ...)` calls with a serialization-local accumulator, which is the claimed hot path.
+2. **Are the preconditions realistic?** YES — `metered_write_xdr` is exercised during Soroban invoke apply for result, ledger-entry, key, and event serialization in the soroswap workload.
+3. **Is the original code inefficient or working as designed?** PARTIAL INEFFICIENCY — per-write budget metering has avoidable overhead, but the optimization must preserve exact budget accounting and improve the objective benchmark.
+4. **Does the benchmark improvement match the claimed severity?** NO — the required three non-Tracy final-review runs show soroswap median apply-time regression, not improvement. Accepted baseline soroswap medians were 313.255239 ms, 297.379806 ms, and 304.8911175 ms (average 305.1753875 ms). Optimized medians were 308.346096 ms, 324.621525 ms, and 331.515681 ms (average 321.494434 ms), a 5.35% regression.
+5. **Is the optimization in scope?** YES — the affected code is called from `closeLedger` / Soroban invoke apply, not TX-set construction.
+6. **Is the benchmark methodology correct?** YES — final review used the accepted baseline in `ai-summary/CURRENT_STATE.md`, built the optimized checkout, ran the full test suite, then ran `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` three times without `--tracy`.
+7. **Can the improvement be explained without the optimization?** NOT APPLICABLE — there was no objective improvement to explain. Both headline soroswap and secondary max-sac medians regressed in the independent final-review runs.
+8. **Is this optimization novel?** YES — no duplicate concern was found, but novelty cannot overcome the failed benchmark gate.
+
+Additional safety note: while auditing Revision 2, final review found that the local meter initially accumulated memory cost for the write that failed the CPU limit check, whereas the original `BudgetImpl::charge` path returns immediately after the CPU limit check and does not charge memory for that failing leaf. I fixed this locally and added focused coverage before running tests and benchmarks; the corrected implementation still failed the benchmark gate.
+
+### Rejection Reason
+
+The optimization does not satisfy the soroswap objective. After the metering-order correctness fix, the full test suite passed, but all three required non-Tracy matrix runs regressed soroswap median apply time relative to the accepted baseline; max-sac also regressed substantially. This fails the final-review benchmark and tradeoff criteria, so the finding cannot be confirmed.
+
+### Failed Checks
+
+- Performance final review Step 5 / Benchmark Results: no measurable soroswap improvement; all three optimized runs are worse than the accepted baseline distribution.
+- Performance final review Step 7.4: benchmark results do not support any severity tier; the measured delta is a regression.
+- Performance final review Verdict Criteria: soroswap regressed and max-sac degraded outside the acceptable tradeoff envelope.
+
+Authoritative non-Tracy final-review measurements:
+
+| run | run id | scenario | median_ms | p95_ms | p99_ms |
+|-----|--------|----------|-----------|--------|--------|
+| 1 | `2f04daece664-20260429-120003` | sac, TX=6000, T=8 | 355.64498249999997 | 383.41925330000083 | 398.7336860999954 |
+| 1 | `2f04daece664-20260429-120003` | soroswap, TX=2000, T=8 | 308.3460960000011 | 318.60038000000134 | 321.6205058099997 |
+| 2 | `2f04daece664-20260429-120649` | sac, TX=6000, T=8 | 379.47648149999804 | 407.08533170000084 | 421.9486096499988 |
+| 2 | `2f04daece664-20260429-120649` | soroswap, TX=2000, T=8 | 324.62152500000184 | 331.42174290000196 | 343.54531878000023 |
+| 3 | `2f04daece664-20260429-121404` | sac, TX=6000, T=8 | 381.31240349999916 | 405.7723045999987 | 417.27193166999615 |
+| 3 | `2f04daece664-20260429-121404` | soroswap, TX=2000, T=8 | 331.51568099999713 | 338.68425729999854 | 347.6114804099999 |
+
+No diagnostic Tracy run was collected because the non-Tracy benchmark gate failed.
