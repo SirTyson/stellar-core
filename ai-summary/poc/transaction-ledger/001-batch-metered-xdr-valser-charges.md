@@ -85,3 +85,28 @@ The projected impact plausibly meets the Medium floor. The provided trace attrib
 - **Change description**: Replace per-chunk immediate `ValSer` charging with a serialization-local histogram keyed by `buf.len()`, then perform exact batched accounting per length bucket. Do not use existing `Budget::bulk_charge(ValSer, count, Some(len))` unless the helper is changed to preserve repeated-single-charge rounding; the safe formula is `count * cost_model.evaluate(1, Some(len))` independently for CPU and memory, with tracker input/iteration fields reflecting the same logical leaves as today.
 - **Correctness check**: Existing `budget_metering::metered_xdr` and `budget_metering::metered_xdr_out_of_budget` cover the basic `ValSer` path. Add a focused test that serializes a nested `ScVal` through old-style per-write accounting and the new batched path under fractional scaled linear terms, asserting identical bytes, CPU total, memory total, tracker input/iteration totals, and budget-limit success/failure at boundary values.
 - **Benchmark focus**: Run the soroswap apply-load matrix for the same shape cited by the hypothesis (`soroswap`, around 4000 tx, 8 clusters/threads) and compare top-line apply time across repeated runs. The expected signal is a 3-6% apply-time reduction if per-leaf metering overhead, rather than real XDR encoding, is the dominant part of the `write xdr` zone.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-04-29
+**PoC by**: claude-opus-4.7, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/budget/dimension.rs` (after `charge`, ~line 189): added `BudgetDimension::charge_amount`, which adds a precomputed amount to `total_count` / `shadow_total_count` and emits the same Tracy `charge` span as the per-leaf path (CPU only). This lets a higher-level batched path apply an exact aggregated charge without re-evaluating the cost model.
+- `src/rust/soroban/p26/soroban-env-host/src/budget.rs`:
+  - Added `use model::HostCostModel;` so `MeteredCostComponent::evaluate` is in scope inside the new helper.
+  - Added `BudgetImpl::charge_val_ser_batched(&mut self, hist: &[(u64, u64)])`. For each `(input_len, count)` bucket it computes `per_leaf = evaluate(1, Some(input_len))` separately for CPU and memory, then aggregates `count * per_leaf` into `total_cpu` / `total_mem`. It then updates the `ValSer` `CostTracker` (`iterations += sum(count)`, `inputs += sum(input_len * count)`, `cpu += total_cpu`, `mem += total_mem`) and `BudgetTracker::meter_count` exactly as if `sum(count)` separate single-leaf charges had been performed, and finally calls `charge_amount` plus `check_budget_limit` on each dimension.
+  - Added a crate-visible `Budget::charge_val_ser_batched` wrapper that takes a single `try_borrow_mut_or_err` for the whole batch.
+- `src/rust/soroban/p26/soroban-env-host/src/host/metered_xdr.rs`: replaced the per-write `Budget::charge` call inside `MeteredWrite::write` with a `Vec<(u64, u64)>` histogram keyed by `buf.len()`. After `write_xdr` returns, `metered_write_xdr` performs a single `budget.charge_val_ser_batched(&histogram)` call, then surfaces any encoder error as `(Budget, ExceededLimit)` to match the prior behavior.
+
+### Demonstration
+
+The optimization removes the per-encoder-chunk `RefCell` borrow, dual cost-model lookups, dual `BudgetDimension::charge` evaluations, dual limit checks, and (under Tracy) the per-CPU-charge `charge` span emission from every low-level XDR write performed by Soroban host serialization (`metered_hash_xdr`, `metered_write_xdr`, return-value / ledger-change / contract-event serialization in `e2e_invoke`). Because the batched path computes `count * evaluate(1, Some(len))` independently per dimension and per length bucket, it preserves bit-identical CPU and memory totals, tracker `iterations`/`inputs`/`cpu`/`mem` fields, and budget-limit success/failure outcomes versus the unbatched per-leaf path; only the timing of the budget-exceeded error shifts from "mid-write" to "after the write completes into a local `Vec<u8>`", which is non-observable to callers because `metered_write_xdr`'s buffer is not exposed on the error path. On the soroswap apply window cited in the hypothesis (8M+ `charge` events nested under 58k `write xdr` zones), folding each `write xdr` invocation's many small-write charges into one batched borrow removes most of the per-chunk metering overhead from the parallel-apply hot path.
+
+### Test Results
+
+`env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` ran to completion with zero failures across all 30 C++ test partitions and all Rust tests in `soroban-env-host` (including `test::budget_metering::metered_xdr` and `test::budget_metering::metered_xdr_out_of_budget`, which directly cover this code path), the p23/p26 host crates, and supporting Rust crates (`bls`, `ed25519_edge_cases`, `fees`, `integration`, `option`, `secp256r1_sig_ver`). `test/selftest-nopg` and `test/check-nondet` both PASS.

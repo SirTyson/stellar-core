@@ -165,3 +165,36 @@ Enforcing Soroban storage now builds deterministic `LedgerKey -> vector index` s
 - `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`: completed.
 - `make -j $(nproc) ALL_SOROBAN_GIT_STATE_STAMPS=`: completed. The `ALL_SOROBAN_GIT_STATE_STAMPS=` override was needed because this worktree stores submodule git metadata under the worktree common-dir while the generated Makefile prerequisite expects `.git/modules/...`.
 - `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check ALL_SOROBAN_GIT_STATE_STAMPS=`: passed. The final run included `soroban-env-host` p26 tests (`750 passed; 0 failed; 2 ignored; 1 filtered out`), p26 integration/doc tests, `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-04-29
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** YES — the change adds enforcing-mode `LedgerKey -> index` side maps for `Footprint` and `StorageMap`, and routes enforcing footprint checks and storage reads through indexed positions while preserving the canonical sorted vectors.
+2. **Are the preconditions realistic?** YES — soroswap SAC paths repeatedly use enforcing host storage for contract data reads/writes during `closeLedger`.
+3. **Is the original code inefficient or working as designed?** INEFFICIENT BUT METERING-SENSITIVE — the generic binary-search path is real work, but the optimized path must preserve the legacy metering profile. The revised PoC no longer edits observation fixtures and passed existing tests.
+4. **Does the benchmark improvement match the claimed severity?** NO — the required three non-Tracy optimized runs did not show a consistent soroswap apply-time improvement, and the three-run average regressed versus the accepted baseline.
+5. **Is the optimization in scope?** YES — the target is in the Soroban host storage access path exercised under `closeLedger`.
+6. **Is the benchmark methodology correct?** YES — benchmarks were run with `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` three times from the optimized tree, without `--tracy`, after a full successful `make check`.
+7. **Can the improvement be explained without the optimization?** YES — the only faster optimized runs are within the baseline run-to-run variance, while one run is a clear regression.
+8. **Is this optimization novel?** NOVEL, but not performant enough for acceptance.
+
+### Rejection Reason
+
+The optimization fails the objective's benchmark gate. The accepted baseline in `ai-summary/CURRENT_STATE.md` reports soroswap medians of 313.255239 ms, 297.379806 ms, and 304.8911175 ms (average 305.1753875 ms). The independently measured optimized runs reported 303.3543115 ms, 316.786584 ms, and 307.2928675 ms (average 309.1445877 ms). Because soroswap is the headline metric, this is an overall regression rather than a reproducible >1% apply-time reduction.
+
+Max-sac improved in the optimized runs (318.280074 ms, 324.294161 ms, 320.356641 ms versus baseline 335.604147 ms, 340.832824 ms, 325.350754 ms), but the objective explicitly rejects max-sac-only wins when soroswap regresses.
+
+### Failed Checks
+
+- Performance final review Step 5: no measurable, reproducible soroswap apply-time improvement from the project's benchmark tool.
+- Objective verdict criteria: soroswap apply time regressed overall, so the change is not eligible for CONFIRMED.
+- Adversarial check 4: benchmark improvement does not match any valid severity tier.
+- Adversarial check 7: apparent wins are explainable by benchmark variance and are not consistent across runs.
