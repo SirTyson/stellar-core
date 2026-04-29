@@ -1,29 +1,30 @@
 # CURRENT_STATE — Soroswap Optimization Baseline
 
 This is the accepted current baseline for the soroswap-performance arc after
-switching authoritative apply-load measurements away from Tracy-enabled runs.
+confirming the validated `LedgerKey` storage-map lookup fast path.
 
 ## Commit
 
-- SHA: `8a1d4c2d0f5bad54b768f15740a3ca7f5e0f819e`
-- Subject: `Restore smaller apply-load matrix counts`
+- SHA: `b196b62380c9c02bf10095707c04eb1074df4517`
+- Subject: `perf(soroban-env): specialize storage map lookups`
+- p26 submodule SHA: `1f86f3e5fa4bae1c529d3eb9520a639bbf872132`
 
 ## Timestamp
 
-- Non-Tracy benchmark runs: 2026-04-28T23:33:11Z through 2026-04-28T23:53:33Z
-- Diagnostic Tracy run: 2026-04-28T23:54:09Z through 2026-04-29T00:01:04Z
-- Recorded: 2026-04-29T00:01:04Z
+- Non-Tracy benchmark runs: 2026-04-29T01:09:22Z through 2026-04-29T01:23:11Z
+- Diagnostic Tracy run: 2026-04-29T01:30:14Z
+- Recorded: 2026-04-29T01:38:51Z
 
 ## Apply-time results (authoritative non-Tracy runs)
 
 | run | run id | scenario | median_ms | p95_ms | p99_ms |
 |-----|--------|----------|-----------|--------|--------|
-| 1 | `a645620fe528-20260428-233312` | sac, TX=6000, T=8 | 374.7747420000005 | 420.67973859999796 | 441.66502910999833 |
-| 1 | `a645620fe528-20260428-233312` | soroswap, TX=2000, T=8 | 314.3531645000003 | 335.76203330000004 | 343.5404278100001 |
-| 2 | `a645620fe528-20260428-234023` | sac, TX=6000, T=8 | 316.10224200000084 | 350.98036009999595 | 370.06274168000334 |
-| 2 | `a645620fe528-20260428-234023` | soroswap, TX=2000, T=8 | 311.7416195000005 | 323.9066271000003 | 328.4619910800045 |
-| 3 | `a645620fe528-20260428-234654` | sac, TX=6000, T=8 | 330.77135400000043 | 355.597785350002 | 375.3653804600006 |
-| 3 | `a645620fe528-20260428-234654` | soroswap, TX=2000, T=8 | 309.7216619999999 | 323.5170060500009 | 326.42506947000055 |
+| 1 | `1695facd04c8-20260429-010922` | sac, TX=6000, T=8 | 335.604147 | 380.9146780499999 | 397.19659729000057 |
+| 1 | `1695facd04c8-20260429-010922` | soroswap, TX=2000, T=8 | 313.2552390000019 | 318.90259645000066 | 325.0410912499998 |
+| 2 | `1695facd04c8-20260429-011626` | sac, TX=6000, T=8 | 340.83282399999916 | 392.9254198499973 | 406.91980039999913 |
+| 2 | `1695facd04c8-20260429-011626` | soroswap, TX=2000, T=8 | 297.3798060000008 | 305.59124730000076 | 319.14616032999714 |
+| 3 | `1695facd04c8-20260429-012311` | sac, TX=6000, T=8 | 325.35075399999914 | 378.40040670000093 | 390.30781033999585 |
+| 3 | `1695facd04c8-20260429-012311` | soroswap, TX=2000, T=8 | 304.8911174999994 | 315.1553698499934 | 323.8556112200008 |
 
 Use all three non-Tracy runs above as the reference baseline for future
 comparisons. Do not replace them with a single best run.
@@ -35,23 +36,23 @@ part of the authoritative baseline.
 
 | run id | scenario | median_ms | p95_ms | p99_ms |
 |--------|----------|-----------|--------|--------|
-| `a645620fe528-20260428-235409` | sac, TX=6000, T=8 | 344.25222199999735 | 407.6281739000005 | 625.45597859 |
-| `a645620fe528-20260428-235409` | soroswap, TX=2000, T=8 | 298.9327135000003 | 312.0726850999999 | 944.3160098099999 |
+| `1695facd04c8-20260429-013014` | sac, TX=6000, T=8 | 316.6367880000016 | 343.19971699999945 | 632.98837132 |
+| `1695facd04c8-20260429-013014` | soroswap, TX=2000, T=8 | 312.09119600000304 | 326.26665359999896 | 895.7621113799993 |
 
 ## Artifact Paths
 
 - Non-Tracy run 1 artifact directory:
-  `/mnt/nvme2/apply-load/a645620fe528-20260428-233312`
+  `/mnt/nvme2/apply-load/1695facd04c8-20260429-010922`
 - Non-Tracy run 2 artifact directory:
-  `/mnt/nvme2/apply-load/a645620fe528-20260428-234023`
+  `/mnt/nvme2/apply-load/1695facd04c8-20260429-011626`
 - Non-Tracy run 3 artifact directory:
-  `/mnt/nvme2/apply-load/a645620fe528-20260428-234654`
+  `/mnt/nvme2/apply-load/1695facd04c8-20260429-012311`
 - Diagnostic Tracy artifact directory:
-  `/mnt/nvme2/apply-load/a645620fe528-20260428-235409`
+  `/mnt/nvme2/apply-load/1695facd04c8-20260429-013014`
 - Diagnostic Tracy trace (sac):
-  `/mnt/nvme2/apply-load/a645620fe528-20260428-235409/logs/a645620fe528-20260428-235409-01-sac-tx-6000-t-8.tracy`
+  `/mnt/nvme2/apply-load/1695facd04c8-20260429-013014/logs/1695facd04c8-20260429-013014-01-sac-tx-6000-t-8.tracy`
 - Diagnostic Tracy trace (soroswap):
-  `/mnt/nvme2/apply-load/a645620fe528-20260428-235409/logs/a645620fe528-20260428-235409-02-soroswap-tx-2000-t-8.tracy`
+  `/mnt/nvme2/apply-load/1695facd04c8-20260429-013014/logs/1695facd04c8-20260429-013014-02-soroswap-tx-2000-t-8.tracy`
 
 The soroswap trace is the headline reference for future hypothesis-round Tracy
 diffs.
