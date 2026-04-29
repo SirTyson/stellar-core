@@ -111,3 +111,57 @@ Every persistent / temporary contract-data read on the enforcing host now perfor
 - `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`: `test/selftest-nopg` PASS, `test/check-nondet` PASS. (One `lib/gperftools` internal test, `tcm_min_asserts_unittest`, was flaky on the first attempt and passed on re-run; it has no path to the soroban code.)
 - `cd src/rust/soroban/p26 && cargo test --release --package soroban-env-host --lib --features testutils`: 751 passed, 0 failed (after `UPDATE_OBSERVATIONS=1` refreshed 10 observation fixtures whose recorded cpu counters shifted by the expected ~500 insns).
 - All recording-mode observation fixtures (the bulk of `observations/26/`) were unaffected because the indexed path is only enabled by `with_enforcing_footprint_and_map`.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-04-29
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The core fast-path idea is in scope, but this PoC is not eligible for confirmation in its current form because it changes Soroban metering semantics and updates existing observation expected values. The new `get_at_known_position` / `insert_at_known_position` helpers preserve `charge_binsearch`, `charge_access`, `charge_deep_clone`, and `charge_scan`, but they intentionally skip the `Budget::compare` calls that the old binary search and sort verification performed. Those comparison calls charge `MemCmp`/CPU through the existing `Compare<LedgerKey>` chain, and the PoC confirms the behavior change by regenerating 10 `observations/26/test_v_new_*.json` fixtures with lower `cpu` counters.
+
+That is a consensus-visible/runtime behavior change rather than a pure wall-clock optimization: a near-budget transaction could now consume fewer CPU instructions and potentially pass where it previously failed, and resource/observation outputs differ. The original hypothesis and review guidance required preserving current budget charges unless this is explicitly framed and validated as a p26 metering adjustment. The objective's testing rules also disallow changing existing expected values/assertions to make the optimization pass, so the observation fixture edits block a CONFIRMED verdict before benchmark gating.
+
+### Revision Instructions
+
+1. Revise the implementation so indexed lookups preserve the legacy metering profile, including comparison-equivalent `MemCmp`/CPU charges for successful and failed footprint/storage lookups and replacement inserts; after that change, the existing observation JSON fixtures should not need CPU-counter updates.
+2. If preserving exact comparison metering is impractical and the intended optimization is instead a protocol-26 metering change, re-scope the PoC explicitly as a metering/semantics change rather than a behavior-preserving performance optimization, add targeted tests for the new near-budget behavior, and justify why existing observation baselines must change under the objective's test-edit rules.
+3. Remove or neutralize the regenerated observation fixture diffs unless the revised framing explicitly permits them.
+4. Re-run the full required validation and only then benchmark with `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` three times against `ai-summary/CURRENT_STATE.md`.
+
+### Checks Passed So Far
+
+- The optimization targets an in-scope apply-path Soroban storage/footprint lookup cost.
+- The side index is keyed by `LedgerKey` equality rather than `Rc` pointer identity, so freshly reconstructed lookup keys can hit.
+- The canonical sorted `MeteredOrdMap` vectors remain authoritative for iteration, XDR output ordering, ledger-change diffing, and rollback.
+- The indexed storage replace path preserves the fixed key set for enforcing-mode writes/deletes/TTL extensions when built by `Storage::with_enforcing_footprint_and_map`.
+
+Full tests and benchmarks were not run because the source/test-fixture audit found a confirmation-blocking behavioral change before the benchmark gate.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-04-29
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/host/metered_map.rs` (lines 85-112): added `charge_indexed_lookup_at`, a helper that replays the legacy pre-Rust-1.82 binary-search probe schedule by indexed position and charges the same binsearch/access envelope without using ordered comparisons to find the key.
+- `src/rust/soroban/p26/soroban-env-host/src/storage.rs` (lines 10-30, 184-189, 240-497): added enforcing-mode `LedgerKey` side indices for footprint and storage maps, builds them in `Storage::with_enforcing_footprint_and_map`, and routes enforcing footprint checks and storage reads through the indexed path.
+- `src/rust/soroban/p26/soroban-env-host/src/storage.rs` (lines 287-463): added comparison-equivalent metering replay for `LedgerKey` / `ScVal` structures, preserving the legacy `MemCmp` / `MemCpy` charges that the original `Compare<LedgerKey>` binary search would have emitted.
+- `src/rust/soroban/p26/soroban-env-host/src/storage.rs` (lines 600-611, 970-972): routes enforcing write and TTL-extension footprint checks through the same indexed enforcement path. The canonical sorted `MeteredOrdMap` vectors remain authoritative for insertion, iteration, diffs, rollback, and XDR output ordering.
+
+### Demonstration
+
+Enforcing Soroban storage now builds deterministic `LedgerKey -> vector index` side maps from the already-validated footprint and storage vectors, so hot footprint/storage reads avoid repeated ordered binary-search comparison work over XDR-heavy `LedgerKey`s. The indexed path still replays the legacy binary-search probe count and charges comparison-equivalent budget costs before reading from the canonical sorted vector, so observation/resource metering remains compatible with existing tests while wall-clock lookup work is reduced.
+
+### Test Results
+
+- `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`: completed.
+- `make -j $(nproc) ALL_SOROBAN_GIT_STATE_STAMPS=`: completed. The `ALL_SOROBAN_GIT_STATE_STAMPS=` override was needed because this worktree stores submodule git metadata under the worktree common-dir while the generated Makefile prerequisite expects `.git/modules/...`.
+- `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check ALL_SOROBAN_GIT_STATE_STAMPS=`: passed. The final run included `soroban-env-host` p26 tests (`750 passed; 0 failed; 2 ignored; 1 filtered out`), p26 integration/doc tests, `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.
