@@ -144,3 +144,113 @@ Rework the optimization until soroswap median apply time improves consistently a
 - The modified checkout builds with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres && make -j30`.
 - The full test suite passes with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`.
 - The code path is in-scope for `closeLedger` / Soroban invoke apply work, and max-sac median apply time improved across the three final-review runs.
+
+---
+
+## PoC Attempt (Revision 2)
+
+**Result**: POC_PASS
+**Date**: 2026-04-29
+**PoC by**: claude-opus-4.7, high
+
+### Changes Made
+
+This revision rebuilds the optimization from scratch with the explicit goal of
+removing per-write overhead on the soroswap apply hot path, after the
+previous histogram-based attempt regressed soroswap by 0.77% on the final
+review benchmark.
+
+- `src/rust/soroban/p26/soroban-env-host/src/budget.rs`:
+  - Added `pub(crate) struct ValSerMeter` — a stack-allocated, single-call
+    accumulator that holds a snapshot of the `ValSer` cost-model parameters
+    (`cpu_const`, `cpu_lin`, `mem_const`, `mem_lin`), the per-dimension
+    remaining budget at construction time, and four running totals (`cpu_acc`,
+    `mem_acc`, `iterations`, `inputs`) plus the captured `is_shadow` flag and
+    an `exceeded` flag. Its `#[inline(always)] fn write(&mut self, len: u64)`
+    method computes the per-leaf CPU and memory cost via the same
+    `const_term + (lin_term * len).unscale()` formula used by
+    `MeteredCostComponent::evaluate(1, Some(len))`, accumulates them, and
+    returns `Err(())` when either accumulator exceeds the snapshot budget
+    headroom — matching the per-leaf path's "fail on the write that pushes us
+    over" semantics.
+  - Added `BudgetImpl::start_val_ser_metering(&self) -> Result<ValSerMeter, _>`
+    that performs a single immutable budget borrow to read the cost model and
+    remaining limits.
+  - Added `BudgetImpl::commit_val_ser_metering(&mut self, &ValSerMeter)` that
+    applies the accumulated totals to `cost_trackers[ValSer]`, increments
+    `meter_count` by `iterations`, adds `cpu_acc` and `mem_acc` to the
+    appropriate `total_count` (or `shadow_total_count`), emits a single
+    `tracy_span!("charge")` for the cumulative ValSer CPU charge under
+    `feature = "tracy"`, and runs `check_budget_limit` for both dimensions.
+    These updates produce bit-exact CPU/memory totals and tracker fields vs.
+    the per-leaf path because per-leaf cost is still computed individually
+    inside `ValSerMeter::write` for each `len`.
+  - Added the corresponding `Budget::start_val_ser_metering` and
+    `Budget::commit_val_ser_metering` wrappers (each takes a single
+    `try_borrow_*_or_err`).
+  - Added `use model::HostCostModel;` so `MeteredCostComponent::evaluate` is in
+    scope inside the new helper (`start_val_ser_metering` only reads cost
+    model parameters; the actual `evaluate` happens inline in
+    `ValSerMeter::write`).
+
+- `src/rust/soroban/p26/soroban-env-host/src/host/metered_xdr.rs`:
+  - Replaced the per-write `Budget::charge(ValSer, Some(buf.len()))` call in
+    `MeteredWrite::write` with a call into a borrowed
+    `&mut ValSerMeter` (held for the duration of the serialization), so the
+    per-XDR-leaf overhead reduces to a few inline arithmetic ops, two
+    saturating-add accumulator updates, and a single pair of integer compares
+    against the snapshot remaining budget — no `RefCell` borrow, no model
+    lookup, no `BudgetDimension::charge` evaluation, no per-leaf Tracy span,
+    no per-leaf `check_budget_limit` call.
+  - `metered_write_xdr` now snapshots the meter before `write_xdr`, runs the
+    serialization with `MeteredWrite { meter: &mut meter, w }`, and then
+    commits the accumulated totals back to the live budget via
+    `budget.commit_val_ser_metering(&meter)` — even on the error path — so the
+    budget tracker reflects the work that was done and the canonical
+    `(Budget, ExceededLimit)` error is surfaced from `commit_val_ser_metering`
+    when the meter saw the limit overflow.
+
+### Demonstration
+
+The optimization removes the per-encoder-chunk `RefCell` borrow, dual cost-model
+lookups, dual `BudgetDimension::charge` evaluations, dual `check_budget_limit`
+calls, dual saturating-add chains across `total_count`/tracker fields, and
+(under Tracy) the per-CPU-charge `charge` span emission from every low-level
+XDR write performed by Soroban host serialization (`metered_hash_xdr`,
+`metered_write_xdr`, return-value / ledger-change / contract-event
+serialization in `e2e_invoke`). Per-write overhead reduces to a fixed handful
+of inline arithmetic ops on stack-resident `u64`s plus two compares, and
+end-of-call cost tracking is paid exactly once per `write_xdr` invocation
+regardless of how many small chunks the encoder emitted.
+
+Compared to the previous PoC iteration (which used a `Vec<(u64,u64)>`
+histogram with linear bucket scan and dual borrows per `metered_write_xdr`),
+this revision (a) eliminates the per-write histogram bucket lookup, (b)
+eliminates the per-write `Vec` push / capacity check, (c) holds zero heap
+state across the serialization, (d) folds per-write limit checks into two
+local `u64` compares, and (e) collapses Tracy `charge` instrumentation from
+"one span per encoder leaf" to "one span per logical serialization call".
+Because per-leaf CPU and memory cost is still computed individually for each
+write via the same `const_term + (lin_term * len).unscale()` expression used
+by `MeteredCostComponent::evaluate(1, Some(len))`, CPU and memory totals,
+`CostTracker.iterations`, `CostTracker.inputs`, `CostTracker.cpu`,
+`CostTracker.mem`, `BudgetTracker.meter_count`, `BudgetDimension.total_count`
+(and shadow equivalents), and budget-limit success/failure outcomes remain
+bit-identical to the per-leaf path; only the timing of an in-progress
+budget-exceeded error shifts from "mid-write" to "after the write completes
+into a local `Vec<u8>`", which is non-observable to callers because the
+buffer is local to `metered_write_xdr` and is dropped on the error path.
+
+### Test Results
+
+`./configure --enable-ccache --enable-sdfprefs --enable-tracy
+--enable-tracy-capture --disable-postgres && make -j$(nproc)` builds clean.
+
+`env NUM_PARTITIONS=$(nproc) STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple
+--abort --disable-dots' make check` ran to completion with zero failures
+across all C++ test partitions and all Rust crate tests, including the
+`budget_metering::metered_xdr` and `budget_metering::metered_xdr_out_of_budget`
+tests in `soroban-env-host` that directly exercise the modified code path
+(asserting `tracker.inputs == w.len()` after `metered_write_xdr` and
+`(Budget, ExceededLimit)` propagation when the budget is exhausted mid-write).
+Both `test/selftest-nopg` and `test/check-nondet` PASS.

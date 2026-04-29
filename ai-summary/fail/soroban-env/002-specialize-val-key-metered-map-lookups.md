@@ -41,3 +41,43 @@ Run the current soroswap apply-load scenario (`soroswap, TX=2000, T=8`) using th
 - Not all `map lookup` time is necessarily from `MeteredOrdMap<Val, V, Host>`; some comes from other key types and construction-time maps. The PoC should add focused instrumentation or compare before/after Tracy self-time to isolate the Val-key subset.
 - The previous validated `LedgerKey` fast path measured only a 2.17% average soroswap median improvement despite targeting broad storage, footprint, TTL, and restored-key maps. This hypothesis clears the Medium threshold only if the remaining Val-key map subset is large enough and the generic-search overhead fraction is comparable or larger.
 - Exact-budget tests may observe comparison charge counts. The implementation must preserve the binary-search probe order and call the same comparator for each probe, including error propagation behavior for invalid object handles.
+
+---
+
+## Review
+
+**Verdict**: NOT_VIABLE
+**Date**: 2026-04-29
+**Reviewed by**: gpt-5.5, high
+**Novelty**: PASS — related to the confirmed `LedgerKey` lookup fast path, but not a duplicate; no prior fail/success record covers a `Val`-key `MeteredOrdMap` lookup specialization
+**Failed At**: reviewer
+
+### Trace Summary
+
+The generic `Val`-key lookup path exists as described: `HostMap` and `InstanceStorageMap` are `MeteredOrdMap<Val, Val, Host>`, and map/instance-storage reads call `get` or `contains_key`, which route through the generic fallible `find` loop. Soroswap SAC code reads `AssetInfo` and `METADATA` from instance storage, and SAC event code constructs host maps with `map_put`, so these paths are plausibly in the apply window. However, a correct specialization must still pay `charge_binsearch`, preserve the same binary-search probe order, call `Compare<Val>` at each probe, and retain all `obj_cmp`, `VisitObject`, and `MemCmp` effects for object-valued comparisons. The safely removable work is therefore only the unmetered generic wrapper/error-side-channel/safe-indexing overhead, not the dominant metered comparison and object-visit work in the cited trace.
+
+### Code Paths Examined
+
+- `src/rust/soroban/p26/soroban-env-host/src/host/metered_map.rs:168-194` — `find` charges the binary-search access cost, then uses the generic `binary_search_by_pre_rust_182` closure with an outer `Option<HostError>` to propagate fallible comparator errors.
+- `src/rust/soroban/p26/soroban-env-host/src/host/metered_map.rs:196-224` — `insert` also calls `find`; specializing only `get`/`contains_key` would miss `map_put` and instance-storage writes, while specializing insert still leaves the broader map rebuild work covered by a separate failed hypothesis.
+- `src/rust/soroban/p26/soroban-env-host/src/host/metered_map.rs:227-300` — `get` and `contains_key` route through `find`; `get` then charges found-entry access and safely indexes the vector.
+- `src/rust/soroban/p26/soroban-env-host/src/host_object.rs:19` — `HostMap` is exactly `MeteredOrdMap<Val, Val, Host>`.
+- `src/rust/soroban/p26/soroban-env-host/src/storage.rs:29-66` — `InstanceStorageMap` wraps `MeteredOrdMap<Val, Val, Host>` and is populated from contract-instance XDR using host-validated `Val` keys and values.
+- `src/rust/soroban/p26/soroban-env-host/src/host.rs:1697-1755` — public `map_put`, `map_get`, and `map_has` operate on `HostMap` and call `insert`, `get`, and `contains_key`.
+- `src/rust/soroban/p26/soroban-env-host/src/host.rs:2190-2264` — instance `put_contract_data`, `has_contract_data`, and `get_contract_data` use `s.map.insert` and `s.map.get` for `StorageType::Instance`.
+- `src/rust/soroban/p26/soroban-env-common/src/compare.rs:127-145` — `Compare<Val>` has an exact-payload fast path but must delegate any object comparison to `Env::obj_cmp`.
+- `src/rust/soroban/p26/soroban-env-host/src/host.rs:1224-1282` and `src/rust/soroban/p26/soroban-env-host/src/host/comparison.rs:46-95` — `obj_cmp` visits host objects and `Compare<HostObject>` performs metered recursive/vector/map/address/string comparisons that the proposed fast path cannot skip.
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/asset_info.rs:20-33` and `metadata.rs:192-205` — SAC reads instance keys such as `AssetInfo` and `METADATA`, feeding the instance-storage `Val` map lookup path.
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/event.rs:75-87` — SAC event construction uses `map_put`, exercising `HostMap` insertion and therefore `find`.
+- `ai-summary/fail/soroban-env/summary.md:9-18` and `ai-summary/fail/soroban-env/001-single-lookup-sac-try-get.md:56-83` — related failures are not duplicates and reinforce that budget-visible conversion/search/comparison work cannot be treated as removable.
+- `ai-summary/success/soroban-env/002-specialize-storage-map-lookup-fast-path.md:9-26,44-53,88-97` — the prior validated `LedgerKey` fast path is related but distinct and measured as only a Low-severity 2.17% median soroswap improvement.
+
+### Why It Failed
+
+The source-level inefficiency exists, but the Medium-impact claim does not survive the code trace. The `map lookup` Tracy span includes mandatory `MemCpy` binary-search charging and all comparator work; for `Val` keys, comparator work includes the exact-payload fast path for common small symbols and full `obj_cmp` / host-object visits for object values. A specialized `MeteredOrdMap<Val, V, Host>` lookup can remove the outer `Option<HostError>`, some generic `Borrow<Q>` machinery, and a redundant safe index, but it cannot remove `charge_binsearch`, `charge_access`, `Compare<Val>`, `obj_cmp`, or the path-dependent `MemCmp` / `VisitObject` charges without changing protocol-visible behavior.
+
+That removable subset is too small for the objective's accepted severity floor. The broader confirmed `LedgerKey` specialization affected storage, footprint, TTL, restored-key, and ledger-change maps and also skipped repeated validated-key handling, yet measured only a 2.17% average soroswap median improvement, which is Low. This hypothesis targets a narrower residual map subset and removes less per-probe work than that prior optimization. Without isolated evidence that the unmetered wrapper overhead alone exceeds the 3% Medium threshold, this is rejected as below the objective severity threshold.
+
+### Lesson Learned
+
+For Soroban `MeteredOrdMap` hypotheses, the `map lookup` aggregate is mostly an upper bound that includes protocol-visible metering and comparator effects. Future `Val`-map optimization hypotheses should first isolate the `MeteredOrdMap<Val, _, Host>` subset and separately measure unmetered search-wrapper overhead after subtracting mandatory `charge_binsearch`, `Compare<Val>`, `obj_cmp`, and `VisitObject` work.
