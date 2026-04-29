@@ -110,3 +110,37 @@ The optimization removes the per-encoder-chunk `RefCell` borrow, dual cost-model
 ### Test Results
 
 `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` ran to completion with zero failures across all 30 C++ test partitions and all Rust tests in `soroban-env-host` (including `test::budget_metering::metered_xdr` and `test::budget_metering::metered_xdr_out_of_budget`, which directly cover this code path), the p23/p26 host crates, and supporting Rust crates (`bls`, `ed25519_edge_cases`, `fees`, `integration`, `option`, `secp256r1_sig_ver`). `test/selftest-nopg` and `test/check-nondet` both PASS.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-04-29
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The optimized checkout built successfully and the full test suite passed, but the required three non-Tracy `scripts/run_apply_load_matrix.py` runs did not show an eligible soroswap apply-time improvement against the accepted `ai-summary/CURRENT_STATE.md` baseline. Soroswap is the headline metric for this objective, and the optimized three-run average regressed from 305.1753875 ms to 307.5390265 ms (-0.77% improvement), with the third optimized run worse than every accepted baseline run.
+
+Authoritative non-Tracy final-review measurements:
+
+| run | run id | scenario | median_ms | p95_ms | p99_ms |
+|-----|--------|----------|-----------|--------|--------|
+| 1 | `268cce140672-20260429-090025` | sac, TX=6000, T=8 | 324.8101505000004 | 342.98105394999834 | 351.3197718200008 |
+| 1 | `268cce140672-20260429-090025` | soroswap, TX=2000, T=8 | 300.13708800000063 | 307.6635625500009 | 314.7307617699986 |
+| 2 | `268cce140672-20260429-090717` | sac, TX=6000, T=8 | 321.71103400000175 | 343.83876854999755 | 365.7195270999977 |
+| 2 | `268cce140672-20260429-090717` | soroswap, TX=2000, T=8 | 303.65322000000015 | 310.48072750000097 | 314.9202224000007 |
+| 3 | `268cce140672-20260429-091351` | sac, TX=6000, T=8 | 325.83739499999865 | 344.7139017500012 | 364.06994586000116 |
+| 3 | `268cce140672-20260429-091351` | soroswap, TX=2000, T=8 | 318.82677149999836 | 324.84167784999863 | 328.4586865899978 |
+
+No diagnostic Tracy run was collected because the non-Tracy benchmark gate did not pass.
+
+### Revision Instructions
+
+Rework the optimization until soroswap median apply time improves consistently across all three required non-Tracy matrix runs relative to the accepted `CURRENT_STATE.md` baseline. The current implementation may still be useful for max-sac (2.94% median average improvement in this final review), but it does not satisfy the soroswap objective as-is. Before resubmitting, also isolate the reviewed diff against the accepted baseline state so unrelated prior storage-map changes and generated observation fixture updates are not mixed into the H001 review surface.
+
+### Checks Passed So Far
+
+- The modified checkout builds with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres && make -j30`.
+- The full test suite passes with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`.
+- The code path is in-scope for `closeLedger` / Soroban invoke apply work, and max-sac median apply time improved across the three final-review runs.
