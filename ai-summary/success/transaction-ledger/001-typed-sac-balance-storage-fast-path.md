@@ -117,3 +117,109 @@ The optimization keeps SAC balance storage on typed XDR values that the built-in
 ### Test Results
 
 Configured with Tracy-enabled PoC flags and built via `make -j30`. Refreshed intentional p26 SAC observation changes with `UPDATE_OBSERVATIONS=1` through the repository `check-sorobans` script, then ran `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check ALL_SOROBAN_GIT_STATE_STAMPS=`; the full suite completed with `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.
+
+---
+
+## Final Review — Confirmed
+
+**Date**: 2026-04-29
+**Final review by**: claude-opus-4.7, high
+**Severity**: Low
+
+### Verdict
+
+CONFIRMED. The typed SAC balance storage fast path delivers a reproducible
+3.82% average soroswap median apply-time improvement across three independent
+non-Tracy runs, on top of the bulk-build host footprint and storage maps
+baseline (transaction-ledger/001). All three optimized soroswap medians
+(290.766 / 286.739 / 288.663 ms) sit **below the previous baseline's best
+run** (294.393 ms) — the improvement is supported across every run, not
+just the average. The full `env NUM_PARTITIONS=30 make check` suite passes
+with no test-logic edits; the nine regenerated SAC observation snapshots
+fall under the budget-number exception in the objective `TESTING_RULES`
+(numeric budget fields only, no behavioral flips). Diagnostic Tracy
+matrix captured for attribution.
+
+### Submodule Commit
+
+- p26 submodule SHA: upstream `b351f88a` ("Bump version to 26.0.0"). The
+  optimization stack lives as p26 working-tree edits on top of upstream:
+  the prior bulk-build edits (`host/metered_map.rs`,
+  `host/metered_xdr.rs`, `storage.rs`, `budget.rs`, `budget/dimension.rs`
+  + 10 `test_v_new_*` observation snapshots) plus this PoC's edits
+  (`builtin_contracts/stellar_asset_contract/balance.rs` + 9 SAC
+  `test__stellar_asset_contract__*` observation snapshots). Both layers
+  stack cleanly with no `.rs` or observation-file overlap.
+
+### Benchmark Results
+
+Independent non-Tracy benchmark runs using
+`PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py`:
+
+| run | run id | sac median_ms | sac p95_ms | sac p99_ms | soroswap median_ms | soroswap p95_ms | soroswap p99_ms |
+|-----|--------|---------------|------------|------------|--------------------|------------------|------------------|
+| 1 | `ca0069935a7f-20260429-215417` | 333.099159 | 409.899619 | 415.473662 | 290.766289 | 320.513204 | 326.261744 |
+| 2 | `ca0069935a7f-20260429-220101` | 314.378531 | 388.362011 | 400.919545 | 286.738946 | 309.253423 | 320.197842 |
+| 3 | `ca0069935a7f-20260429-220735` | 316.290692 | 364.102294 | 383.006800 | 288.663084 | 294.675579 | 305.874426 |
+
+| Scenario | Baseline avg median ms | Optimized avg median ms | Average delta |
+|----------|------------------------|--------------------------|---------------|
+| soroswap, TX=2000, T=8 | 300.186161 | 288.722773 | **−3.82% (improvement)** |
+| sac, TX=6000, T=8 | 318.961386 | 321.256127 | +0.72% (regression, inside noise) |
+
+Baseline reference: `ai-summary/CURRENT_STATE.md` after the bulk-build host
+storage maps baseline update — soroswap medians `306.252726`, `294.393414`,
+`299.912345` ms (avg `300.186161` ms); sac medians `323.572193`,
+`313.851046`, `319.460919` ms (avg `318.961386` ms).
+
+#### Tradeoff Analysis
+
+- Soroswap absolute median improvement: 11.463 ms
+- Max-sac absolute median regression: 2.295 ms
+- **Tradeoff ratio: 4.99×** (rule-of-thumb requires ≥ ~2×)
+- Max-sac median regression: 0.72%, well under the 5% ceiling, and
+  comfortably inside the run-to-run noise floor (the baseline 3-run sac
+  median spread was ~3%; runs 2 and 3 of this PoC fall inside the baseline
+  range; the run-1 high of 333.10 ms is a single-run outlier).
+
+Result: comfortably inside the acceptable-tradeoff envelope.
+
+### Diagnostic Tracy Trace
+
+- Run id: `ca0069935a7f-20260429-222159`
+- Soroswap trace: `/mnt/nvme2/apply-load/ca0069935a7f-20260429-222159/logs/ca0069935a7f-20260429-222159-02-soroswap-tx-2000-t-8.tracy`
+- SAC trace: `/mnt/nvme2/apply-load/ca0069935a7f-20260429-222159/logs/ca0069935a7f-20260429-222159-01-sac-tx-6000-t-8.tracy`
+- Tracy apply-time numbers from this run are intentionally ignored for the
+  verdict per the workflow; the headline metric is the average of the
+  three non-Tracy runs above.
+
+### Artifact Paths
+
+- Run 1: `/mnt/nvme2/apply-load/ca0069935a7f-20260429-215417`
+- Run 2: `/mnt/nvme2/apply-load/ca0069935a7f-20260429-220101`
+- Run 3: `/mnt/nvme2/apply-load/ca0069935a7f-20260429-220735`
+- Tracy diagnostic: `/mnt/nvme2/apply-load/ca0069935a7f-20260429-222159`
+
+### Checks Passed
+
+- Source path is in scope: SAC builtin balance read/write under the
+  enforcing Soroban invoke path during `closeLedger`, not TX-set
+  construction or background bucket work.
+- No existing test logic was modified. The nine regenerated SAC
+  observation snapshots fall under the budget-number exception in
+  `TESTING_RULES` — numeric budget fields only, no behavioral or pass/fail
+  outcome flips.
+- Build passed with `./configure --enable-ccache --enable-sdfprefs
+  --enable-tracy --enable-tracy-capture --disable-postgres` followed by
+  `make -j $(nproc)`. (A worktree-local fix to `src/Makefile` was
+  required to work around the worktree+submodule incompatibility in the
+  `git-state.txt` rule introduced by upstream PR #5187; the fix is
+  Makefile-only and does not affect the optimization or the recorded
+  numbers.)
+- Full test suite passed with `env NUM_PARTITIONS=30 make check`.
+- Three independent non-Tracy benchmark runs show a reproducible soroswap
+  improvement (3.82% average; all three optimized runs below the
+  baseline's best run) and an acceptable max-sac tradeoff (0.72% median
+  regression, well under 5%; tradeoff ratio ~5×).
+- Diagnostic Tracy matrix captured for attribution; trace path recorded
+  above.

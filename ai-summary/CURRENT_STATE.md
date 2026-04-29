@@ -1,63 +1,82 @@
 # CURRENT_STATE — Soroswap Optimization Baseline
 
 This is the accepted current baseline for the soroswap-performance arc after
-confirming the bulk-build host footprint and storage maps optimization
-(transaction-ledger/001).
+confirming the typed SAC balance storage fast path
+(transaction-ledger/001-typed-sac-balance-storage-fast-path), stacked on top
+of the prior bulk-build host footprint and storage maps optimization
+(transaction-ledger/001-bulk-build-host-storage-maps).
 
 ## Commit
 
-- p26 submodule SHA: see the commit recorded with this update; the
-  enforcing-mode `build_storage_footprint_from_xdr` and
-  `build_storage_map_from_xdr_ledger_entries` paths now construct each
-  `MeteredOrdMap` with a single `from_map` call after sorting+merging,
-  rather than per-key `MeteredOrdMap::insert`.
+- p26 submodule SHA: upstream `b351f88a` ("Bump version to 26.0.0"); the
+  optimization stack lives as p26 working-tree edits in
+  `src/rust/soroban/p26/soroban-env-host/`. Both layers stack cleanly:
+  - **bulk-build host storage maps** (transaction-ledger/001):
+    `host/metered_map.rs`, `host/metered_xdr.rs`, `storage.rs`, `budget.rs`,
+    `budget/dimension.rs`, plus 10 `test_v_new_*` observation snapshots.
+  - **typed SAC balance storage fast path**
+    (transaction-ledger/001-typed-sac-balance-storage-fast-path):
+    `builtin_contracts/stellar_asset_contract/balance.rs`, plus 9
+    `test__stellar_asset_contract__*` observation snapshots.
+- Outer worktree branch: `poc/001-typed-sac-balance-storage-fast-path`. The
+  submodule edits are uncommitted in the worktree, matching the prior
+  workflow established at the bulk-build update.
 
 ## Timestamp
 
-- Non-Tracy benchmark runs: 2026-04-29T18:04:10Z through 2026-04-29T18:17:17Z
-- Diagnostic Tracy run: SKIPPED for this baseline update.
+- Non-Tracy benchmark runs: 2026-04-29T21:54:17Z through 2026-04-29T22:07:35Z
+- Diagnostic Tracy run: 2026-04-29T22:21:59Z
 - Recorded: 2026-04-29
 
 ## Apply-time results (authoritative non-Tracy runs)
 
 | run | run id | scenario | median_ms | p95_ms | p99_ms |
 |-----|--------|----------|-----------|--------|--------|
-| 1 | `3259abf99f36-20260429-180410` | sac, TX=6000, T=8 | 323.572193 | 354.983247 | 388.081342 |
-| 1 | `3259abf99f36-20260429-180410` | soroswap, TX=2000, T=8 | 306.252726 | 310.776013 | 313.924768 |
-| 2 | `3259abf99f36-20260429-181048` | sac, TX=6000, T=8 | 313.851046 | 333.603606 | 356.475479 |
-| 2 | `3259abf99f36-20260429-181048` | soroswap, TX=2000, T=8 | 294.393414 | 301.649963 | 316.209646 |
-| 3 | `3259abf99f36-20260429-181717` | sac, TX=6000, T=8 | 319.460919 | 353.275286 | 373.037554 |
-| 3 | `3259abf99f36-20260429-181717` | soroswap, TX=2000, T=8 | 299.912345 | 306.932627 | 313.700032 |
+| 1 | `ca0069935a7f-20260429-215417` | sac, TX=6000, T=8 | 333.099159 | 409.899619 | 415.473662 |
+| 1 | `ca0069935a7f-20260429-215417` | soroswap, TX=2000, T=8 | 290.766289 | 320.513204 | 326.261744 |
+| 2 | `ca0069935a7f-20260429-220101` | sac, TX=6000, T=8 | 314.378531 | 388.362011 | 400.919545 |
+| 2 | `ca0069935a7f-20260429-220101` | soroswap, TX=2000, T=8 | 286.738946 | 309.253423 | 320.197842 |
+| 3 | `ca0069935a7f-20260429-220735` | sac, TX=6000, T=8 | 316.290692 | 364.102294 | 383.006800 |
+| 3 | `ca0069935a7f-20260429-220735` | soroswap, TX=2000, T=8 | 288.663084 | 294.675579 | 305.874426 |
 
 Use all three non-Tracy runs above as the reference baseline for future
 comparisons. Do not replace them with a single best run.
 
 ## Improvement vs Previous Baseline
 
-Previous baseline (specialized storage map lookup fast path):
-- soroswap median average: 305.175 ms
-- sac median average: 333.929 ms
+Previous baseline (bulk build host storage maps):
+- soroswap median average: 300.186 ms
+- sac median average: 318.961 ms
 
-Current baseline (bulk build host storage maps):
-- soroswap median average: 300.186 ms — 1.63% improvement
-- sac median average: 318.961 ms — 4.48% improvement
+Current baseline (typed SAC balance storage fast path, stacked on bulk-build):
+- soroswap median average: 288.723 ms — **3.82% improvement**
+- sac median average: 321.256 ms — 0.72% regression (inside run-to-run noise;
+  baseline 3-run sac spread was ~3%)
+
+Tradeoff ratio (soroswap absolute win ÷ sac absolute loss): 11.463 / 2.295 = **4.99×**, well above the 2× rule-of-thumb. Max-sac regression is 0.72%, well under the 5% ceiling.
+
+All three optimized soroswap medians (290.77 / 286.74 / 288.66 ms) are below
+the previous baseline's best run (294.39 ms) — the improvement is supported
+across every run, not just the average.
 
 ## Diagnostic Tracy Run
 
-Skipped for this baseline update. The previous Tracy reference traces from
-`1695facd04c8-20260429-013014` remain valid for hypothesis-round attribution
-work; see the prior CURRENT_STATE archived in
-`ai-summary/success/soroban-env/002-specialize-storage-map-lookup-fast-path.md`
-if specific paths are needed.
+- Run id: `ca0069935a7f-20260429-222159`
+- Soroswap trace: `/mnt/nvme2/apply-load/ca0069935a7f-20260429-222159/logs/ca0069935a7f-20260429-222159-02-soroswap-tx-2000-t-8.tracy`
+- SAC trace: `/mnt/nvme2/apply-load/ca0069935a7f-20260429-222159/logs/ca0069935a7f-20260429-222159-01-sac-tx-6000-t-8.tracy`
+- Tracy apply-time numbers from this run are **ignored for the verdict**;
+  the headline metric is the average of the three non-Tracy runs above.
 
 ## Artifact Paths
 
 - Non-Tracy run 1 artifact directory:
-  `/mnt/nvme2/apply-load/3259abf99f36-20260429-180410`
+  `/mnt/nvme2/apply-load/ca0069935a7f-20260429-215417`
 - Non-Tracy run 2 artifact directory:
-  `/mnt/nvme2/apply-load/3259abf99f36-20260429-181048`
+  `/mnt/nvme2/apply-load/ca0069935a7f-20260429-220101`
 - Non-Tracy run 3 artifact directory:
-  `/mnt/nvme2/apply-load/3259abf99f36-20260429-181717`
+  `/mnt/nvme2/apply-load/ca0069935a7f-20260429-220735`
+- Tracy diagnostic run artifact directory:
+  `/mnt/nvme2/apply-load/ca0069935a7f-20260429-222159`
 
 ## Build configuration
 
@@ -68,7 +87,20 @@ make -j $(nproc)
 PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py
 PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py
 PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py
+PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py --tracy
 ```
 
-The three benchmark commands are the authoritative non-Tracy baseline. No
-diagnostic Tracy run was captured for this baseline update.
+The first three benchmark commands are the authoritative non-Tracy baseline.
+The fourth command captured the diagnostic Tracy trace for attribution; its
+apply-time numbers are not used for the verdict.
+
+## Worktree Build Note
+
+This baseline was measured in a git worktree, which exposed a worktree
+incompatibility in the `src/Makefile.am:267` rule introduced by upstream
+PR #5187. A worktree-local fix in `src/Makefile` replaces the pattern rule's
+hardcoded `$(top_srcdir)/.git/modules/...` prereq with per-protocol explicit
+rules using `git rev-parse --git-path` to resolve the actual submodule
+gitdir. The fix is local to the generated Makefile and does not affect the
+optimization or the recorded numbers; an upstream patch to PR #5187 would
+generalize this for all worktree-based builds.
