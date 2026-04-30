@@ -146,3 +146,58 @@ The reproducibility issue from the prior final review has been addressed:
 
 The PoC source state is now reproducible from committed history and ready
 for final review benchmarking.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-04-30
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The revised handoff is now reproducible and the optimized commit passes the full unit-test gate, but the required soroswap benchmark signal is not strong or consistent enough to confirm. The headline soroswap apply-time metric from the three required non-Tracy `scripts/run_apply_load_matrix.py` runs was:
+
+| run | artifact directory | soroswap median_ms | sac median_ms |
+|-----|--------------------|-------------------:|--------------:|
+| 1 | `/mnt/nvme2/apply-load/14093af09b60-20260430-033900` | 285.1599055 | 308.3181165 |
+| 2 | `/mnt/nvme2/apply-load/14093af09b60-20260430-034527` | 290.9849725 | 306.9058000 |
+| 3 | `/mnt/nvme2/apply-load/14093af09b60-20260430-035148` | 288.8660825 | 309.6410040 |
+
+The accepted baseline in `ai-summary/CURRENT_STATE.md` has soroswap medians 290.766289 / 286.738946 / 288.663084 ms, average 288.723 ms. The optimized soroswap average is 288.337 ms, only about 0.13% better, and one run regresses above the baseline average. This is below the objective's 1% minimum and fails the requirement that soroswap improve consistently across the three non-Tracy runs. The max-sac metric improved, but max-sac is secondary and cannot confirm a soroswap-focused optimization when the soroswap headline signal is mixed and within noise.
+
+Because the non-Tracy benchmark result was not eligible, no diagnostic `--tracy` run was collected for this final-review attempt.
+
+### Revision Instructions
+
+Keep the committed handoff structure, but revise the optimization so that it produces a reproducible soroswap apply-time improvement of at least 1% across all three non-Tracy matrix runs against the current accepted baseline. If continuing with the storage-map construction approach, use Tracy only diagnostically to confirm that the remaining cost is still in the in-scope host-input construction path, then pair it with additional in-scope changes large enough to move the top-line soroswap metric. Re-run `env NUM_PARTITIONS=30 make check` and three non-Tracy `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` runs before resubmitting.
+
+### Checks Passed So Far
+
+- The revised outer branch `poc/001-bulk-build-soroban-storage-maps` records p26 gitlink `1f156d0ec040d369233af91b62eb0ac949465fb6`, and the submodule branch contains that committed source state.
+- The outer source tree and p26 submodule had no source dirt outside `ai-summary/` housekeeping.
+- The source diff targets the claimed in-scope Soroban host input construction path.
+- Existing test-file edits are limited to recording-mode instruction-count expectations, consistent with the budget-number exception.
+- `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres && make -j30` completed successfully.
+- `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` completed successfully.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-04-30
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:47-1299` — extended the prior bulk-build implementation so the enforcing invoke path collects an `InitialStorageSnapshot` while decoding ledger entries, builds the storage map from an already sorted footprint-aligned vector, skips building the TTL lookup map when it is not needed, and generates ledger changes from aligned storage/footprint/snapshot iterators instead of cloning and binary-searching a second initial storage map.
+- `src/rust/soroban/p26/soroban-env-host/src/test/e2e_tests.rs:61-2958` — updated only recording-mode budget tolerance and instruction-count expectations to the measured lower values produced by the cheaper enforcing storage-map and ledger-change construction path.
+
+### Demonstration
+
+The revision keeps the original one-shot `MeteredOrdMap` construction and removes additional post-invoke map churn from the successful enforcing path: the initial storage state is retained as an aligned snapshot rather than materialized as another metered map clone, and TTL map construction is avoided outside recording mode. This preserves deterministic sorted key order, footprint membership validation, TTL handling, restored-entry accounting, and ledger-change semantics while reducing allocation/copy and lookup work in the Soroban apply path.
+
+### Test Results
+
+`make -j $(nproc)` completed successfully from the top-level worktree. `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` completed successfully; the final run included p26 Rust host tests (`750 passed; 0 failed; 2 ignored; 1 filtered out`), Rust integration tests, `test/selftest-nopg`, and `test/check-nondet` with exit code 0.
