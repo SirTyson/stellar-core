@@ -133,3 +133,60 @@ satisfying the determinism rule.
   C++ partitions and the Rust soroban-env-host test suites reporting "All
   tests passed" / `# FAIL: 0 / # ERROR: 0`. `selftest-nopg` and
   `check-nondet` PASS.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-04-30
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The PoC source changes are not committed on the handoff branch. The outer worktree is dirty with uncommitted modifications to:
+
+- `src/ledger/LedgerManagerImpl.cpp`
+- `src/ledger/LedgerManagerImpl.h`
+- `src/transactions/ParallelApplyUtils.cpp`
+
+This violates the optimize-soroswap final-review handoff model, which requires the PoC optimization to exist as committed source changes on `poc/001-parallelize-cluster-state-setup` before final review builds, tests, or benchmarks it. Benchmarking a dirty worktree would not be reproducible from the branch tip, and the current branch history also appears inconsistent with this PoC (`git log -5` shows recent `002-fuse-enforcing-storage-footprint-lookups` commits rather than a committed `001-parallelize-cluster-state-setup` optimization).
+
+### Revision Instructions
+
+Commit the optimization source diff to the correct outer PoC branch and ensure the handoff is reproducible from a clean checkout:
+
+1. Commit the three source-file changes on `poc/001-parallelize-cluster-state-setup` with a descriptive PoC commit.
+2. Ensure `git status --short --branch` is clean in the outer worktree except for expected pipeline artifact handling, and ensure `git -C src/rust/soroban/p26 status --short --branch` is clean.
+3. Ensure the branch tip/history corresponds to this PoC rather than an unrelated hypothesis.
+4. Leave `ai-summary/CURRENT_STATE.md` unchanged until final review confirms the optimization.
+
+After that, final review can rerun the required full test suite and the three authoritative non-Tracy `scripts/run_apply_load_matrix.py` benchmark runs against a committed, reproducible optimized state.
+
+### Checks Passed So Far
+
+- The dirty source diff matches the described scheduling optimization: `ThreadParallelApplyLedgerState` construction moves into `applyThread`, and `applySorobanStageClustersInParallel` submits futures without serially constructing each thread state first.
+- The p26 submodule is clean at the prior accepted baseline SHA `e6728024aed9bb39cac3c2f247579bfac5b8bc79`.
+- No benchmark verdict was attempted because handoff validation failed before the build/test/benchmark gates.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-04-30
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/ledger/LedgerManagerImpl.h:372-377` — Updated `applyThread` to accept the shared `GlobalParallelApplyLedgerState` and `clusterIdx` instead of a pre-constructed `ThreadParallelApplyLedgerState`.
+- `src/ledger/LedgerManagerImpl.cpp:2483-2523` — Constructed `ThreadParallelApplyLedgerState` at the top of each async worker so per-cluster footprint collection runs inside the worker.
+- `src/ledger/LedgerManagerImpl.cpp:2533-2575` — Removed serial thread-state construction from `applySorobanStageClustersInParallel`; the launch loop now submits one future per cluster while keeping results collected in cluster order.
+- `src/transactions/ParallelApplyUtils.cpp:925-935` — Removed the apply-thread assertion from `collectClusterFootprintEntriesFromGlobal` and documented the concurrent read-only contract required while `DeactivateScopeGuard` keeps global state deactivated.
+
+### Demonstration
+
+The optimization removes serial per-cluster state setup from the apply-thread future launch path. Each async worker now performs its own footprint-copy setup before applying its cluster, so setup work can overlap across the existing bounded `stage.numClusters()` worker set while the result vector is still populated and merged in deterministic cluster order.
+
+### Test Results
+
+Tracy-enabled configure and build completed successfully with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` followed by `make -j $(nproc)`. Full regression passed with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`: all C++ partitions completed, Rust soroban-env-host tests completed, `selftest-nopg` PASS, `check-nondet` PASS, and the suite ended with `All 2 tests passed`.
