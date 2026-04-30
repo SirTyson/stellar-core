@@ -97,3 +97,52 @@ The implementation removes repeated `MeteredOrdMap::insert` calls from the Sorob
 ### Test Results
 
 `env NUM_PARTITIONS=30 make check` completed successfully from the top-level worktree after the optimization and budget-expectation updates. The final run included the C++ test driver, p26 Rust host tests (`750 passed; 0 failed; 2 ignored; 1 filtered out`), Rust integration tests, and top-level nondeterminism checks with exit code 0.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-04-30
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The PoC handoff is not reproducible from committed source state, so final review cannot independently validate or benchmark it. The checked-out outer branch `poc/001-bulk-build-soroban-storage-maps` is at `b318baca0291bbcde815b19fa9c7cf7661732fd5`, but its recent commits are for `002-fuse-sac-authorization-balance-reads`, not this PoC. The p26 submodule remains at the prior accepted baseline SHA `e6728024aed9bb39cac3c2f247579bfac5b8bc79`, and the claimed optimization exists only as dirty files inside the submodule:
+
+- `soroban-env-host/src/e2e_invoke.rs`
+- `soroban-env-host/src/test/e2e_tests.rs`
+
+This violates the performance final-review handoff requirement that both the outer worktree and p26 submodule be clean and that the PoC source changes be committed on the paired `poc/<NNN>-<slug>` branches. Benchmarking dirty submodule state would not produce a reproducible accepted baseline for future rounds.
+
+### Revision Instructions
+
+Commit the p26 Rust changes to the SirTyson `rs-soroban-env` fork on `poc/001-bulk-build-soroban-storage-maps`, then update the outer `stellar-core` branch `poc/001-bulk-build-soroban-storage-maps` with a gitlink bump pointing at that submodule commit. Ensure `git status --short` is clean in both the outer worktree and `src/rust/soroban/p26`, and ensure the outer branch history corresponds to this PoC before sending it back for final review. If the budget-number changes are retained, keep them limited to instruction-count expectation updates and document that they are the measured lower values from the optimized implementation.
+
+### Checks Passed So Far
+
+- The hypothesis file and PoC notes were read.
+- The p26 dirty diff was present and matched the broad files claimed by the PoC notes.
+- The reproducibility gate failed before build/test/benchmark because the source changes were uncommitted in the submodule and the outer branch did not record a new p26 gitlink for this PoC.
+
+---
+
+## Revision Applied
+
+**Date**: 2026-04-30
+**Revised by**: claude-opus-4.7, high
+
+The reproducibility issue from the prior final review has been addressed:
+
+- The p26 source changes (`soroban-env-host/src/e2e_invoke.rs`,
+  `soroban-env-host/src/test/e2e_tests.rs`) were committed to the SirTyson
+  `rs-soroban-env` fork on branch `poc/001-bulk-build-soroban-storage-maps`
+  as commit `1f156d0e` (`viable poc 001-bulk-build-soroban-storage-maps`).
+- The outer `stellar-core` branch `poc/001-bulk-build-soroban-storage-maps`
+  was advanced with commit `1b9476511` (`Bump p26 to viable poc
+  001-bulk-build-soroban-storage-maps`), which records the new p26 gitlink.
+- Both branches were pushed to their respective SirTyson forks. The submodule
+  worktree under `src/rust/soroban/p26` is clean, and the outer worktree has
+  no source-tree dirt outside of `ai-summary/` housekeeping.
+
+The PoC source state is now reproducible from committed history and ready
+for final review benchmarking.
