@@ -87,3 +87,25 @@ Severity is Medium, not High. The total `storage get`/conversion Tracy time incl
 - **Change description**: Add an internal contract-balance read helper that, after matching `ScAddress::Contract(id)`, returns the contract id plus `Option<BalanceValue>` from one balance lookup. Use that value to check authorization and then mutate amount in contract-address `receive_balance`/`spend_balance`; leave account-address logic on the existing classic path. Preserve missing-entry behavior for receive, nonzero spend, and zero spend, and initially leave `write_contract_balance` semantics unchanged unless the PoC separately proves a safe direct-storage write that preserves TTL/live-until behavior.
 - **Correctness check**: Existing SAC coverage in `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/test_stellar_asset_contract.rs` and C++ invoke-host-function SAC tests should still cover authorized/deauthorized transfers, insufficient balance, missing balance, account/trustline paths, clawback-related fields, events, and TTL extension behavior.
 - **Benchmark focus**: Run `scripts/run_apply_load_matrix.py` against the SAC/soroswap apply-load config and compare top-line apply time across repeated runs. Tracy should show lower `SAC transfer`, `storage has`/`storage get`, `ScVal to Val`, and `Val to ScVal` time under `applyLedger`; expect a Medium-sized 3-10% target only if the optimized contract-balance endpoints account for a large enough share of the current storage/conversion zones.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-04-30
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/balance.rs:169-201` — added contract-balance helper functions that read a contract balance once and reuse the decoded `BalanceValue` for authorization checks.
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/balance.rs:313-477` — split contract-address receive/spend mutation paths so `receive_balance` and `spend_balance` pass the already-read `Option<BalanceValue>` into the amount mutation, while account-address paths continue through classic trustline/account logic and `spend_balance_no_authorization_check` remains available for clawback.
+- `src/rust/soroban/p26/soroban-env-host/observations/26/test__stellar_asset_contract__*.json` — regenerated 44 p26 SAC observation fixtures to reflect the intentional lower CPU/resource observations from the cheaper contract-balance path.
+
+### Demonstration
+
+The PoC removes the duplicate contract-balance read/decode in SAC `receive_balance` and authorized `spend_balance`: the contract path now reads `Option<BalanceValue>` once, checks `authorized` from that decoded value, then mutates `amount` from the same value. Missing-entry behavior is preserved: receive creates an authorized zero balance after the asset authorization rule passes, missing nonzero spend still fails with `BalanceError`, and missing zero spend remains a no-op.
+
+### Test Results
+
+Built successfully with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` and `make -j30`. Full suite passed with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`: `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and all p26 Soroban host tests passed (`750 passed; 0 failed; 2 ignored; 1 filtered out` in the main p26 host test binary, plus integration/doc test binaries passed).

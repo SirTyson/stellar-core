@@ -195,3 +195,34 @@ make check` from a clean build of the now-committed gitlink. The suite
 ran to completion with zero failing tests, matching the prior iteration's
 green run on the same source diff (now that diff is reachable via the
 recorded gitlink rather than via a working-tree edit).
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-04-30
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** YES. The p26 commit `3af0b5a5fce5cf3d314a4c65c9db0d085ed782c1` changes only `soroban-env-host/src/host/conversion.rs` and carries one immutable host-object slice through recursive read-only `Val` -> `ScVal` conversion, replacing nested `visit_obj_untyped` object-table borrows in the targeted path while preserving per-object `VisitObject` charging.
+2. **Are the preconditions realistic?** YES. The modified conversion path is exercised by Soroban storage/key/value externalization and contract return/event conversion during `InvokeHostFunctionOpFrame::doParallelApply`, which is inside the measured closeLedger apply path for soroswap.
+3. **Is the original code inefficient or working as designed?** INEFFICIENCY. The per-nested-object borrow/closure overhead is removable in read-only conversion without changing deterministic budget totals. The final review did not find evidence that the repeated borrow itself was required for correctness.
+4. **Does the benchmark improvement match the claimed severity?** NO. Independent non-Tracy apply-load runs showed no eligible improvement. Accepted baseline soroswap medians were `290.766289 / 286.738946 / 288.663084 ms` (average `288.722773 ms`); optimized medians were `304.220270 / 288.316975 / 287.212452 ms` (average `293.249899 ms`), a `+1.568%` regression. Max-sac medians regressed from baseline `333.099159 / 314.378531 / 316.290692 ms` (average `321.256127 ms`) to optimized `364.823694 / 344.357855 / 315.108117 ms` (average `341.429889 ms`), a `+6.280%` regression.
+5. **Is the optimization in scope?** YES. The source change is in Soroban host conversion code reached from parallel Soroban apply, not transaction-set construction, consensus, overlay, or background bucket merge work.
+6. **Is the benchmark methodology correct?** YES. Final review used the required optimized build and ran `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` exactly three times without `--tracy`, comparing against `ai-summary/CURRENT_STATE.md`. The full suite also passed before benchmarking with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`.
+7. **Can the improvement be explained without the optimization?** YES. The only favorable soroswap data points are sub-1% and within normal run-to-run variation, while the three-run average regressed and the first run was substantially slower. There is no reproducible positive signal to attribute to the code change.
+8. **Is this optimization novel?** NOVEL. No duplicate prior accepted finding was identified during final review.
+
+### Rejection Reason
+
+The optimization is reproducible and tests pass, but the required independent non-Tracy benchmark runs do not demonstrate a soroswap apply-time improvement. Soroswap regressed on average by `1.568%`, and max-sac regressed by `6.280%`, which fails the objective's CONFIRMED criteria and exceeds the allowed tradeoff envelope.
+
+### Failed Checks
+
+- Performance final-review verdict criteria: soroswap apply time did not improve consistently across the three non-Tracy runs.
+- Soroswap-vs-max-sac tradeoff: max-sac regressed by `6.280%`, outside the allowed under-5% envelope, while soroswap did not provide an offsetting win.
+- Adversarial check 4: benchmark improvement did not match any accepted severity tier.
+- Adversarial check 7: any isolated favorable datapoint is explainable as benchmark noise rather than a reproducible optimization effect.
