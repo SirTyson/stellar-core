@@ -77,3 +77,59 @@ Severity is Medium, not High. The total/self Tracy numbers for `applySorobanStag
 - **Change description**: Move `ThreadParallelApplyLedgerState` construction into the async worker task so each future constructs its own state before running the existing tx loop. Keep one future per `stage.numClusters()`, keep result storage indexed by cluster, and keep `DeactivateScopeGuard globalStateDeactivateGuard(globalState)` alive until after all futures have completed. Adjust the footprint-collection helper so it no longer calls `app.threadIsType(Application::ThreadType::APPLY)` from an unregistered async worker; it only needs read-only access to the deactivated global state.
 - **Correctness check**: Existing parallel Soroban apply tests should continue to cover deterministic result application, TTL bump merging, restored-entry handling, and meta generation. Pay particular attention to tests under `src/transactions/test/ParallelApplyTest.cpp` and Soroban invoke/TTL/restore tests that exercise clustered parallel apply.
 - **Benchmark focus**: Measure soroswap apply time with `scripts/run_apply_load_matrix.py` before and after, and add temporary timing if needed to isolate constructor/setup time from future wait time. The expected metric is reduced `applyLedger` / `applyParallelPhase` wall time by overlapping the per-cluster footprint-copy setup; the finding only meets the objective if repeated runs show a reproducible 3-10% apply-time reduction.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-04-30
+**PoC by**: claude-opus-4.7, high
+
+### Changes Made
+
+- `src/ledger/LedgerManagerImpl.h:372-377` — Changed `applyThread` signature to
+  accept `GlobalParallelApplyLedgerState const&` and `clusterIdx` instead of a
+  pre-built `std::unique_ptr<ThreadParallelApplyLedgerState>`.
+- `src/ledger/LedgerManagerImpl.cpp:2483-2521` — `applyThread` now constructs
+  its own `ThreadParallelApplyLedgerState` at the top of the worker function
+  (so `collectClusterFootprintEntriesFromGlobal` runs concurrently across
+  cluster workers rather than serially on the apply thread).
+- `src/ledger/LedgerManagerImpl.cpp:2530-2575` —
+  `applySorobanStageClustersInParallel` no longer constructs each thread state
+  before submitting `std::async`. The launch loop is now a tight loop of
+  future submissions; the existing `DeactivateScopeGuard globalState`
+  remains alive until after all futures have been joined, preserving the
+  scope-deactivation invariant required by `scopeAdoptEntryOptFrom`.
+- `src/transactions/ParallelApplyUtils.cpp:925-944` — Removed the
+  `releaseAssert(threadIsMain() || app.threadIsType(APPLY))` from
+  `ThreadParallelApplyLedgerState::collectClusterFootprintEntriesFromGlobal`,
+  since this helper is now invoked from std::async worker threads which are
+  not registered in `ApplicationImpl::mThreadTypes`. Replaced with a comment
+  documenting the concurrent-read-only contract.
+
+### Demonstration
+
+The optimization moves per-cluster `ThreadParallelApplyLedgerState`
+construction (which walks every transaction footprint in the cluster and
+copies matching entries from `GlobalParallelApplyLedgerState`) off the apply
+thread's serial launch path and into each worker future. With
+`NUM_CLUSTERS=8`, the per-stage setup work that previously delayed each
+subsequent worker submission now overlaps across the same bounded set of
+cluster workers. Result merging in `commitChangesFromThreads` continues to
+iterate `threadStates` in cluster order, preserving deterministic ledger
+output. The number of parallel workers is unchanged (`stage.numClusters()`),
+satisfying the determinism rule.
+
+### Test Results
+
+- `[soroban]` tag: All tests passed (3,476,743 assertions in 111 test cases),
+  including the parallel-apply suites (`ParallelApplyTest.cpp` partitioning
+  scenarios, `InvokeHostFunctionTests.cpp` readonly-TTL/restore/autorestore
+  scenarios, and the soroban fee-bump scenarios that exercise sequential
+  pre-parallel-apply fall-through).
+- Full suite: `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r
+  simple --abort --disable-dots' make check` ran to completion with all 30
+  C++ partitions and the Rust soroban-env-host test suites reporting "All
+  tests passed" / `# FAIL: 0 / # ERROR: 0`. `selftest-nopg` and
+  `check-nondet` PASS.

@@ -195,3 +195,33 @@ Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --
 ### Handoff Notes
 
 The source changes are intentionally left in the `src/rust/soroban/p26` submodule working tree as the PoC deliverable. No commits were created because the PoC instructions for this run explicitly say the orchestrator handles commits.
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-04-30
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** PARTIAL PASS — the committed p26 diff replaces the `get_ledger_changes` footprint-map binary search with `Storage::get_access_type`, which can use the enforcing side index. The broader runtime read/write fast paths described by the PoC were already present in the accepted baseline, so this handoff only covers the remaining ledger-change lookup.
+2. **Are the preconditions realistic?** NOT FULLY TESTED — the changed callsite is on the in-scope apply path after host execution, but the required full test suite failed before benchmarks could be run.
+3. **Is the original code inefficient or working as designed?** PLAUSIBLE INEFFICIENCY — direct `footprint_map.get` in `get_ledger_changes` was an additional ordered-map lookup for keys already represented in enforcing storage; however, no benchmark evidence from final review is available because the test gate failed.
+4. **Does the benchmark improvement match the claimed severity?** NOT TESTED — final review did not run `scripts/run_apply_load_matrix.py` because the mandatory full-suite gate failed first.
+5. **Is the optimization in scope?** YES — the code is in p26 Soroban host ledger-change materialization called from `invoke_host_function` during apply.
+6. **Is the benchmark methodology correct?** NOT REACHED — no authoritative non-Tracy benchmark runs were performed.
+7. **Can the improvement be explained without the optimization?** NOT ASSESSED — no benchmark deltas were collected.
+8. **Is this optimization novel?** NOT DISQUALIFIED — no duplicate was identified during this final review.
+
+### Rejection Reason
+
+The PoC cannot be confirmed because the required full validation command failed before benchmarking. In a clean detached validation worktree at outer commit `0a9f3f2ab0256e8d3960405c6924b1a9bb88e21e` with p26 submodule `a3fad963d283fe6092225a7d2f88947b6cb4d1e5`, `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` initially hit the documented git-worktree `git-state.txt` Makefile issue. After applying the documented worktree-local generated-`src/Makefile` fix, the same gate failed in vendored gperftools: `FAIL: tcm_min_asserts_unittest`, specifically `TCMallocTest.LargeAllocsRelease` (`Expected: (num_fail) <= (32), actual: 33 vs 32`) followed by a tcmalloc internal out-of-memory fatal in the subprocess. The objective-specific final-review rules require this full suite to pass cleanly before benchmarking and state that any test failure blocks CONFIRMED.
+
+### Failed Checks
+
+- **Step 4: Run Existing Tests** — failed; full `make check` did not complete cleanly.
+- **Step 5: Run Benchmarks** — not run because existing tests failed.
+- **Verdict Criteria: CONFIRMED eligibility** — failed; the required clean full-suite gate was not satisfied.
