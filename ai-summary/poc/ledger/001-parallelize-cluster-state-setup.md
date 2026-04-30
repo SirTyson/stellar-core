@@ -190,3 +190,107 @@ The optimization removes serial per-cluster state setup from the apply-thread fu
 ### Test Results
 
 Tracy-enabled configure and build completed successfully with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` followed by `make -j $(nproc)`. Full regression passed with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`: all C++ partitions completed, Rust soroban-env-host tests completed, `selftest-nopg` PASS, `check-nondet` PASS, and the suite ended with `All 2 tests passed`.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-04-30
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The handoff still is not reproducible from a clean branch tip. Independent handoff validation shows the outer worktree remains dirty with the optimization source diff uncommitted:
+
+- `src/ledger/LedgerManagerImpl.cpp`
+- `src/ledger/LedgerManagerImpl.h`
+- `src/transactions/ParallelApplyUtils.cpp`
+
+The current branch is `poc/001-parallelize-cluster-state-setup`, but `git log --oneline -8` still shows recent `002-fuse-enforcing-storage-footprint-lookups` / `001-bulk-build-soroban-storage-maps` commits rather than a committed `001-parallelize-cluster-state-setup` PoC. The p26 submodule is clean at the accepted baseline SHA `e6728024aed9bb39cac3c2f247579bfac5b8bc79`, so the blocker is the outer-repo PoC handoff.
+
+Per the optimize-soroswap final-review handoff model, final review must refuse uncommitted source changes before build/test/benchmarking. Running the required `make check` and three `run_apply_load_matrix.py` measurements against this dirty worktree would not validate a reproducible branch state.
+
+### Revision Instructions
+
+Commit the optimization source diff to the correct outer PoC branch and ensure the checked-out branch tip is the reproducible handoff:
+
+1. Commit the three modified source files on `poc/001-parallelize-cluster-state-setup` with a descriptive PoC commit for this specific optimization.
+2. Ensure `git status --short --branch` is clean in the outer worktree except for expected `ai-summary` artifact handling, and ensure `git -C src/rust/soroban/p26 status --short --branch` is clean.
+3. Ensure `git log --oneline -8` on the outer branch clearly includes the committed `001-parallelize-cluster-state-setup` optimization rather than only unrelated PoC commits.
+4. Leave `ai-summary/CURRENT_STATE.md` untouched until final review confirms the optimization and promotes it.
+
+After that, final review can run the full required regression suite and the three authoritative non-Tracy `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` benchmark runs against the committed optimized state.
+
+### Checks Passed So Far
+
+- The modified source-file set matches the expected scheduling optimization surface.
+- The p26 submodule worktree is clean at the prior accepted baseline SHA.
+- No benchmark verdict was attempted because the reproducibility handoff gate failed before build/test/benchmarking.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-04-30
+**PoC by**: claude-opus-4.7, high
+
+### Changes Made
+
+This iteration is a re-handoff to address the prior final-review revision
+request: the optimization source diff was already correct and validated by
+the previous PoC attempts, but had not been committed to the outer PoC
+branch. The same three-file diff is now committed on
+`poc/001-parallelize-cluster-state-setup` and pushed to
+`origin` (https://github.com/SirTyson/stellar-core).
+
+- `src/ledger/LedgerManagerImpl.h:372-377` — `applyThread` accepts
+  `GlobalParallelApplyLedgerState const&` and `clusterIdx` instead of a
+  pre-built `std::unique_ptr<ThreadParallelApplyLedgerState>`.
+- `src/ledger/LedgerManagerImpl.cpp:2483-2492` — `applyThread` constructs
+  its own `ThreadParallelApplyLedgerState` at the top of the worker so
+  `collectClusterFootprintEntriesFromGlobal` runs concurrently across
+  cluster workers rather than serially on the apply thread.
+- `src/ledger/LedgerManagerImpl.cpp:2548-2554` —
+  `applySorobanStageClustersInParallel` no longer constructs each thread
+  state before submitting `std::async`; the launch loop is now a tight
+  loop of future submissions. The existing
+  `DeactivateScopeGuard globalState` remains alive until after all
+  futures have been joined, preserving the scope-deactivation invariant
+  required by `scopeAdoptEntryOptFrom`.
+- `src/transactions/ParallelApplyUtils.cpp:925-934` — Removed the
+  `releaseAssert(threadIsMain() || app.threadIsType(APPLY))` from
+  `ThreadParallelApplyLedgerState::collectClusterFootprintEntriesFromGlobal`
+  since this helper is now invoked from `std::async` worker threads
+  which are not registered in `ApplicationImpl::mThreadTypes`. Replaced
+  with a comment documenting the concurrent read-only contract.
+
+Outer commit: `29d5a7787 viable poc 001-parallelize-cluster-state-setup`
+on branch `poc/001-parallelize-cluster-state-setup`. The submodule
+`src/rust/soroban/p26` is unchanged and remains at the accepted
+baseline SHA `e6728024aed9bb39cac3c2f247579bfac5b8bc79`.
+
+### Demonstration
+
+The optimization moves per-cluster `ThreadParallelApplyLedgerState`
+construction (which walks every transaction footprint in the cluster
+and copies matching entries from `GlobalParallelApplyLedgerState`) off
+the apply thread's serial launch path and into each worker future.
+With `NUM_CLUSTERS=8`, the per-stage setup work that previously delayed
+each subsequent worker submission now overlaps across the same bounded
+set of cluster workers. The result vector remains indexed by cluster
+and `commitChangesFromThreads` continues to merge `threadStates` in
+cluster order, preserving deterministic ledger output. Worker count
+is unchanged (`stage.numClusters()`), satisfying the determinism rule.
+
+### Test Results
+
+The committed source diff is byte-identical to the diff verified by the
+prior PoC attempts on this hypothesis. Those attempts ran
+`env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple
+--abort --disable-dots' make check` to completion with all 30 C++
+partitions and the Rust soroban-env-host suites reporting "All tests
+passed" (`# FAIL: 0 / # ERROR: 0`), plus `selftest-nopg` PASS and
+`check-nondet` PASS. No source code has changed since that validation;
+this iteration only adds the missing commit and push so final review can
+benchmark a reproducible branch tip.
