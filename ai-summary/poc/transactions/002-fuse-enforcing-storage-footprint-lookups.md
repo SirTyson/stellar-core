@@ -101,3 +101,97 @@ The p26 host now routes the ledger-change access-type lookup through the same en
 ### Test Results
 
 Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`, built with `make -j30`, and ran `env NUM_PARTITIONS=30 make check`. The full test command completed successfully; the tail included p26 Rust host tests passing (`750 passed; 0 failed; 2 ignored`) and the final make-check harness reported all tests passed.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-04-30
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The PoC handoff is not reproducible because the source changes are left as dirty working-tree state in the `src/rust/soroban/p26` submodule. Final review found the outer branch at `poc/002-fuse-enforcing-storage-footprint-lookups`, but the p26 submodule remains at baseline commit `e6728024aed9bb39cac3c2f247579bfac5b8bc79` with uncommitted modifications to:
+
+- `soroban-env-host/src/e2e_invoke.rs`
+- `soroban-env-host/src/storage.rs`
+
+The outer repo therefore only records `Subproject commit e6728024...-dirty`, not a concrete submodule SHA that can be fetched, checked out, tested, benchmarked, or promoted to `soroswap-perf`. The performance final-review handoff model explicitly requires the PoC source changes to be committed on the PoC submodule branch and recorded by an outer gitlink commit before final review measures anything.
+
+### Revision Instructions
+
+Commit the p26 submodule changes to `github.com/SirTyson/rs-soroban-env` on branch `poc/002-fuse-enforcing-storage-footprint-lookups`, then update the outer `stellar-core` branch `poc/002-fuse-enforcing-storage-footprint-lookups` with a gitlink bump pointing at that committed submodule SHA. Re-run the required build and `env NUM_PARTITIONS=30 make check` from a clean checkout, update the PoC notes with the committed outer SHA and p26 SHA, and ensure both `git status` in the outer repo and `git -C src/rust/soroban/p26 status` are clean before handing back to final review.
+
+Do not change `ai-summary/CURRENT_STATE.md` for this revision; the current accepted baseline remains the reference until a reproducible committed PoC is benchmarked and confirmed.
+
+### Checks Passed So Far
+
+The hypothesis file and CURRENT_STATE baseline were readable, the claimed source files exist, and the dirty diff matches the PoC's stated implementation area (`storage.rs` and `e2e_invoke.rs`). No benchmark or full test validation was performed in final review because measuring uncommitted submodule state would violate the reproducible-handoff requirement.
+
+---
+
+## Revision (PoC handoff fix)
+
+**Date**: 2026-04-30
+**Revised by**: claude-opus-4.7, high
+
+### Fix Summary
+
+Committed the previously dirty p26 submodule changes so the PoC is
+reproducible from a clean checkout:
+
+- **p26 submodule branch**: `poc/002-fuse-enforcing-storage-footprint-lookups`
+  on `https://github.com/SirTyson/rs-soroban-env`
+  - Commit SHA: `a3fad963d283fe6092225a7d2f88947b6cb4d1e5`
+  - Parent baseline SHA: `e6728024aed9bb39cac3c2f247579bfac5b8bc79`
+    (`viable success 001-typed-sac-balance-storage-fast-path`, already on fork)
+  - Diff: same `soroban-env-host/src/storage.rs` and
+    `soroban-env-host/src/e2e_invoke.rs` changes as the original POC_PASS.
+
+- **Outer stellar-core branch**: `poc/002-fuse-enforcing-storage-footprint-lookups`
+  on `https://github.com/SirTyson/stellar-core`
+  - Commit SHA: `0a9f3f2ab0256e8d3960405c6924b1a9bb88e21e`
+  - Parent: `197d41b2ce4bf695ad24693702a9b96401f1063e`
+    (`viable poc 001-bulk-build-soroban-storage-maps`)
+  - Single change: gitlink bump of `src/rust/soroban/p26` to `a3fad963`.
+
+### Reproducibility Verification
+
+After committing both branches, ran from a clean working tree:
+
+- `git status` (outer): clean (only the unrelated `ai-summary` symlink
+  state appears, which is a worktree-local symlink pointing at the
+  shared `ai-summary/` directory and is not part of this PoC).
+- `git -C src/rust/soroban/p26 status`: clean.
+- `make -j$(nproc)`: build succeeded (Tracy-enabled configure preserved).
+- `env NUM_PARTITIONS=$(nproc) STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`:
+  all tests passed (`PASS: test/selftest-nopg`, `PASS: test/check-nondet`,
+  `All 2 tests passed`); p26 Rust host doc/integration tests passed cleanly.
+
+The PoC source change is unchanged from the original POC_PASS notes;
+only the packaging/handoff (committed branches + gitlink bump) was fixed.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-04-30
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/storage.rs:323-354` — added `Storage::get_access_type`, an enforcing-mode side-index lookup helper for footprint access types. It uses the precomputed enforcing footprint index when available, preserves the legacy lookup/access budget charges through `get_at_known_position`/`charge_lookup`, returns the same `Option<AccessType>` shape, and falls back to `FootprintMap::get` for recording/test-constructed storage.
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:253` — changed `get_ledger_changes` to call `storage.get_access_type(key, budget)` instead of directly searching `storage.footprint.0` for every storage entry. This removes the post-invoke duplicate footprint binary search while preserving read-only flags, restored-key handling, deterministic storage iteration order, and recording-mode fallback behavior.
+
+### Demonstration
+
+The p26 host now reuses the enforcing footprint side index for ledger-change access-type lookup, so output materialization no longer performs an independent `MeteredOrdMap` binary search over the footprint for each storage entry. Together with the existing enforcing side-index fast paths for runtime storage reads, writes, and TTL updates in this baseline, the PoC demonstrates fused enforcing storage/footprint lookup without changing execution order, ledger output ordering, or parallelism.
+
+### Test Results
+
+Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`, built with `make -j $(nproc)`, and ran `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`. The full test command completed successfully; the tail included p26 Rust host tests passing (`750 passed; 0 failed; 2 ignored`) and the final make-check harness reported `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.
+
+### Handoff Notes
+
+The source changes are intentionally left in the `src/rust/soroban/p26` submodule working tree as the PoC deliverable. No commits were created because the PoC instructions for this run explicitly say the orchestrator handles commits.
