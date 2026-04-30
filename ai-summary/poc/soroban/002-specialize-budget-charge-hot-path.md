@@ -90,3 +90,26 @@ The main caveat is measurement quality. The cited `charge,soroban-env-host/src/b
 - **Change description**: Add a specialized `BudgetImpl::charge_one(ty, input)` path for `iterations == 1` that directly indexes the tracker and both cost-model arrays, evaluates CPU and memory costs with `iterations` folded out, updates normal/shadow totals, and preserves the exact current error and side-effect ordering. Keep `BudgetImpl::charge(ty, iterations, input)` for true bulk charges and route `bulk_charge` through it.
 - **Correctness check**: Compare old vs new behavior for constant and linear cost types, `Some`/`None` input mismatch, CPU-limit failure, memory-limit failure, shadow mode, `meter_count`, per-type `CostTracker::{iterations,inputs,cpu,mem}`, `get_cpu_insns_consumed`, and `get_mem_bytes_consumed`. Existing Soroban host budget/metering, invoke-host-function, XDR, map/vector, storage, SAC, and transaction resource-limit tests should continue to pass without weakening assertions.
 - **Benchmark focus**: Use the objective's non-Tracy `scripts/run_apply_load_matrix.py` workflow for the acceptance metric, repeated against `ai-summary/CURRENT_STATE.md` baselines. Tracy may be used only diagnostically to confirm charge-event counts and reduced instrumentation/self-time; a `charge` span drop alone is not sufficient because that line measures Tracy-only instrumentation.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-04-30
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/budget.rs:236-338,1449-1450` — routed single-iteration charges through `BudgetImpl::charge_one`, while preserving the generic bulk path for real batched charges and maintaining tracker/input-validation and CPU-before-memory limit side-effect ordering.
+- `src/rust/soroban/p26/soroban-env-host/src/budget/dimension.rs:160-187` — added an inlined single-charge dimension helper that directly indexes the fixed cost-model array, emits the same Tracy CPU charge span, and updates normal or shadow totals.
+- `src/rust/soroban/p26/soroban-env-host/src/budget/model.rs:116-131` — added `MeteredCostComponent::evaluate_one` to fold out `iterations == 1` and avoid the generic result-returning model path in the hot charge case.
+- `src/rust/soroban/p26/soroban-env-host/src/test/budget_metering.rs:238-332` — added coverage for constant and linear single charges, input mismatch side effects, CPU-limit failure, memory-limit failure, and shadow-mode accounting.
+
+### Demonstration
+
+The optimization makes the ubiquitous `Budget::charge(ty, input)` path use a dedicated single-unit routine instead of the generic bulk-charge routine used for `bulk_charge`. It removes repeated fallible fixed-array lookups and generic `iterations` arithmetic from per-host-operation metering while keeping the exact CPU/memory totals, tracker fields, shadow totals, and limit-failure ordering expected by existing callers.
+
+### Test Results
+
+`./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` completed successfully after initializing Soroban submodules. `make -j30` completed successfully. `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS="--ll fatal -r simple --abort --disable-dots" make check` completed successfully; the final output included p26 Soroban Rust tests with `751 passed; 0 failed; 2 ignored` and the top-level `All 2 tests passed` summary.
