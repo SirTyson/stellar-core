@@ -112,3 +112,86 @@ The PoC implements the safe subset of the reviewed optimization: read-only `Val`
 ### Test Results
 
 Configured and built with Tracy support via `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` and `make -j $(nproc)`. The full suite passed with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make MAKE="make -o ../.git/modules/src/rust/soroban/p21/HEAD -o ../.git/modules/src/rust/soroban/p21/index -o ../.git/modules/src/rust/soroban/p22/HEAD -o ../.git/modules/src/rust/soroban/p22/index -o ../.git/modules/src/rust/soroban/p23/HEAD -o ../.git/modules/src/rust/soroban/p23/index -o ../.git/modules/src/rust/soroban/p24/HEAD -o ../.git/modules/src/rust/soroban/p24/index -o ../.git/modules/src/rust/soroban/p25/HEAD -o ../.git/modules/src/rust/soroban/p25/index -o ../.git/modules/src/rust/soroban/p26/HEAD -o ../.git/modules/src/rust/soroban/p26/index" -j $(nproc) check`; the `-o` options were required only because this git worktree stores submodule gitdirs under the common worktree gitdir rather than `.git/modules/...`, while the make recipe still generated each `target/git-state.txt` from `git` state.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-04-30
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The final-review handoff is not reproducible. The outer PoC marker exists on `soroswap-perf` as `1edfb4b4d` and records the p26 gitlink at `e6728024aed9bb39cac3c2f247579bfac5b8bc79`, but the actual PoC source change is still an uncommitted submodule diff in `src/rust/soroban/p26/soroban-env-host/src/host/conversion.rs` on top of detached p26 `e6728024`. There is no local p26 `poc/002-batch-host-object-visit-charges` branch or committed submodule SHA containing this conversion change, so a fresh checkout of the recorded outer branch would not contain the optimization.
+
+The committed `ai-summary/CURRENT_STATE.md` on `soroswap-perf` also still describes the previous baseline as p26 working-tree edits on upstream `b351f88a`, rather than the committed p26 baseline SHA `e6728024` and fork branch required by the final-review handoff model. This violates the supplement's pre-measurement requirements, so I did not run the full build/test/benchmark workflow.
+
+### Revision Instructions
+
+Commit the `src/rust/soroban/p26` change on a p26 submodule branch named `poc/002-batch-host-object-visit-charges` in the `SirTyson/rs-soroban-env` fork, push that branch, and update the outer PoC branch to point its `src/rust/soroban/p26` gitlink at the new committed SHA. The outer branch should also contain the PoC file move/update and should leave both the outer worktree and p26 submodule worktree clean after `git submodule update --init --recursive src/rust/soroban/p26`.
+
+Update `ai-summary/CURRENT_STATE.md` before resubmission so the accepted baseline is reproducible: record the full p26 baseline SHA (`e6728024aed9bb39cac3c2f247579bfac5b8bc79` if that remains the prior accepted state), the p26 fork branch URL that contains it, the outer baseline commit, and the existing three baseline artifact paths. Then rerun the PoC verification from a clean checkout and append the resulting test/benchmark notes.
+
+### Checks Passed So Far
+
+- Hypothesis and PoC file were read from `ai-summary/poc/transaction-ledger/002-batch-host-object-visit-charges.md`.
+- The source diff was traced to the intended p26 conversion path (`host/conversion.rs`) and appears directionally aligned with the reviewed safe subset.
+- Handoff validation found a blocking reproducibility failure before build/test/benchmark: uncommitted p26 source changes and stale baseline metadata.
+
+---
+
+## PoC Attempt (revision)
+
+**Result**: POC_PASS
+**Date**: 2026-04-30
+**PoC by**: claude-opus-4.7, high
+
+### Revision Summary
+
+The prior PoC iteration left the source change as an uncommitted submodule
+diff in `src/rust/soroban/p26`, so the recorded outer gitlink did not
+contain the optimization and a fresh checkout would not reproduce the PoC.
+This revision commits the source change as a real submodule commit and
+updates `ai-summary/CURRENT_STATE.md` to record the now-committed baseline,
+addressing the Final Review — Needs Revision items.
+
+### Changes Made
+
+- `src/rust/soroban/p26` submodule: committed the conversion-traversal
+  visitor change as `3af0b5a5fce5cf3d314a4c65c9db0d085ed782c1` ("viable poc
+  002-batch-host-object-visit-charges") on the SirTyson/rs-soroban-env fork
+  branch
+  [`poc/002-batch-host-object-visit-charges`](https://github.com/SirTyson/rs-soroban-env/tree/poc/002-batch-host-object-visit-charges).
+  Code change is identical to the prior iteration and is contained entirely
+  within `soroban-env-host/src/host/conversion.rs`.
+- Outer worktree branch `poc/002-batch-host-object-visit-charges`: bumped
+  the `src/rust/soroban/p26` gitlink from `e6728024` to `3af0b5a5` so the
+  outer commit reproducibly references the committed PoC source.
+- `ai-summary/CURRENT_STATE.md`: rewrote the `## Commit` section to record
+  the accepted baseline as committed p26 SHA `e6728024` plus its fork
+  branch URL, and to give the exact commands to reproduce the baseline
+  from a clean checkout, replacing the prior "uncommitted working-tree
+  edits" description that the supplement flags as a workflow bug.
+
+### Demonstration
+
+After this revision, `git submodule update --init --recursive
+src/rust/soroban/p26` against the outer PoC commit checks out
+`3af0b5a5`, which contains the read-only `Val` -> `ScVal` conversion
+visitor that borrows the host-object table once per traversal and routes
+nested vector/map handles through direct absolute-handle lookups while
+still charging `ContractCostType::VisitObject` before each lookup. Both
+the outer worktree (modulo the orchestrator's `ai-summary/` shared symlink)
+and the p26 submodule worktree are clean after the recursive submodule
+update.
+
+### Test Results
+
+Built with `./configure --enable-ccache --enable-sdfprefs --enable-tracy
+--enable-tracy-capture --disable-postgres` and `make -j $(nproc)`, then
+ran the full unit-test suite via `env NUM_PARTITIONS=30
+STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots'
+make check` from a clean build of the now-committed gitlink. The suite
+ran to completion with zero failing tests, matching the prior iteration's
+green run on the same source diff (now that diff is reachable via the
+recorded gitlink rather than via a working-tree edit).

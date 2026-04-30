@@ -8,19 +8,27 @@ of the prior bulk-build host footprint and storage maps optimization
 
 ## Commit
 
-- p26 submodule SHA: upstream `b351f88a` ("Bump version to 26.0.0"); the
-  optimization stack lives as p26 working-tree edits in
-  `src/rust/soroban/p26/soroban-env-host/`. Both layers stack cleanly:
-  - **bulk-build host storage maps** (transaction-ledger/001):
-    `host/metered_map.rs`, `host/metered_xdr.rs`, `storage.rs`, `budget.rs`,
-    `budget/dimension.rs`, plus 10 `test_v_new_*` observation snapshots.
-  - **typed SAC balance storage fast path**
-    (transaction-ledger/001-typed-sac-balance-storage-fast-path):
-    `builtin_contracts/stellar_asset_contract/balance.rs`, plus 9
-    `test__stellar_asset_contract__*` observation snapshots.
-- Outer worktree branch: `poc/001-typed-sac-balance-storage-fast-path`. The
-  submodule edits are uncommitted in the worktree, matching the prior
-  workflow established at the bulk-build update.
+- p26 submodule SHA: `e6728024aed9bb39cac3c2f247579bfac5b8bc79`
+  ("viable success 001-typed-sac-balance-storage-fast-path"), committed on
+  the SirTyson fork at branch
+  [`poc/001-typed-sac-balance-storage-fast-path`](https://github.com/SirTyson/rs-soroban-env/tree/poc/001-typed-sac-balance-storage-fast-path).
+  The baseline stack is recorded as real submodule commits, in order:
+  - upstream `b351f88a` ("Bump version to 26.0.0", v26.0.0)
+  - `2b026eca` "viable success 001-bulk-build-host-storage-maps"
+  - `e6728024` "viable success 001-typed-sac-balance-storage-fast-path"
+- Outer worktree branch: `poc/001-typed-sac-balance-storage-fast-path` on
+  the SirTyson stellar-core fork. Outer commit recording the gitlink at
+  `e6728024` is `fe9b7873e` "Bump p26 submodule to record bulk-build +
+  typed-sac-balance success" (also present on `soroswap-perf` at the
+  identical SHA chain `4e306108d` -> `fe9b7873e`).
+- Reproduce baseline from a clean checkout with:
+  ```sh
+  git fetch origin soroswap-perf
+  git checkout fe9b7873e
+  git submodule update --init --recursive src/rust/soroban/p26
+  ```
+  After this, both the outer worktree and the p26 submodule worktree are
+  clean and contain both accepted optimizations as committed code.
 
 ## Timestamp
 
