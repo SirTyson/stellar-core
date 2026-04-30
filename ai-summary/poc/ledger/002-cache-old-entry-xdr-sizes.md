@@ -261,3 +261,119 @@ The budget delta remains deliberate for p26: successful recording-mode resource 
 ### Test Results
 
 Configured and built with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` and `make -j30`. Final full regression run `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` completed with exit status 0; `test/selftest-nopg` and `test/check-nondet` passed, including p26 `soroban-env-host` results of 750 passed, 0 failed, 2 ignored, 1 filtered out.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-04-30
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The revised PoC is still not a reproducible final-review handoff. The outer
+branch is `poc/002-cache-old-entry-xdr-sizes` at
+`a863ae68b6bdb74c646841e4af5d50fd040f9bdc`, and its committed gitlink points
+to p26 submodule commit `ac6316c2ba689385be61c9590086d65a762d6a9d`. However,
+the current p26 worktree has uncommitted modifications on top of that commit:
+
+- `soroban-env-host/src/e2e_invoke.rs`
+- `soroban-env-host/src/test/e2e_tests.rs`
+
+Those dirty files are the revised implementation described in the latest PoC
+Attempt section: positional `InitialEntryMetadata`, known-position lookup use,
+and the additional recording-mode instruction baseline at line 844 are present
+only in the submodule working tree. A clean checkout of the outer branch would
+reproduce the older `ac6316c2` implementation that already failed the previous
+benchmark gate, not this revised PoC. Final review therefore cannot run the
+required full regression suite or three authoritative non-Tracy matrix
+benchmarks against a reproducible committed state.
+
+### Revision Instructions
+
+Commit the current dirty p26 submodule revision to
+`github.com/SirTyson/rs-soroban-env` branch
+`poc/002-cache-old-entry-xdr-sizes`, then update and commit the outer
+`stellar-core` gitlink on branch `poc/002-cache-old-entry-xdr-sizes`. The next
+handoff must satisfy all of the following before benchmarking:
+
+1. `git -C src/rust/soroban/p26 status --short` is clean.
+2. `git status --short` in the outer worktree is clean except for
+   orchestrator-managed `ai-summary` artifacts.
+3. `git submodule status src/rust/soroban/p26` reports the new committed p26
+   SHA for the revised positional-metadata implementation, not the older
+   `ac6316c2ba689385be61c9590086d65a762d6a9d` commit.
+4. The PoC file records the new outer commit SHA and submodule commit SHA.
+5. Keep test edits within the budget-number exception: only numeric
+   recording-mode instruction expectations may change, with no test logic,
+   fixture, control-flow, assertion-strength, or pass/fail semantic changes.
+
+If the intended handoff is instead the already committed `ac6316c2`
+implementation, revert the dirty submodule files and revise the PoC notes to
+remove the latest positional-metadata claims. That committed implementation
+already measured below the objective threshold in the prior final review, so it
+would still need a stronger optimization before confirmation.
+
+### Checks Passed So Far
+
+- Previous committed-handoff reproducibility for `ac6316c2`: PASS, but that is
+  not the latest revised PoC described here.
+- Source-level direction for the dirty revision: preliminarily aligned with the
+  prior revision instructions, because it removes the extra metered side maps by
+  threading initial metadata positionally through the storage map.
+- Test-edit shape for the dirty revision: preliminarily acceptable; the visible
+  test diff changes only exact recording-mode instruction-count expectations.
+- Benchmark/test eligibility for this final review: BLOCKED until the revised
+  p26 source changes are committed and the outer gitlink is updated.
+
+---
+
+## PoC Revision
+
+**Result**: POC_PASS
+**Date**: 2026-04-30
+**PoC by**: claude-opus-4.7, high
+
+### Revision Summary
+
+Addresses the prior "Needs Revision" feedback by committing the
+previously-dirty p26 submodule state (the positional-metadata revision
+described in the most recent PoC Attempt section) to the paired
+PoC branches required for reproducible final review. No source-level
+changes were made on top of that prior PoC diff — only the workflow /
+handoff issue was fixed.
+
+### Handoff SHAs
+
+- **Outer** branch `poc/002-cache-old-entry-xdr-sizes` on
+  `github.com/SirTyson/stellar-core` at commit
+  `f81a07c9a8f160ae396e71a1189d9b60d877f092` (gitlink bump only).
+- **Submodule** branch `poc/002-cache-old-entry-xdr-sizes` on
+  `github.com/SirTyson/rs-soroban-env` at commit
+  `a417a96314085a070bd7daf2cb29e85809f21ae3` (v26.0.0-4-ga417a963),
+  applied on top of the prior committed PoC SHA
+  `ac6316c2ba689385be61c9590086d65a762d6a9d`.
+
+### Verification
+
+- `git status --short` in the outer worktree is clean apart from
+  orchestrator-managed `ai-summary` artifacts.
+- `git -C src/rust/soroban/p26 status --short` is clean.
+- `git submodule status src/rust/soroban/p26` reports
+  `a417a96314085a070bd7daf2cb29e85809f21ae3` (v26.0.0-4-ga417a963),
+  not the prior baseline or the prior committed PoC SHA.
+- The new submodule commit contains only the two files identified by
+  prior final review (`soroban-env-host/src/e2e_invoke.rs` and
+  `soroban-env-host/src/test/e2e_tests.rs`); test edits remain limited
+  to numeric recording-mode instruction-count baselines, preserving
+  all control flow and pass/fail assertions.
+
+### Test Results
+
+Configured with `./configure --enable-ccache --enable-sdfprefs
+--enable-tracy --enable-tracy-capture --disable-postgres`, built with
+`make -j30`, then ran `env NUM_PARTITIONS=30
+STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots'
+make check` — exit status 0; both `test/selftest-nopg` and
+`test/check-nondet` passed. p26 `soroban-env-host` Rust tests passed in
+the same run, including all `e2e_tests` instruction-count baselines.
