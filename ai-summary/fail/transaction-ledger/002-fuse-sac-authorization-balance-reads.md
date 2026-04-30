@@ -185,3 +185,32 @@ commit `d5edc3e55` belongs to `002-fuse-sac-authorization-balance-reads`.
 Tests were run during the original PoC attempt above and passed; this
 revision only commits and pushes the existing source state, so no new
 test run was required.
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-04-30
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** YES — the p26 diff is local to `stellar_asset_contract/balance.rs` and changes contract-address `receive_balance` / `spend_balance` so the decoded `Option<BalanceValue>` used for authorization is reused for amount mutation. Account-address paths remain on the classic account/trustline logic, and `spend_balance_no_authorization_check` remains available for clawback.
+2. **Are the preconditions realistic?** YES — the optimized path is in the SAC transfer/transfer_from apply path used by the soroswap matrix, not in transaction-set construction.
+3. **Is the original code inefficient or working as designed?** INEFFICIENCY — the original contract-address path performed a duplicate balance read/decode between authorization and mutation. The PoC removes that specific redundancy without adding parallelism or changing ordering.
+4. **Does the benchmark improvement match the claimed severity?** NO — the independent non-Tracy benchmark did not show a soroswap apply-time improvement. Accepted baseline soroswap medians are `290.766289 / 286.738946 / 288.663084 ms` (average `288.722773 ms`). Optimized soroswap medians were `289.984827 / 292.755570 / 298.807497 ms` (average `293.849298 ms`), a `+5.126525 ms` / `+1.78%` regression. Only the first optimized run was near baseline; the second and third were slower than every accepted baseline run.
+5. **Is the optimization in scope?** YES — the changed code runs under SAC transfer execution during `closeLedger`.
+6. **Is the benchmark methodology correct?** YES — built the optimized tree with Tracy enabled, ran the full unit test suite, then ran `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` exactly three times without `--tracy`. The accepted baseline was read from `ai-summary/CURRENT_STATE.md`.
+7. **Can the improvement be explained WITHOUT the optimization?** N/A — there is no accepted headline improvement to explain. The max-sac median improved (`321.256 ms` baseline average to `312.332 ms` optimized average), but the objective's headline soroswap metric regressed and max-sac improvement cannot rescue a soroswap regression.
+8. **Is this optimization novel?** YES — no duplicate prior accepted optimization was found in the reviewed context, but novelty does not overcome the failed performance gate.
+
+### Rejection Reason
+
+The optimization is correctness-preserving and the full suite passed, but it fails the final-review performance gate: soroswap apply time regressed across the three required independent non-Tracy runs instead of improving consistently. Because soroswap is the headline metric for this objective, the PoC cannot be promoted to `soroswap-perf`.
+
+### Failed Checks
+
+- Performance final review Step 7.4: measured improvement does not match the claimed severity; the headline metric regressed.
+- Objective verdict criteria: soroswap apply time regressed in the required three-run non-Tracy benchmark comparison.

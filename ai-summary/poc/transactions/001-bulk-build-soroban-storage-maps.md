@@ -75,3 +75,25 @@ Severity is Medium, not High. The referenced benchmark log has steady-state 4000
 - **Change description**: Add a metered/fallible bulk construction helper for `MeteredOrdMap` keyed by `Rc<LedgerKey>` or local builder helpers in `e2e_invoke.rs`. Build `FootprintMap`, `StorageMap`, and `TtlEntryMap` from collected vectors, sort with `Budget::compare` on ledger keys, and construct each map once with `from_map`.
 - **Correctness check**: Preserve `Storage::check_supported_ledger_key_type`, `ledger_entry_to_ledger_key`, TTL expiration handling, ledger/TTL length mismatch handling, footprint membership checks, missing-entry insertion, and duplicate rejection/error behavior. Existing e2e host tests under `src/rust/soroban/p26/soroban-env-host/src/test/e2e_tests.rs` and C++ Soroban transaction tests cover host invocation, storage, TTL, restore, and footprint validation behavior.
 - **Benchmark focus**: Run the soroswap apply-load matrix repeatedly and compare median apply time, not just Tracy zone totals. Expected improvement should come from fewer `new map` calls and fewer insert-time `map lookup` calls, with a target top-line apply reduction in the 3-6% range to satisfy the objective threshold.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-04-30
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:2-103` — imported ordering/comparison support and added local bulk-build helpers that sort ledger-key pairs with `Budget::compare`, preserve repeated-`insert` replacement semantics by keeping the last duplicate value, charge the final vector clone, and construct `MeteredOrdMap` once with `from_map`.
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:995-1134` — changed footprint, storage, and TTL input construction to collect vectors and bulk-build maps instead of repeatedly rebuilding immutable maps through `insert`; the missing-footprint pass now performs a merge-style membership scan over sorted storage entries before adding absent footprint keys.
+- `src/rust/soroban/p26/soroban-env-host/src/test/e2e_tests.rs:844-2958` — updated recording-mode instruction-count expectations only, reflecting the lower metered instruction usage from the cheaper map construction path.
+
+### Demonstration
+
+The implementation removes repeated `MeteredOrdMap::insert` calls from the Soroban host input builders and replaces them with one bulk sort/dedupe/`from_map` construction per map. This preserves deterministic ledger-key ordering, supported-key checks, TTL handling, missing footprint entries, and duplicate replacement semantics while eliminating per-entry full-map allocation/copy churn in the apply path.
+
+### Test Results
+
+`env NUM_PARTITIONS=30 make check` completed successfully from the top-level worktree after the optimization and budget-expectation updates. The final run included the C++ test driver, p26 Rust host tests (`750 passed; 0 failed; 2 ignored; 1 filtered out`), Rust integration tests, and top-level nondeterminism checks with exit code 0.
