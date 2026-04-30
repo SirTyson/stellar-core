@@ -486,3 +486,59 @@ test driver, p26 Rust host tests (`750 passed; 0 failed; 2 ignored;
 `tcm_min_asserts_unittest` resource-pressure subtest was observed on the
 first attempt and disappeared on retry; it is unrelated to Soroban
 storage-map construction.)
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-04-30
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** YES — the diff replaces repeated immutable `MeteredOrdMap::insert` construction in `e2e_invoke.rs` with sorted one-shot map construction and aligned ledger-change iteration, which targets the originally claimed Soroban host storage/footprint map churn.
+2. **Are the preconditions realistic?** YES — the changed path is reached from Soroban invoke host-function apply/recording flows exercised by the soroswap apply-load workload.
+3. **Is the original code inefficient or working as designed?** PARTIAL INEFFICIENCY — repeated immutable-map rebuilds are plausibly wasteful, and the test edits remain limited to lower measured instruction-count expectations with `RECORDING_MODE_INSTRUCTIONS_RANGE` preserved at `0.02`.
+4. **Does the benchmark improvement match the claimed severity?** NO — the independent final-review non-Tracy matrix runs showed a soroswap regression in all three runs, not an improvement.
+5. **Is the optimization in scope?** YES — the source changes are in the Soroban host invocation path under `closeLedger`, not tx-set construction.
+6. **Is the benchmark methodology correct?** YES — the final review used the required local binary path prefix and ran `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` three times without `--tracy`, comparing against the accepted baseline in `ai-summary/CURRENT_STATE.md`.
+7. **Can the improvement be explained without the optimization?** NOT APPLICABLE — no eligible improvement was measured.
+8. **Is this optimization novel?** YES — no duplicate accepted finding was identified during this review.
+
+### Benchmark Results
+
+Accepted baseline from `ai-summary/CURRENT_STATE.md`:
+
+| run | scenario | median_ms | p95_ms | p99_ms |
+|-----|----------|----------:|-------:|-------:|
+| 1 | sac, TX=6000, T=8 | 333.099159 | 409.899619 | 415.473662 |
+| 1 | soroswap, TX=2000, T=8 | 290.766289 | 320.513204 | 326.261744 |
+| 2 | sac, TX=6000, T=8 | 314.378531 | 388.362011 | 400.919545 |
+| 2 | soroswap, TX=2000, T=8 | 286.738946 | 309.253423 | 320.197842 |
+| 3 | sac, TX=6000, T=8 | 316.290692 | 364.102294 | 383.006800 |
+| 3 | soroswap, TX=2000, T=8 | 288.663084 | 294.675579 | 305.874426 |
+
+Final-review optimized non-Tracy runs:
+
+| run | artifact directory | scenario | median_ms | p95_ms | p99_ms |
+|-----|--------------------|----------|----------:|-------:|-------:|
+| 1 | `/mnt/nvme2/apply-load/232468d765b5-20260430-090759` | sac, TX=6000, T=8 | 352.853418 | 372.894430 | 384.784947 |
+| 1 | `/mnt/nvme2/apply-load/232468d765b5-20260430-090759` | soroswap, TX=2000, T=8 | 306.759847 | 312.485252 | 316.797159 |
+| 2 | `/mnt/nvme2/apply-load/232468d765b5-20260430-091456` | sac, TX=6000, T=8 | 365.787002 | 387.107057 | 398.372351 |
+| 2 | `/mnt/nvme2/apply-load/232468d765b5-20260430-091456` | soroswap, TX=2000, T=8 | 304.187249 | 311.455089 | 318.146192 |
+| 3 | `/mnt/nvme2/apply-load/232468d765b5-20260430-092156` | sac, TX=6000, T=8 | 355.556934 | 378.477516 | 390.699121 |
+| 3 | `/mnt/nvme2/apply-load/232468d765b5-20260430-092156` | soroswap, TX=2000, T=8 | 298.464055 | 305.553173 | 314.898912 |
+
+Baseline soroswap median average: 288.723 ms. Optimized soroswap median average: 303.137 ms, a 4.99% regression. Every optimized soroswap run is slower than the corresponding accepted baseline values and slower than the baseline average. Baseline sac median average: 321.256 ms. Optimized sac median average: 358.066 ms, an 11.46% regression.
+
+### Rejection Reason
+
+The optimization fails the mandatory benchmark gate: soroswap apply time regressed consistently across all three authoritative non-Tracy final-review runs, and max-sac also regressed substantially. This violates the objective requirement for at least a reproducible 1% soroswap apply-time reduction and maps to REJECTED under the performance final-review verdict criteria.
+
+### Failed Checks
+
+- Check 4 — benchmark improvement does not match the claimed severity; it is a regression.
+- Check 7 — no measured improvement exists to attribute to the optimization.
+- Verdict criterion — soroswap regressed across all three non-Tracy runs; max-sac also degraded outside the allowed tradeoff envelope.

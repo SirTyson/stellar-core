@@ -22,8 +22,8 @@ Run the current soroswap apply-load benchmark (`soroswap`, 4000 tx, 8 clusters) 
 
 - `src/rust/soroban/p26/soroban-env-host/src/storage.rs:130-154` — `Footprint::enforce_access` searches the footprint map to validate read/write permissions.
 - `src/rust/soroban/p26/soroban-env-host/src/storage.rs:252-267` — `Storage::try_get_full_helper` enforces footprint access and then searches `StorageMap` for the same key.
-- `src/rust/soroban/p26/soroban-env-host/src/storage.rs:333-357` — `Storage::put_opt_helper` enforces write access and then inserts into `StorageMap`, causing another map search/rebuild.
-- `src/rust/soroban/p26/soroban-env-host/src/storage.rs:421-428` — `Storage::has` funnels through the same double-lookup read path.
+- `src/rust/soroban/p26/soroban-env-host/src/storage.rs:333-357` — writes perform the access lookup and then `StorageMap::insert`, which performs its own binary search.
+- `src/rust/soroban/p26/soroban-env-host/src/storage.rs:421-428` — `has` funnels through the same double-lookup read path.
 - `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:933-1052` — enforcing-mode `FootprintMap` and `StorageMap` are built from the same validated footprint, making a combined enforcing view possible after input construction.
 - `src/rust/soroban/p26/soroban-env-host/src/host/metered_map.rs:168-194` — `MeteredOrdMap::find` is the hot `map lookup` zone used by both maps.
 
@@ -80,3 +80,24 @@ The main risk is consensus-visible budget accounting. `MeteredOrdMap::find` char
 - **Change description**: Add an enforcing-only storage representation that stores access type beside the optional ledger entry for each key, or add an enforcing lookup/update helper that searches one sorted key structure and returns both `AccessType` and `Option<EntryWithLiveUntil>`. Limit the fast path to `FootprintMode::Enforcing`; preserve recording-mode behavior.
 - **Correctness check**: Preserve out-of-footprint errors, read-only write errors, in-footprint missing-entry behavior, TTL extension behavior, ledger-change `read_only` flags, restored-key handling, and deterministic sorted iteration order. Pay special attention to budget outputs from `InvokeHostFunctionOpFrame` because removing `MeteredOrdMap` searches changes `cpu_insns`/`mem_bytes` unless deliberately gated as a p26 metering update or compatibility charges are added.
 - **Benchmark focus**: Measure soroswap `apply_time` across repeated `scripts/run_apply_load_matrix.py` runs and compare Tracy `map lookup`, `storage get`, `storage has`, `storage put`, `extend key`, and `get_ledger_changes` descendants. The required target is at least a reproducible 3% median apply-time reduction, roughly 18 ms wall-clock from the current 596.381 ms baseline.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-04-30
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/storage.rs:320-343` — added `Storage::get_access_type`, which reuses the enforcing footprint side index when available and falls back to the legacy `FootprintMap::get` path otherwise. The indexed path preserves the previous missing-key lookup charge and returns the same `Option<AccessType>` shape used by ledger-change generation.
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:193-258` — changed `get_ledger_changes` to ask `Storage` for each key's access type instead of searching `storage.footprint.0` directly. This removes the remaining post-invoke footprint binary search for enforcing storage while preserving read-only flags, restored-key handling, storage iteration order, and recording-mode fallback behavior.
+
+### Demonstration
+
+The p26 host now routes the ledger-change access-type lookup through the same enforcing side index used by runtime storage access, so the storage entry iteration no longer performs an independent footprint-map binary search for every output entry. Combined with the existing enforcing side-index fast paths for storage reads, writes, and TTL updates in the p26 baseline, this demonstrates the proposed fused lookup strategy without changing execution order, ledger output ordering, or parallelism.
+
+### Test Results
+
+Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`, built with `make -j30`, and ran `env NUM_PARTITIONS=30 make check`. The full test command completed successfully; the tail included p26 Rust host tests passing (`750 passed; 0 failed; 2 ignored`) and the final make-check harness reported all tests passed.
