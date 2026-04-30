@@ -89,3 +89,26 @@ Budget-error ordering is the main correctness constraint. A PoC must not simply 
 - **Change description**: Add a private read-only conversion visitor that borrows the object table once for a conversion traversal, performs direct absolute-handle lookup for nested objects, and batches `ContractCostType::VisitObject` with `Budget::bulk_charge` only where doing so preserves current validation and error ordering. Do not change object-producing `to_host_obj` first.
 - **Correctness check**: Existing conversion, storage, SAC, and budget-metering tests should continue to see identical `VisitObject` tracker iterations and identical CPU/memory budget totals. Add or run focused tests for invalid handles, wrong object tags, muxed-address storage-key rejection, and budget-exceeded precedence if the PoC changes charge timing.
 - **Benchmark focus**: Measure `scripts/run_apply_load_matrix.py` soroswap apply time in non-Tracy builds before/after, with additional counters or narrow spans for `from_host_val` / storage-key conversion visit counts. The expected signal is reduced wall time in `Host::invoke_function`/parallel apply and a top-line apply-time improvement in the 3-10% range; if only Tracy span time improves, the finding should not advance.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-04-29
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/host/conversion.rs:3-5` imports direct object-handle helpers for internal read-only conversion traversal.
+- `src/rust/soroban/p26/soroban-env-host/src/host/conversion.rs:269-311` keeps public map conversion entry points intact while adding private variants that reuse a caller-provided immutable host-object slice for map key/value recursion, including storage-key conversion mode.
+- `src/rust/soroban/p26/soroban-env-host/src/host/conversion.rs:435-465` changes `from_host_val` and `from_host_val_for_storage` object paths to borrow the object table once for the conversion traversal instead of reacquiring it at every nested object visit.
+- `src/rust/soroban/p26/soroban-env-host/src/host/conversion.rs:499-631` adds private read-only helpers that perform direct absolute-handle lookup against the borrowed object slice and recurse through vectors/maps without nested `visit_obj_untyped` calls. The helper still charges `ContractCostType::VisitObject` before each handle lookup to preserve current budget totals and charge-before-validation ordering.
+
+### Demonstration
+
+The PoC implements the safe subset of the reviewed optimization: read-only `Val` -> `ScVal` conversion now carries one immutable object-table borrow through recursive vector/map traversal. This removes repeated `RefCell` object-table borrows and nested `visit_obj_untyped` closures/Tracy spans from conversion-heavy return, event, storage, and generated contracttype externalization paths while preserving per-object `VisitObject` iterations and error ordering.
+
+### Test Results
+
+Configured and built with Tracy support via `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` and `make -j $(nproc)`. The full suite passed with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make MAKE="make -o ../.git/modules/src/rust/soroban/p21/HEAD -o ../.git/modules/src/rust/soroban/p21/index -o ../.git/modules/src/rust/soroban/p22/HEAD -o ../.git/modules/src/rust/soroban/p22/index -o ../.git/modules/src/rust/soroban/p23/HEAD -o ../.git/modules/src/rust/soroban/p23/index -o ../.git/modules/src/rust/soroban/p24/HEAD -o ../.git/modules/src/rust/soroban/p24/index -o ../.git/modules/src/rust/soroban/p25/HEAD -o ../.git/modules/src/rust/soroban/p25/index -o ../.git/modules/src/rust/soroban/p26/HEAD -o ../.git/modules/src/rust/soroban/p26/index" -j $(nproc) check`; the `-o` options were required only because this git worktree stores submodule gitdirs under the common worktree gitdir rather than `.git/modules/...`, while the make recipe still generated each `target/git-state.txt` from `git` state.
