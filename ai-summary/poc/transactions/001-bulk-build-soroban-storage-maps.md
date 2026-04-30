@@ -201,3 +201,52 @@ The revision keeps the original one-shot `MeteredOrdMap` construction and remove
 ### Test Results
 
 `make -j $(nproc)` completed successfully from the top-level worktree. `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` completed successfully; the final run included p26 Rust host tests (`750 passed; 0 failed; 2 ignored; 1 filtered out`), Rust integration tests, `test/selftest-nopg`, and `test/check-nondet` with exit code 0.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-04-30
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The latest revision again fails the reproducible-handoff gate before final review can build, test, or benchmark it. The outer branch `poc/001-bulk-build-soroban-storage-maps` is at `1b9476511d` and records p26 gitlink `1f156d0ec040d369233af91b62eb0ac949465fb6`, but the revised optimization described in the latest PoC attempt is present only as dirty files inside the p26 submodule:
+
+- `soroban-env-host/src/e2e_invoke.rs`
+- `soroban-env-host/src/test/e2e_tests.rs`
+
+The p26 submodule HEAD is still `1f156d0ec0` on `poc/001-bulk-build-soroban-storage-maps`, so a clean checkout of the outer branch would not reproduce the source state currently in this worktree. Per the performance final-review handoff rules, benchmarking dirty submodule state is invalid because it cannot become the next reproducible accepted baseline.
+
+### Revision Instructions
+
+Commit the revised p26 changes to the SirTyson `rs-soroban-env` fork on branch `poc/001-bulk-build-soroban-storage-maps`, then advance the outer `stellar-core` branch `poc/001-bulk-build-soroban-storage-maps` with a gitlink bump pointing at that new submodule commit. Before resubmitting, verify both `git status --short` in the outer worktree and `git -C src/rust/soroban/p26 status --short` in the submodule are clean except for `ai-summary/` pipeline housekeeping, then rerun the full test gate and three non-Tracy apply-load matrix runs against the accepted baseline.
+
+### Checks Passed So Far
+
+- The hypothesis file and latest PoC notes were read.
+- The outer branch records the prior committed p26 gitlink `1f156d0ec040d369233af91b62eb0ac949465fb6`.
+- The latest revision's source changes were found as dirty p26 submodule modifications only, so final review stopped at the reproducibility gate before build/test/benchmark.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-04-30
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:43-116` — added an aligned `InitialStorageSnapshot` representation plus sorted one-shot `MeteredOrdMap` helpers for ledger-key maps.
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:374-484` — added an enforcing-mode ledger-change builder that walks aligned storage, footprint, and initial snapshot vectors instead of querying a cloned initial storage map and TTL lookup map.
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:1124-1287` — bulk-builds footprint/storage maps, aligns decoded entries to footprint order, keeps initial entry and TTL-hash data in the snapshot, and skips constructing the TTL map outside recording mode.
+- `src/rust/soroban/p26/soroban-env-host/src/test/e2e_tests.rs:61-2958` — updated only recording-mode instruction-count expectations and the existing recording/enforcing tolerance to measured values from the cheaper map/snapshot construction path.
+
+### Demonstration
+
+The implementation removes repeated immutable `MeteredOrdMap::insert` rebuilds from Soroban host input construction and avoids cloning/searching a second initial storage map in the successful enforcing path. It preserves deterministic sorted ledger-key order, footprint membership validation, TTL hash/live-until handling, restore accounting, and ledger-change output while reducing allocation/copy and lookup work in the apply path.
+
+### Test Results
+
+`./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` and `make -j $(nproc)` completed successfully from the top-level worktree. `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` completed successfully; the final run included p26 Rust host tests (`750 passed; 0 failed; 2 ignored; 1 filtered out`), Rust integration tests, `test/selftest-nopg`, and `test/check-nondet` with exit code 0.
