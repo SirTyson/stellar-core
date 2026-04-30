@@ -173,3 +173,91 @@ diff — only the workflow/handoff issue was fixed.
   `soroban-env-host/src/test/e2e_tests.rs`); test edits remain limited
   to numeric recording-mode instruction-count baselines, preserving all
   control flow and pass/fail assertions.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-04-30
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The committed handoff is now reproducible and the implementation passes the
+source-level and full-regression gates, but the authoritative non-Tracy
+benchmark result does not meet the objective threshold for confirmation.
+
+Accepted baseline soroswap medians from `ai-summary/CURRENT_STATE.md`:
+
+| run | soroswap median_ms | sac median_ms |
+|-----|--------------------|---------------|
+| 1 | 290.766289 | 333.099159 |
+| 2 | 286.738946 | 314.378531 |
+| 3 | 288.663084 | 316.290692 |
+
+Final-review optimized non-Tracy runs:
+
+| run | run id | soroswap median_ms | sac median_ms |
+|-----|--------|--------------------|---------------|
+| 1 | `a6f00204f39b-20260430-144123` | 283.7244445000033 | 313.8720120000007 |
+| 2 | `a6f00204f39b-20260430-144745` | 290.35067450000133 | 314.04778799999985 |
+| 3 | `a6f00204f39b-20260430-145408` | 283.63469950000126 | 312.0881810000028 |
+
+Soroswap average improved from `288.722773 ms` to `285.903273 ms`, a
+`0.98%` improvement. This is below the objective's 1% minimum, and run 2
+regressed by `0.56%` relative to the accepted baseline average. Because the
+three-run soroswap signal is marginal and inconsistent, it is not eligible for
+CONFIRMED. Per the benchmark workflow, no diagnostic Tracy run was collected
+because the non-Tracy runs did not show an eligible improvement.
+
+### Revision Instructions
+
+Revise the optimization so the soroswap apply-time improvement is at least 1%
+and supported across all three non-Tracy `scripts/run_apply_load_matrix.py`
+runs. The current source approach appears low-risk and directionally useful,
+but it likely needs a larger paired reduction in the same ledger-change/XDR
+path or a narrower implementation that avoids adding enough metered-map work to
+offset the removed old-entry serialization. Re-run the same required workflow:
+clean committed handoff, full `env NUM_PARTITIONS=30
+STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make
+check`, then three non-Tracy matrix runs compared against the unchanged
+`CURRENT_STATE.md` baseline.
+
+### Checks Passed So Far
+
+- Handoff reproducibility: PASS — outer source diff is only the p26 gitlink,
+  and the p26 submodule is clean on `poc/002-cache-old-entry-xdr-sizes` at
+  `ac6316c2ba689385be61c9590086d65a762d6a9d`.
+- Source audit: PASS — the implementation threads cached ingress
+  `LedgerEntry` XDR lengths into `get_ledger_changes` and preserves the
+  fallback serialization path for callers without cached sizes.
+- Test-edit audit: PASS — test changes are limited to numeric
+  recording-mode instruction baselines, matching the budget-number exception.
+- Full regression: PASS — `env NUM_PARTITIONS=30
+  STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make
+  check` completed successfully.
+- Benchmark gate: FAIL — soroswap average improvement was only `0.98%` and
+  was not consistent across all three non-Tracy runs.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-04-30
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:41-47,188-324,500-575,793-905,1039-1151` — revised the prior ingress-size cache to store initial entry XDR size and optional TTL metadata in an unmetered positional vector aligned with the fixed enforcing storage map. `get_ledger_changes` now reuses positional metadata for old rent sizes and TTL key hashes, and uses known-position lookups for the initial storage snapshot and footprint access type instead of separate metered map lookups.
+- `src/rust/soroban/p26/soroban-env-host/src/test/e2e_tests.rs:844,1400,1538,1609,2048,2115,2415,2558,2698,2835,2958` — updated only recording-mode instruction-count expectations that decreased after removing the extra metered TTL/size map work from the ledger-change path.
+
+### Demonstration
+
+The revised optimization keeps the original POC's semantic change — old-entry rent size is computed from the canonical ingress `LedgerEntry` XDR length rather than reserializing the old entry — and reduces overhead added by the first implementation. By aligning cached metadata to the enforcing storage map positions, successful invoke-host-function ledger-change construction avoids the previous side `MeteredOrdMap` inserts/lookups for initial sizes and TTL entries while preserving key encoding, new value encoding, TTL changes, rent sizes, events, result XDR, and modified ledger effects.
+
+The budget delta remains deliberate for p26: successful recording-mode resource snapshots now charge fewer instructions because both redundant old-entry `ValSer` work and the prior POC's extra metered metadata-map work are gone. Test changes are limited to numeric instruction baselines for this cheaper execution path.
+
+### Test Results
+
+Configured and built with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` and `make -j30`. Final full regression run `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` completed with exit status 0; `test/selftest-nopg` and `test/check-nondet` passed, including p26 `soroban-env-host` results of 750 passed, 0 failed, 2 ignored, 1 filtered out.
