@@ -98,3 +98,78 @@ The budget delta is deliberate for p26: successful recording-mode resource snaps
 ### Test Results
 
 Configured and built with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` and `make -j30`. Final full regression run `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` completed with exit status 0; `test/selftest-nopg` and `test/check-nondet` passed, including p26 `soroban-env-host` results of 750 passed, 0 failed, 2 ignored, 1 filtered out.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-04-30
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The PoC handoff is not reproducible in the required final-review model. The outer worktree is on `poc/002-cache-old-entry-xdr-sizes`, but the recorded `src/rust/soroban/p26` gitlink still points at the previous accepted baseline SHA `e6728024aed9bb39cac3c2f247579bfac5b8bc79`, while the actual PoC source changes are uncommitted dirty state inside the detached `p26` submodule:
+
+- `soroban-env-host/src/e2e_invoke.rs`
+- `soroban-env-host/src/test/e2e_tests.rs`
+
+Final review cannot run the required clean-checkout build, full `make check`, or three authoritative `scripts/run_apply_load_matrix.py` measurements against uncommitted submodule state. A fresh checkout of the outer branch would not contain the optimization, so any benchmark from this worktree would not be a reproducible validation of the handed-off PoC branch.
+
+### Revision Instructions
+
+Commit the `p26` submodule changes to the `github.com/SirTyson/rs-soroban-env` branch `poc/002-cache-old-entry-xdr-sizes`, then update the outer `stellar-core` gitlink to that submodule commit and commit the outer branch `poc/002-cache-old-entry-xdr-sizes`. The handoff must satisfy all of the following before final review can proceed:
+
+1. `git status --short` in the outer worktree is clean except for orchestrator-managed `ai-summary` artifacts.
+2. `git -C src/rust/soroban/p26 status --short` is clean.
+3. `git submodule status src/rust/soroban/p26` reports the new committed PoC SHA, not the previous baseline SHA `e6728024aed9bb39cac3c2f247579bfac5b8bc79`.
+4. The PoC file records the outer commit SHA and submodule commit SHA/branch used for the handoff.
+5. Keep the test edits limited to the budget-number exception already claimed here: only numeric recording-mode instruction baselines may change, with no test logic, fixtures, control flow, assertions, or pass/fail semantics weakened.
+
+Once the committed handoff is available, final review should check out the PoC branch from scratch, update the submodule, verify both worktrees are clean, run the full regression suite, and then run the three non-Tracy matrix benchmarks against `ai-summary/CURRENT_STATE.md`.
+
+### Checks Passed So Far
+
+- Source-level intent appears aligned with the hypothesis: the dirty diff adds `InitialEntryXdrSizeMap`, threads cached ingress `LedgerEntry` XDR sizes into `get_ledger_changes`, and keeps a fallback serialization path for callers without cached sizes.
+- The visible test-file edits are only numeric recording-mode instruction-count reductions, matching the narrow budget-number exception shape.
+- The prior accepted baseline in `ai-summary/CURRENT_STATE.md` is present and records the reproducible baseline submodule SHA and three authoritative non-Tracy runs needed for later comparison.
+
+---
+
+## PoC Revision
+
+**Result**: POC_PASS
+**Date**: 2026-04-30
+**PoC by**: claude-opus-4.7, high
+
+### Revision Summary
+
+Addresses the prior "Needs Revision" feedback by committing the previously
+dirty submodule state to the paired PoC branches required for reproducible
+final review. No source-level changes were made on top of the prior PoC
+diff — only the workflow/handoff issue was fixed.
+
+### Handoff SHAs
+
+- **Outer** branch `poc/002-cache-old-entry-xdr-sizes` on
+  `github.com/SirTyson/stellar-core` at commit
+  `a863ae68b6bdb74c646841e4af5d50fd040f9bdc` (gitlink bump only).
+- **Submodule** branch `poc/002-cache-old-entry-xdr-sizes` on
+  `github.com/SirTyson/rs-soroban-env` at commit
+  `ac6316c2ba689385be61c9590086d65a762d6a9d`, applied on top of the prior
+  accepted baseline `e6728024aed9bb39cac3c2f247579bfac5b8bc79`.
+
+### Verification
+
+- `git status --short` in the outer worktree is clean apart from the
+  orchestrator-managed `ai-summary` artifacts (the `D ai-summary/...`
+  entries reflect the now-untracked `ai-summary` directory and are
+  pipeline-managed, not PoC-owned).
+- `git -C src/rust/soroban/p26 status --short` is clean.
+- `git submodule status src/rust/soroban/p26` reports
+  `ac6316c2ba689385be61c9590086d65a762d6a9d` (v26.0.0-3-gac6316c2),
+  not the prior baseline SHA.
+- The submodule commit contains only the two files identified by final
+  review (`soroban-env-host/src/e2e_invoke.rs` and
+  `soroban-env-host/src/test/e2e_tests.rs`); test edits remain limited
+  to numeric recording-mode instruction-count baselines, preserving all
+  control flow and pass/fail assertions.
