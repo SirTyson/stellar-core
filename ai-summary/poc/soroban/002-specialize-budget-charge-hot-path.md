@@ -113,3 +113,97 @@ The optimization makes the ubiquitous `Budget::charge(ty, input)` path use a ded
 ### Test Results
 
 `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` completed successfully after initializing Soroban submodules. `make -j30` completed successfully. `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS="--ll fatal -r simple --abort --disable-dots" make check` completed successfully; the final output included p26 Soroban Rust tests with `751 passed; 0 failed; 2 ignored` and the top-level `All 2 tests passed` summary.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-04-30
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The final-review handoff is not reproducible. The p26 Soroban submodule contains the PoC source changes only as uncommitted working-tree edits:
+
+- `soroban-env-host/src/budget.rs`
+- `soroban-env-host/src/budget/dimension.rs`
+- `soroban-env-host/src/budget/model.rs`
+- `soroban-env-host/src/test/budget_metering.rs`
+
+The outer checkout is on `poc/002-specialize-budget-charge-hot-path`, but `src/rust/soroban/p26` still records the previous accepted baseline SHA `a417a96314085a070bd7daf2cb29e85809f21ae3`, and the submodule is dirty rather than pointing at a committed `poc/002-specialize-budget-charge-hot-path` branch tip. The objective handoff model explicitly refuses uncommitted source changes because a fresh checkout cannot reproduce or benchmark the PoC.
+
+### Revision Instructions
+
+Commit the p26 changes to the SirTyson `rs-soroban-env` fork on branch `poc/002-specialize-budget-charge-hot-path`, then update the outer `stellar-core` PoC branch so the `src/rust/soroban/p26` gitlink points at that committed submodule SHA. Commit the outer gitlink update on `poc/002-specialize-budget-charge-hot-path`. Before returning to final review, verify both worktrees are clean with:
+
+```sh
+git status --short
+git -C src/rust/soroban/p26 status --short
+```
+
+The next final-review attempt can then run the required build, full test suite, and three-run non-Tracy benchmark comparison against `ai-summary/CURRENT_STATE.md`.
+
+### Checks Passed So Far
+
+- The hypothesis and PoC notes were read from `ai-summary/poc/soroban/002-specialize-budget-charge-hot-path.md`.
+- The current accepted baseline was read from `ai-summary/CURRENT_STATE.md`, including the baseline p26 SHA and benchmark artifact paths.
+- Handoff validation confirmed the PoC source diff exists, but only as uncommitted p26 submodule state, so tests and benchmarks were intentionally not run.
+
+---
+
+## PoC Revision
+
+**Result**: POC_PASS (revision)
+**Date**: 2026-04-30
+**PoC by**: claude-opus-4.7, high
+
+### Revision Summary
+
+Final-review revision request was workflow-only: the source diff already
+verified by the prior PoC was uncommitted in the `src/rust/soroban/p26`
+submodule. No code changes were required; this revision only commits the
+existing diff so the handoff is reproducible.
+
+### Commits
+
+- Submodule (`SirTyson/rs-soroban-env`, branch
+  `poc/002-specialize-budget-charge-hot-path`): one commit `33cf228d`
+  containing the four modified files
+  (`soroban-env-host/src/budget.rs`, `budget/dimension.rs`,
+  `budget/model.rs`, `test/budget_metering.rs`), pushed to `fork`.
+- Outer (`SirTyson/stellar-core`, branch
+  `poc/002-specialize-budget-charge-hot-path`): commit `89c3a73b9` bumps
+  the `src/rust/soroban/p26` gitlink to `33cf228d`, pushed to `origin`.
+
+### Verification
+
+- `git -C src/rust/soroban/p26 status --short` → clean.
+- `git status --short` → only the worktree-level `ai-summary` symlink
+  artifact (shared across worktrees; not part of this PoC).
+- The submodule branch tip and the outer gitlink both point at the
+  committed PoC SHA `33cf228d`, so a fresh checkout of
+  `SirTyson/stellar-core` `poc/002-specialize-budget-charge-hot-path`
+  with `git submodule update --init --recursive` reproduces the diff.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-04-30
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/budget.rs:236-330,1442-1449` — added `BudgetImpl::charge_one`, routed `Budget::charge` and single-iteration `BudgetImpl::charge` calls through it, and preserved tracker/input-validation plus CPU-before-memory limit side-effect ordering.
+- `src/rust/soroban/p26/soroban-env-host/src/budget/dimension.rs:190-216` — added an inlined single-charge dimension helper that directly indexes the fixed cost-model array, emits the same Tracy CPU charge span, and updates normal or shadow totals.
+- `src/rust/soroban/p26/soroban-env-host/src/budget/model.rs:116-131` — added `MeteredCostComponent::evaluate_one` to fold out `iterations == 1` while preserving the same saturating arithmetic and scaling behavior.
+- `src/rust/soroban/p26/soroban-env-host/src/test/budget_metering.rs:237-374` — added focused coverage for constant and linear single charges, input mismatch side effects, CPU-limit failure, memory-limit failure, shadow-mode accounting, and meter count preservation.
+
+### Demonstration
+
+The optimization makes the ubiquitous `Budget::charge(ty, input)` path use a dedicated single-unit routine instead of the generic bulk-charge routine. It removes repeated fallible fixed-array lookups and generic iteration arithmetic from per-host-operation metering while keeping the same CPU/memory totals, tracker fields, shadow totals, and limit-failure ordering expected by existing callers.
+
+### Test Results
+
+`./autogen.sh`, `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`, and `make -j $(nproc)` completed successfully. `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` completed successfully after initializing required submodules in this fresh worktree; the final output included p26 Soroban Rust tests with `755 passed; 0 failed; 2 ignored` and the top-level `All 2 tests passed` summary.
