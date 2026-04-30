@@ -109,3 +109,79 @@ The PoC removes the duplicate contract-balance read/decode in SAC `receive_balan
 ### Test Results
 
 Built successfully with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` and `make -j30`. Full suite passed with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`: `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and all p26 Soroban host tests passed (`750 passed; 0 failed; 2 ignored; 1 filtered out` in the main p26 host test binary, plus integration/doc test binaries passed).
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-04-30
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The PoC handoff is not reproducible as a committed optimization. The p26 submodule is still checked out at the prior accepted baseline SHA `e6728024aed9bb39cac3c2f247579bfac5b8bc79`, while the optimization and observation updates are present only as dirty working-tree changes inside `src/rust/soroban/p26`. The outer worktree only records the submodule as modified and does not point its gitlink at a committed p26 PoC SHA. This violates the final-review handoff requirement that both the outer repo and p26 submodule be clean, committed branch tips before measurement.
+
+There is also a branch/metadata mismatch: the outer branch is `poc/002-fuse-sac-authorization-balance-reads`, but the visible outer commits are named `viable poc 002-batch-host-object-visit-charges`, and the gitlink still resolves to the previous baseline. Final review cannot determine from a fresh checkout which source state should be validated, built, benchmarked, or promoted to `soroswap-perf`.
+
+### Revision Instructions
+
+Commit the p26 optimization and regenerated p26 observation fixtures to `github.com/SirTyson/rs-soroban-env` on branch `poc/002-fuse-sac-authorization-balance-reads`, then update the outer stellar-core submodule gitlink to that exact p26 commit and commit the gitlink on outer branch `poc/002-fuse-sac-authorization-balance-reads`. Push both branches. After `git submodule update --init --recursive src/rust/soroban/p26`, both the outer worktree and `src/rust/soroban/p26` must report clean `git status`, and the hypothesis file should record the exact outer commit SHA and p26 submodule SHA for the final reviewer.
+
+Also ensure the outer commit naming matches this PoC (`002-fuse-sac-authorization-balance-reads`) rather than the unrelated `002-batch-host-object-visit-charges` label, or explain why those commits are intentionally part of this handoff.
+
+### Checks Passed So Far
+
+Handoff inspection reached the first required final-review gate and found the optimization as dirty p26 working-tree state: `balance.rs` plus 44 SAC observation JSON files were modified, but p26 remained at baseline SHA `e6728024aed9bb39cac3c2f247579bfac5b8bc79`. Because the handoff is unreproducible, build, full test, benchmark, safety, and performance-severity checks were not run.
+
+---
+
+## PoC Revision
+
+**Result**: POC_PASS
+**Date**: 2026-04-30
+**PoC by**: claude-opus-4.7, high
+
+### Revision Summary
+
+Committed and pushed the previously-dirty p26 SAC fuse changes so the
+handoff is reproducible from a fresh checkout, addressing the final
+reviewer's revision instructions. No source-code logic changed in this
+revision — the optimization itself (the `balance.rs` fused-read helpers
+and the 44 regenerated p26 SAC observation fixtures from the prior PoC
+attempt) is unchanged; only the git/submodule plumbing was completed.
+
+### Branches and SHAs
+
+- **p26 submodule** (`github.com/SirTyson/rs-soroban-env`)
+  - Branch: `poc/002-fuse-sac-authorization-balance-reads`
+  - Tip SHA: `f98f3665a3370c995b1278ed53c5c6a41d262497`
+  - Parent: `e6728024aed9bb39cac3c2f247579bfac5b8bc79` (the prior accepted
+    baseline `viable success 001-typed-sac-balance-storage-fast-path`)
+  - Diff vs parent: `soroban-env-host/src/builtin_contracts/stellar_asset_contract/balance.rs`
+    plus 44 `soroban-env-host/observations/26/test__stellar_asset_contract__*.json`
+    fixtures.
+
+- **Outer repo** (`github.com/SirTyson/stellar-core`)
+  - Branch: `poc/002-fuse-sac-authorization-balance-reads`
+  - Tip SHA: `d5edc3e557bfe1a8c503c2dfa8880b669b19a799`
+  - Diff vs parent: bumps `src/rust/soroban/p26` gitlink to
+    `f98f3665a3370c995b1278ed53c5c6a41d262497`.
+
+### Reproducibility
+
+After `git fetch origin && git checkout poc/002-fuse-sac-authorization-balance-reads`
+on the outer repo, then `git submodule update --init --recursive
+src/rust/soroban/p26`, both the outer worktree and `src/rust/soroban/p26`
+report clean `git status`, and `src/rust/soroban/p26` is detached at
+`f98f3665a3370c995b1278ed53c5c6a41d262497`. The two prior unrelated
+documentation-only commits on this outer branch (`7ea9c80b9` and
+`1edfb4b4d`, both labeled "viable poc 002-batch-host-object-visit-charges")
+are pre-existing on this worktree's branch from earlier orchestrator
+work and were not authored as part of this PoC; only the new top
+commit `d5edc3e55` belongs to `002-fuse-sac-authorization-balance-reads`.
+
+### Test Results
+
+Tests were run during the original PoC attempt above and passed; this
+revision only commits and pushes the existing source state, so no new
+test run was required.
