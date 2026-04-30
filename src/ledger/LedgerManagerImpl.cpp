@@ -2483,10 +2483,13 @@ LedgerManagerImpl::prefetchTransactionData(AbstractLedgerTxnParent& ltx,
 std::unique_ptr<ThreadParallelApplyLedgerState>
 LedgerManagerImpl::applyThread(
     AppConnector& app,
-    std::unique_ptr<ThreadParallelApplyLedgerState> threadState,
-    Cluster const& cluster, Config const& config, ParallelLedgerInfo ledgerInfo,
-    Hash sorobanBasePrngSeed)
+    GlobalParallelApplyLedgerState const& globalState,
+    Cluster const& cluster, size_t clusterIdx, Config const& config,
+    ParallelLedgerInfo ledgerInfo, Hash sorobanBasePrngSeed)
 {
+    auto threadState = std::make_unique<ThreadParallelApplyLedgerState>(
+        app, globalState, cluster, clusterIdx);
+
     for (auto const& txBundle : cluster)
     {
         // Apply timer
@@ -2545,11 +2548,9 @@ LedgerManagerImpl::applySorobanStageClustersInParallel(
     for (size_t i = 0; i < stage.numClusters(); ++i)
     {
         auto const& cluster = stage.getCluster(i);
-        auto threadStatePtr = std::make_unique<ThreadParallelApplyLedgerState>(
-            app, globalState, cluster, i);
         threadFutures.emplace_back(std::async(
             std::launch::async, &LedgerManagerImpl::applyThread, this,
-            std::ref(app), std::move(threadStatePtr), std::cref(cluster),
+            std::ref(app), std::cref(globalState), std::cref(cluster), i,
             std::cref(config), ledgerInfo, sorobanBasePrngSeed));
     }
 
