@@ -294,3 +294,70 @@ passed" (`# FAIL: 0 / # ERROR: 0`), plus `selftest-nopg` PASS and
 `check-nondet` PASS. No source code has changed since that validation;
 this iteration only adds the missing commit and push so final review can
 benchmark a reproducible branch tip.
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-04-30
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** YES — the committed diff moves `ThreadParallelApplyLedgerState` construction from the serial launcher loop in `applySorobanStageClustersInParallel` into each async `applyThread` worker, directly targeting the serial per-cluster setup bubble described by the hypothesis.
+2. **Are the preconditions realistic?** PARTIAL — the code path is exercised by the soroswap apply-load benchmark and by parallel Soroban apply generally, but the measured setup-overlap benefit did not materialize as a top-line improvement.
+3. **Is the original code inefficient or working as designed?** INCONCLUSIVE — serial construction is plausibly inefficient, but the optimization also moves `app.getModuleCache()->shallow_clone()` into every worker concurrently and did not improve the measured apply path.
+4. **Does the benchmark improvement match the claimed severity?** NO — independent authoritative non-Tracy measurements showed soroswap regression, not improvement.
+5. **Is the optimization in scope?** YES — the touched path is inside `closeLedger` / parallel Soroban apply, and the worker count remains bounded by `stage.numClusters()`.
+6. **Is the benchmark methodology correct?** YES — final review used the required local binary invocation, `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py`, three times without `--tracy`, and compared against the accepted `ai-summary/CURRENT_STATE.md` baseline.
+7. **Can the improvement be explained without the optimization?** YES / NOT APPLICABLE — there was no reproducible improvement to explain; the optimized runs were worse than the accepted soroswap baseline.
+8. **Is this optimization novel?** YES — the scheduling change is distinct from prior accepted or failed findings, but novelty does not overcome the benchmark regression.
+
+### Independent Verification
+
+- Handoff validation passed on the re-handoff: branch `poc/001-parallelize-cluster-state-setup` was at outer commit `29d5a7787`, the source diff was committed, and `src/rust/soroban/p26` was clean at accepted baseline SHA `e6728024aed9bb39cac3c2f247579bfac5b8bc79`.
+- Source audit found no test-file edits and no immediate determinism issue: results are still collected in cluster order, `DeactivateScopeGuard` remains alive until all futures have joined, and the parallelism level is unchanged.
+- Independent build and full regression test passed with:
+  - `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`
+  - `make -j $(nproc)`
+  - `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`
+- Final review did not run a diagnostic `--tracy` capture because the required three non-Tracy benchmark runs did not show an eligible improvement.
+
+### Benchmark Comparison
+
+Accepted baseline from `ai-summary/CURRENT_STATE.md`:
+
+| run | scenario | median_ms | p95_ms | p99_ms |
+|-----|----------|-----------|--------|--------|
+| 1 | sac, TX=6000, T=8 | 333.099159 | 409.899619 | 415.473662 |
+| 1 | soroswap, TX=2000, T=8 | 290.766289 | 320.513204 | 326.261744 |
+| 2 | sac, TX=6000, T=8 | 314.378531 | 388.362011 | 400.919545 |
+| 2 | soroswap, TX=2000, T=8 | 286.738946 | 309.253423 | 320.197842 |
+| 3 | sac, TX=6000, T=8 | 316.290692 | 364.102294 | 383.006800 |
+| 3 | soroswap, TX=2000, T=8 | 288.663084 | 294.675579 | 305.874426 |
+
+Optimized PoC measurements from final review (rejected run artifacts were
+deleted during final-review cleanup per the objective instructions):
+
+| run | run id | scenario | median_ms | p95_ms | p99_ms |
+|-----|--------|----------|-----------|--------|--------|
+| 1 | `baf4a39f0314-20260430-130541` | sac, TX=6000, T=8 | 316.490124 | 336.617002 | 350.963096 |
+| 1 | `baf4a39f0314-20260430-130541` | soroswap, TX=2000, T=8 | 295.711161 | 300.875210 | 313.664323 |
+| 2 | `baf4a39f0314-20260430-131219` | sac, TX=6000, T=8 | 311.592159 | 330.017357 | 338.847667 |
+| 2 | `baf4a39f0314-20260430-131219` | soroswap, TX=2000, T=8 | 290.531587 | 296.544490 | 309.022231 |
+| 3 | `baf4a39f0314-20260430-131839` | sac, TX=6000, T=8 | 310.055077 | 328.218928 | 341.764920 |
+| 3 | `baf4a39f0314-20260430-131839` | soroswap, TX=2000, T=8 | 292.027936 | 298.401276 | 311.610624 |
+
+Soroswap median average regressed from the accepted baseline average of `288.723 ms` to `292.757 ms`, a `1.40%` regression. All three optimized soroswap medians are above the prior accepted baseline average, and the first optimized run is worse than every accepted baseline run. This fails the objective's confirmation gate, which requires soroswap apply time to improve consistently across all three non-Tracy runs.
+
+### Rejection Reason
+
+The optimization is correctly implemented as a scheduling change and passes the full test suite, but it does not improve the headline soroswap apply-time metric. Independent required benchmarks show a reproducible soroswap regression rather than the claimed 3-10% reduction, so the finding is rejected.
+
+### Failed Checks
+
+- Check 4: Benchmark improvement does not match the claimed severity; soroswap regressed.
+- Check 7: The observed measurements do not support any improvement attributable to the optimization.
+- Verdict criteria: REJECTED because soroswap apply time regressed across the three required non-Tracy runs.
