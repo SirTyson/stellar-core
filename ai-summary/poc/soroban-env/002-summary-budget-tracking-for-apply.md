@@ -115,3 +115,95 @@ The p26 production Core invoke path now skips per-cost diagnostic tracker update
 ### Test Results
 
 Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`, built with `make -j $(nproc)`, and ran `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`. The full run completed successfully; the p26 Soroban host unit tests reported `750 passed; 0 failed; 2 ignored`, the additional p26 integration/doc tests passed, and the top-level suite ended with `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-01
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The final-review handoff is not reproducible from committed branch state. The outer repository is on `poc/002-summary-budget-tracking-for-apply`, but the source changes described by the PoC are still uncommitted: `src/rust/src/soroban_proto_all.rs`, `src/rust/src/soroban_proto_any.rs`, and the `src/rust/soroban/p26` gitlink are dirty. Inside the p26 submodule, `soroban-env-host/src/budget.rs` is also modified while the submodule remains checked out at the previous accepted baseline commit `a417a96314085a070bd7daf2cb29e85809f21ae3`.
+
+The objective-specific handoff rules require the PoC's outer branch and p26 submodule branch to contain real commits for the optimization, with a clean worktree in both repositories after `git submodule update --init --recursive src/rust/soroban/p26`. Dirty source state is a blocking handoff bug, so I did not run the full test suite or benchmark matrix.
+
+### Revision Instructions
+
+Commit the p26 changes on the `github.com/SirTyson/rs-soroban-env` branch `poc/002-summary-budget-tracking-for-apply`, then update and commit the outer repository gitlink plus the Rust bridge changes on the outer `poc/002-summary-budget-tracking-for-apply` branch. Push both branches. Re-run the PoC verification from a clean checkout and ensure `git status --short` is empty in both the outer repository and `src/rust/soroban/p26` before sending back to final review.
+
+Also preserve the reproducibility metadata: the hypothesis should identify the exact p26 commit SHA containing `BudgetTrackingMode` / summary-tracking changes and the exact outer commit SHA that records the gitlink bump and `soroban_proto_*` adapter changes.
+
+### Checks Passed So Far
+
+- The hypothesis and PoC notes were readable and describe an in-scope apply-path optimization.
+- The accepted baseline in `ai-summary/CURRENT_STATE.md` was readable and records the prior p26 baseline SHA `a417a96314085a070bd7daf2cb29e85809f21ae3`.
+- Final-review handoff validation found uncommitted outer and p26 source changes, which blocks independent benchmark verification until the PoC is committed and clean.
+
+---
+
+## PoC Revision
+
+**Result**: POC_PASS (revision)
+**Date**: 2026-05-01
+**PoC by**: claude-opus-4.7, high
+**Failed At**: n/a — addresses final-review revision request
+
+### Revision Summary
+
+Addressed the final-review blocker by committing and pushing the previously
+uncommitted PoC source changes on paired branches. No source-code changes were
+made; the diff is identical to the prior PoC_PASS state, just persisted as
+real commits.
+
+### Reproducibility Metadata
+
+- **Submodule branch**: `poc/002-summary-budget-tracking-for-apply` on
+  `https://github.com/SirTyson/rs-soroban-env.git`
+- **Submodule commit SHA** (contains `BudgetTrackingMode` /
+  summary-tracking changes in `soroban-env-host/src/budget.rs`):
+  `12458fc39b9993513a711b872fdc54db747280f6`
+- **Outer branch**: `poc/002-summary-budget-tracking-for-apply` on
+  `https://github.com/SirTyson/stellar-core.git`
+- **Outer commit SHA** (records the gitlink bump for p26 plus the
+  `soroban_proto_all.rs` / `soroban_proto_any.rs` adapter changes):
+  `6f8e68597f0920ea0d5c5905886559a234c8f8e8`
+- **Prior accepted baseline p26 SHA** (gitlink before this PoC):
+  `a417a96314085a070bd7daf2cb29e85809f21ae3`
+
+After `git submodule update --init --recursive src/rust/soroban/p26` from a
+clean checkout of the outer branch tip above, both `git status --short` in the
+outer repo (outside the `ai-summary/` symlink) and in `src/rust/soroban/p26`
+are clean.
+
+### Verification
+
+Reconfigured with
+`./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`
+and rebuilt with `make -j $(nproc)`; the build succeeded with the committed
+gitlink and adapter changes. Re-ran the full unit-test suite via
+`env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`
+to re-confirm the PoC_PASS regression result on the committed source state.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-01
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/budget.rs:198-337,380-413,1393-1427,1559-1593` — restored the reviewed p26 `BudgetTrackingMode` implementation from submodule commit `12458fc39b9993513a711b872fdc54db747280f6`; default budgets keep full diagnostic tracking, while summary-tracking budgets skip per-cost tracker updates and retain aggregate CPU/memory accounting plus `VmInstantiation` CPU/time summaries.
+- `src/rust/src/soroban_proto_all.rs:95-114,271-288,446-463,621-638,835-852,1044-1061` — restored protocol adapter helpers so only p26 Core invocation budgets use summary tracking, while p21-p25 preserve full-tracking behavior and existing `get_tracker(VmInstantiation)` CPU subtraction.
+- `src/rust/src/soroban_proto_any.rs:412-463` — restored the shared invoke path to construct budgets through the protocol adapter and compute `cpu_insns_excluding_vm_instantiation` through the matching adapter.
+
+### Demonstration
+
+The p26 Core invoke path now avoids maintaining full per-cost diagnostic counters on every hot `BudgetImpl::charge` call, while preserving all aggregate budget totals, limit checks, input-shape validation, and the exact VM-instantiation CPU/time summaries returned through the bridge. Full tracking remains the default for tests, benches, cost runners, and older protocol adapters, so diagnostic `get_tracker` consumers keep their existing semantics.
+
+### Test Results
+
+Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`, built with `make -j $(nproc)`, and ran `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`. The full suite completed successfully; p26 Soroban host tests reported `750 passed; 0 failed; 2 ignored`, additional p26 integration/doc tests passed, and the top-level suite ended with `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.
