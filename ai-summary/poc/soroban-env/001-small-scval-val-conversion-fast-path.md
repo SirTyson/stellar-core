@@ -102,3 +102,94 @@ The optimization bypasses generic `TryFromVal` object-classification plumbing an
 ### Test Results
 
 Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`, then built with `make -j $(nproc) ALL_SOROBAN_GIT_STATE_STAMPS=`. Full regression suite passed with `NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check ALL_SOROBAN_GIT_STATE_STAMPS=`: p26 Rust host tests reported `750 passed; 0 failed; 2 ignored`, additional Rust integration/doc tests passed, and stellar-core reported `All 2 tests passed`.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-01
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The PoC handoff is not reproducible. The final-review objective requires the PoC source changes to be committed to paired outer and p26 submodule branches before benchmarking, but this worktree has the optimization only as dirty submodule state:
+
+- Outer branch: `poc/001-small-scval-val-conversion-fast-path`
+- Outer HEAD: `c603fa012f04dbef73640123c8ffd9efcfcdcdc6` (`viable poc 001-count-old-entry-xdr-size-without-buffer`), not a committed outer change for this PoC
+- p26 gitlink recorded by the outer repo: `a417a96314085a070bd7daf2cb29e85809f21ae3`, the prior accepted baseline from `CURRENT_STATE.md`
+- p26 worktree status: dirty `soroban-env-host/src/budget.rs` and `soroban-env-host/src/host/conversion.rs`
+
+Because the Rust changes are uncommitted and the outer gitlink is not bumped, a fresh checkout of the PoC branch would benchmark the previous accepted baseline rather than the claimed optimization. Benchmarking this dirty state would violate the handoff model and produce numbers that cannot be reproduced from the fork branches.
+
+### Revision Instructions
+
+Commit the p26 changes on the fork's submodule branch `poc/001-small-scval-val-conversion-fast-path`, push that branch, update the outer repository gitlink to the new p26 commit, and commit/push the outer branch `poc/001-small-scval-val-conversion-fast-path`. Then verify both worktrees are clean:
+
+```sh
+git status --short
+cd src/rust/soroban/p26 && git status --short
+```
+
+The outer commit should be clearly named for the small `ScVal`/`Val` conversion fast path and should record the new p26 SHA. Do not rely on `ALL_SOROBAN_GIT_STATE_STAMPS=` or any dirty submodule files for the handoff; final review must be able to reproduce the source state with only:
+
+```sh
+git checkout poc/001-small-scval-val-conversion-fast-path
+git submodule update --init --recursive src/rust/soroban/p26
+```
+
+After the committed clean handoff is available, final review can rerun the required full suite and three non-Tracy `scripts/run_apply_load_matrix.py` measurements.
+
+### Checks Passed So Far
+
+- The hypothesis and PoC notes were present at `ai-summary/poc/soroban-env/001-small-scval-val-conversion-fast-path.md`.
+- The dirty p26 diff touches the files described by the PoC notes: `soroban-env-host/src/host/conversion.rs` and `soroban-env-host/src/budget.rs`.
+- The edited code targets the claimed conversion helpers and preserves object-valued conversions on the existing generic path at a source-inspection level.
+- No authoritative final-review tests or benchmarks were run, because the uncommitted submodule state fails the reproducible handoff prerequisite.
+
+---
+
+## PoC Revision
+
+**Result**: POC_PASS
+**Date**: 2026-05-01
+**PoC by**: claude-opus-4.7, high
+
+### Revision Addressed
+
+Final review flagged that the previous PoC iteration left the p26 changes
+as dirty submodule state with the outer gitlink still pointing at the prior
+accepted baseline, making the handoff non-reproducible from the fork
+branches alone. This revision commits and pushes the same code change on
+the paired fork branches and bumps the outer gitlink so a fresh checkout
+of `poc/001-small-scval-val-conversion-fast-path` plus a recursive
+submodule init reproduces the optimization without any working-tree
+patches.
+
+### Branches and Commits
+
+- p26 submodule fork branch
+  `https://github.com/SirTyson/rs-soroban-env.git poc/001-small-scval-val-conversion-fast-path`
+  at commit `926a15a9f01949cb1717f1516b50e396a98f64f7`, parented on the
+  prior accepted baseline `a417a96314085a070bd7daf2cb29e85809f21ae3`
+  (also published as `poc/002-cache-old-entry-xdr-sizes` on the same
+  fork). Diff: `soroban-env-host/src/budget.rs` and
+  `soroban-env-host/src/host/conversion.rs` only — same content described
+  in the original PoC notes above.
+- Outer fork branch
+  `https://github.com/SirTyson/stellar-core.git poc/001-small-scval-val-conversion-fast-path`
+  at commit `b9bf7a31f5c8291bda0fddebb768959d52889427`, parented on
+  `c603fa012f04dbef73640123c8ffd9efcfcdcdc6`
+  (`viable poc 001-count-old-entry-xdr-size-without-buffer`). Diff: only
+  the `src/rust/soroban/p26` gitlink bump to the new submodule commit.
+
+### Verification
+
+- `git status --short` in the outer worktree shows no source changes
+  (only pre-existing intentional `ai-summary/*` symlink-driven entries
+  unrelated to this PoC).
+- `git status --short` inside `src/rust/soroban/p26` is empty.
+- `git submodule status src/rust/soroban/p26` reports
+  `926a15a9f01949cb1717f1516b50e396a98f64f7`, matching the pushed fork
+  commit.
+- Code change content is unchanged from the prior POC_PASS iteration;
+  test results from that iteration apply.
