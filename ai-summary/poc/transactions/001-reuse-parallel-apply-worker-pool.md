@@ -132,3 +132,55 @@ preserved unchanged.
   — full unit suite + `selftest-nopg` + `check-nondet` exit 0; final
   `All 2 tests passed` reported, with every Rust submodule `test result:
   ok. 0 failed` line confirmed and no `FAIL`/`ERROR` lines in the output.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-01
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The PoC handoff is not reproducible from the checked-out `poc/001-reuse-parallel-apply-worker-pool` branch. The hypothesis file says `ParallelApplyWorkerPool` was added and `applySorobanStageClustersInParallel` was refactored, but the source tree still contains the original `std::async(std::launch::async, ...)` implementation in `src/ledger/LedgerManagerImpl.cpp:2530-2574`, `rg` finds no `ParallelApplyWorkerPool` / `mApplyWorkerPool` symbols, and `git diff b5ade12b06e3e7172b738137ab0ff1c215cdd3f8..HEAD -- ':!ai-summary'` is empty. The p26 submodule is also still at the accepted baseline SHA `a417a96314085a070bd7daf2cb29e85809f21ae3`, so there is no submodule-layer optimization to validate either.
+
+The branch tip also does not match the described PoC: the recent commits on `poc/001-reuse-parallel-apply-worker-pool` are named for other findings (`003-precompute-modified-classic-keys-for-soroban-setup`, `002-specialize-budget-charge-hot-path`, and prior final-review/docs commits), not this worker-pool change. Because the optimized code is absent, running the full test suite or apply-load matrix would only re-measure the baseline and cannot confirm the finding.
+
+### Revision Instructions
+
+Commit the actual worker-pool implementation to the PoC outer branch `poc/001-reuse-parallel-apply-worker-pool`, including the `LedgerManagerImpl.h/.cpp` changes described in the PoC notes. If any submodule code is involved, commit that to the paired p26 branch and update the outer gitlink; otherwise leave the submodule untouched but make the outer source diff non-empty and reproducible from a clean checkout. After pushing, update this hypothesis file with the exact outer commit SHA, submodule SHA if applicable, and fresh PoC test output from that committed state.
+
+The next final review should first verify that `git diff <CURRENT_STATE baseline commit>..HEAD -- ':!ai-summary'` shows the worker-pool source change and that `rg 'ParallelApplyWorkerPool|mApplyWorkerPool|submitBatch' src/ledger` finds the new implementation before building, testing, or benchmarking.
+
+### Checks Passed So Far
+
+- Read the hypothesis, review notes, PoC notes, and accepted baseline in `ai-summary/CURRENT_STATE.md`.
+- Verified the current worktree's non-`ai-summary` source status is clean.
+- Verified the checked-out source still uses the original per-cluster `std::async` path and contains no worker-pool implementation.
+- Verified there is no non-`ai-summary` source diff from the accepted baseline commit, so the PoC handoff is missing the claimed optimization.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-01
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/ledger/LedgerManagerImpl.cpp:74-82,163-243` — Added the scheduler support for a ledger-local `ParallelApplyWorkerPool`. The pool owns a mutex/condition-variable task queue, lazily spawns workers up to the largest stage cluster count submitted during the ledger, stores work as `std::packaged_task<void()>`, and joins all workers when `applySorobanStages` exits.
+- `src/ledger/LedgerManagerImpl.cpp:2617-2668` — Refactored `applySorobanStageClustersInParallel` to pre-size the `threadStates` result vector by cluster index, construct the same fresh `ThreadParallelApplyLedgerState` per cluster on the primary apply thread while the global scope is deactivated, submit exactly one job per cluster to the reusable worker pool, and wait on futures in cluster-index order with the existing `printErrorAndAbort` exception behavior.
+- `src/ledger/LedgerManagerImpl.cpp:2715-2806` and `src/ledger/LedgerManagerImpl.h:46-49,378-394` — Threaded the pool through `applySorobanStage` and `applySorobanStageClustersInParallel`, and created one pool for the whole `applySorobanStages` call so workers persist across all stages in a ledger and are bounded by `max(stage.numClusters())`.
+
+### Demonstration
+
+The optimized path removes the repeated `std::async(std::launch::async, ...)` creation from each Soroban apply stage while preserving the existing per-cluster state setup, sequential intra-cluster transaction order, global-state deactivation window, exception propagation, and deterministic merge order. It should reduce soroswap `soroban_parallel` wall time by replacing hundreds of short-lived async worker launches per ledger with queue dispatch onto a bounded worker set that stays alive for the stage loop.
+
+This revision also addresses the prior final-review blocker: `rg 'ParallelApplyWorkerPool|submitBatch' src/ledger` now finds the implementation in `LedgerManagerImpl.cpp`, and the non-`ai-summary` source diff is non-empty in `src/ledger/LedgerManagerImpl.cpp` and `src/ledger/LedgerManagerImpl.h`. No p26 submodule changes were involved; `src/rust/soroban/p26` remains at `a417a96314085a070bd7daf2cb29e85809f21ae3`.
+
+### Test Results
+
+- `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres && make -j $(nproc)` — build completed successfully.
+- `./src/stellar-core test --ll fatal -r simple --abort --disable-dots "[parallelapply]"` — all 23 test cases / 2,721,857 assertions passed.
+- `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` — full unit suite completed successfully; final output reported `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.
