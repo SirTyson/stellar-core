@@ -251,3 +251,33 @@ No test logic, fixture, or budget-constant edits were required.
 - Both worktrees are clean prior to handoff. Final review can pull these
   paired branches and run the non-Tracy `run_apply_load_matrix.py` runs
   against the committed state.
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-05-01
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change address the claimed inefficiency?** PARTIAL — the source change does replace enforcing-mode storage writes/deletes/TTL updates at known positions without rebuilding the entire `MeteredOrdMap`, and it also adds indexed enforcing footprint/storage lookups. This targets an in-scope apply-path cost under `Host::invoke_function`.
+2. **Are the preconditions realistic?** YES — enforcing Soroban storage has a fixed footprint during contract execution, so position indices can be valid when built from the enforcing footprint/storage map.
+3. **Is the original code inefficient or by design?** INEFFICIENCY, WITH CAREFUL METERING REQUIREMENTS — rebuilding the vector for value-only replacement is extra work, but the legacy path also charges consensus-visible budget work. The revised implementation mirrors the legacy access/binsearch/deep-clone/scan charge sequence closely enough for this final review to proceed to benchmarking.
+4. **Does the benchmark improvement match the claimed severity?** NO — the independent three-run non-Tracy matrix showed a soroswap regression, not an improvement. Accepted baseline soroswap medians from `ai-summary/CURRENT_STATE.md` are 278.119725 ms, 279.118436 ms, and 278.981930 ms. The reviewed change measured 292.086262 ms, 279.806609 ms, and 279.180254 ms. The average moved from 278.740030 ms to 283.691041 ms, a 1.78% regression.
+5. **Is the optimization in scope?** YES — the modified storage path is under ledger apply / Soroban host execution, not TX-set construction.
+6. **Is the benchmark methodology correct?** YES — final review used the required local-build command `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` three times without `--tracy`. No diagnostic Tracy run was performed because the non-Tracy results were not eligible for confirmation.
+7. **Can the result be explained without the optimization?** YES — the only favorable signal is max-sac median average improving from 317.717361 ms to 310.145962 ms, but the objective headline metric is soroswap apply time and it regressed. Benchmark noise cannot support confirmation when all three soroswap runs are slower than the accepted baseline average and one run is a large outlier regression.
+8. **Is this optimization novel?** YES — it is distinct from the earlier bulk-build and unified-lookup findings, but novelty does not overcome the failed soroswap benchmark gate.
+
+### Rejection Reason
+
+The optimization does not produce the required soroswap apply-time improvement. Independent final-review benchmarks show soroswap medians of 292.086262 ms, 279.806609 ms, and 279.180254 ms versus the accepted baseline medians of 278.119725 ms, 279.118436 ms, and 278.981930 ms. This is an average soroswap regression of 1.78%, so the change fails the objective's headline metric and is ineligible for CONFIRMED regardless of max-sac improvement.
+
+### Failed Checks
+
+- Performance final-review Step 5: benchmark improvement not supported by the required three non-Tracy `run_apply_load_matrix.py` runs.
+- Adversarial check 4: measured improvement does not match the claimed Medium severity; the headline soroswap metric regressed.
+- Verdict criteria: soroswap did not improve consistently across all three non-Tracy runs, so no diagnostic Tracy run or promotion to `soroswap-perf` is allowed.
