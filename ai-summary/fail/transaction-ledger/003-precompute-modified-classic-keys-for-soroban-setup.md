@@ -308,3 +308,32 @@ The optimization eliminates the per-transaction current/LCL snapshot value compa
 - Outer commit: `1dbb1b9ec16a052c58430b1d2a58bf37b7327a68`
 - p26 submodule: unchanged at `a417a96314085a070bd7daf2cb29e85809f21ae3` with a clean submodule worktree.
 - Source branch pushed to `origin/poc/003-precompute-modified-classic-keys-for-soroban-setup` for reproducible final-review checkout.
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-05-01
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** YES — the committed diff replaces the protocol-26 `requiresSequentialPreParallelApply` current/LCL value comparison with `AbstractLedgerTxn::isModifiedKey`, removing the repeated `LedgerSnapshot::load` calls in the serial `soroban_setup_glbl` classification loop.
+2. **Are the preconditions realistic?** YES — this path is exercised by the soroswap apply-load benchmark during protocol-26 parallel Soroban setup.
+3. **Is the original code inefficient or working as designed?** INEFFICIENCY, but conservative — the previous value comparison performed more work than necessary for detecting keys modified in the in-flight ledger transaction. The replacement is safe but may over-classify touched-and-restored keys as sequential.
+4. **Does the benchmark improvement match the claimed severity?** NO — the required three non-Tracy matrix runs showed a soroswap regression, not an improvement. Baseline soroswap medians from `CURRENT_STATE.md` were 278.119725 / 279.118436 / 278.981930 ms. Optimized soroswap medians were 284.342765 / 283.945565 / 286.802775 ms, an average regression from 278.740030 ms to 285.030368 ms (+2.26%).
+5. **Is the optimization in scope?** YES — the changed code is in the `closeLedger` Soroban parallel-apply setup path, not TX-set construction or background bucket work.
+6. **Is the benchmark methodology correct?** YES — final review built the PoC commit with the required Tracy-enabled configuration, ran the full test suite, then ran `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` exactly three times without `--tracy`. No diagnostic Tracy run was performed because the non-Tracy runs were not eligible.
+7. **Can the improvement be explained without the optimization?** NOT APPLICABLE — no improvement was observed; the measured top-line soroswap result regressed in every optimized run.
+8. **Is this optimization novel?** YES — no duplicate optimization was identified, but novelty cannot overcome the top-line regression.
+
+### Rejection Reason
+
+The optimization fails the objective's headline metric: soroswap apply time regressed consistently across all three required non-Tracy benchmark runs. Although the source change is plausibly safe and removes a real classification cost, it does not reduce apply time on the authoritative project benchmark and therefore cannot be promoted to `soroswap-perf`.
+
+### Failed Checks
+
+- Performance final-review adversarial check 4: benchmark improvement/severity support failed.
+- Objective verdict criterion: soroswap apply time must improve consistently across all three non-Tracy runs; it regressed in all three.

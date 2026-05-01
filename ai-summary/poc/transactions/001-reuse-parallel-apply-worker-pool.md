@@ -76,3 +76,59 @@ The hypothesis's Tracy wall/worker-gap evidence overstates recoverable savings b
 - **Change description**: introduce a ledger-local bounded worker pool or equivalent persistent worker set with size `max(stage.numClusters())` over the `applySorobanStages` call. For each stage, allocate a result vector sized to `stage.numClusters()`, submit exactly one cluster job per cluster index, have each job build/use its fresh `ThreadParallelApplyLedgerState` and call the existing `applyThread` logic, wait for all jobs before returning, and preserve exception-to-`printErrorAndAbort` behavior.
 - **Correctness check**: existing parallel-apply coverage in `src/transactions/test/ParallelApplyTest.cpp` and Soroban apply tests in `src/transactions/test/InvokeHostFunctionTests.cpp` should remain unchanged; pay particular attention to deterministic metadata, read-only TTL bump behavior, invariant checks, and per-transaction PRNG sub-seeds.
 - **Benchmark focus**: compare repeated non-Tracy `scripts/run_apply_load_matrix.py` soroswap TX=2000 T=8 runs against the baseline medians in `ai-summary/CURRENT_STATE.md`. The relevant top-line metric is apply/close time; subphase logs should show `soroban_parallel` decreasing by at least about 9 ms per ledger to clear the Medium threshold, with no regression in `commit_from_thrds`, `commit_to_ltx`, or tail phases.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-01
+**PoC by**: claude-opus-4.7, high
+
+### Changes Made
+
+- `src/ledger/LedgerManagerImpl.h` — Forward-declared `ParallelApplyWorkerPool`,
+  added `std::unique_ptr<ParallelApplyWorkerPool> mApplyWorkerPool` member, and
+  declared an out-of-line `~LedgerManagerImpl()` so the unique_ptr destructor
+  can see the complete type.
+- `src/ledger/LedgerManagerImpl.cpp` — Defined `ParallelApplyWorkerPool`: a
+  bounded persistent worker pool with a mutex+condvar task queue and
+  `std::packaged_task<void()>` jobs. Workers are spawned lazily up to the
+  largest cluster count seen and reused for the lifetime of the
+  `LedgerManagerImpl`. Added the destructor (`= default`) and constructor
+  initialization. Refactored
+  `LedgerManagerImpl::applySorobanStageClustersInParallel` to:
+    * pre-size `threadStates` to `stage.numClusters()` so each worker writes
+      its slot by cluster index (preserving deterministic merge order in
+      `commitChangesFromThreads`),
+    * build a vector of `packaged_task`s wrapping the existing `applyThread`
+      logic (each constructed with its fresh `ThreadParallelApplyLedgerState`),
+    * submit the batch to `mApplyWorkerPool->submitBatch(...)`, then await
+      each future in submission/cluster-index order with the same
+      `printErrorAndAbort` exception-propagation behavior as the previous
+      `std::async` path.
+  The `DeactivateScopeGuard` over the `GlobalParallelApplyLedgerState` and
+  the per-cluster scope index passed to `ThreadParallelApplyLedgerState`
+  construction are unchanged.
+
+### Demonstration
+
+The previous implementation called `std::async(std::launch::async, ...)` for
+every cluster of every stage (41 stage launches and up to 8 clusters each in
+the soroswap trace), creating and tearing down hundreds of OS threads per
+ledger inside the measured `applySorobanStageClustersInParallel` window.
+With this change, the pool spawns at most `max(stage.numClusters())` threads
+once and dispatches each cluster job through a queue+condvar handoff, so per-
+stage cost reduces to two notify_all calls plus N `future::get()` waits and
+the workers stay live across stages and across ledgers. Cluster construction,
+scope guarding, sequential intra-cluster apply, and ordered merge are all
+preserved unchanged.
+
+### Test Results
+
+- `./src/stellar-core test "[parallelapply]"` — all 23 test cases /
+  2,721,857 assertions pass.
+- `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`
+  — full unit suite + `selftest-nopg` + `check-nondet` exit 0; final
+  `All 2 tests passed` reported, with every Rust submodule `test result:
+  ok. 0 failed` line confirmed and no `FAIL`/`ERROR` lines in the output.
