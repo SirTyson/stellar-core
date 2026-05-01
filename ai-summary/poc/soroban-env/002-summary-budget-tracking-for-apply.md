@@ -93,3 +93,25 @@ Key correctness constraints for the PoC:
 - **Change description**: Add an explicit budget tracking mode, keeping full tracking as the default. Use a summary mode only for `invoke_host_function_or_maybe_panic` in the Core bridge. In summary mode, skip full `BudgetTracker` per-cost updates in `BudgetImpl::charge`, but still update aggregate `BudgetDimension` totals and a dedicated `vm_instantiation_cpu` summary when `ty == ContractCostType::VmInstantiation`. Keep `time_tracker` or an equivalent `VmInstantiation` time accumulator because Core uses `time_nsecs_excluding_vm_instantiation`.
 - **Correctness check**: Existing Rust host tests that inspect `get_tracker` should continue to use full tracking and remain unchanged. Exact budget/resource tests should verify unchanged aggregate `cpu_insns` and `mem_bytes`. Add focused coverage for the new summary mode if it exposes a constructor: charging linear and constant cost types should still reject mismatched `input`, and `VmInstantiation` CPU/time summaries should match full-tracking mode.
 - **Benchmark focus**: Compare non-Tracy `scripts/run_apply_load_matrix.py` runs for soroswap and max-sac before/after. The primary metric is soroswap median apply time; the hypothesis needs a reproducible 3-10% median improvement to satisfy this objective. A diagnostic trace can be used only to confirm reduced budget-charge self-time after the non-Tracy signal is established.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-01
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/budget.rs:198-254,270-333,377-390,1393-1427,1559-1593` — added an explicit `BudgetTrackingMode`, kept `Full` tracking as the default, added summary-tracking construction for p26 production invocation budgets, preserved input-shape validation, and maintained a dedicated `vm_instantiation_cpu` accumulator for Core's `cpu_insns_excluding_vm_instantiation` summary.
+- `src/rust/src/soroban_proto_all.rs:95-114,271-300,446-475,621-650,835-864,1044-1073` — added per-protocol budget-construction and VM-instantiation CPU summary adapters so only p26 uses summary tracking while p21-p25 retain existing full-tracking semantics.
+- `src/rust/src/soroban_proto_any.rs:409-466` — changed the shared invoke path to construct budgets through the protocol adapter and compute `cpu_insns_excluding_vm_instantiation` through the protocol adapter instead of directly reading the full per-cost tracker.
+
+### Demonstration
+
+The p26 production Core invoke path now skips per-cost diagnostic tracker updates for every non-shadow budget charge, while still charging aggregate CPU/memory dimensions, checking limits, validating cost-type input shape, and preserving the exact VM-instantiation CPU subtraction used by the bridge output. Default/test/bench/cost-runner budgets still use full tracking, so diagnostic `get_tracker` consumers retain their prior behavior outside the optimized Core apply path.
+
+### Test Results
+
+Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`, built with `make -j $(nproc)`, and ran `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`. The full run completed successfully; the p26 Soroban host unit tests reported `750 passed; 0 failed; 2 ignored`, the additional p26 integration/doc tests passed, and the top-level suite ended with `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.

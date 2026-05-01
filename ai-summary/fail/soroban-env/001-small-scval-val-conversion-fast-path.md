@@ -193,3 +193,48 @@ patches.
   commit.
 - Code change content is unchanged from the prior POC_PASS iteration;
   test results from that iteration apply.
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-05-01
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** YES — source inspection confirms `Host::from_host_val`, `Host::from_host_val_for_storage`, and `Host::to_host_val` now fast-path allow-listed immediate values before the generic depth-limited conversion path.
+2. **Are the preconditions realistic?** PARTIAL — the conversion helpers are exercised by the soroswap apply path, but the real workload did not benefit from bypassing this wrapper work.
+3. **Is the original code inefficient or working as designed?** INEFFICIENCY — the removed work is unmetered wrapper/depth-limiter/classification overhead for non-recursive immediate values, not an intentional correctness charge. The implementation keeps object conversions on the existing path.
+4. **Does the benchmark improvement match the claimed severity?** NO — the required non-Tracy matrix runs showed a regression, not an improvement. Accepted baseline soroswap medians were 278.119725 ms, 279.118436 ms, and 278.981930 ms; optimized medians were 281.722937 ms, 289.963655 ms, and 286.868784 ms. The optimized soroswap average regressed from 278.740030 ms to 286.185125 ms (-2.67%). SAC also regressed from 317.717361 ms average to 338.458279 ms average (-6.53%).
+5. **Is the optimization in scope?** YES — the changed conversion helpers run inside Soroban host execution during `closeLedger`; the rejected result is not due to being out of scope.
+6. **Is the benchmark methodology correct?** YES — built the optimized handoff, ran the full regression suite, then ran `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` three times without `--tracy`, comparing against `ai-summary/CURRENT_STATE.md` as required.
+7. **Can the improvement be explained without the optimization?** N/A — no improvement was measured. The repeated regression is sufficient to reject without a diagnostic Tracy run.
+8. **Is this optimization novel?** YES — no duplicate accepted optimization was identified; novelty does not overcome the benchmark regression.
+
+### Rejection Reason
+
+The production code change is correct enough to pass the full test suite, but it fails the performance objective: all three authoritative non-Tracy soroswap benchmark runs are slower than the accepted baseline, and SAC regresses as well. Because soroswap apply time is the headline metric, this blocks CONFIRMED and warrants rejection.
+
+### Failed Checks
+
+- Step 5 / Benchmark improvement: FAILED — optimized soroswap medians regressed in all three non-Tracy runs.
+- Step 7.4 / Severity support: FAILED — measured result is a 2.67% soroswap regression, not a Low-or-better improvement.
+- Verdict criteria / Soroswap-vs-Max-SAC tradeoff: FAILED — both soroswap and SAC regressed.
+
+### Independent Verification
+
+- Build: `make -j $(nproc)` completed successfully under the existing Tracy-enabled configuration.
+- Regression tests: `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` passed cleanly.
+- Benchmark runs:
+
+| run | run id | scenario | median_ms | p95_ms | p99_ms |
+|-----|--------|----------|-----------|--------|--------|
+| 1 | `4fdce75942a6-20260501-072511` | sac, TX=6000, T=8 | 327.468997 | 352.032596 | 361.220530 |
+| 1 | `4fdce75942a6-20260501-072511` | soroswap, TX=2000, T=8 | 281.722937 | 287.936966 | 293.785085 |
+| 2 | `4fdce75942a6-20260501-073155` | sac, TX=6000, T=8 | 338.735627 | 368.285746 | 389.983505 |
+| 2 | `4fdce75942a6-20260501-073155` | soroswap, TX=2000, T=8 | 289.963655 | 298.042720 | 304.007072 |
+| 3 | `4fdce75942a6-20260501-073848` | sac, TX=6000, T=8 | 349.170214 | 367.425883 | 378.090974 |
+| 3 | `4fdce75942a6-20260501-073848` | soroswap, TX=2000, T=8 | 286.868784 | 292.630211 | 309.904976 |
