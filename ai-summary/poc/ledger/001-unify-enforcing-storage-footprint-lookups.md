@@ -67,7 +67,7 @@ The hot enforcing path is `invoke_host_function` building an enforcing `Storage`
 - `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:959-1052` — storage-map construction verifies every supplied ledger entry is in the footprint and pads missing footprint keys with `None`, establishing the enforcing key-set invariant.
 - `src/rust/soroban/p26/soroban-env-host/src/storage.rs:130-153` — `Footprint::enforce_access` performs a metered binary search and checks the requested `AccessType`.
 - `src/rust/soroban/p26/soroban-env-host/src/storage.rs:252-267` — `try_get_full_helper` calls `prepare_read_only_access` and then immediately does `self.map.get` for the same key.
-- `src/rust/soroban/p26/soroban-env-host/src/storage.rs:333-357` — `put_opt_helper` enforces read-write access and then calls `self.map.insert`, which re-searches the storage map before rebuilding it.
+- `src/rust/soroban/p26/soroban-env-host/src/storage.rs:333-357` — `put_opt_helper` enforces read-write access and then calls `StorageMap::insert`, which re-searches the storage map before rebuilding it.
 - `src/rust/soroban/p26/soroban-env-host/src/storage.rs:421-429, 431-642` — `has` and TTL extension paths funnel through `try_get_full` / `get_with_live_until_ledger`, so they inherit the duplicate read lookup.
 - `src/rust/soroban/p26/soroban-env-host/src/host.rs:2210-2285` and `src/rust/soroban/p26/soroban-env-host/src/host/data_helper.rs:113-164, 509-560` — contract storage host functions and helper paths call the durable `Storage` get/has/put APIs during guest execution.
 - `src/rust/soroban/p26/soroban-env-host/src/host/metered_map.rs:168-242` — `MeteredOrdMap::get` runs `find`, charges binary-search access, and then charges value access; this is paid twice for enforcing reads today.
@@ -89,3 +89,27 @@ Budget accounting is the main implementation constraint. Removing a real binary 
 - **Change description**: For enforcing mode only, avoid doing both `FootprintMap::get` and `StorageMap::get`/`insert` by reusing a single lookup result. The narrowest approach is to add an internal `MeteredOrdMap` API that returns the found index with the value, have `Footprint::enforce_access` return that index/access type in enforcing reads/writes, then use `StorageMap::get_at_index` or a new replace-at-index helper after asserting/debug-checking the key at that index matches. A broader approach is an enforcing-only map value that stores `(AccessType, Option<EntryWithLiveUntil>)`, while keeping recording mode on the existing separate footprint/storage machinery.
 - **Correctness check**: Existing Soroban invoke, storage, TTL extension, authorization, and recording-mode tests should cover footprint enforcement, missing values, read-only/write violations, deletes, TTL bumps, and budget-sensitive behavior. Pay special attention to tests that assert budget/instruction counts and to recording-mode tests where storage and footprint do not necessarily have identical key sets.
 - **Benchmark focus**: Add temporary Tracy zones or counters separating `Footprint::enforce_access` calls made from enforcing durable `Storage` reads/writes from other `MeteredOrdMap` users. The PoC should show fewer `map lookup` events in `Host::invoke_function`/`storage get` descendants and a reproducible 3-10% improvement in soroswap apply time across the objective's repeated non-Tracy apply-load matrix runs.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-01
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/host/metered_map.rs:227-250,328-380` — added `get_with_index` so callers can receive a successful lookup ordinal with the value, and adjusted `insert_at_known_position` to replace by known ordinal without charging or executing another binary-search lookup.
+- `src/rust/soroban/p26/soroban-env-host/src/storage.rs:131-160,191-200,261-305,376-399,490-567,752-780` — made enforcing footprint access return the found ordinal, removed the runtime side-index maps, and reused that ordinal for enforcing reads, writes/deletes, and TTL-extension replacements. Recording mode still uses the existing lookup/cache behavior.
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:188-218,514-516,892` — removed the now-unneeded storage side-index plumbing from initial-entry metadata positioning.
+- `src/rust/soroban/p26/soroban-env-host/src/test/hostile.rs:527-538` — updated the `excessive_logging` budget expectation to the lower CPU/MemCpy/MemCmp values caused by eliminating one ordered-map search.
+- `src/rust/soroban/p26/soroban-env-host/observations/26/*.json` — refreshed 14 p26 host observation files whose CPU trace values changed due to the cheaper enforcing-storage lookup path.
+
+### Demonstration
+
+The implementation demonstrates the reviewed narrow design: enforcing-mode footprint validation performs the single ordered-map search and returns the key ordinal, then storage reads use `get_at_index` and writes/TTL updates use `insert_at_known_position` at that same ordinal. This removes the second same-key storage-map binary search from durable enforcing storage access while preserving recording-mode behavior and the fixed key-set invariant established when enforcing storage is built.
+
+### Test Results
+
+Configured and built with Tracy capture enabled using `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` and `make -j $(nproc)`. Full regression suite passed with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`: `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, `All 2 tests passed`.
