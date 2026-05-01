@@ -46,6 +46,7 @@ class Database;
 class LedgerTxnHeader;
 class BasicWork;
 class ParallelLedgerInfo;
+class ParallelApplyWorkerPool;
 
 #ifdef BUILD_TESTS
 namespace BucketTestUtils
@@ -380,7 +381,8 @@ class LedgerManagerImpl : public LedgerManager
         AppConnector& app, ApplyStage const& stage,
         GlobalParallelApplyLedgerState const& globalState,
         Hash const& sorobanBasePrngSeed, Config const& config,
-        ParallelLedgerInfo const& ledgerInfo);
+        ParallelLedgerInfo const& ledgerInfo,
+        ParallelApplyWorkerPool& workerPool);
 
     void checkAllTxBundleInvariants(AppConnector& app, ApplyStage const& stage,
                                     Config const& config,
@@ -390,7 +392,8 @@ class LedgerManagerImpl : public LedgerManager
     void applySorobanStage(AppConnector& app, LedgerHeader const& header,
                            GlobalParallelApplyLedgerState& globalParState,
                            ApplyStage const& stage,
-                           Hash const& sorobanBasePrngSeed);
+                           Hash const& sorobanBasePrngSeed,
+                           ParallelApplyWorkerPool& workerPool);
 
     void applySorobanStages(AppConnector& app, AbstractLedgerTxn& ltx,
                             std::vector<ApplyStage> const& stages,

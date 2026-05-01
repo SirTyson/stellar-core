@@ -74,8 +74,11 @@
 
 #include "LedgerManagerImpl.h"
 #include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <regex>
 #include <sstream>
@@ -156,6 +159,88 @@ mergeOpInTx(std::vector<Operation> const& ops)
     return false;
 }
 }
+
+class ParallelApplyWorkerPool
+{
+    std::mutex mMutex;
+    std::condition_variable mWorkAvailable;
+    std::deque<std::packaged_task<void()>> mTasks;
+    std::vector<std::thread> mWorkers;
+    bool mStopping{false};
+
+    void
+    ensureWorkerCount(size_t count)
+    {
+        while (mWorkers.size() < count)
+        {
+            mWorkers.emplace_back([this]() { workerLoop(); });
+        }
+    }
+
+    void
+    workerLoop()
+    {
+        for (;;)
+        {
+            std::packaged_task<void()> task;
+            {
+                std::unique_lock<std::mutex> lock(mMutex);
+                mWorkAvailable.wait(
+                    lock, [this] { return mStopping || !mTasks.empty(); });
+                if (mStopping && mTasks.empty())
+                {
+                    return;
+                }
+                task = std::move(mTasks.front());
+                mTasks.pop_front();
+            }
+            task();
+        }
+    }
+
+  public:
+    ParallelApplyWorkerPool() = default;
+    ParallelApplyWorkerPool(ParallelApplyWorkerPool const&) = delete;
+    ParallelApplyWorkerPool& operator=(ParallelApplyWorkerPool const&) = delete;
+
+    ~ParallelApplyWorkerPool()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            mStopping = true;
+        }
+        mWorkAvailable.notify_all();
+        for (auto& worker : mWorkers)
+        {
+            worker.join();
+        }
+    }
+
+    std::vector<std::future<void>>
+    submitBatch(std::vector<std::packaged_task<void()>>&& tasks)
+    {
+        if (tasks.empty())
+        {
+            return {};
+        }
+
+        ensureWorkerCount(tasks.size());
+
+        std::vector<std::future<void>> futures;
+        futures.reserve(tasks.size());
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            releaseAssert(!mStopping);
+            for (auto& task : tasks)
+            {
+                futures.emplace_back(task.get_future());
+                mTasks.emplace_back(std::move(task));
+            }
+        }
+        mWorkAvailable.notify_all();
+        return futures;
+    }
+};
 
 std::unique_ptr<LedgerManager>
 LedgerManager::create(Application& app)
@@ -2532,34 +2617,39 @@ LedgerManagerImpl::applySorobanStageClustersInParallel(
     AppConnector& app, ApplyStage const& stage,
     GlobalParallelApplyLedgerState const& globalState,
     Hash const& sorobanBasePrngSeed, Config const& config,
-    ParallelLedgerInfo const& ledgerInfo)
+    ParallelLedgerInfo const& ledgerInfo, ParallelApplyWorkerPool& workerPool)
 {
     ZoneScoped;
 
-    std::vector<std::unique_ptr<ThreadParallelApplyLedgerState>> threadStates;
-    std::vector<std::future<std::unique_ptr<ThreadParallelApplyLedgerState>>>
-        threadFutures;
+    std::vector<std::unique_ptr<ThreadParallelApplyLedgerState>> threadStates(
+        stage.numClusters());
+    std::vector<std::packaged_task<void()>> threadTasks;
+    threadTasks.reserve(stage.numClusters());
 
     DeactivateScopeGuard globalStateDeactivateGuard(globalState);
 
     for (size_t i = 0; i < stage.numClusters(); ++i)
     {
-        auto const& cluster = stage.getCluster(i);
+        auto const* cluster = &stage.getCluster(i);
         auto threadStatePtr = std::make_unique<ThreadParallelApplyLedgerState>(
-            app, globalState, cluster, i);
-        threadFutures.emplace_back(std::async(
-            std::launch::async, &LedgerManagerImpl::applyThread, this,
-            std::ref(app), std::move(threadStatePtr), std::cref(cluster),
-            std::cref(config), ledgerInfo, sorobanBasePrngSeed));
+            app, globalState, *cluster, i);
+        threadTasks.emplace_back(
+            [this, &app, &config, ledgerInfo, sorobanBasePrngSeed,
+             &threadStates, i, cluster,
+             threadStatePtr = std::move(threadStatePtr)]() mutable {
+                threadStates.at(i) = applyThread(
+                    app, std::move(threadStatePtr), *cluster, config,
+                    ledgerInfo, sorobanBasePrngSeed);
+            });
     }
 
+    auto threadFutures = workerPool.submitBatch(std::move(threadTasks));
     for (auto& threadFuture : threadFutures)
     {
         releaseAssert(threadFuture.valid());
         try
         {
-            auto futureResult = threadFuture.get();
-            threadStates.emplace_back(std::move(futureResult));
+            threadFuture.get();
         }
         catch (std::exception const& e)
         {
@@ -2570,7 +2660,10 @@ LedgerManagerImpl::applySorobanStageClustersInParallel(
             printErrorAndAbort("Unknown exception on apply thread");
         }
     }
-    threadFutures.clear();
+    for (auto const& threadState : threadStates)
+    {
+        releaseAssert(threadState);
+    }
     return threadStates;
 }
 
@@ -2623,7 +2716,7 @@ void
 LedgerManagerImpl::applySorobanStage(
     AppConnector& app, LedgerHeader const& header,
     GlobalParallelApplyLedgerState& globalParState, ApplyStage const& stage,
-    Hash const& sorobanBasePrngSeed)
+    Hash const& sorobanBasePrngSeed, ParallelApplyWorkerPool& workerPool)
 {
     ZoneScoped;
     auto const& config = app.getConfig();
@@ -2633,7 +2726,8 @@ LedgerManagerImpl::applySorobanStage(
     auto subStart = std::chrono::steady_clock::now();
 #endif
     auto threadStates = applySorobanStageClustersInParallel(
-        app, stage, globalParState, sorobanBasePrngSeed, config, ledgerInfo);
+        app, stage, globalParState, sorobanBasePrngSeed, config, ledgerInfo,
+        workerPool);
 #ifdef BUILD_TESTS
     auto subEnd = std::chrono::steady_clock::now();
     mLastPhaseTimings.sorobanParallelApplyMs +=
@@ -2698,10 +2792,13 @@ LedgerManagerImpl::applySorobanStages(AppConnector& app, AbstractLedgerTxn& ltx,
         mLastPhaseTimings.sorobanCommitFromThreadsMs = 0;
         mLastPhaseTimings.sorobanDestroyThreadStatesMs = 0;
 #endif
-        for (auto const& stage : stages)
         {
-            applySorobanStage(app, header, globalParState, stage,
-                              sorobanBasePrngSeed);
+            ParallelApplyWorkerPool workerPool;
+            for (auto const& stage : stages)
+            {
+                applySorobanStage(app, header, globalParState, stage,
+                                  sorobanBasePrngSeed, workerPool);
+            }
         }
 #ifdef BUILD_TESTS
         auto subStart = std::chrono::steady_clock::now();
