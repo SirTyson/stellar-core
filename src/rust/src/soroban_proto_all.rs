@@ -92,6 +92,27 @@ pub(crate) mod p26 {
         v.interface.protocol
     }
 
+    pub(crate) fn new_invocation_budget(
+        cpu_limit: u64,
+        mem_limit: u64,
+        cpu_cost_params: soroban_env_host::xdr::ContractCostParams,
+        mem_cost_params: soroban_env_host::xdr::ContractCostParams,
+    ) -> Result<Budget, HostError> {
+        Budget::try_from_configs_summary_tracking(
+            cpu_limit,
+            mem_limit,
+            cpu_cost_params,
+            mem_cost_params,
+        )
+    }
+
+    pub(crate) fn get_cpu_insns_excluding_vm_instantiation(
+        budget: &Budget,
+        _cpu_insns: u64,
+    ) -> Result<u64, HostError> {
+        budget.get_cpu_insns_excluding_vm_instantiation()
+    }
+
     pub fn invoke_host_function_with_trace_hook_and_module_cache<
         T: AsRef<[u8]>,
         I: ExactSizeIterator<Item = T>,
@@ -245,6 +266,26 @@ pub(crate) mod p25 {
 
     pub(crate) const fn get_version_protocol(v: &soroban_env_host::Version) -> u32 {
         v.interface.protocol
+    }
+
+    pub(crate) fn new_invocation_budget(
+        cpu_limit: u64,
+        mem_limit: u64,
+        cpu_cost_params: soroban_env_host::xdr::ContractCostParams,
+        mem_cost_params: soroban_env_host::xdr::ContractCostParams,
+    ) -> Result<Budget, HostError> {
+        Budget::try_from_configs(cpu_limit, mem_limit, cpu_cost_params, mem_cost_params)
+    }
+
+    pub(crate) fn get_cpu_insns_excluding_vm_instantiation(
+        budget: &Budget,
+        cpu_insns: u64,
+    ) -> Result<u64, HostError> {
+        Ok(cpu_insns.saturating_sub(
+            budget
+                .get_tracker(soroban_env_host::xdr::ContractCostType::VmInstantiation)?
+                .cpu,
+        ))
     }
 
     pub fn invoke_host_function_with_trace_hook_and_module_cache<
@@ -402,6 +443,26 @@ pub(crate) mod p24 {
         v.interface.protocol
     }
 
+    pub(crate) fn new_invocation_budget(
+        cpu_limit: u64,
+        mem_limit: u64,
+        cpu_cost_params: soroban_env_host::xdr::ContractCostParams,
+        mem_cost_params: soroban_env_host::xdr::ContractCostParams,
+    ) -> Result<Budget, HostError> {
+        Budget::try_from_configs(cpu_limit, mem_limit, cpu_cost_params, mem_cost_params)
+    }
+
+    pub(crate) fn get_cpu_insns_excluding_vm_instantiation(
+        budget: &Budget,
+        cpu_insns: u64,
+    ) -> Result<u64, HostError> {
+        Ok(cpu_insns.saturating_sub(
+            budget
+                .get_tracker(soroban_env_host::xdr::ContractCostType::VmInstantiation)?
+                .cpu,
+        ))
+    }
+
     pub fn invoke_host_function_with_trace_hook_and_module_cache<
         T: AsRef<[u8]>,
         I: ExactSizeIterator<Item = T>,
@@ -555,6 +616,26 @@ pub(crate) mod p23 {
 
     pub(crate) const fn get_version_protocol(v: &soroban_env_host::Version) -> u32 {
         v.interface.protocol
+    }
+
+    pub(crate) fn new_invocation_budget(
+        cpu_limit: u64,
+        mem_limit: u64,
+        cpu_cost_params: soroban_env_host::xdr::ContractCostParams,
+        mem_cost_params: soroban_env_host::xdr::ContractCostParams,
+    ) -> Result<Budget, HostError> {
+        Budget::try_from_configs(cpu_limit, mem_limit, cpu_cost_params, mem_cost_params)
+    }
+
+    pub(crate) fn get_cpu_insns_excluding_vm_instantiation(
+        budget: &Budget,
+        cpu_insns: u64,
+    ) -> Result<u64, HostError> {
+        Ok(cpu_insns.saturating_sub(
+            budget
+                .get_tracker(soroban_env_host::xdr::ContractCostType::VmInstantiation)?
+                .cpu,
+        ))
     }
 
     pub fn invoke_host_function_with_trace_hook_and_module_cache<
@@ -751,6 +832,26 @@ pub(crate) mod p22 {
         v.interface.protocol
     }
 
+    pub(crate) fn new_invocation_budget(
+        cpu_limit: u64,
+        mem_limit: u64,
+        cpu_cost_params: soroban_env_host::xdr::ContractCostParams,
+        mem_cost_params: soroban_env_host::xdr::ContractCostParams,
+    ) -> Result<Budget, HostError> {
+        Budget::try_from_configs(cpu_limit, mem_limit, cpu_cost_params, mem_cost_params)
+    }
+
+    pub(crate) fn get_cpu_insns_excluding_vm_instantiation(
+        budget: &Budget,
+        cpu_insns: u64,
+    ) -> Result<u64, HostError> {
+        Ok(cpu_insns.saturating_sub(
+            budget
+                .get_tracker(soroban_env_host::xdr::ContractCostType::VmInstantiation)?
+                .cpu,
+        ))
+    }
+
     pub fn invoke_host_function_with_trace_hook_and_module_cache<
         T: AsRef<[u8]>,
         I: ExactSizeIterator<Item = T>,
@@ -938,6 +1039,26 @@ pub(crate) mod p21 {
 
     pub(crate) const fn get_version_protocol(v: &soroban_env_host::Version) -> u32 {
         soroban_env_host::meta::get_ledger_protocol_version(v.interface)
+    }
+
+    pub(crate) fn new_invocation_budget(
+        cpu_limit: u64,
+        mem_limit: u64,
+        cpu_cost_params: soroban_env_host::xdr::ContractCostParams,
+        mem_cost_params: soroban_env_host::xdr::ContractCostParams,
+    ) -> Result<Budget, HostError> {
+        Budget::try_from_configs(cpu_limit, mem_limit, cpu_cost_params, mem_cost_params)
+    }
+
+    pub(crate) fn get_cpu_insns_excluding_vm_instantiation(
+        budget: &Budget,
+        cpu_insns: u64,
+    ) -> Result<u64, HostError> {
+        Ok(cpu_insns.saturating_sub(
+            budget
+                .get_tracker(soroban_env_host::xdr::ContractCostType::VmInstantiation)?
+                .cpu,
+        ))
     }
 
     pub fn invoke_host_function_with_trace_hook_and_module_cache<

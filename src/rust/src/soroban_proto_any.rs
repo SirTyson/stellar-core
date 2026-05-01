@@ -409,7 +409,7 @@ fn invoke_host_function_or_maybe_panic(
 
     let protocol_version = ledger_info.protocol_version;
 
-    let budget = Budget::try_from_configs(
+    let budget = super::new_invocation_budget(
         instruction_limit as u64,
         ledger_info.memory_limit as u64,
         // These are the only non-metered XDR conversions that we perform. They
@@ -457,11 +457,8 @@ fn invoke_host_function_or_maybe_panic(
 
     let cpu_insns = budget.get_cpu_insns_consumed()?;
     let mem_bytes = budget.get_mem_bytes_consumed()?;
-    let cpu_insns_excluding_vm_instantiation = cpu_insns.saturating_sub(
-        budget
-            .get_tracker(xdr::ContractCostType::VmInstantiation)?
-            .cpu,
-    );
+    let cpu_insns_excluding_vm_instantiation =
+        super::get_cpu_insns_excluding_vm_instantiation(&budget, cpu_insns)?;
     let time_nsecs_excluding_vm_instantiation =
         time_nsecs.saturating_sub(budget.get_time(xdr::ContractCostType::VmInstantiation)?);
     #[cfg(feature = "tracy")]
