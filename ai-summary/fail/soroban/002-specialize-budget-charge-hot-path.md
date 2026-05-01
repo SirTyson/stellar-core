@@ -310,3 +310,54 @@ summary. The current revision changed only the outer gitlink metadata; handoff
 verification now shows `git ls-tree HEAD src/rust/soroban/p26` at
 `33cf228d00fd84f24f838db556d17648abf5629b` and
 `git status --short -- ':!ai-summary'` clean.
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-05-01
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** YES — the p26 source diff routes the ubiquitous single-unit `Budget::charge(ty, input)` path through `BudgetImpl::charge_one`, avoiding the generic bulk-charge path while preserving the existing public API.
+2. **Are the preconditions realistic?** YES — Soroswap apply invokes Soroban host metering frequently through object visits, storage/map operations, XDR conversion, and dispatch.
+3. **Is the original code inefficient or working as designed?** INEFFICIENCY — the generic bulk-charge machinery is not required for the common single-iteration call, provided exact accounting and failure ordering are preserved.
+4. **Does the benchmark improvement match the claimed severity?** NO — the authoritative non-Tracy matrix runs regressed the headline soroswap apply-time metric in all three runs, so there is no supported improvement to grade.
+5. **Is the optimization in scope?** YES — the modified budget metering path is executed during `closeLedger` Soroban apply.
+6. **Is the benchmark methodology correct?** YES — final review used the required local-build command `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` three times without `--tracy`, compared against `ai-summary/CURRENT_STATE.md`.
+7. **Can the improvement be explained without the optimization?** N/A — no improvement was measured. The observed top-line result is a regression rather than a win.
+8. **Is this optimization novel?** YES — no duplicate accepted optimization was identified during this review.
+
+### Independent Verification
+
+- Handoff reproducibility check passed: the outer PoC branch records `src/rust/soroban/p26` at committed submodule SHA `33cf228d00fd84f24f838db556d17648abf5629b`, and both outer and p26 source worktrees were clean before validation, excluding the shared `ai-summary` artifact tree.
+- Source audit found the change narrow and plausibly correctness-preserving: `Budget::charge` uses the new single-charge path, `bulk_charge` still uses the existing generic path except for the `iterations == 1` case, and the added budget metering test covers accounting totals, input-shape failure, CPU-limit failure, memory-limit failure, shadow mode, and meter-count preservation.
+- Full gate passed after configuring with Tracy enabled: `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`, `make -j30`, and `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` completed successfully with `All 2 tests passed`.
+
+### Benchmark Results
+
+Baseline values are the accepted non-Tracy apply-time numbers from `ai-summary/CURRENT_STATE.md`. Optimized values are from this final review's three required non-Tracy matrix runs.
+
+| run | scenario | baseline median_ms | optimized median_ms | result |
+|-----|----------|--------------------|---------------------|--------|
+| 1 | sac, TX=6000, T=8 | 312.139381 | 333.571607 | 6.87% slower |
+| 1 | soroswap, TX=2000, T=8 | 278.119725 | 282.048602 | 1.41% slower |
+| 2 | sac, TX=6000, T=8 | 305.929053 | 330.434463 | 8.01% slower |
+| 2 | soroswap, TX=2000, T=8 | 279.118436 | 289.397505 | 3.68% slower |
+| 3 | sac, TX=6000, T=8 | 335.083649 | 329.519196 | 1.66% faster |
+| 3 | soroswap, TX=2000, T=8 | 278.981930 | 285.645994 | 2.39% slower |
+
+Average soroswap median moved from 278.740030 ms to 285.697367 ms, a 2.50% regression. Average SAC median moved from 317.717361 ms to 331.175088 ms, a 4.24% regression. Because soroswap regressed in every optimized run, the optimization fails the objective's verdict criteria and no diagnostic Tracy run was warranted.
+
+### Rejection Reason
+
+The optimization is correctness-safe enough to build and test, but it does not deliver a measurable apply-time improvement. The required non-Tracy benchmark workflow shows a consistent soroswap regression against the accepted baseline, so the claimed performance finding is unsupported.
+
+### Failed Checks
+
+- Step 5 / benchmark gate: no measurable improvement; all three soroswap optimized medians are slower than the accepted baseline medians.
+- Step 7.4 / severity check: the observed delta is a 2.50% average soroswap regression, not a Medium improvement.
+- Verdict criteria: soroswap regresses, which blocks CONFIRMED.

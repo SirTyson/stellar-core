@@ -178,3 +178,48 @@ Estimated impact is Medium. The measured soroswap `soroban_setup_glbl` median is
 - **Change description**: replace the `LedgerSnapshot current/previous` value-comparison classifier with a classic-key predicate based on `AbstractLedgerTxn::isModifiedKey(key)` or an equivalent mutable modified-key set. Keep the `isSorobanEntry` guard. If using a set rather than `isModifiedKey`, initialize it after fee/classic processing and update it after any sequential `preParallelApply` write before classifying later txs.
 - **Correctness check**: existing protocol-26 Soroban and fee-bump pre-auth signer tests exercise the sequence/signature side effects that make stale read-only pre-apply unsafe; any PoC should also cover a later tx whose source/op-source/footprint references an account modified by an earlier sequential pre-apply.
 - **Benchmark focus**: compare median `soroban_setup_glbl` and top-line `apply_transactions` in `scripts/run_apply_load_matrix.py --benchmarks soroswap --threads 8` over repeated runs. The expected signal is a multi-millisecond drop in `soroban_setup_glbl`; promote only if top-line apply time improves by at least the objective's 3% Medium threshold.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-01
+**PoC by**: claude-opus-4.7, high
+
+### Changes Made
+
+- `src/transactions/ParallelApplyUtils.cpp` (lines 151-208): Replaced the
+  `LedgerSnapshot current/previous` value-comparison classifier with a direct
+  `AbstractLedgerTxn::isModifiedKey(key)` check.
+  - `isModifiedClassicKey` now takes `AbstractLedgerTxn const& ltx` instead of
+    two `LedgerSnapshot` references and delegates to the existing O(1) EntryMap
+    membership predicate. The `isSorobanEntry` short-circuit is preserved.
+  - `requiresSequentialPreParallelApply` was updated to take and forward the
+    `AbstractLedgerTxn const&` instead of two snapshots.
+- `src/transactions/ParallelApplyUtils.cpp` (lines 431-468):
+  `preParallelApplyAndCollectModifiedClassicEntries` no longer constructs the
+  `LedgerSnapshot current(ltx)` / `LedgerSnapshot previous(mLCLSnapshot)` pair
+  for the protocol-26 classification loop; it passes `ltx` directly.
+
+### Demonstration
+
+The hot per-tx classification used `LedgerSnapshot::load` against both the
+in-flight `LedgerTxn` and the LCL bucket snapshot for every classic key
+referenced (source, fee-source, op-source, plus classic footprint keys),
+amounting to thousands of snapshot loads per soroswap ledger on the apply
+thread before any worker future is launched. The new code reduces each per-key
+check to a single O(1) `mEntry.find(InternalLedgerKey(key))` against the
+existing `LedgerTxn` modified-key map, which already reflects fee/seq
+processing AND any sequential `preParallelApply` writes performed earlier in
+the same loop -- preserving correctness (over-classification is safe;
+under-classification is impossible because the predicate sees every prior
+write to `ltx`).
+
+### Test Results
+
+`env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort
+--disable-dots' make check` ran to completion with all unit tests passing
+(including `selftest-nopg` and `check-nondet`), and all Rust crate tests for
+p21-p26 passed. No regressions observed across the protocol-26 Soroban,
+fee-bump, parallel apply, and LedgerTxn-touching test suites.
