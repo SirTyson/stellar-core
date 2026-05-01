@@ -223,3 +223,88 @@ write to `ltx`).
 (including `selftest-nopg` and `check-nondet`), and all Rust crate tests for
 p21-p26 passed. No regressions observed across the protocol-26 Soroban,
 fee-bump, parallel apply, and LedgerTxn-touching test suites.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-01
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The PoC source change was handed off as uncommitted working-tree state in the
+outer `stellar-core` worktree. Final review cannot benchmark or promote this
+state because a fresh checkout of `poc/003-precompute-modified-classic-keys-for-soroban-setup`
+does not reproduce the optimization: `git status` shows
+`M src/transactions/ParallelApplyUtils.cpp`, while the p26 submodule is clean at
+`a417a96314085a070bd7daf2cb29e85809f21ae3`.
+
+This violates the objective handoff rule that the PoC's outer branch and
+submodule branch must contain committed source changes and have clean worktrees
+before final review measures them. No build, full test suite, or apply-load
+matrix was run because the handoff failed at validation-before-measuring.
+
+### Revision Instructions
+
+Commit the `src/transactions/ParallelApplyUtils.cpp` optimization on the
+outer branch `poc/003-precompute-modified-classic-keys-for-soroban-setup` and
+push it to `github.com/SirTyson/stellar-core`. If any submodule changes become
+part of the PoC, commit and push them to the matching
+`github.com/SirTyson/rs-soroban-env` branch and update the outer gitlink.
+
+Then update this PoC note with the outer commit SHA and any submodule SHA, and
+ensure both worktrees are clean:
+
+```sh
+git status --short
+git -C src/rust/soroban/p26 status --short
+```
+
+After that, final review can rerun the required gate:
+
+```sh
+./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres
+make -j30
+env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check
+PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py
+PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py
+PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py
+```
+
+### Checks Passed So Far
+
+- The hypothesis file was read and the claimed code change was located.
+- The p26 submodule worktree is clean at the previous accepted baseline SHA.
+- The dirty diff in `src/transactions/ParallelApplyUtils.cpp` appears to match
+  the PoC's described implementation target, but it was not tested or
+  benchmarked because the uncommitted outer source change blocks a reproducible
+  final-review handoff.
+
+---
+
+## PoC Attempt — Revision
+
+**Result**: POC_PASS
+**Date**: 2026-05-01
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/transactions/ParallelApplyUtils.cpp` (lines 151-205): Replaced the protocol-26 modified-classic-key classifier from a pair of `LedgerSnapshot::load` calls plus value comparison with `AbstractLedgerTxn::isModifiedKey(key)`, preserving the `isSorobanEntry` guard and making touched-classic-key detection an O(1) EntryMap lookup.
+- `src/transactions/ParallelApplyUtils.cpp` (lines 441-460): Removed construction of `LedgerSnapshot current(ltx)` and `LedgerSnapshot previous(mLCLSnapshot)` in the serial classification loop, and passed the mutable `LedgerTxn` directly so sequential `preParallelApply` writes performed earlier in the loop are visible to later classifications.
+
+### Demonstration
+
+The optimization eliminates the per-transaction current/LCL snapshot value comparison for source, fee-source, op-source, and classic footprint keys during `soroban_setup_glbl`. `LedgerTxn::isModifiedKey` directly answers the required safety predicate using the existing modified-key map, avoiding thousands of serial snapshot loads in soroswap-style ledgers while remaining conservative: keys touched and restored may still force the sequential path, but keys touched by fee/sequence processing or earlier sequential pre-apply writes cannot be missed.
+
+### Test Results
+
+`./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` and `make -j30` completed successfully. `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` completed successfully with `selftest-nopg`, `check-nondet`, and all Rust crate tests passing.
+
+### Handoff
+
+- Outer branch: `poc/003-precompute-modified-classic-keys-for-soroban-setup`
+- Outer commit: `1dbb1b9ec16a052c58430b1d2a58bf37b7327a68`
+- p26 submodule: unchanged at `a417a96314085a070bd7daf2cb29e85809f21ae3` with a clean submodule worktree.
+- Source branch pushed to `origin/poc/003-precompute-modified-classic-keys-for-soroban-setup` for reproducible final-review checkout.
