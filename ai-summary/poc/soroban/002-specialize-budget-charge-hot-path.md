@@ -207,3 +207,106 @@ The optimization makes the ubiquitous `Budget::charge(ty, input)` path use a ded
 ### Test Results
 
 `./autogen.sh`, `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`, and `make -j $(nproc)` completed successfully. `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` completed successfully after initializing required submodules in this fresh worktree; the final output included p26 Soroban Rust tests with `755 passed; 0 failed; 2 ignored` and the top-level `All 2 tests passed` summary.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-01
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The revised handoff is still not reproducible from a committed outer tree. The
+p26 submodule checkout is clean at the PoC commit `33cf228d`, and the staged
+outer gitlink diff points from the accepted baseline `a417a963` to
+`33cf228d`, but `HEAD` of `poc/002-specialize-budget-charge-hot-path` still
+records `src/rust/soroban/p26` at `a417a96314085a070bd7daf2cb29e85809f21ae3`.
+
+`git status --short -- ':!ai-summary'` reports `M  src/rust/soroban/p26`, and
+`git diff --cached --submodule=log -- src/rust/soroban/p26` shows:
+
+```text
+Submodule src/rust/soroban/p26 a417a9631..33cf228d0:
+  > viable poc 002-specialize-budget-charge-hot-path
+```
+
+That means the required outer gitlink update exists only in the index, not in a
+commit. The PoC notes claim an outer commit `89c3a73b9` bumps the gitlink, but
+the current branch history contains only hypothesis-file updates after the prior
+accepted baseline, and `git ls-tree HEAD src/rust/soroban/p26` still shows the
+old baseline SHA. A fresh checkout of the current branch followed by
+`git submodule update --init --recursive src/rust/soroban/p26` would therefore
+check out the old baseline submodule and miss the optimization.
+
+### Revision Instructions
+
+Commit the staged outer gitlink update on
+`poc/002-specialize-budget-charge-hot-path` so that
+`git ls-tree HEAD src/rust/soroban/p26` records
+`33cf228d00fd84f24f838db556d17648abf5629b`. Do not just leave the gitlink
+staged. After committing, verify from the outer repository:
+
+```sh
+git status --short -- ':!ai-summary'
+git ls-tree HEAD src/rust/soroban/p26
+git -C src/rust/soroban/p26 status --short
+```
+
+The next final-review attempt can then run the required build, full test suite,
+and three non-Tracy benchmark runs against `ai-summary/CURRENT_STATE.md`.
+
+### Checks Passed So Far
+
+- The hypothesis and revised PoC notes were read from
+  `ai-summary/poc/soroban/002-specialize-budget-charge-hot-path.md`.
+- The current accepted baseline was read from `ai-summary/CURRENT_STATE.md`.
+- The p26 source diff was traced in `budget.rs`, `budget/dimension.rs`,
+  `budget/model.rs`, and `test/budget_metering.rs`; the optimization targets
+  the claimed single-charge metering path and includes focused budget accounting
+  tests.
+- The submodule itself is clean at `33cf228d`, but the outer branch does not
+  yet commit the gitlink, so final-review build/test/benchmark validation was
+  intentionally not run.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-01
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26` — committed the already-staged outer gitlink update so
+  `HEAD` now records the p26 submodule at
+  `33cf228d00fd84f24f838db556d17648abf5629b`, the committed submodule PoC
+  containing the budget fast-path source changes.
+- `ai-summary/poc/soroban/002-specialize-budget-charge-hot-path.md` — wrote
+  this PoC handoff artifact from the in-progress reviewed hypothesis and
+  appended the current revision notes.
+
+### Demonstration
+
+The optimization itself remains the previously implemented p26 Soroban budget
+single-charge fast path: `Budget::charge(ty, input)` routes through a dedicated
+single-unit routine while preserving CPU/memory totals, tracker fields,
+shadow-mode accounting, and CPU-before-memory limit side-effect ordering. This
+revision demonstrates the reproducibility requirement by making the outer
+stellar-core commit point at the committed p26 PoC SHA, so a fresh checkout can
+reconstruct the optimized source instead of landing on the old baseline
+submodule.
+
+### Test Results
+
+The prior PoC run for this exact p26 source commit completed
+`./autogen.sh`, `./configure --enable-ccache --enable-sdfprefs --enable-tracy
+--enable-tracy-capture --disable-postgres`, `make -j $(nproc)`, and
+`env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort
+--disable-dots' make check` successfully, including p26 Soroban Rust tests with
+`755 passed; 0 failed; 2 ignored` and the top-level `All 2 tests passed`
+summary. The current revision changed only the outer gitlink metadata; handoff
+verification now shows `git ls-tree HEAD src/rust/soroban/p26` at
+`33cf228d00fd84f24f838db556d17648abf5629b` and
+`git status --short -- ':!ai-summary'` clean.
