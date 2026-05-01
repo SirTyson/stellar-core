@@ -85,3 +85,27 @@ The severity is plausibly Medium. The cited trace places almost all 40,872 `push
 - **Change description**: replace enforcing-mode dense `match_stack: Vec<MatchState>` and eager `AuthorizationManagerSnapshot` allocation with sparse frame-depth tracking plus an undo journal or per-frame mutation log. Keep recording mode on the existing representation initially if that is simpler. Push should record a frame marker and replay existing metering, while matches/authentication append undo records only when they mutate tracker state. Error pop should restore from the marker; success pop should discard the journal entries for that frame.
 - **Correctness check**: existing auth tests must continue to cover nested account auth, custom account `__check_auth`, invoker-contract auth, failed subcalls, rollback of `verified` and nonce-consumption side effects, repeated auth attempts after recoverable contract errors, and recording-mode payload generation if that path is touched. Add targeted tests if no existing test fails a nested frame after partially matching a sub-invocation and then retries through another path.
 - **Benchmark focus**: run non-Tracy `scripts/run_apply_load_matrix.py` three times against the current baseline and require a reproducible >=3% soroswap median apply-time improvement. Add temporary diagnostic counters for auth frames, tracker-frame pushes avoided, snapshot allocations avoided, undo records written, and rollback count so the measured delta can be attributed to successful-frame snapshot elision rather than noise.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-01
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/auth.rs:206-329` — added an enforcing-mode undo log, lightweight enforcing snapshot marker, tracker references, and mutation records for invocation exhaustion and account verification state.
+- `src/rust/soroban/p26/soroban-env-host/src/auth.rs:774-796` — added charge-only snapshot traversal and path-based authorized-invocation lookup so enforcing-mode rollback can restore mutated nodes without preallocating full recursive snapshots.
+- `src/rust/soroban/p26/soroban-env-host/src/auth.rs:1236-1432` — changed enforcing-mode `AuthorizationManager::snapshot` to replay the old metering costs while storing only undo-log and invoker-tracker lengths, and changed enforcing-mode rollback to replay undo records and truncate invoker trackers.
+- `src/rust/soroban/p26/soroban-env-host/src/auth.rs:1840-1971` — changed invocation matching to return an undo mutation describing the exhausted invocation path and prior root-processing state, plus a rollback helper for those mutations.
+- `src/rust/soroban/p26/soroban-env-host/src/auth.rs:2087-2162,2487-2518` — recorded undo entries when account or invoker authorization matching mutates tracker state, and recorded the prior account `verified` flag before setting it.
+
+### Demonstration
+
+The PoC removes the eager recursive enforcing-mode `AuthorizationManagerSnapshot` allocation from every auth frame and replaces it with an undo-log marker that is only replayed on failed frames. It preserves the existing dense match stack and its metering after a sparse-frame attempt exposed rollback/observation risks, so this demonstrates the snapshot-elision portion of the reviewed finding while leaving unmatched-frame push removal for a follow-up change.
+
+### Test Results
+
+Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`, built with `make -j $(nproc)`, and ran the full suite with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`. Result: all tests passed, including `test/selftest-nopg` and `test/check-nondet`.
