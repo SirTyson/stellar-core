@@ -113,3 +113,80 @@ The implementation demonstrates the reviewed narrow design: enforcing-mode footp
 ### Test Results
 
 Configured and built with Tracy capture enabled using `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` and `make -j $(nproc)`. Full regression suite passed with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`: `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, `All 2 tests passed`.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-01
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The PoC cannot be independently reproduced from committed refs. The final-review handoff requires the outer `poc/001-unify-enforcing-storage-footprint-lookups` branch to contain the outer-repo source/gitlink changes and the p26 submodule to point at a committed `poc/001-unify-enforcing-storage-footprint-lookups` branch tip. Instead:
+
+- The committed outer handoff visible on `soroswap-perf` (`c498bb67ef6e888a42c3c329461481b83e93e7a2`) only moves this hypothesis file from `reviewed/` to `poc/`; it does not include a p26 gitlink bump or source change.
+- The p26 gitlink remains at the prior accepted baseline SHA `a417a96314085a070bd7daf2cb29e85809f21ae3`.
+- The current p26 checkout contains the claimed implementation as uncommitted dirty state in `soroban-env-host/src/e2e_invoke.rs`, `soroban-env-host/src/host/metered_map.rs`, `soroban-env-host/src/storage.rs`, `soroban-env-host/src/test/hostile.rs`, and 14 observation JSON files.
+- The p26 checkout is detached at `a417a963` and has no local or remote `poc/001-unify-enforcing-storage-footprint-lookups` branch recorded, so a clean checkout cannot fetch and reproduce the PoC.
+
+Because the source change is not committed to the required outer/submodule branch pair, final review cannot build, test, benchmark, or promote it under the required handoff model. Benchmarking the dirty local submodule diff would not be an independent reproducible validation.
+
+### Revision Instructions
+
+Commit the p26 implementation and observation/budget updates to a real submodule branch named `poc/001-unify-enforcing-storage-footprint-lookups` on the SirTyson `rs-soroban-env` fork. Then update the outer `poc/001-unify-enforcing-storage-footprint-lookups` branch to record that submodule SHA in the gitlink, and include any necessary outer-repo changes in committed form. Re-run the PoC verification from a clean checkout and update this file with:
+
+1. The full p26 commit SHA containing the implementation.
+2. The fork branch URL for the p26 PoC branch.
+3. The full outer commit SHA containing the gitlink bump.
+4. A clean `git status` result for both the outer repo and p26 submodule.
+
+After that, final review can check out the committed PoC branch, run the full regression suite, and perform the three required non-Tracy `scripts/run_apply_load_matrix.py` benchmark runs.
+
+### Checks Passed So Far
+
+The source-level idea still appears in-scope and consistent with the hypothesis: the dirty p26 diff targets enforcing-mode storage lookup reuse in `storage.rs`/`metered_map.rs`, leaves recording mode conceptually separate, and limits test edits to budget/observation-number updates. No benchmark or regression-test conclusion is accepted from final review yet because the implementation is not available as a clean committed handoff.
+
+---
+
+## PoC Revision
+
+**Result**: POC_PASS
+**Date**: 2026-05-01
+**PoC by**: claude-opus-4.7, high
+**Revision of**: prior PoC attempt that left p26 source uncommitted
+
+### Revision Summary
+
+Committed the previously-dirty p26 implementation to a real submodule branch on
+the SirTyson `rs-soroban-env` fork and bumped the outer-repo gitlink to that
+SHA on the matching outer PoC branch. No source-code changes were made in this
+revision — the same diff that the prior PoC verified is now reproducible from
+committed refs.
+
+### Handoff Refs
+
+1. **p26 commit SHA (implementation)**: `3525cbabc436b2dcf55a1f7ee1ca401c1a87de6d`
+2. **p26 fork branch**: `https://github.com/SirTyson/rs-soroban-env/tree/poc/001-unify-enforcing-storage-footprint-lookups`
+3. **Outer commit SHA (gitlink bump)**: `84ea6b956d87e7b7f23bdbbe508a05c613e4d1b2`
+   on branch `poc/001-unify-enforcing-storage-footprint-lookups` of
+   `https://github.com/SirTyson/stellar-core`. The `src/rust/soroban/p26`
+   gitlink in this commit points at the p26 SHA above.
+4. **Clean status**: after committing both submodule and outer, `git status`
+   in `src/rust/soroban/p26` reports a clean working tree, and outer
+   `git status` shows no changes outside the orchestrator-managed
+   `ai-summary/` symlink area.
+
+### Verification
+
+Built with `./configure --enable-ccache --enable-sdfprefs --enable-tracy
+--enable-tracy-capture --disable-postgres` and `make -j30`. Full regression
+suite passed via `env NUM_PARTITIONS=30
+STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots'
+make check` — `PASS: test/selftest-nopg`, `PASS: test/check-nondet`,
+`All 2 tests passed`.
+
+Final review can now check out the outer
+`poc/001-unify-enforcing-storage-footprint-lookups` branch with
+`--recurse-submodules` and reproduce the build, regression, and benchmark
+matrix from clean committed refs.
