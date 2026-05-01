@@ -190,3 +190,32 @@ Final review can now check out the outer
 `poc/001-unify-enforcing-storage-footprint-lookups` branch with
 `--recurse-submodules` and reproduce the build, regression, and benchmark
 matrix from clean committed refs.
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-05-01
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** YES — the p26 diff reuses the enforcing footprint lookup ordinal for enforcing-mode durable storage reads, writes/deletes, and TTL-extension replacements. This removes the second same-key ordered-map search on the intended hot path.
+2. **Are the preconditions realistic?** YES — soroswap apply-load exercises enforcing-mode Soroban storage access through `Host::invoke_function`, and enforcing storage construction pads the storage map to the footprint key set.
+3. **Is the original code inefficient or working as designed?** INEFFICIENCY — the duplicate lookup is real and not required for recording-mode semantics, which remain on the keyed fallback path.
+4. **Does the benchmark improvement match the claimed severity?** NO — independent non-Tracy matrix runs showed a soroswap regression, not an improvement. Baseline soroswap medians from `ai-summary/CURRENT_STATE.md` were 278.119725 ms, 279.118436 ms, and 278.981930 ms; optimized medians were 289.862887 ms, 280.136352 ms, and 289.146394 ms.
+5. **Is the optimization in scope?** YES — the change is inside the `closeLedger` Soroban apply path and does not target TX-set construction or background bucket merge work.
+6. **Is the benchmark methodology correct?** YES — the optimized commit was built with the required Tracy-enabled configuration, the full regression suite passed, and the authoritative measurements came from three runs of `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` without `--tracy`.
+7. **Can the improvement be explained without the optimization?** NOT APPLICABLE — no top-line improvement was measured; instead all three soroswap medians were worse than the accepted baseline.
+8. **Is this optimization novel?** YES — no duplicate prior confirmed optimization was identified, but novelty does not overcome the measured regression.
+
+### Rejection Reason
+
+The optimization fails the objective's headline metric. All three independent non-Tracy soroswap apply-load runs regressed relative to the accepted baseline in `ai-summary/CURRENT_STATE.md`, so the change is ineligible for CONFIRMED regardless of the plausible source-level inefficiency and passing tests.
+
+### Failed Checks
+
+- Check 4: benchmark improvement / severity support failed; soroswap apply time regressed.
+- Verdict criteria: `CONFIRMED` requires consistent soroswap apply-time improvement across all three non-Tracy runs, which was not observed.
