@@ -323,3 +323,54 @@ preserved.
   `src/ledger/LedgerManagerImpl.cpp`.
 - Outer branch `poc/001-reuse-parallel-apply-worker-pool` pushed to
   `origin` at SHA `8e87ac70585a410292526fdf91c533cac2a1a116`.
+
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-05-01
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** PARTIALLY — the committed diff replaces per-stage `std::async(std::launch::async, ...)` cluster launches in `LedgerManagerImpl::applySorobanStageClustersInParallel` with a per-ledger bounded `ParallelApplyWorkerPool`, while preserving fresh `ThreadParallelApplyLedgerState` construction per cluster and ordered result slots.
+2. **Are the preconditions realistic?** YES — the soroswap apply-load workload exercises many Soroban stages with up to eight clusters, so worker launch/scheduling overhead is in the measured close-ledger path.
+3. **Is the original code inefficient or working as designed?** PLAUSIBLE INEFFICIENCY — repeated short-lived async workers are plausibly wasteful, and no intentional correctness reason for per-stage OS-thread recreation was identified.
+4. **Does the benchmark improvement match the claimed severity?** NO — independent authoritative non-Tracy benchmark runs show soroswap regressed in every run versus the accepted baseline.
+5. **Is the optimization in scope?** YES — the touched code is in the `closeLedger` Soroban apply path and does not target TX-set construction or background bucket work.
+6. **Is the benchmark methodology correct?** YES — the optimized branch was built with the required Tracy-capable configuration, the full test suite passed, and the three deciding measurements were produced by `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` without `--tracy`, compared against `ai-summary/CURRENT_STATE.md`.
+7. **Can the improvement be explained without the optimization?** NOT APPLICABLE — no soroswap improvement was observed; the measured result is a regression.
+8. **Is this optimization novel?** YES — no duplicate implementation was identified, but novelty does not overcome the benchmark regression.
+
+### Benchmark Results
+
+Accepted baseline from `ai-summary/CURRENT_STATE.md`:
+
+| run | sac median_ms | soroswap median_ms |
+|-----|---------------|--------------------|
+| 1 | 312.139381 | 278.119725 |
+| 2 | 305.929053 | 279.118436 |
+| 3 | 335.083649 | 278.981930 |
+
+Independent optimized non-Tracy runs:
+
+| run | artifact directory | sac median_ms | soroswap median_ms |
+|-----|--------------------|---------------|--------------------|
+| 1 | `/mnt/nvme2/apply-load/5f97462a74d1-20260501-025406` | 307.667669 | 290.103338 |
+| 2 | `/mnt/nvme2/apply-load/5f97462a74d1-20260501-030030` | 313.536534 | 288.734571 |
+| 3 | `/mnt/nvme2/apply-load/5f97462a74d1-20260501-030651` | 315.723043 | 285.349033 |
+
+The baseline soroswap average is 278.740030 ms; the optimized soroswap average is 288.062314 ms, a 3.35% regression. Each optimized soroswap run is slower than each accepted baseline soroswap run, so the objective's headline metric fails decisively. SAC improved on average, but max-sac improvement cannot rescue a soroswap regression under the objective-specific verdict rules.
+
+### Rejection Reason
+
+The required independent apply-load matrix validation shows the worker-pool change regresses the headline soroswap apply-time metric across all three non-Tracy runs. The optimization is therefore not eligible for confirmation, regardless of the passing test suite or plausible source-level rationale.
+
+### Failed Checks
+
+- Check 4: benchmark improvement/severity — soroswap regressed in every authoritative run.
+- Check 7: alternative explanations/performance signal — there is no positive soroswap signal to attribute to the optimization.
+- Objective verdict criterion: `CONFIRMED` requires consistent soroswap apply-time improvement; this handoff shows consistent soroswap regression.

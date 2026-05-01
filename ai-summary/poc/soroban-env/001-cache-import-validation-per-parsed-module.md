@@ -186,3 +186,24 @@ The projected impact clears this objective's Medium threshold. The cited trace a
 - **Change description**: Cache owned import-symbol metadata on `ParsedModule` once, store the import count needed to reproduce the existing `Vec::<(&str, &str)>::charge_bulk_init_cpy` charge, and record the last ledger protocol that successfully passed `check_contract_imports_match_host_protocol`. On fast-path hits for the same ledger protocol, re-charge the bulk-init cost and return without rebuilding the `BTreeSet` or scanning `HOST_FUNCTIONS`.
 - **Correctness check**: Existing Soroban host tests that assert budget totals and e2e invocation behavior should continue to pass, especially `budget_metering::*`, `e2e_tests::*`, lifecycle/module-cache tests, and hostile/invalid-Wasm tests that exercise missing, unsupported, or protocol-gated imports.
 - **Benchmark focus**: Run non-Tracy `scripts/run_apply_load_matrix.py` multiple times and compare soroswap median apply time; the expected signal is removal of nearly all physical self-time from `ParsedModule::check_contract_imports_match_host_protocol` after the first invocation per `(ParsedModule, ledger_proto)`, translating to an estimated 3-5% soroswap apply-time reduction if the trace attribution holds.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-01
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/vm/parsed_module.rs:158-164,234-283,443-483` — added per-`ParsedModule` cached owned import-symbol metadata, preserved the existing import-symbol bulk-copy budget charge on every use, and added an atomic successful-ledger-protocol marker so repeated import validation for the same protocol recharges and returns without rebuilding symbols or scanning `HOST_FUNCTIONS`.
+- `src/rust/soroban/p26/soroban-env-host/src/vm.rs:105-118` — updated the minimal linker helper to consume the cached owned import-symbol representation.
+
+### Demonstration
+
+The optimization moves import-symbol enumeration from every VM instantiation to the first use of each parsed module, while preserving the protocol-visible `Vec::<(&str, &str)>::charge_bulk_init_cpy` metering on each validation call. After a module successfully validates for a ledger protocol, later invocations of the same cached `ParsedModule` under that protocol avoid the `wasmi_module.imports()` walk, `BTreeSet` rebuild, and `HOST_FUNCTIONS` validation scan on the apply hot path.
+
+### Test Results
+
+Built successfully with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` and `make -j $(nproc)`. The full regression suite passed with `NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` (run with `ALL_SOROBAN_GIT_STATE_STAMPS=` to work around this git-worktree checkout's stale submodule git-state dependency path).
