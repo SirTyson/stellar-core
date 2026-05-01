@@ -184,3 +184,142 @@ This revision also addresses the prior final-review blocker: `rg 'ParallelApplyW
 - `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres && make -j $(nproc)` — build completed successfully.
 - `./src/stellar-core test --ll fatal -r simple --abort --disable-dots "[parallelapply]"` — all 23 test cases / 2,721,857 assertions passed.
 - `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` — full unit suite completed successfully; final output reported `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-01
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The revised PoC still is not a valid final-review handoff because the worker-pool source changes are uncommitted working-tree state. The checked-out branch is `poc/001-reuse-parallel-apply-worker-pool`, but `git status --short -- ':!ai-summary'` reports dirty source files:
+
+- `src/ledger/LedgerManagerImpl.cpp`
+- `src/ledger/LedgerManagerImpl.h`
+
+`rg 'ParallelApplyWorkerPool|submitBatch|mApplyWorkerPool' src/ledger` does now find the claimed implementation, and the uncommitted diff contains the worker pool plus the refactor of `applySorobanStageClustersInParallel`. However, `git diff --stat b5ade12b06e3e7172b738137ab0ff1c215cdd3f8..HEAD -- ':!ai-summary'` is empty, so a clean checkout of the PoC branch tip does not contain the optimization. The branch tip commits are still unrelated to this worker-pool change, and the p26 submodule remains at the accepted baseline SHA `a417a96314085a070bd7daf2cb29e85809f21ae3`.
+
+The objective-specific final-review handoff rules explicitly require PoC code to be committed before validation. Benchmarking or running the full test suite against dirty state would not prove that the branch is reproducible, so this review stops before build/test/benchmark.
+
+### Revision Instructions
+
+Commit the existing worker-pool modifications to the PoC outer branch `poc/001-reuse-parallel-apply-worker-pool` so that a clean checkout has a non-empty source diff from `ai-summary/CURRENT_STATE.md`'s accepted baseline commit. If no submodule changes are involved, leave p26 at `a417a96314085a070bd7daf2cb29e85809f21ae3`; otherwise commit the p26 change on the paired fork branch and update the outer gitlink. Then update this hypothesis file with the exact outer commit SHA, submodule SHA, and fresh PoC test output from the committed state.
+
+The next final review should verify all of the following before measuring:
+
+1. `git status --short -- ':!ai-summary'` is clean in the outer worktree.
+2. `git -C src/rust/soroban/p26 status --short` is clean.
+3. `git diff --stat b5ade12b06e3e7172b738137ab0ff1c215cdd3f8..HEAD -- ':!ai-summary'` shows the worker-pool source change.
+4. `rg 'ParallelApplyWorkerPool|submitBatch' src/ledger` finds the committed implementation.
+
+### Checks Passed So Far
+
+- Read the hypothesis, prior review notes, revised PoC notes, and accepted baseline in `ai-summary/CURRENT_STATE.md`.
+- Verified the worker-pool implementation exists in the current working tree and is limited to `src/ledger/LedgerManagerImpl.cpp` and `src/ledger/LedgerManagerImpl.h`.
+- Verified the implementation is uncommitted and therefore not reproducible from the PoC branch tip.
+- Verified no p26 submodule change is involved in the current handoff.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-01
+**PoC by**: claude-opus-4.7, high
+
+### Changes Made
+
+The worker-pool implementation already present in the working tree from
+the prior PoC attempt was committed to the PoC outer branch
+`poc/001-reuse-parallel-apply-worker-pool` and pushed to
+`origin` (`https://github.com/SirTyson/stellar-core.git`). No p26
+submodule changes were required; `src/rust/soroban/p26` remains at
+the accepted baseline SHA `a417a96314085a070bd7daf2cb29e85809f21ae3`.
+
+- **Outer commit SHA**: `8e87ac70585a410292526fdf91c533cac2a1a116`
+  ("viable poc 001-reuse-parallel-apply-worker-pool"), parent
+  `45e67c165` on branch `poc/001-reuse-parallel-apply-worker-pool`.
+- **Source diff vs accepted baseline `b5ade12b06e3e7172b738137ab0ff1c215cdd3f8`**
+  (`git diff --stat b5ade12b0..HEAD -- ':!ai-summary'`):
+    * `src/ledger/LedgerManagerImpl.cpp` — +115 / -22 lines
+    * `src/ledger/LedgerManagerImpl.h`   — +5 / -2 lines
+- `src/ledger/LedgerManagerImpl.cpp:77-82,163-243` — adds
+  `ParallelApplyWorkerPool`: a header-private class owning a
+  `std::mutex`, `std::condition_variable`, FIFO `std::deque<std::packaged_task<void()>>`
+  task queue, and a `std::vector<std::thread>` worker set. Workers are
+  spawned lazily by `ensureWorkerCount(N)` up to the largest cluster
+  count seen, each running a `workerLoop` that waits on the condvar,
+  pops one task, and runs it. The destructor signals `mStopping`,
+  `notify_all`s, and joins workers. `submitBatch` ensures enough
+  workers exist, queues the batch under the mutex, returns one
+  `std::future<void>` per task in submission order, and notifies
+  workers once.
+- `src/ledger/LedgerManagerImpl.cpp:2617-2666` — refactors
+  `applySorobanStageClustersInParallel` to take a
+  `ParallelApplyWorkerPool&`, pre-size `threadStates` to
+  `stage.numClusters()` so each worker writes its own slot by cluster
+  index (preserving deterministic merge order in
+  `commitChangesFromThreads`), construct each fresh
+  `ThreadParallelApplyLedgerState` on the primary apply thread under
+  the existing `DeactivateScopeGuard(globalState)` window, build one
+  `std::packaged_task<void()>` per cluster wrapping the existing
+  `applyThread` call, submit the whole batch through
+  `workerPool.submitBatch(...)`, and then `future::get()` each future
+  in cluster-index order with the existing `printErrorAndAbort`
+  exception-propagation behavior. A trailing `releaseAssert(threadState)`
+  loop verifies every cluster slot was filled.
+- `src/ledger/LedgerManagerImpl.cpp:2716-2807` and
+  `src/ledger/LedgerManagerImpl.h:46-49,381-396` — thread the pool
+  through `applySorobanStage` and `applySorobanStageClustersInParallel`,
+  and create one `ParallelApplyWorkerPool` (stack-local) inside
+  `applySorobanStages` that owns workers for the duration of all stages
+  in a single ledger so they persist across stages and are joined when
+  the ledger's apply phase exits.
+
+### Demonstration
+
+The optimization removes the repeated
+`std::async(std::launch::async, ...)` worker creation that the
+baseline performs for every cluster of every Soroban apply stage
+(~41 stage launches with up to 8 clusters each in the soroswap
+trace, so up to several hundred short-lived OS threads per ledger
+inside the measured `applySorobanStageClustersInParallel` window).
+With this change, the per-ledger pool spawns at most
+`max(stage.numClusters())` workers once, dispatches each cluster job
+through a mutex+condvar handoff, and reuses the same workers across
+all of the ledger's stages, leaving per-stage scheduling cost as
+two `notify_all`s plus N `future::get()` waits. Cluster setup,
+`DeactivateScopeGuard` over `GlobalParallelApplyLedgerState`, the
+per-cluster scope index, sequential intra-cluster apply, ordered
+merge by cluster index, and exception-to-abort behavior are all
+preserved.
+
+### Test Results
+
+- `make -j $(nproc)` with the configured Tracy flags
+  (`--enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`)
+  built cleanly.
+- `./src/stellar-core test --ll fatal -r simple --abort --disable-dots "[parallelapply]"` —
+  `All tests passed (2721857 assertions in 23 test cases)`.
+- `env NUM_PARTITIONS=$(nproc) STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` —
+  full unit suite + every Rust submodule reported `test result: ok`,
+  ending with `PASS: test/selftest-nopg`, `PASS: test/check-nondet`,
+  and `All 2 tests passed`.
+
+### Reproducibility Verification
+
+- `git status --short -- ':!ai-summary'` is clean on the outer
+  worktree after the commit.
+- `git -C src/rust/soroban/p26 status --short` is clean and at
+  `a417a96314085a070bd7daf2cb29e85809f21ae3`.
+- `git diff --stat b5ade12b06e3e7172b738137ab0ff1c215cdd3f8..HEAD -- ':!ai-summary'`
+  shows the worker-pool source change in
+  `src/ledger/LedgerManagerImpl.cpp` and
+  `src/ledger/LedgerManagerImpl.h`.
+- `rg 'ParallelApplyWorkerPool|submitBatch|mApplyWorkerPool' src/ledger`
+  finds the committed implementation in
+  `src/ledger/LedgerManagerImpl.cpp`.
+- Outer branch `poc/001-reuse-parallel-apply-worker-pool` pushed to
+  `origin` at SHA `8e87ac70585a410292526fdf91c533cac2a1a116`.
