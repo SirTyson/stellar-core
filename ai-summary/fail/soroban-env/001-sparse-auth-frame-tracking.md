@@ -189,3 +189,33 @@ diff was committed and pushed. The previously reported test results
 (`env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple
 --abort --disable-dots' make check` passing) remain the verification of
 record for the source change itself.
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-05-01
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** PARTIAL — the committed PoC removes eager enforcing-mode full-snapshot materialization by replacing snapshots with an undo-log marker and rollback journal. It does not remove the dense per-frame `match_stack` pushes from the original hypothesis, and `InvocationTracker::push_frame` still appends `MatchState::Unmatched` for every tracker on every frame.
+2. **Are the preconditions realistic?** YES — the affected auth-frame path is exercised by soroswap's nested contract/SAC calls and is inside the measured close-ledger apply path.
+3. **Is the original code inefficient or working as designed?** PARTIAL INEFFICIENCY — eager successful-frame snapshot allocation is avoidable in principle, but the PoC still has to replay the same recursive metering traversal and keeps dense frame pushes. The remaining physical work is enough that the claimed optimization did not translate into a top-line soroswap win.
+4. **Does the benchmark improvement match the claimed severity?** NO — the independent non-Tracy benchmark runs did not improve soroswap apply time. Baseline soroswap medians from `CURRENT_STATE.md` were 278.119725 ms, 279.118436 ms, and 278.981930 ms. Optimized medians were 278.309492 ms, 290.692799 ms, and 281.637413 ms, an average regression from 278.740030 ms to 283.546568 ms.
+5. **Is the optimization in scope?** YES — the source change is in p26 Soroban authorization during host frames under `closeLedger`, not TX-set construction or background bucket merge work.
+6. **Is the benchmark methodology correct?** YES — the final review built the PoC commit, ran the full unit suite, then ran `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` three times without `--tracy`, comparing against the accepted `ai-summary/CURRENT_STATE.md` baseline.
+7. **Can the improvement be explained without the optimization?** NOT APPLICABLE — there was no supported soroswap improvement to explain. The single run close to baseline is within noise, while the three-run set regresses overall.
+8. **Is this optimization novel?** YES — the reviewed change targets enforcing-mode auth snapshot rollback representation, distinct from prior accepted or failed storage-map, budget, XDR, VM, and ledger-entry-size optimizations.
+
+### Rejection Reason
+
+The optimization failed the objective's headline benchmark gate: soroswap apply time regressed across the three independent non-Tracy runs. Even though max-sac medians improved on average (319.407982 ms, 311.112600 ms, 306.224398 ms versus baseline 312.139381 ms, 305.929053 ms, 335.083649 ms), the objective requires soroswap improvement and explicitly rejects soroswap regressions.
+
+### Failed Checks
+
+- **Benchmark Workflow check 3** — optimized soroswap apply times did not improve consistently against `CURRENT_STATE.md`; two of three optimized runs were slower than every baseline soroswap run.
+- **Verdict Criteria** — soroswap regressed, so the PoC is REJECTED regardless of max-sac movement.
+- **Severity Scale** — no reproducible >=1% soroswap apply-time reduction was measured, so the finding does not meet even Low severity.
