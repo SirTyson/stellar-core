@@ -149,40 +149,38 @@ readOnlyPreParallelApplyRange(AppConnector& app,
 }
 
 bool
-isModifiedClassicKey(LedgerSnapshot const& current,
-                     LedgerSnapshot const& previous, LedgerKey const& key)
+isModifiedClassicKey(AbstractLedgerTxn const& ltx, LedgerKey const& key)
 {
     if (isSorobanEntry(key))
     {
         return false;
     }
 
-    auto currentEntry = current.load(key);
-    auto previousEntry = previous.load(key);
-    if (static_cast<bool>(currentEntry) != static_cast<bool>(previousEntry))
-    {
-        return true;
-    }
-
-    return currentEntry && currentEntry.current() != previousEntry.current();
+    // Use the LedgerTxn's O(1) modified-key predicate. A key is modified iff
+    // it has been touched (created, updated, or deleted) by any prior write to
+    // this LedgerTxn in the current ledger -- which covers both the classic
+    // apply phase (committed back into `ltx`) and any sequential
+    // preParallelApply writes performed earlier in the same classification
+    // loop. This is at least as conservative as the prior load/compare
+    // implementation: any over-classification (a key touched then restored to
+    // its prior value) merely sends the tx to the sequential path, which is
+    // safe.
+    return ltx.isModifiedKey(key);
 }
 
 bool
-requiresSequentialPreParallelApply(LedgerSnapshot const& current,
-                                   LedgerSnapshot const& previous,
+requiresSequentialPreParallelApply(AbstractLedgerTxn const& ltx,
                                    TransactionFrameBase const& tx)
 {
-    if (isModifiedClassicKey(current, previous, accountKey(tx.getSourceID())) ||
-        isModifiedClassicKey(current, previous,
-                             accountKey(tx.getFeeSourceID())))
+    if (isModifiedClassicKey(ltx, accountKey(tx.getSourceID())) ||
+        isModifiedClassicKey(ltx, accountKey(tx.getFeeSourceID())))
     {
         return true;
     }
 
     for (auto const& op : tx.getOperationFrames())
     {
-        if (isModifiedClassicKey(current, previous,
-                                 accountKey(op->getSourceID())))
+        if (isModifiedClassicKey(ltx, accountKey(op->getSourceID())))
         {
             return true;
         }
@@ -191,14 +189,14 @@ requiresSequentialPreParallelApply(LedgerSnapshot const& current,
     auto const& footprint = tx.sorobanResources().footprint;
     for (auto const& key : footprint.readOnly)
     {
-        if (isModifiedClassicKey(current, previous, key))
+        if (isModifiedClassicKey(ltx, key))
         {
             return true;
         }
     }
     for (auto const& key : footprint.readWrite)
     {
-        if (isModifiedClassicKey(current, previous, key))
+        if (isModifiedClassicKey(ltx, key))
         {
             return true;
         }
@@ -441,14 +439,11 @@ GlobalParallelApplyLedgerState::
                                   ProtocolVersion::V_26))
     {
         std::vector<TxBundle const*> txBundles;
-        LedgerSnapshot current(ltx);
-        LedgerSnapshot previous(mLCLSnapshot);
         for (auto const& stage : stages)
         {
             for (auto const& txBundle : stage)
             {
-                if (requiresSequentialPreParallelApply(current, previous,
-                                                       *txBundle.getTx()))
+                if (requiresSequentialPreParallelApply(ltx, *txBundle.getTx()))
                 {
                     txBundle.getTx()->preParallelApply(
                         app, ltx, txBundle.getEffects().getMeta(),
