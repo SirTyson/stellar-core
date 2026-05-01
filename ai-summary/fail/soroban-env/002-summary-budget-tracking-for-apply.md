@@ -207,3 +207,45 @@ The p26 Core invoke path now avoids maintaining full per-cost diagnostic counter
 ### Test Results
 
 Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`, built with `make -j $(nproc)`, and ran `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`. The full suite completed successfully; p26 Soroban host tests reported `750 passed; 0 failed; 2 ignored`, additional p26 integration/doc tests passed, and the top-level suite ended with `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.
+
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-05-01
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** PARTIAL — the code does route p26 Core invocation budgets through a summary-tracking mode and skips full per-cost diagnostic tracker updates in `BudgetImpl::charge`, while retaining aggregate dimension charging and VM-instantiation CPU/time summaries.
+2. **Are the preconditions realistic?** YES — budget charging is on the Soroban apply hot path and the apply-load soroswap workload exercises millions of budget charges.
+3. **Is the original code inefficient or working as designed?** PLAUSIBLE INEFFICIENCY — full per-cost diagnostic tracking is not needed for the production bridge output, but the implementation changes public `Budget::get_tracker` behavior for summary budgets and must be justified by performance.
+4. **Does the benchmark improvement match the claimed severity?** NO — independent non-Tracy apply-load runs regressed soroswap apply time in every run: 302.556 ms, 298.173 ms, and 301.257 ms versus the accepted baseline runs of 278.120 ms, 279.118 ms, and 278.982 ms.
+5. **Is the optimization in scope?** YES — the changed code is in the p26 Soroban invocation budget used during `closeLedger` apply.
+6. **Is the benchmark methodology correct?** YES — final review built the committed PoC checkout, ran the full unit test suite successfully, then ran `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` three times without `--tracy` as required.
+7. **Can the improvement be explained without the optimization?** NOT APPLICABLE — there was no measured improvement; both headline soroswap and secondary SAC medians were slower than baseline.
+8. **Is this optimization novel?** YES — it is distinct from prior budget fast-path failures, but novelty does not overcome the measured regression.
+
+### Rejection Reason
+
+The optimization failed the objective's benchmark gate. All three authoritative non-Tracy soroswap runs regressed versus `ai-summary/CURRENT_STATE.md`, and SAC also regressed substantially, so the change is not eligible for CONFIRMED or NEEDS_REVISION as a performance win.
+
+Independent benchmark results:
+
+| run | artifact directory | scenario | median_ms | p95_ms | p99_ms |
+|-----|--------------------|----------|-----------|--------|--------|
+| 1 | `/mnt/nvme2/apply-load/1e95a90aee52-20260501-092316` | sac, TX=6000, T=8 | 355.967357 | 381.536153 | 398.847633 |
+| 1 | `/mnt/nvme2/apply-load/1e95a90aee52-20260501-092316` | soroswap, TX=2000, T=8 | 302.555715 | 311.015465 | 318.533498 |
+| 2 | `/mnt/nvme2/apply-load/1e95a90aee52-20260501-093016` | sac, TX=6000, T=8 | 354.188457 | 374.491193 | 385.482441 |
+| 2 | `/mnt/nvme2/apply-load/1e95a90aee52-20260501-093016` | soroswap, TX=2000, T=8 | 298.172722 | 303.696119 | 308.793930 |
+| 3 | `/mnt/nvme2/apply-load/1e95a90aee52-20260501-093706` | sac, TX=6000, T=8 | 354.115529 | 377.010914 | 390.152122 |
+| 3 | `/mnt/nvme2/apply-load/1e95a90aee52-20260501-093706` | soroswap, TX=2000, T=8 | 301.257241 | 306.949506 | 310.482227 |
+
+### Failed Checks
+
+- Check 4: benchmark improvement does not match claimed severity; the headline soroswap metric regressed in every non-Tracy run.
+- Check 7: there is no positive measured improvement to attribute to the optimization.
+- Verdict criteria: soroswap regressed and max-sac regressed, which blocks CONFIRMED.
