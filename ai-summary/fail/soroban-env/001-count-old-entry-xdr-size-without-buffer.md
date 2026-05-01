@@ -106,3 +106,35 @@ The optimization removes the per-old-entry `Vec<u8>` allocation, capacity growth
 - `./src/stellar-core test [bucket]` — All tests passed (1,789,788 assertions in 47 test cases).
 - `make check` Rust unit tests for `soroban-env-host` (e2e, budget metering, fees, integration, secp256r1) all passed.
 - The only `make check` failures were pre-existing environmental issues unrelated to this change: `lib/gperftools/tcm_min_asserts_unittest::TCMallocTest.LargeAllocsRelease` (host-memory dependent tcmalloc test) and `doc/xdrc.1` manpage build (missing `xmlto`/`asciidoctor`).
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-05-01
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** NO. The accepted baseline already added `InitialEntryMetadata.xdr_size` and production `invoke_host_function` passes `Some(&init_entry_metadata)` into `get_ledger_changes`; the PoC helper is only used in the `None` fallback when metadata is absent.
+2. **Are the preconditions realistic?** NO for the apply-load benchmark. `build_storage_map_from_xdr_ledger_entries` records metadata for every decoded initial ledger entry, `initial_entry_metadata_by_position` aligns it to storage positions, and enforcing-mode `get_ledger_changes` receives it with `missing_is_error = true`.
+3. **Is the original code inefficient or working as designed?** SUPERSEDED. The originally inefficient old-entry discarded-buffer path was removed from the hot production path by the prior accepted cached-size optimization recorded in `ai-summary/CURRENT_STATE.md`.
+4. **Does the benchmark improvement match the claimed severity?** NOT ELIGIBLE. No benchmark run can support this PoC as handed off because the changed code is not expected to execute in the benchmark's normal enforcing path.
+5. **Is the optimization in scope?** The affected function is in the apply path, but the modified fallback is not the exercised hot path for this objective's current baseline.
+6. **Is the benchmark methodology correct?** NO. The handoff was not reproducible: the p26 submodule was dirty with uncommitted source edits, detached at the prior accepted baseline SHA `a417a96314085a070bd7daf2cb29e85809f21ae3`, and the outer branch did not record a gitlink bump for this PoC.
+7. **Can the improvement be explained without the optimization?** YES. Any claimed top-line movement would be noise or attributable to other branch state because the PoC code path is bypassed when metadata exists.
+8. **Is this optimization novel?** NO as an effective current-baseline optimization. It is a stale fallback variant of an old-entry XDR-size problem already addressed by the accepted cached-size baseline.
+
+### Rejection Reason
+
+The PoC is superseded by the current accepted baseline and does not optimize the production benchmark path: `get_ledger_changes` now uses cached initial-entry XDR sizes for normal enforcing apply-load entries, so the newly added counting writer only affects a fallback path where metadata is missing. The source handoff was also invalid because the optimization existed only as dirty submodule state rather than committed p26 and outer gitlink commits.
+
+### Failed Checks
+
+- Validation before measuring: clean committed handoff required by the final-review handoff model.
+- Adversarial check 1: changed code does not address the current hot-path inefficiency.
+- Adversarial check 2: claimed preconditions are no longer realistic for the accepted baseline.
+- Adversarial check 4: no eligible benchmark improvement can be attributed to this change.
+- Adversarial check 6: benchmark methodology/handoff reproducibility failed.

@@ -81,3 +81,24 @@ Correctness is the main constraint. A naive early return that skips all depth-li
 - **Change description**: Add direct immediate conversion matches before the existing generic object path. For `Val -> ScVal`, match non-object tags handled at `convert.rs:436-484`; for object tags and invalid tags, fall back to the existing depth-limited path. For `ScVal -> Val`, match only representable immediate variants that fit small encodings; route large integers, long symbols, bytes, strings, vecs, maps, addresses, and invalid/non-representable variants to the existing path or existing error handling as appropriate.
 - **Correctness check**: Preserve depth-limit behavior for recursive conversions, preserve `from_host_val_for_storage` muxed-address rejection for object values, preserve `ConversionError`/`HostError` mapping for invalid values, and preserve all `VisitObject`, `MemAlloc`, `MemCpy`, and recursive conversion charges. Existing tests to keep green include `depth_limit`, `hostile_opt` depth tests, storage muxed-address conversion tests, symbol/basic/map/vec conversion tests, and budget metering tests that cover object conversions.
 - **Benchmark focus**: First instrument immediate-vs-object hit counts for the three target helpers in the soroswap apply window. Then run the required non-Tracy `scripts/run_apply_load_matrix.py` comparison against the current baseline three times. The promoted result must show a reproducible >=3% soroswap median apply-time improvement; otherwise this should be rejected later as below the objective severity floor.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-01
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/host/conversion.rs:393-595` — added private immediate `Val`/`ScVal` conversion helpers and wired them into `Host::from_host_val`, `Host::from_host_val_for_storage`, and `Host::to_host_val` before the generic depth-limited conversion path. The allow-list covers bool, void, error, 32-bit values, small 64/128/256-bit values, small timepoint/duration values, and small symbols; large numerics, long symbols, object values, invalid values, and non-Val-representable ScVals still use the existing path.
+- `src/rust/soroban/p26/soroban-env-host/src/budget.rs:1422-1431` — added a read-only depth-limit availability check so immediate conversion leaves preserve the existing `ExceededLimit` boundary without cloning the budget or mutating enter/leave depth state.
+
+### Demonstration
+
+The optimization bypasses generic `TryFromVal` object-classification plumbing and `Budget::with_limited_depth` enter/leave mutations for immediate values that cannot recurse and do not allocate host objects. Object-valued conversions still fall through to the existing conversion path, so `VisitObject`, `MemAlloc`, `MemCpy`, muxed-address storage-key rejection, recursive conversion metering, and recursive depth checks remain unchanged.
+
+### Test Results
+
+Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`, then built with `make -j $(nproc) ALL_SOROBAN_GIT_STATE_STAMPS=`. Full regression suite passed with `NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check ALL_SOROBAN_GIT_STATE_STAMPS=`: p26 Rust host tests reported `750 passed; 0 failed; 2 ignored`, additional Rust integration/doc tests passed, and stellar-core reported `All 2 tests passed`.
