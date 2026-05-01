@@ -80,3 +80,29 @@ The path is hot enough to justify PoC work under this objective. The cited diagn
 - **Change description**: add a metered XDR length/count helper that reuses the existing per-chunk `ValSer` charging and `Limited` traversal but writes to a counting `Write` implementation; replace only the old-entry `Vec` in `get_ledger_changes` with this helper and keep all buffer-producing call sites unchanged.
 - **Correctness check**: existing Soroban host e2e and budget metering tests should continue to assert identical ledger changes, rent sizes, `cpu_insns`, and `mem_bytes`; pay particular attention to contract-code entries, restored entries whose old size is later zeroed, expired recording-mode entries, and budget-limit error mapping.
 - **Benchmark focus**: compare three non-Tracy `scripts/run_apply_load_matrix.py` runs against the accepted `CURRENT_STATE.md` baseline, with the headline metric being soroswap median apply time. Instrumentation for the PoC should separately report old-entry count-write calls/bytes versus remaining buffer-producing `write xdr` calls so the measured delta can be attributed to discarded old-entry materialization.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-01
+**PoC by**: claude-opus-4.7, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/host/metered_xdr.rs` — added a new `metered_write_xdr_size` helper that mirrors `metered_write_xdr` but writes the XDR encoding through `std::io::sink()` instead of a `Vec<u8>`. The same `MeteredWrite` wrapper (same per-chunk histogram), the same `Limited<_, DEFAULT_XDR_RW_LIMITS>` wrapper, the same `WriteXdr::write_xdr` call, and the same `budget.charge_val_ser_batched(&histogram)` invocation are used; the helper returns the total emitted byte count (sum of `len * count` over the histogram, saturating to `u32::MAX`) and maps a write-error to the same `(Budget, ExceededLimit)` error as the buffered path.
+
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs` — replaced the discarded-buffer pattern in `get_ledger_changes` (old-entry XDR sizing branch) with `metered_write_xdr_size(budget, old_entry.as_ref())?`. Imports updated accordingly. All other call sites of `metered_write_xdr` (encoded keys, encoded new ledger entries, contract events, result values, footprint-only changes) are unchanged because their bytes are consumed downstream.
+
+### Demonstration
+
+The optimization removes the per-old-entry `Vec<u8>` allocation, capacity growth, and byte copies that `get_ledger_changes` previously performed solely to call `buf.len()`. XDR traversal, `Limited` length checks, the per-chunk histogram, and the resulting batched `ValSer` charge (both CPU and memory dimensions) are preserved exactly, so observable budget consumption, ledger changes, rent sizes, and error timing are unchanged. Because every successful Soroban invocation runs `get_ledger_changes` over its full storage footprint and serializes every old entry just to obtain its XDR length, removing the byte buffer materialization for that subset is expected to cut a measurable fraction of the `write xdr` self-time observed in the soroswap baseline.
+
+### Test Results
+
+- `./src/stellar-core test [soroban]` — All tests passed (3,571,416 assertions in 111 test cases), including `InvokeHostFunctionTests`, `ParallelApplyTest`, autorestore, fee-bump, and protocol gating tests.
+- `./src/stellar-core test [tx]` — All tests passed (575,539 assertions in 127 test cases).
+- `./src/stellar-core test [bucket]` — All tests passed (1,789,788 assertions in 47 test cases).
+- `make check` Rust unit tests for `soroban-env-host` (e2e, budget metering, fees, integration, secp256r1) all passed.
+- The only `make check` failures were pre-existing environmental issues unrelated to this change: `lib/gperftools/tcm_min_asserts_unittest::TCMallocTest.LargeAllocsRelease` (host-memory dependent tcmalloc test) and `doc/xdrc.1` manpage build (missing `xmlto`/`asciidoctor`).

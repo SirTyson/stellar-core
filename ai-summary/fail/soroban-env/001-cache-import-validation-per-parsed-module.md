@@ -298,3 +298,54 @@ The optimization moves import-symbol enumeration from every VM instantiation to 
 ### Test Results
 
 Built successfully with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` and `make -j $(nproc) ALL_SOROBAN_GIT_STATE_STAMPS=`. The full regression suite passed with `NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check ALL_SOROBAN_GIT_STATE_STAMPS=`.
+
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-05-01
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** YES — source review confirmed the p26 change caches owned import-symbol metadata on `ParsedModule`, preserves the previous `Vec::<(&str, &str)>::charge_bulk_init_cpy` charge on each validation use, and skips the repeated `HOST_FUNCTIONS` scan after a successful validation for the same ledger protocol.
+2. **Are the preconditions realistic?** YES — the soroswap apply benchmark uses repeated cached-module VM instantiation during `closeLedger`, so repeated import validation is on an exercised apply path.
+3. **Is the original code inefficient or working as designed?** INEFFICIENCY — the repeated import-symbol reconstruction and protocol-gating scan are pure for a fixed `ParsedModule` and ledger protocol, aside from the explicit metering charge that the PoC preserves.
+4. **Does the benchmark improvement match the claimed severity?** NO — independent non-Tracy benchmark runs showed soroswap median apply time regressed rather than improved.
+5. **Is the optimization in scope?** YES — the touched code is p26 Soroban VM instantiation reached from invoke-host-function execution inside ledger apply.
+6. **Is the benchmark methodology correct?** YES — measurements used `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` from the built worktree, without `--tracy`, three times, compared against `ai-summary/CURRENT_STATE.md`.
+7. **Can the improvement be explained without the optimization?** NOT APPLICABLE — no improvement was observed; the measured direction is a regression.
+8. **Is this optimization novel?** YES — no duplicate was identified during this final review.
+
+### Benchmark Results
+
+Baseline from `ai-summary/CURRENT_STATE.md`:
+
+| run | sac median_ms | soroswap median_ms |
+|-----|---------------|--------------------|
+| 1 | 312.139381 | 278.119725 |
+| 2 | 305.929053 | 279.118436 |
+| 3 | 335.083649 | 278.981930 |
+
+Optimized non-Tracy runs measured in final review:
+
+| run | artifact directory | sac median_ms | soroswap median_ms |
+|-----|--------------------|---------------|--------------------|
+| 1 | `/mnt/nvme2/apply-load/d5241a9f0536-20260501-045239` | 346.963983 | 291.399352 |
+| 2 | `/mnt/nvme2/apply-load/d5241a9f0536-20260501-045934` | 328.671750 | 279.671181 |
+| 3 | `/mnt/nvme2/apply-load/d5241a9f0536-20260501-050619` | 335.511250 | 286.911457 |
+
+All three soroswap medians are worse than the accepted baseline runs, and the average soroswap median moved from 278.740030 ms to 285.993997 ms (approximately 2.60% slower). SAC also regressed on average. No diagnostic Tracy run was collected because the non-Tracy runs did not show an eligible improvement.
+
+### Rejection Reason
+
+The optimization is source-level plausible and tests passed, but the required independent benchmark matrix did not support the performance claim. It regressed the headline soroswap apply-time metric across all three non-Tracy runs relative to the accepted baseline, which blocks confirmation under the objective verdict criteria.
+
+### Failed Checks
+
+- Check 4: benchmark improvement does not match the claimed severity; the measured result is a regression.
+- Check 7: no positive improvement exists to attribute to the optimization.
+- Verdict criterion: soroswap apply time regressed in the required non-Tracy benchmark runs.
