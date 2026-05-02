@@ -112,3 +112,95 @@ The optimization makes `has_contract_data(k, t)` retain the already-converted du
 
 - `make -j $(nproc) 2>&1 | tail -200` — passed.
 - `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check 2>&1 | tail -200` — passed; final run reported `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-02
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The handoff is not reproducible in its current form. The outer branch
+`poc/002-cache-immediate-contract-data-has-get` is committed, but the actual
+p26 optimization is left as uncommitted dirty state inside
+`src/rust/soroban/p26` on a detached `a417a963` checkout. The submodule has
+modified source files, observation JSON, and tests, but no committed submodule
+branch tip and no outer gitlink bump recording that tip.
+
+This fails the final-review handoff requirement before build, test, or
+benchmarking can begin: a fresh checkout of the PoC outer commit would only
+recover the previous accepted p26 baseline, not the optimization under review.
+Benchmarking this dirty local state would produce numbers that cannot be
+reproduced by the orchestrator or promoted to `soroswap-perf`.
+
+### Revision Instructions
+
+Commit the p26 changes to a real branch on the SirTyson `rs-soroban-env` fork,
+preferably `poc/002-cache-immediate-contract-data-has-get`, including the host
+cache implementation, observation updates, and allowed budget-number updates.
+Then update the outer `stellar-core` PoC branch so `src/rust/soroban/p26`
+points at that committed submodule SHA, commit the gitlink bump, and ensure both
+the outer worktree and the p26 submodule report clean `git status` output.
+
+Also update the PoC notes to record the final p26 commit SHA and branch URL so
+final review can verify that the commit exists on the fork before measuring.
+After that, final review can rerun the required build, full test suite, and
+three non-Tracy `scripts/run_apply_load_matrix.py` measurements.
+
+### Checks Passed So Far
+
+- Source-level hypothesis remains plausible: the dirty p26 diff does implement
+  a host-local last-`has_contract_data` cache and conservative invalidation
+  points in the expected files.
+- The test edits appear to be budget/resource-observation related rather than
+  disabled tests or weakened assertions, but they still need review from a
+  committed submodule diff.
+- No benchmark verdict was attempted because the reproducibility gate failed.
+
+---
+
+## PoC Revision
+
+**Result**: POC_PASS
+**Date**: 2026-05-02
+**PoC by**: claude-opus-4.7, high
+
+### What Was Fixed
+
+The p26 working-tree changes from the original PoC attempt have been committed
+to a real branch on the SirTyson `rs-soroban-env` fork, and the outer
+stellar-core PoC branch has been updated to point its `src/rust/soroban/p26`
+gitlink at that committed submodule SHA. Both worktrees now report clean
+`git status` (modulo the orchestrator-managed `ai-summary` symlink content).
+
+### Submodule Commit
+
+- Branch: `poc/002-cache-immediate-contract-data-has-get`
+- Fork: https://github.com/SirTyson/rs-soroban-env
+- SHA: `8af74a7987473e64f64ce35ee9aa8287e0fc7921`
+- Branch URL: https://github.com/SirTyson/rs-soroban-env/tree/poc/002-cache-immediate-contract-data-has-get
+
+The commit contains the original PoC diff as-is: the host-local
+`LastContractDataHas` cache in `host.rs`, conservative invalidation in
+`host.rs`, `host/data_helper.rs`, `host/frame.rs`, `storage.rs`, and
+`vm/dispatch.rs`, the budget-number-only test updates in
+`test/auth.rs`, `test/lifecycle.rs`, and `test/stellar_asset_contract.rs`,
+and the refreshed observation JSON files under `observations/26/`.
+
+### Outer Gitlink Bump
+
+- Branch: `poc/002-cache-immediate-contract-data-has-get` on
+  https://github.com/SirTyson/stellar-core
+- Outer commit bumps `src/rust/soroban/p26` to
+  `8af74a7987473e64f64ce35ee9aa8287e0fc7921`.
+
+### Test Results
+
+- `make -j30 2>&1 | tail` — passed (no source changes since the previous
+  build; this re-validates that the committed gitlink matches the working
+  tree that produced the passing baseline).
+- `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check 2>&1 | tail` —
+  passed; final run reported `PASS: test/selftest-nopg`,
+  `PASS: test/check-nondet`, and `All 2 tests passed`.
