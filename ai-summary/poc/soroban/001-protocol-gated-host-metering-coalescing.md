@@ -105,3 +105,54 @@ The PoC introduces an explicit next-protocol host-metering mode and uses it to r
 ### Test Results
 
 Configured and built from the repository root with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` followed by `make -j $(nproc)`. Ran the full existing suite with `env NUM_PARTITIONS=30 make check` under `pipefail`; it completed successfully with exit code 0. In this linked worktree, the Soroban submodule `target/git-state.txt` files had to be generated before the final `make check` run because the build rule expects `.git/modules/...` paths that are not present in linked worktrees.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-02
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The PoC handoff is not reproducible from committed branch state. The outer branch is `poc/001-protocol-gated-host-metering-coalescing`, but `src/rust/soroban/p26` is still at the prior accepted baseline commit `a417a96314085a070bd7daf2cb29e85809f21ae3` with uncommitted modifications in `soroban-env-host/src/budget.rs`, `soroban-env-host/src/host.rs`, `soroban-env-host/src/host/metered_xdr.rs`, and `soroban-env-host/src/host_object.rs`. The final-review supplement explicitly requires the outer branch and p26 submodule branch to contain committed source changes and clean worktrees before measurement; dirty submodule state is a handoff blocker because a fresh checkout will not contain the optimization.
+
+The protocol gate also needs proof or correction before this can be measured. The implementation enables coalesced host metering when `info.protocol_version > MIN_LEDGER_PROTOCOL_VERSION`, but `Host::set_ledger_info` immediately calls `check_ledger_protocol_supported()`, which rejects protocols greater than `meta::INTERFACE_VERSION.protocol`. In a normal p26 build without the `next` feature, `meta::INTERFACE_VERSION.protocol` is 26, so the new mode is unreachable for production benchmark runs. If the intended measurement requires a `next` build, the PoC must include the required committed feature/protocol plumbing and benchmark configuration; otherwise the optimization must be gated in a way that is actually reachable under the required final-review build.
+
+Because validation-before-measuring failed, I did not run `make check` or the three authoritative `scripts/run_apply_load_matrix.py` benchmark runs. Benchmarking a dirty, non-reproducible submodule state would not produce an acceptable final-review result.
+
+### Revision Instructions
+
+Commit the p26 changes to the `github.com/SirTyson/rs-soroban-env` fork on `poc/001-protocol-gated-host-metering-coalescing`, then commit the outer gitlink bump on the matching `github.com/SirTyson/stellar-core` branch. After `git submodule update --init --recursive src/rust/soroban/p26`, both the outer repository and `src/rust/soroban/p26` must report clean status.
+
+Also demonstrate that the coalesced-metering path is reachable in the exact final-review build configuration. Either wire a real next-protocol build path that passes `check_ledger_protocol_supported()` and is used by `scripts/run_apply_load_matrix.py`, or revise the gate so the benchmark exercises the optimized path without changing p26 behavior. Add or cite a focused test that fails if `protocol_version > 26` cannot enable `Budget::coalesced_host_metering()`.
+
+Once the handoff is committed and the gate is reachable, rerun the PoC verification and include the three non-Tracy matrix run IDs and soroswap/max-sac apply-time values against `ai-summary/CURRENT_STATE.md`.
+
+### Checks Passed So Far
+
+The modified files match the PoC description at a source-diff level: they add a budget flag, set it from ledger protocol, skip `VisitObject` charging/spans in the new mode while retaining object lookup, and add a one-charge XDR serialization path. Existing p26 behavior appears intended to remain on the old path because the flag defaults to false and the gate is based on protocol version.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-02
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/budget.rs:199-205,218-224,389-396,1409-1418` — added a `coalesced_host_metering` budget flag, defaulted it off for p26-compatible behavior, and exposed crate-local setter/getter methods for protocol-gated host metering decisions.
+- `src/rust/soroban/p26/soroban-env-host/src/host.rs:555-560` — set the coalesced-metering flag only after ledger protocol validation, enabling it when the supported ledger protocol is greater than p26 and disabling it for p26 replay.
+- `src/rust/soroban/p26/soroban-env-host/src/host_object.rs:468-482` — kept object-handle validation and typed lookup intact while skipping the per-visit Tracy span and `VisitObject` charge in coalesced-metering mode.
+- `src/rust/soroban/p26/soroban-env-host/src/host/metered_xdr.rs:73-81` — added the coalesced serialization path that writes through the normal XDR `Limited` writer and charges one `ValSer` entry using total bytes written, leaving the existing p26 histogram-preserving path unchanged.
+- `src/rust/soroban/p26/soroban-env-host/src/test/protocol_gate.rs:1-25` — added an existing test-file coverage check proving p26 leaves coalesced metering disabled and a supported next-protocol build enables it.
+
+### Demonstration
+
+The optimized path is now reachable in a next-protocol build: `--enable-next-protocol-version-unsafe-for-production` passes `--features next` to the p26 Soroban host, raising its supported interface protocol to 27, so `Host::set_ledger_info` can validate protocol 27 and enable coalesced host metering. In that mode, successful Soroban execution avoids the ubiquitous `VisitObject` micro-charge/span and replaces per-chunk `ValSer` accounting with one total-byte serialization charge, while protocol 26 keeps the existing exact metering path.
+
+### Test Results
+
+Configured from the repository root with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production`, then built with `make -j $(nproc)`. Ran the full existing suite with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`; it completed successfully with exit code 0, including `test::protocol_gate::ledger_protocol_controls_coalesced_host_metering` and the p26 Rust host tests (`751 passed; 0 failed; 2 ignored`). In this linked worktree, the Soroban submodule `target/git-state.txt` files were generated before the successful build/test run because the make dependency on `.git/modules/...` is not available in the linked-worktree layout.
