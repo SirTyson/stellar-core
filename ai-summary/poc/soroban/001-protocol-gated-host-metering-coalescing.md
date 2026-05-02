@@ -82,3 +82,26 @@ The projected impact is large enough for review-stage viability only if the PoC 
 - **Change description**: add a strictly next-protocol metering mode and keep the current p26 path bit-for-bit. In the new mode, move selected host-internal costs from per-leaf `Budget::charge` calls to calibrated bulk charges at stable boundaries such as VM import dispatch, `ScVal`/`Val` tree conversion, event externalization, and ledger-change/result XDR serialization. The PoC should physically skip or combine the corresponding microcharge calls; merely changing ledger cost params while still executing millions of charge calls will not prove the hypothesis.
 - **Correctness check**: prove that ledger entries, emitted events, auth effects, diagnostics gating, and deterministic host errors remain unchanged for non-budget-limited successful transactions. For p26, existing budget/tracker observations must remain unchanged. For the new protocol, near-limit transactions may intentionally have different resource outcomes, but budget-exceeded failures must still be deterministic and must not leave partially applied storage/events beyond the existing rollback semantics.
 - **Benchmark focus**: run three authoritative non-Tracy `scripts/run_apply_load_matrix.py` runs against the current `ai-summary/CURRENT_STATE.md` baseline. The required signal is reduced soroswap median apply time of at least 3% across repeated runs, with Tracy used only to confirm that `charge`, `visit host object`, `ScVal to Val`, `write xdr`, and `read xdr with budget` self-time fall in the optimized build.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-02
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/budget.rs:198-225,1383-1390` — added a `coalesced_host_metering` flag to `BudgetImpl`, defaulting off, with accessors used to gate next-protocol metering behavior.
+- `src/rust/soroban/p26/soroban-env-host/src/host.rs:555-560,637-642` — enabled coalesced host metering from `Host::set_ledger_info` only when `ledger_info.protocol_version > MIN_LEDGER_PROTOCOL_VERSION`, preserving the current p26 path.
+- `src/rust/soroban/p26/soroban-env-host/src/host_object.rs:460-499` — split object-table lookup from `VisitObject` charging so next-protocol execution physically skips the per-visit charge/span while retaining handle validation and typed lookup behavior.
+- `src/rust/soroban/p26/soroban-env-host/src/host/metered_xdr.rs:67-91` — added a next-protocol XDR serialization path that writes directly through `Limited` and charges one `ValSer` entry using total bytes written instead of replaying the per-chunk histogram path.
+
+### Demonstration
+
+The PoC introduces an explicit next-protocol host-metering mode and uses it to remove two hot micro-metering surfaces from successful Soroban execution: ubiquitous host-object `VisitObject` charges and per-chunk `ValSer` serialization accounting. Because the flag is set only for protocols above p26, existing p26 replay and budget observations continue through the prior exact microcharge path, while the new protocol path performs the same object lookup, validation, XDR writing, event/result/storage externalization, and error propagation with fewer budget calls and fewer Tracy `charge`/`visit host object` spans.
+
+### Test Results
+
+Configured and built from the repository root with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` followed by `make -j $(nproc)`. Ran the full existing suite with `env NUM_PARTITIONS=30 make check` under `pipefail`; it completed successfully with exit code 0. In this linked worktree, the Soroban submodule `target/git-state.txt` files had to be generated before the final `make check` run because the build rule expects `.git/modules/...` paths that are not present in linked worktrees.
