@@ -97,3 +97,84 @@ Correctness is the gating risk. A native JIT/AOT that depends on node-local CPU 
 - **Change description**: Introduce a deterministic compiled execution backend for cached Wasm modules that reuses the existing host import ABI and frame/storage/auth machinery while eliminating wasmi interpreter dispatch for successful router/pair Wasm calls. Do not hand-write soroswap semantics and do not key behavior on node-local timing or scheduling.
 - **Correctness check**: Preserve or explicitly protocol-gate `WasmInsnExec`, memory charging, trap mapping, missing-function handling, host import dispatch ordering, relative/absolute object handle translation, diagnostic/event ordering, reentry behavior, and rollback semantics. Existing Soroban invoke-host-function tests, VM tests, auth tests, and budget/resource-limit tests should cover the behavior surface; exact budget-number updates are acceptable only under a protocol-gated semantic change.
 - **Benchmark focus**: Compare soroswap `TX=2000,T=8` and max-SAC apply-load runs with and without the compiled tier over multiple runs. Attribute the win to guest execution by separating compiled-tier time from mandatory host import/storage/SAC work; the top-line apply-time target is at least Medium (3-10%) and this should be treated as High only if the backend materially reduces the VM worker envelope across repeated runs.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_FAIL
+**Date**: 2026-05-02
+**PoC by**: claude-opus-4.7, high
+**Failed At**: poc
+**Iterations**: 0 (declared infeasible before any build-test cycle)
+
+### Failure Reason
+
+The hypothesis itself classifies this as "a major VM/backend redesign" of the
+Soroban Wasm execution tier. To implement even a minimum viable deterministic
+compiled tier inside `soroban-env-host` (p26) and demonstrate it against the
+existing soroban test surface, a PoC must, at minimum:
+
+1. Introduce a non-wasmi compiled execution backend into the
+   `soroban-env-host` workspace. The current dependency closure contains only
+   `wasmi 0.31.1-soroban` (a pure interpreter); there is no in-tree
+   compiled/AOT backend to switch on. Every realistic candidate
+   (wasmtime+Cranelift, wasmer singlepass, a custom mini-compiler) is either
+   not deterministic across CPU vendors/microarchitectures, or is months of
+   integration work, or both.
+2. Re-implement the entire Soroban host-import surface against the new
+   backend's `Linker`/equivalent — every `dispatch.rs`-generated import must
+   exist on the new backend with identical relative/absolute object handle
+   translation, fuel return/refill semantics, and trap mapping.
+3. Bridge fuel/budget accounting so per-instruction `WasmInsnExec` charging,
+   memory growth charging, and dispatch charging match wasmi exactly — or
+   formally protocol-gate every divergence and update the corresponding
+   budget/resource-limit unit tests under that new gate.
+4. Preserve trap mapping, missing-function handling, reentry behavior,
+   diagnostic/event ordering, frame rollback, and storage/auth interaction so
+   `make check` continues to pass without weakening any test.
+5. Wire the new artifact through `ParsedModule`/`ModuleCache`,
+   `SharedModuleCacheCompiler`, and the C++/Rust bridge protocol-cache plumbing
+   (`soroban_proto_any.rs`, `soroban_module_cache.rs`,
+   `SharedModuleCacheCompiler.cpp`) without breaking shallow_clone semantics
+   shared across protocols.
+6. Prove deterministic output across hardware (CPU vendor, ISA extensions,
+   pointer width), since any divergence is a consensus bug. None of the
+   off-the-shelf production Wasm compilers provides this guarantee out of the
+   box for arbitrary guest Wasm.
+
+The PoC budget for this objective is 10 build-test cycles, where each cycle
+includes a full `make -j30` rebuild of stellar-core (tens of minutes after a
+cold cache hit on a new dep tree) and an `env NUM_PARTITIONS=30 make check`
+run (substantially longer). Adding a new compiled-Wasm backend dependency to
+the locked `soroban-env-host` workspace alone routinely requires multiple
+iterations to even compile, before any of items (2)–(6) can begin. There is
+no plausible path from the current baseline to a passing `make check` with a
+deterministic compiled execution tier replacing or shadowing the wasmi
+dispatch path within that budget.
+
+The reviewer's own anti-evidence and correctness section already acknowledge
+this: the optimization is gated on (a) cross-platform deterministic execution
+of compiled Wasm and (b) byte-for-byte preservation of p26 budget/trap
+semantics or an explicit new protocol gate with redefined semantics. Neither
+sub-problem has a "small surgical change" form, and a partial backend (e.g.,
+compiling only soroswap router/pair Wasms) collapses back into the previously
+rejected "code-hash native precompile" hypothesis class.
+
+### Changes Attempted
+
+No source code changes were made. After reading the hypothesis file,
+re-reading the reviewer's PoC Guidance, and inspecting
+`src/rust/soroban/p26/soroban-env-host/Cargo.toml`,
+`src/rust/soroban/p26/soroban-env-host/src/vm/module_cache.rs`, and
+`src/rust/soroban/p26/soroban-env-host/src/vm/parsed_module.rs` to confirm
+that the current backend is wasmi-only with no latent compiled-tier hook,
+the work was abandoned without modifying any source files. The p26 submodule
+was initialized at the recorded baseline SHA (`a417a96`) but no commits were
+made on either the outer or submodule repository.
+
+Recommendation: this hypothesis should not be re-attempted in PoC form
+without first scoping out the deterministic compiled backend as its own
+research project (likely a multi-month engineering effort: pick or build a
+deterministic compiler, port the host import ABI, prove cross-platform
+determinism), rather than as a single PoC iteration.
