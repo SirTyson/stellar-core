@@ -88,3 +88,26 @@ The severity is Medium rather than High on the available objective baseline. The
 - **Change description**: Native router/pair calls should push a production frame that preserves contract ID, function name, args, instance storage, rollback behavior, diagnostics, auth tracking, events, and storage footprint enforcement. Do not reuse the empty-Wasm test-contract marker; the ledger entry must remain `ContractExecutable::Wasm(hash)` so the dispatch decision is deterministic from protocol version plus ledger state.
 - **Correctness check**: Existing Soroban host, auth, storage, SAC, and invoke-host-function tests cover much of the shared host machinery, but the PoC needs focused equivalence checks against the bundled soroswap Wasms for successful swaps, liquidity setup, missing/invalid functions, deadline and slippage failures, auth tree shape, event ordering, diagnostics, storage changes, and budget/resource-limit behavior under the new protocol gate.
 - **Benchmark focus**: Run the current `soroswap, TX=2000, T=8` matrix from `ai-summary/CURRENT_STATE.md` repeatedly. The expected improvement should appear as lower top-line apply time, with Tracy attribution showing large reductions in `Vm::invoke_function_raw`, `Vm::instantiate_wasmi`, and generated VM dispatch `call` zones for router/pair calls while SAC/native storage zones remain present.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_FAIL
+**Date**: 2026-05-02
+**PoC by**: gpt-5.5, high
+**Failed At**: poc
+**Iterations**: 0 build-test cycles
+
+### Failure Reason
+
+I could not safely demonstrate this optimization as a production PoC. The reviewed guidance requires exact native, protocol-gated implementations of the Soroswap router and pool Wasm contracts, preserving ledger reads/writes, authorization tree shape, events, diagnostics, return values, rollback behavior, and budget/resource accounting. In this worktree the Soroswap contracts are vendored only as opaque Wasm binaries under `src/rust/apply-load-wasm/`; there is no vendored source or existing equivalence harness for the mainnet router/pool behavior. The p26 host does have a narrow dispatch hook before `ContractExecutable::Wasm` instantiates a VM, plus production SAC native dispatch and test-only native contract scaffolding, but those do not provide the contract-specific semantics required here.
+
+A hash-recognition stub or VM-delegating registry would either be behaviorally incomplete or would not bypass wasmi, so it would not demonstrate the hypothesis. Implementing a full audited native Soroswap router/pool inside this PoC without contract source and focused equivalence coverage would be too risky for consensus-critical transaction execution.
+
+### Changes Attempted
+
+- Initialized the recorded `src/rust/soroban/p26` submodule to inspect the actual host dispatch code at `soroban-env-host/src/host/frame.rs`.
+- Confirmed `Host::call_contract_fn` sends every production `ContractExecutable::Wasm(hash)` through `instantiate_vm` and `Vm::invoke_function_raw`, while only `ContractExecutable::StellarAsset` has a production native path.
+- Confirmed test-native `ContractFunctionSet` support is gated behind `test`/`testutils` and uses an empty-Wasm marker, so it cannot be reused for deterministic production code-hash precompiles.
+- No production source changes were kept because the optimization could not be implemented correctly within the available code and coverage.
