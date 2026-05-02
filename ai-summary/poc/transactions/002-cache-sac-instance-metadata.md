@@ -85,3 +85,28 @@ Correctness constraints are manageable. `with_mut_instance_storage` marks the fr
 - **Change description**: add a next-protocol-only, frame-local immutable SAC metadata cache populated from the `ScContractInstance` already stored in `Frame::StellarAssetContract`; use it for `AssetInfo` and metadata name reads in the SAC event path when instance storage has not been mutably accessed. Bypass or clear the cache whenever `with_mut_instance_storage` runs, and fall back to existing generic `get_contract_data` reads for current protocol or modified instance storage.
 - **Correctness check**: existing SAC transfer, transfer_from, mint/burn event, metadata/name/symbol, init_asset, set_admin, authorization, and storage-metering tests should remain semantically unchanged. Expect budget-number updates only if the optimization is next-protocol-gated and intentionally changes next-protocol host metering.
 - **Benchmark focus**: compare all three non-Tracy `scripts/run_apply_load_matrix.py` runs for `soroswap, TX=2000, T=8` and `sac, TX=6000, T=8` against the `ai-summary/CURRENT_STATE.md` baseline. The expected signal is reduced median apply time from fewer per-transfer instance-map constructions, map lookups, and metadata conversions; promotion requires a reproducible 3-10% improvement band for Medium.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-02
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract.rs:7-9` — made the SAC metadata and storage key modules visible within the crate so the host frame cache can decode the existing instance fields directly.
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/asset_info.rs:20-26` — consults `Host::cached_sac_asset_info` before falling back to generic instance `get_contract_data`.
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/metadata.rs:192-200` — consults `Host::cached_sac_metadata_name` before falling back to generic metadata lookup and decode.
+- `src/rust/soroban/p26/soroban-env-host/src/host.rs:117-120,263-268,386-394` — adds a per-frame SAC metadata cache stack to `HostImpl` and initializes its borrow helpers/default state.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:104-123,225-244,343-473` — adds the cache object, keeps it aligned with frame push/pop, gates use to next protocol, and populates `AssetInfo`/metadata-name values directly from the current `Frame::StellarAssetContract` `ScContractInstance` storage.
+- `src/rust/soroban/p26/soroban-env-host/src/host/data_helper.rs:70-75` — invalidates the cache on any mutable instance-storage access so initialization, metadata changes, or future instance mutations fall back to the canonical storage path.
+
+### Demonstration
+
+The optimization is next-protocol-only (`ledger protocol > MIN_LEDGER_PROTOCOL_VERSION`) and frame-local, so released p26 metering and current-protocol observation traces remain unchanged. In next protocol SAC frames, repeated `read_asset_info` and `read_name` calls can reuse metadata decoded from the already-loaded `ScContractInstance`, avoiding lazy `InstanceStorageMap` construction and repeated generic `get_contract_data`/map lookup work on the hot transfer-event path while still falling back after any mutable instance-storage access.
+
+### Test Results
+
+Configured and built with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` and `make -j $(nproc)`. Full regression command `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` completed successfully: p26 host tests reported `751 passed; 0 failed; 2 ignored; 1 filtered out`, and the top-level check reported `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, `All 2 tests passed`.
