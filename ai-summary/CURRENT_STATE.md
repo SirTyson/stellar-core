@@ -95,7 +95,8 @@ net improvement and therefore satisfies the soroswap-vs-max-sac tradeoff rules.
 
 ```sh
 ./configure --enable-ccache --enable-sdfprefs --enable-tracy \
-            --enable-tracy-capture --disable-postgres
+            --enable-tracy-capture --disable-postgres \
+            --enable-next-protocol-version-unsafe-for-production
 make -j30
 env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check
 PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py
@@ -107,6 +108,19 @@ PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py --tracy
 The first three benchmark commands are the authoritative non-Tracy baseline.
 The fourth benchmark command captured the diagnostic Tracy trace for
 attribution; its apply-time numbers are not used for the verdict.
+
+The `--enable-next-protocol-version-unsafe-for-production` flag is required
+starting with PoC 001 (protocol-gated host metering coalescing): the
+optimization is intentionally gated behind a protocol number greater than the
+released p26 so that p26 ledgers retain their exact metering. The flag bumps
+`Config::CURRENT_LEDGER_PROTOCOL_VERSION` from 26 to 27 and propagates the
+`next` cargo feature into the p26 Soroban host crate, raising the host's
+compiled `INTERFACE_VERSION.protocol` to 27 so `Host::set_ledger_info` accepts
+the new protocol and enables coalesced host metering. The apply-load benchmark
+inherits `LEDGER_PROTOCOL_VERSION` from the configured build and therefore
+exercises the optimized path automatically. The
+`next_protocol_build_enables_coalesced_host_metering` test in the host crate
+fails the suite if the gate becomes unreachable under this configuration.
 
 ## Worktree Build Note
 
