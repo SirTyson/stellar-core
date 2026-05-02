@@ -204,3 +204,43 @@ and the refreshed observation JSON files under `observations/26/`.
 - `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check 2>&1 | tail` —
   passed; final run reported `PASS: test/selftest-nopg`,
   `PASS: test/check-nondet`, and `All 2 tests passed`.
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-05-02
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** YES — the p26 commit `8af74a7987473e64f64ce35ee9aa8287e0fc7921` implements a host-local single-entry `LastContractDataHas` cache. `has_contract_data` stores durable `LedgerKey`/`EntryWithLiveUntil` or instance `Val`, and the immediately following same-key `get_contract_data` consumes it instead of repeating the lookup.
+2. **Are the preconditions realistic?** PARTIAL — adjacent has/get pairs are plausible and covered by the implementation, but the required real workload improvement did not survive the project benchmark.
+3. **Is the original code inefficient or working as designed?** INEFFICIENCY — the original durable `has_contract_data` path used `Storage::has`, which calls `try_get_full(...).is_some()`, so present entries were looked up and then discarded before a following `get_contract_data` repeated the work.
+4. **Does the benchmark improvement match the claimed severity?** NO — independent non-Tracy `scripts/run_apply_load_matrix.py` runs did not show a consistent soroswap win. Accepted baseline soroswap medians are 278.119725 ms, 279.118436 ms, and 278.981930 ms. Optimized medians were 277.560538 ms, 282.672042 ms, and 279.623256 ms. Only run 1 improved; runs 2 and 3 regressed, and the three-run average regressed from 278.740030 ms to 279.951945 ms (-0.43% improvement).
+5. **Is the optimization in scope?** YES — the modified host storage API is exercised under Soroban transaction execution in `closeLedger`; it is not TX-set construction or background bucket work.
+6. **Is the benchmark methodology correct?** YES — the optimized branch was built with the required Tracy-enabled configuration, the full test suite passed, and benchmark numbers came from three independent non-Tracy invocations of `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` compared against `ai-summary/CURRENT_STATE.md`.
+7. **Can the improvement be explained without the optimization?** YES — the single faster soroswap run is within run-to-run variance. Because two subsequent soroswap runs were slower than baseline and the average regressed, the apparent run-1 win is not attributable to a reproducible apply-path optimization.
+8. **Is this optimization novel?** YES — this exact immediate has/get cache is not one of the prior accepted transaction-ledger successes, but novelty does not overcome the failed benchmark gate.
+
+### Independent Verification Performed
+
+- `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres 2>&1 | tail -200` — passed.
+- `make -j30 2>&1 | tail -200` — passed.
+- `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check 2>&1 | tail -200` — passed.
+- `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` run 1: SAC median 306.253376 ms, soroswap median 277.560538 ms.
+- `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` run 2: SAC median 309.791692 ms, soroswap median 282.672042 ms.
+- `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` run 3: SAC median 311.137566 ms, soroswap median 279.623256 ms.
+
+### Rejection Reason
+
+The optimization is not performance-viable for the objective. The headline soroswap apply-time metric did not improve consistently across the three required non-Tracy benchmark runs and regressed on average relative to the accepted baseline. The objective verdict criteria explicitly require consistent soroswap improvement and reject soroswap regressions, so this PoC cannot be confirmed even though the source change builds and tests cleanly.
+
+### Failed Checks
+
+- Performance final-review Step 5 / objective benchmark workflow: three non-Tracy benchmark runs did not show eligible soroswap improvement.
+- Adversarial analysis check 4: measured improvement does not match the claimed Medium severity and is below the 1% validity floor.
+- Objective verdict criteria for CONFIRMED: soroswap apply time did not improve consistently across all three runs; average soroswap apply time regressed by 0.43%.
+
