@@ -86,3 +86,27 @@ The impact projection meets the objective's Medium floor. The diagnostic trace c
 - **Change description**: Add a SAC-private helper for contract addresses that reads `DataKey::Balance(addr)` once and returns the key plus `Option<BalanceValue>` or equivalent. In `receive_balance`, branch on `addr.to_sc_address()` first: keep the account path unchanged; in the contract path, read once, derive authorization from existing `balance.authorized` or `!is_asset_auth_required(e)?`, then update/create the same `BalanceValue` and call `write_contract_balance`. In `spend_balance`, similarly branch so the contract path reads once, checks authorization from the decoded or missing state, performs the existing amount checks, and writes only when the current implementation writes. Do not change `is_authorized` itself because the public `authorized` SAC function still needs the standalone read behavior.
 - **Correctness check**: Existing SAC tests and transaction tests should cover public `balance`, `authorized`, `transfer`, `transfer_from`, `mint`, `burn`, `clawback`, and trustline SAC behavior (`src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/test_stellar_asset_contract.rs:112-224`, `src/transactions/test/InvokeHostFunctionTests.cpp:192-375,8826-9007,9465`). Add focused Rust host tests if existing coverage does not directly assert missing contract balance, deauthorized contract balance, zero-amount spend, and auth-required receive semantics for contract addresses.
 - **Benchmark focus**: Re-run the soroswap apply-load matrix and compare top-line apply time. The expected improvement should come from fewer `try_get_contract_data`/`get_contract_data`, `storage get`, `ScVal to Val`, and `visit host object` events inside `applyLedger`, with no change in final balances, TTL bumps, events, or authorization outcomes.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-02
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/balance.rs:169-175` adds a SAC-private helper that builds the contract balance key once and returns the decoded `BalanceValue` for a contract ID.
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/balance.rs:287-297` centralizes the existing balance-deauthorized error so fused branches return the same error.
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/balance.rs:300-337` changes `receive_balance` so contract-address recipients read `DataKey::Balance` once, derive authorization from the decoded balance or `!is_asset_auth_required`, then update/create the same `BalanceValue`.
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/balance.rs:409-460` changes `spend_balance` so contract-address spenders read `DataKey::Balance` once, check authorization from that decoded value or the missing-balance fallback, then perform the existing amount checks and writes. `spend_balance_no_authorization_check` remains unchanged for clawback.
+- `src/rust/soroban/p26/soroban-env-host/observations/26/*.json` updates 44 SAC observation snapshots after the intentional CPU-budget reduction from removing duplicate balance reads.
+
+### Demonstration
+
+The optimization fuses the SAC contract-address authorization and balance update read paths: present contract balances are decoded once and reused for both the `authorized` flag and `amount`. This removes one `read_contract_balance`/storage lookup/ScVal decode from each contract endpoint handled by `receive_balance` or authorized `spend_balance`, while preserving missing-balance auth-required behavior, deauthorized errors, insufficient-balance checks, clawback semantics, final writes, and public `authorized` behavior.
+
+### Test Results
+
+`make -j30` completed successfully with Tracy capture enabled. `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS="--ll fatal -r simple --abort --disable-dots" make -j30 check` completed successfully after regenerating intentional p26 SAC observation snapshots with `UPDATE_OBSERVATIONS=1`; the final normal run reported `All 2 tests passed` for stellar-core checks and p26 Rust host tests including `750 passed; 0 failed; 2 ignored; 1 filtered out`.
