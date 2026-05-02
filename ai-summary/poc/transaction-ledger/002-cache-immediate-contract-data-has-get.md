@@ -88,3 +88,27 @@ This is not a duplicate of the existing transaction-ledger success records. `001
 - **Change description**: Have `has_contract_data` populate a single-entry last-has cache containing storage type, original key `Val`, converted `Rc<LedgerKey>` for persistent/temporary storage, the existence bit, and the retrieved `EntryWithLiveUntil` or instance-storage `Val` when present. Have `get_contract_data` consume the cache only for an exact same-key/same-type immediate hit; otherwise fall back to the existing code. Invalidate the cache on `put_contract_data`, `del_contract_data`, `extend_contract_data_ttl`, `extend_contract_data_ttl_v2`, mutable instance-storage access, frame push/pop or context switch, and any other operation that can change the current contract ID or storage view.
 - **Correctness check**: Existing host storage tests under `src/rust/soroban/p26/soroban-env-host/src/test/storage.rs`, frame/storage tests, SAC tests, and transaction-level Soroban tests in `src/transactions/test/InvokeHostFunctionTests.cpp` cover storage presence, missing values, footprint enforcement, TTL behavior, and budget/resource-limit outcomes. Pay special attention to observation/resource-budget tests because silent metering changes are protocol-visible.
 - **Benchmark focus**: Before and after the functional change, add temporary counters or Tracy spans for same-key cacheable pairs, cache hits, and fallback reasons. The benchmark must improve top-line `scripts/run_apply_load_matrix.py` soroswap apply time by at least 3% across repeated non-Tracy runs; Tracy should show lower `storage get`, duplicate `Val to ScVal`, and has/get self-time under `applyLedger`, with no increase in failed resource-limit or diagnostic behavior.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-02
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/host.rs:91-113,257-289,2248-2379` — added a host-local single-entry `LastContractDataHas` cache, populated it from `has_contract_data`, and taught `get_contract_data` to consume exact same-key/same-storage-type durable and instance hits, including missing-value cache hits.
+- `src/rust/soroban/p26/soroban-env-host/src/host.rs:2388-2514`, `src/rust/soroban/p26/soroban-env-host/src/host/data_helper.rs:52-57`, `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:404-416,557-565`, `src/rust/soroban/p26/soroban-env-host/src/storage.rs:460-468,647-656,710-720`, and `src/rust/soroban/p26/soroban-env-host/src/vm/dispatch.rs:239-245` — conservatively clear the cache on storage mutation, TTL extension, mutable instance-storage access, frame push/pop, and any VM host call other than the immediately following `get_contract_data`.
+- `src/rust/soroban/p26/soroban-env-host/src/test/auth.rs:2470-2526`, `src/rust/soroban/p26/soroban-env-host/src/test/lifecycle.rs:1988-2072`, and `src/rust/soroban/p26/soroban-env-host/src/test/stellar_asset_contract.rs:3628-3658` — updated hardcoded budget/resource expectations to the lower instruction and memory counts produced by the cheaper lookup path.
+- `src/rust/soroban/p26/soroban-env-host/observations/26/*.json` for affected storage/SAC/hostile-opt tests — refreshed recorded host observations with `UPDATE_OBSERVATIONS=1` after the intentional budget-observation changes.
+
+### Demonstration
+
+The optimization makes `has_contract_data(k, t)` retain the already-converted durable `LedgerKey` and fetched `EntryWithLiveUntil`, or the instance-storage `Val`, and lets the immediately following same-key `get_contract_data(k, t)` return from that cache instead of repeating conversion and storage-map lookup work. The VM dispatch invalidation keeps the cache usable only for the adjacent has/get pattern, while mutation and frame-boundary invalidation preserve storage semantics and rollback behavior. Existing resource-observation tests measured lower instruction and memory counts in auth, constructor, SAC, and storage paths, demonstrating that the duplicate work was removed without changing behavioral outcomes.
+
+### Test Results
+
+- `make -j $(nproc) 2>&1 | tail -200` — passed.
+- `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check 2>&1 | tail -200` — passed; final run reported `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.
