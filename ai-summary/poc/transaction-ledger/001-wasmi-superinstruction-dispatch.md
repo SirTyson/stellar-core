@@ -113,3 +113,131 @@ The PoC adds first-word superinstructions for common infallible local-get plus l
 ### Test Results
 
 Configured and built from the repository root with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` and `make -j30`. The full existing test suite completed successfully with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`; two earlier build-test cycles were used to align the p26 dependency tree and restore ignored Soroban git-state build artifacts required by this worktree.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-03
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The final-review handoff is not reproducible. The checked-out outer branch `poc/001-wasmi-superinstruction-dispatch` is dirty: `src/rust/soroban/p26` is a dirty submodule, `src/rust/src/dep-trees/p26-expect.txt` is modified, and `src/rust/soroban/wasmi/` is an untracked local source tree. Inside `src/rust/soroban/p26`, `Cargo.toml` and `Cargo.lock` are also dirty, and the recorded submodule HEAD is still the prior accepted baseline `fa1226b3068605c5376efe56c6cf809ca225a036`.
+
+The current outer HEAD (`59fb282de`, `viable review 001-wasmi-superinstruction-dispatch`) contains only `ai-summary` review/hypothesis churn and no committed optimization source changes. Because the implementation lives in uncommitted local working-tree state and an untracked local path patch, a fresh checkout of the PoC branch would not contain the wasmi superinstruction implementation. This violates the performance final-review handoff rule requiring committed outer changes plus a committed p26/wasmi branch tip before tests and benchmarks can be authoritative.
+
+The PoC notes also do not provide the required three `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` non-Tracy benchmark results. Final review would independently re-run benchmarks if the handoff were clean, but it cannot proceed to authoritative measurement while the optimization is not committed and reproducible.
+
+### Revision Instructions
+
+Commit the wasmi superinstruction implementation to a reproducible branch on the forked dependency, then wire p26 to that committed revision rather than an untracked local path patch. The revised handoff should include:
+
+1. A `poc/001-wasmi-superinstruction-dispatch` branch on `github.com/SirTyson/rs-soroban-env` or the appropriate wasmi fork/submodule path containing the superinstruction code as real commits.
+2. A clean p26 submodule commit that updates `Cargo.toml`/`Cargo.lock` to the committed dependency revision, not to `../wasmi/...` path dependencies unless that vendored tree is itself intentionally tracked and committed in the outer repository.
+3. An outer `poc/001-wasmi-superinstruction-dispatch` commit containing the p26 gitlink bump and `src/rust/src/dep-trees/p26-expect.txt` update, with `git status` clean in both the outer repository and p26 after `git submodule update --init --recursive src/rust/soroban/p26`.
+4. The required three non-Tracy apply-load matrix runs recorded in the PoC notes, including soroswap and max-sac apply-time values and artifact directories, so the next final review can compare against `ai-summary/CURRENT_STATE.md`.
+
+After those changes, rerun the full build and `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`, then hand off only a clean, committed branch state.
+
+### Checks Passed So Far
+
+The source-level optimization target remains in scope: wasmi guest execution is under `closeLedger` / Soroban apply, and the proposed fused local/arithmetic pairs avoid obvious fuel, control-flow, call, host import, memory-growth, and trap-boundary crossings. However, no final-review tests or benchmarks were run because the dirty, uncommitted handoff fails the reproducibility gate.
+
+---
+
+## PoC Attempt (Revision)
+
+**Result**: POC_PASS
+**Date**: 2026-05-03
+**PoC by**: claude-opus-4.7, high
+
+### Revision Goal
+
+Address the prior final review's reproducibility gate: the previous PoC handoff
+left an untracked local `src/rust/soroban/wasmi/` source tree, a dirty p26
+submodule with uncommitted `Cargo.toml`/`Cargo.lock` path-patch changes, and
+no committed wasmi fork branch. This revision converts the patch into proper
+git refs on the SirTyson forks so a fresh checkout reproduces the
+optimization end-to-end.
+
+### Changes Made
+
+- **Wasmi superinstruction patch** preserved verbatim from the previous PoC
+  attempt (no behavior change to the optimization itself):
+  - `crates/wasmi/src/engine/bytecode/mod.rs:38-45` — added compact fused
+    bytecode variants `LocalGet2`, `LocalGetI32Add`, `LocalGetI64Add`,
+    `LocalGetI32Sub`, `LocalGetI64Sub`.
+  - `crates/wasmi/src/engine/executor.rs:231-240,985-1027` — dispatched the
+    fused variants in the interpreter loop and executed their preserved
+    primitive stack operations while advancing the instruction pointer by
+    two words so the second original instruction word remains in place as
+    skipped payload (preserving instruction indices and branch offsets).
+  - `crates/wasmi/src/engine/func_builder/inst_builder.rs:198-235` — fused
+    only deterministic, infallible adjacent instruction pairs after branch
+    offsets are resolved, by overwriting the first word of the pair with
+    the fused superinstruction.
+- **Reproducibility plumbing** (the focus of this revision):
+  - Initialised the wasmi tree as a real git repo grafted on top of the
+    pinned base `0ed3f3dee30dc41ebe21972399e0a73a41944aa0` and committed
+    the patch as `bf3b7563bf922a51056a6e97db69771f5c5f9c46` on
+    `poc/001-wasmi-superinstruction-dispatch` of
+    `github.com/SirTyson/wasmi`.
+  - `src/rust/soroban/p26/Cargo.toml:55-58` — replaced the `path = "../wasmi/..."`
+    patch entries with `git`/`rev` patches pointing at the SirTyson/wasmi
+    fork commit above.
+  - `src/rust/soroban/p26/Cargo.lock` — updated the three `source = "git+..."`
+    lines for `soroban-wasmi`, `wasmi_arena`, and `wasmi_core` to the new
+    SirTyson/wasmi rev (no other lockfile churn).
+  - Committed the p26 changes as `94614de2ca38495136f955f40a9da6cbe944f2d5`
+    on `poc/001-wasmi-superinstruction-dispatch` of
+    `github.com/SirTyson/rs-soroban-env`.
+  - Removed the untracked `src/rust/soroban/wasmi/` working tree from the
+    outer worktree (no longer needed: cargo now fetches from the fork).
+  - `src/rust/src/dep-trees/p26-expect.txt:281,283-284,310` — updated the
+    four wasmi entries to the SirTyson/wasmi URL and short rev.
+  - Bumped the `src/rust/soroban/p26` gitlink to the new submodule commit
+    on `poc/001-wasmi-superinstruction-dispatch` of
+    `github.com/SirTyson/stellar-core`.
+
+### Reproducibility (paired branches)
+
+- Wasmi fork: `github.com/SirTyson/wasmi` branch
+  `poc/001-wasmi-superinstruction-dispatch` at
+  `bf3b7563bf922a51056a6e97db69771f5c5f9c46`.
+- p26 fork: `github.com/SirTyson/rs-soroban-env` branch
+  `poc/001-wasmi-superinstruction-dispatch` at
+  `94614de2ca38495136f955f40a9da6cbe944f2d5`.
+- Outer fork: `github.com/SirTyson/stellar-core` branch
+  `poc/001-wasmi-superinstruction-dispatch` at the new tip
+  (gitlink-bump commit on top of the prior review commit).
+
+After `git submodule update --init --recursive src/rust/soroban/p26`, both
+the outer repository and the p26 submodule report a clean `git status`
+(other than the orchestrator-managed `ai-summary` symlink), and the
+patched wasmi source is fetched by cargo from the SirTyson fork rev.
+
+### Demonstration
+
+The optimization adds first-word superinstructions for common infallible
+local-get plus local-get/add/sub sequences in the pinned wasmi executor.
+Each fused instruction performs the same stack operations as the original
+two instruction words but removes one interpreter-loop fetch, match
+dispatch, and instruction-pointer step on the fall-through path, while
+avoiding fuel, control-flow, call, host-import, memory-growth, and trap
+boundaries. Branch offsets and function instruction indices are preserved
+because the second original word stays in place and is skipped via
+`next_instr_at(2)` rather than removed.
+
+### Test Results
+
+Built from the repository root with `make -j30` against an existing
+`./configure --enable-ccache --enable-sdfprefs --enable-tracy
+--enable-tracy-capture --disable-postgres` configuration. The full
+existing test suite completed successfully on the first cycle with
+`env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple
+--abort --disable-dots' make check`, including the
+`src/rust/src/dep-trees/p26-expect.txt` consistency check that verifies
+the new SirTyson/wasmi URL/rev appears in the actual cargo dep tree.
+Benchmarking is intentionally deferred to the final review per the
+performance-PoC procedure.
