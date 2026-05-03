@@ -131,3 +131,59 @@ Re-validated against the now-committed branches:
 
 - Build: `make -j30` completed successfully with the existing Tracy-enabled configuration (`./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`, plus `--enable-minimal --enable-valgrind` already on the worktree).
 - Tests: `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make -j30 check` ran to completion with `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, `All 2 tests passed`. Rust unit tests in `src/rust/soroban/p26` (including the SAC observation suite) also passed.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-03
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The committed handoff is reproducible and the full required test gate passes, but the required three non-Tracy `scripts/run_apply_load_matrix.py` runs do not show an eligible soroswap improvement. The accepted baseline soroswap medians are 272.249541 ms, 275.885919 ms, and 270.551362 ms (average 272.895607 ms). The optimized medians measured in final review were 271.021041 ms, 274.745693 ms, and 274.075828 ms (average 273.280854 ms), which is an average regression of 0.141% and is not consistently better across the three runs. Max-sac improved from a 306.542755 ms baseline average to 301.957539 ms, but the objective's headline metric is soroswap apply time, so this cannot be confirmed.
+
+There is also one source-level safety concern to resolve or explicitly justify before the next review: `Storage::extend_ttl_from_entry` preserves most `extend_ttl` semantics, but it does not call `handle_maybe_expired_entry` in recording-mode/test builds before preparing the TTL extension from the carried entry. The existing `extend_ttl` path does call that normalization hook. If the carried entry can be stale in recording mode, this is a behavior change; if it cannot happen for this SAC transfer-local path, document the invariant and add a targeted regression test if practical.
+
+### Revision Instructions
+
+Revise the optimization so the soroswap medians improve reproducibly by at least the Low threshold across three non-Tracy matrix runs, or narrow/rework the change to remove the soroswap-neutral pieces. Re-run the exact final-review benchmark command three times:
+
+```sh
+PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py
+```
+
+Use the accepted `ai-summary/CURRENT_STATE.md` numbers as the baseline. Do not run or report a Tracy diagnostic trace until the three non-Tracy runs are eligible. Also address the recording-mode TTL normalization concern in `extend_ttl_from_entry`, either by preserving the same hook behavior as `extend_ttl` or by proving the carried-entry path cannot observe expired entries and recording that proof in the PoC notes.
+
+### Checks Passed So Far
+
+- Handoff reproducibility: PASS — outer branch `poc/002-sac-transfer-balance-slot-context` records only the p26 gitlink bump, and p26 branch `poc/002-sac-transfer-balance-slot-context` contains the source changes at `4c0458861e0d7728529c95abcf26d0f89a8fa79b`.
+- Worktree cleanliness for source: PASS — no uncommitted source changes outside the `ai-summary` artifact symlink were present before validation.
+- Test-file audit: PASS — 44 SAC observation JSON files changed values only; their observation key/order structure is unchanged.
+- Required build/test gate: PASS — `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production`, `make -j30`, and `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` completed successfully.
+- Benchmark gate: FAIL — soroswap apply time is inconsistent and below the objective threshold; diagnostic Tracy was intentionally not run.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-03
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/balance.rs:170-339` — kept the transfer-local `ContractBalanceSlot` path for SAC contract balances and revised writeback so it computes the post-extension persistent balance TTL before `Storage::put`. This preserves the same threshold, current-ledger liveness check, and max-live-until clamp while fusing the balance mutation and TTL update into one storage write for the contract transfer side.
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/balance.rs:453-584` — contract-address branches of `receive_balance`, `spend_balance_no_authorization_check`, and `spend_balance` continue to route through the slot, while account/trustline branches still use the existing classic authorization and balance paths.
+- `src/rust/soroban/p26/soroban-env-host/src/storage.rs:531-612` — removed the prior public `extend_ttl_from_entry` helper from the hot path. The generic storage TTL path remains unchanged for non-SAC callers, and the final-review recording-mode concern is avoided because SAC writeback no longer calls a carried-entry TTL helper that bypasses `handle_maybe_expired_entry`.
+- `src/rust/soroban/p26/soroban-env-host/observations/26/test__stellar_asset_contract__*.json` — regenerated the 7 SAC observation fixtures whose host-call traces changed because balance writeback now emits one fused storage write/TTL update sequence instead of a separate TTL extension call.
+
+### Demonstration
+
+The PoC now carries each SAC contract-balance side through key construction, load, authorization, mutation, and writeback, and folds the TTL extension into the same persistent entry written by `Storage::put`. This removes the duplicate authorization/mutation balance read and the separate post-write TTL storage lookup/update for the contract side of each soroswap SAC transfer while preserving missing-balance authorization, deauthorization rejection, insufficient-balance errors, overflow checks, TTL thresholding, liveness checks, and max-live-until clamping.
+
+### Test Results
+
+- Build: `make -j $(nproc)` completed successfully with the Tracy-enabled configuration (`./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` already present in the worktree).
+- Observation refresh: `env UPDATE_OBSERVATIONS=1 NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` completed successfully and updated the affected SAC observation fixtures.
+- Clean full suite: `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` completed successfully with `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.
