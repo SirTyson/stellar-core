@@ -241,3 +241,53 @@ existing test suite completed successfully on the first cycle with
 the new SirTyson/wasmi URL/rev appears in the actual cargo dep tree.
 Benchmarking is intentionally deferred to the final review per the
 performance-PoC procedure.
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-05-03
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** PARTIAL — the patch adds first-word superinstructions for `local.get` paired with `local.get`, `i32.add`, `i64.add`, `i32.sub`, and `i64.sub` in the pinned wasmi interpreter, so it targets interpreter dispatch as claimed.
+2. **Are the preconditions realistic?** PLAUSIBLE — Soroswap contract execution enters this wasmi interpreter from the close-ledger Soroban apply path, but the final benchmark result shows the selected fused pairs do not improve the real workload.
+3. **Is the original code inefficient or working as designed?** NOT PROVEN — one-instruction-at-a-time dispatch has overhead, but the final measurements do not demonstrate that this specific fusion is a net optimization in the benchmark.
+4. **Does the benchmark improvement match the claimed severity?** NO — the authoritative non-Tracy soroswap medians regressed from the accepted baseline of 272.249541 / 275.885919 / 270.551362 ms to 277.148919 / 280.837352 / 276.348005 ms.
+5. **Is the optimization in scope?** YES — wasmi guest execution is under Soroban `closeLedger` apply and is not TX-set construction.
+6. **Is the benchmark methodology correct?** YES — final review used the required local-build command `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` three times without `--tracy`, comparing against `ai-summary/CURRENT_STATE.md`.
+7. **Can the improvement be explained without the optimization?** NOT APPLICABLE — there was no soroswap improvement to explain; the result is a consistent regression.
+8. **Is this optimization novel?** YES — no duplicate wasmi superinstruction change was identified during review.
+
+Full build and unit-test validation passed before benchmarking:
+
+```text
+./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production
+make -j $(nproc)
+env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check
+```
+
+Authoritative benchmark comparison:
+
+| Run | Scenario | Baseline median_ms | PoC median_ms | Result |
+|-----|----------|--------------------|---------------|--------|
+| 1 | sac, TX=6000, T=8 | 306.357371 | 305.751703 | 0.20% faster |
+| 1 | soroswap, TX=2000, T=8 | 272.249541 | 277.148919 | 1.80% slower |
+| 2 | sac, TX=6000, T=8 | 300.543791 | 303.899384 | 1.12% slower |
+| 2 | soroswap, TX=2000, T=8 | 275.885919 | 280.837352 | 1.79% slower |
+| 3 | sac, TX=6000, T=8 | 312.727103 | 306.175572 | 2.09% faster |
+| 3 | soroswap, TX=2000, T=8 | 270.551362 | 276.348005 | 2.14% slower |
+
+### Rejection Reason
+
+The optimization fails the objective's headline metric. All three independent non-Tracy soroswap apply-load runs are slower than the accepted baseline, so the required reproducible soroswap apply-time reduction is absent. Under the final-review verdict criteria, soroswap regression blocks confirmation regardless of source-level plausibility or passing unit tests.
+
+### Failed Checks
+
+- Performance Step 5: benchmark improvement not demonstrated.
+- Adversarial check 4: claimed severity and improvement not supported by measurements.
+- Adversarial check 7: no improvement exists; observed result is a consistent soroswap regression.
+- Verdict criteria: REJECTED because soroswap regresses across all three authoritative non-Tracy runs.
