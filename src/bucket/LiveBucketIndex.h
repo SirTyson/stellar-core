@@ -133,6 +133,7 @@ class LiveBucketIndex : public NonMovableOrCopyable
     static std::streamoff getPageSize(Config const& cfg, size_t bucketSize);
 
     IndexReturnT lookup(LedgerKey const& k) const;
+    IndexReturnT lookup(LedgerKey const& k, size_t keyHash) const;
 
     std::pair<IndexReturnT, IterT> scan(IterT start, LedgerKey const& k) const;
 

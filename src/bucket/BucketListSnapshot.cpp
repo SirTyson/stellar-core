@@ -7,6 +7,7 @@
 #include "bucket/BucketInputIterator.h"
 #include "bucket/BucketListBase.h"
 #include "bucket/LiveBucketList.h"
+#include "ledger/LedgerHashUtils.h"
 #include "ledger/LedgerTxn.h"
 #include "ledger/LedgerTypeUtils.h"
 #include "util/GlobalChecks.h"
@@ -169,7 +170,8 @@ SearchableBucketListSnapshot<BucketT>::getEntryAtOffset(
 template <class BucketT>
 std::pair<std::shared_ptr<typename BucketT::EntryT const>, bool>
 SearchableBucketListSnapshot<BucketT>::getBucketEntry(
-    std::shared_ptr<BucketT const> const& bucket, LedgerKey const& k) const
+    std::shared_ptr<BucketT const> const& bucket, LedgerKey const& k,
+    size_t keyHash) const
 {
     ZoneScoped;
     if (bucket->isEmpty())
@@ -177,7 +179,16 @@ SearchableBucketListSnapshot<BucketT>::getBucketEntry(
         return {nullptr, false};
     }
 
-    auto indexRes = bucket->getIndex().lookup(k);
+    auto indexRes = [&]() {
+        if constexpr (std::is_same_v<BucketT, LiveBucket>)
+        {
+            return bucket->getIndex().lookup(k, keyHash);
+        }
+        else
+        {
+            return bucket->getIndex().lookup(k);
+        }
+    }();
     switch (indexRes.getState())
     {
     // Index had entry in cache
@@ -322,10 +333,15 @@ SearchableBucketListSnapshot<BucketT>::load(LedgerKey const& k) const
     auto timer = timerIter->second.get().TimeScope();
 
     std::shared_ptr<typename BucketT::LoadT const> result{};
+    size_t keyHash = 0;
+    if constexpr (std::is_same_v<BucketT, LiveBucket>)
+    {
+        keyHash = std::hash<LedgerKey>{}(k);
+    }
 
     // Search function called on each Bucket in BucketList until we find the key
     auto loadKeyBucketLoop = [&](std::shared_ptr<BucketT const> const& bucket) {
-        auto [be, bloomMiss] = getBucketEntry(bucket, k);
+        auto [be, bloomMiss] = getBucketEntry(bucket, k, keyHash);
         if (bloomMiss)
         {
             // Reset timer on bloom miss to avoid outlier metrics, since we

@@ -29,7 +29,7 @@ class InternalInMemoryBucketEntry
     LedgerEntryType mType;
 
   public:
-    explicit InternalInMemoryBucketEntry(IndexPtrT entry);
+    InternalInMemoryBucketEntry(IndexPtrT entry, LedgerKey const& key);
 
     size_t
     hash() const
@@ -82,7 +82,7 @@ class InMemoryBucketState : public NonMovableOrCopyable
     using IterT = InMemoryEntries::const_iterator;
 
     // Insert a LedgerEntry (INIT/LIVE) into the cache.
-    void insert(BucketEntry const& be);
+    void insert(BucketEntry const& be, LedgerKey const& key);
 
     // Build cache-local immutable lookup tables and assert no duplicate keys
     // were inserted.
@@ -95,6 +95,7 @@ class InMemoryBucketState : public NonMovableOrCopyable
     // DiskIndex::scan.
     std::pair<IndexReturnT, IterT> scan(IterT start,
                                         LedgerKey const& searchKey) const;
+    IndexReturnT lookup(LedgerKey const& searchKey, size_t searchHash) const;
 
     IterT
     begin() const
@@ -162,6 +163,11 @@ class InMemoryIndex
     scan(IterT start, LedgerKey const& searchKey) const
     {
         return mInMemoryState.scan(start, searchKey);
+    }
+    IndexReturnT
+    lookup(LedgerKey const& searchKey, size_t searchHash) const
+    {
+        return mInMemoryState.lookup(searchKey, searchHash);
     }
 
     std::optional<std::pair<std::streamoff, std::streamoff>>

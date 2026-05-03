@@ -223,6 +223,12 @@ LiveBucketIndex::getCachedEntry(LedgerKey const& k) const
 IndexReturnT
 LiveBucketIndex::lookup(LedgerKey const& k) const
 {
+    return lookup(k, std::hash<LedgerKey>{}(k));
+}
+
+IndexReturnT
+LiveBucketIndex::lookup(LedgerKey const& k, size_t keyHash) const
+{
     if (mDiskIndex)
     {
         if (auto cached = getCachedEntry(k); cached)
@@ -235,7 +241,7 @@ LiveBucketIndex::lookup(LedgerKey const& k) const
     else
     {
         releaseAssertOrThrow(mInMemoryIndex);
-        return mInMemoryIndex->scan(mInMemoryIndex->begin(), k).first;
+        return mInMemoryIndex->lookup(k, keyHash);
     }
 }
 

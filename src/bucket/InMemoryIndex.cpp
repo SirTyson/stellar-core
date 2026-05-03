@@ -233,21 +233,19 @@ processEntry(BucketEntry const& be, InMemoryBucketState& inMemoryState,
         }
     }
 
-    inMemoryState.insert(be);
+    inMemoryState.insert(be, lk);
     updateTypeBoundaries(lk.type(), lastOffset, typeStartOffsets,
                          typeEndOffsets, lastTypeSeen);
 }
 }
 
-InternalInMemoryBucketEntry::InternalInMemoryBucketEntry(IndexPtrT entry)
+InternalInMemoryBucketEntry::InternalInMemoryBucketEntry(IndexPtrT entry,
+                                                         LedgerKey const& key)
     : mEntry(std::move(entry))
-    , mHash(0)
-    , mType(ACCOUNT)
+    , mHash(std::hash<LedgerKey>{}(key))
+    , mType(key.type())
 {
     releaseAssertOrThrow(mEntry);
-    auto key = getBucketLedgerKey(*mEntry);
-    mHash = std::hash<LedgerKey>{}(key);
-    mType = key.type();
 }
 
 bool
@@ -264,9 +262,9 @@ InternalInMemoryBucketEntry::operator==(
 }
 
 void
-InMemoryBucketState::insert(BucketEntry const& be)
+InMemoryBucketState::insert(BucketEntry const& be, LedgerKey const& key)
 {
-    mEntries.emplace_back(std::make_shared<BucketEntry const>(be));
+    mEntries.emplace_back(std::make_shared<BucketEntry const>(be), key);
 }
 
 void
@@ -313,17 +311,15 @@ InMemoryBucketState::reserve(size_t size)
     mEntries.reserve(size);
 }
 
-// Perform an open-addressed hash lookup over the type-specific flat index;
-// start is ignored for in-memory indexes.
-std::pair<IndexReturnT, InMemoryBucketState::IterT>
-InMemoryBucketState::scan(IterT start, LedgerKey const& searchKey) const
+IndexReturnT
+InMemoryBucketState::lookup(LedgerKey const& searchKey,
+                            size_t searchHash) const
 {
     ZoneScoped;
-    auto const searchHash = std::hash<LedgerKey>{}(searchKey);
     auto const& table = mLookupTables[ledgerEntryTypeIndex(searchKey.type())];
     if (table.empty())
     {
-        return {IndexReturnT(), mEntries.begin()};
+        return IndexReturnT();
     }
 
     auto const mask = table.size() - 1;
@@ -335,14 +331,23 @@ InMemoryBucketState::scan(IterT start, LedgerKey const& searchKey) const
             auto const& entry = mEntries[table[slotIndex].mEntryIndex];
             if (entry.keyEquals(searchKey))
             {
-                return {IndexReturnT(entry.get()), mEntries.begin()};
+                return IndexReturnT(entry.get());
             }
         }
 
         slotIndex = (slotIndex + 1) & mask;
     }
 
-    return {IndexReturnT(), mEntries.begin()};
+    return IndexReturnT();
+}
+
+// Perform an open-addressed hash lookup over the type-specific flat index;
+// start is ignored for in-memory indexes.
+std::pair<IndexReturnT, InMemoryBucketState::IterT>
+InMemoryBucketState::scan(IterT start, LedgerKey const& searchKey) const
+{
+    return {lookup(searchKey, std::hash<LedgerKey>{}(searchKey)),
+            mEntries.begin()};
 }
 
 InMemoryIndex::InMemoryIndex(BucketManager& bm,

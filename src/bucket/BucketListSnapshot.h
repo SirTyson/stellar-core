@@ -125,7 +125,7 @@ template <class BucketT> class SearchableBucketListSnapshot
     // where bloomMiss is true if a bloomMiss occurred during the load.
     std::pair<std::shared_ptr<typename BucketT::EntryT const>, bool>
     getBucketEntry(std::shared_ptr<BucketT const> const& bucket,
-                   LedgerKey const& k) const;
+                   LedgerKey const& k, size_t keyHash) const;
 
     // Loads LedgerEntry's for given keys in the given bucket. When a key is
     // found, the entry is added to result and the key is removed from keys.
