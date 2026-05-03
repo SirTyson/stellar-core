@@ -12,6 +12,7 @@
 #include "util/XDRStream.h"
 #include "util/types.h"
 #include "xdr/Stellar-ledger-entries.h"
+#include <algorithm>
 #include <stdexcept>
 #include <utility>
 
@@ -20,6 +21,37 @@ namespace stellar
 
 namespace
 {
+size_t
+ledgerEntryTypeIndex(LedgerEntryType type)
+{
+    switch (type)
+    {
+    case ACCOUNT:
+        return 0;
+    case TRUSTLINE:
+        return 1;
+    case OFFER:
+        return 2;
+    case DATA:
+        return 3;
+    case CLAIMABLE_BALANCE:
+        return 4;
+    case LIQUIDITY_POOL:
+        return 5;
+    case CONTRACT_DATA:
+        return 6;
+    case CONTRACT_CODE:
+        return 7;
+    case CONFIG_SETTING:
+        return 8;
+    case TTL:
+        return 9;
+    }
+
+    releaseAssertOrThrow(false);
+    return 0;
+}
+
 // Direct, single-pass identity equality: compare the identifying key fields
 // of `data` (the .data of an INIT/LIVE LedgerEntry) against the LedgerKey
 // `key`. Equivalent in semantics to LedgerEntryIdCmp but avoids the double
@@ -94,9 +126,9 @@ bucketEntryKeyEqual(BucketEntry const& be, LedgerKey const& key)
     }
 }
 
-// Direct entry-vs-entry identity equality (used only by set internals during
-// insert/dedup). Falls back to extracting one bucket key and comparing against
-// the other entry's identifying fields via the fast path above.
+// Direct entry-vs-entry identity equality used during flat-index duplicate
+// detection. Falls back to extracting one bucket key and comparing against the
+// other entry's identifying fields via the fast path above.
 bool
 bucketEntriesKeyEqual(BucketEntry const& lhs, BucketEntry const& rhs)
 {
@@ -160,6 +192,22 @@ bucketEntriesKeyEqual(BucketEntry const& lhs, BucketEntry const& rhs)
     return false;
 }
 
+bool
+inMemoryEntryLess(InternalInMemoryBucketEntry const& lhs,
+                  InternalInMemoryBucketEntry const& rhs)
+{
+    if (lhs.type() != rhs.type())
+    {
+        return lhs.type() < rhs.type();
+    }
+    if (lhs.hash() != rhs.hash())
+    {
+        return lhs.hash() < rhs.hash();
+    }
+
+    return BucketEntryIdCmp<LiveBucket>{}(*lhs.get(), *rhs.get());
+}
+
 // Helper function to process a single bucket entry for InMemoryIndex
 // construction
 void
@@ -198,9 +246,12 @@ processEntry(BucketEntry const& be, InMemoryBucketState& inMemoryState,
 InternalInMemoryBucketEntry::InternalInMemoryBucketEntry(IndexPtrT entry)
     : mEntry(std::move(entry))
     , mHash(0)
+    , mType(ACCOUNT)
 {
     releaseAssertOrThrow(mEntry);
-    mHash = std::hash<LedgerKey>{}(getBucketLedgerKey(*mEntry));
+    auto key = getBucketLedgerKey(*mEntry);
+    mHash = std::hash<LedgerKey>{}(key);
+    mType = key.type();
 }
 
 bool
@@ -216,46 +267,69 @@ InternalInMemoryBucketEntry::operator==(
     return bucketEntriesKeyEqual(*mEntry, *other.mEntry);
 }
 
-bool
-InternalInMemoryBucketEntryEqual::operator()(
-    InternalInMemoryBucketEntry const& lhs,
-    InternalInMemoryBucketEntry const& rhs) const
-{
-    return lhs == rhs;
-}
-
-bool
-InternalInMemoryBucketEntryEqual::operator()(
-    InternalInMemoryBucketEntry const& lhs, LedgerKey const& rhs) const
-{
-    return lhs.keyEquals(rhs);
-}
-
-bool
-InternalInMemoryBucketEntryEqual::operator()(
-    LedgerKey const& lhs, InternalInMemoryBucketEntry const& rhs) const
-{
-    return rhs.keyEquals(lhs);
-}
-
 void
 InMemoryBucketState::insert(BucketEntry const& be)
 {
-    auto [_, inserted] = mEntries.insert(
-        InternalInMemoryBucketEntry(std::make_shared<BucketEntry const>(be)));
-    releaseAssertOrThrow(inserted);
+    mEntries.emplace_back(std::make_shared<BucketEntry const>(be));
 }
 
-// Perform a hash lookup; start is ignored for in-memory indexes.
+void
+InMemoryBucketState::finalize()
+{
+    std::sort(mEntries.begin(), mEntries.end(), inMemoryEntryLess);
+    mEntryRanges.fill({0, 0});
+
+    for (size_t i = 1; i < mEntries.size(); ++i)
+    {
+        releaseAssertOrThrow(!(mEntries[i - 1].hash() == mEntries[i].hash() &&
+                               mEntries[i - 1] == mEntries[i]));
+    }
+
+    size_t rangeStart = 0;
+    while (rangeStart < mEntries.size())
+    {
+        auto const type = mEntries[rangeStart].type();
+        auto rangeEnd = rangeStart + 1;
+        while (rangeEnd < mEntries.size() && mEntries[rangeEnd].type() == type)
+        {
+            ++rangeEnd;
+        }
+
+        mEntryRanges[ledgerEntryTypeIndex(type)] = {rangeStart, rangeEnd};
+        rangeStart = rangeEnd;
+    }
+}
+
+void
+InMemoryBucketState::reserve(size_t size)
+{
+    mEntries.reserve(size);
+}
+
+// Perform a hash lookup over the type-specific flat index; start is ignored for
+// in-memory indexes.
 std::pair<IndexReturnT, InMemoryBucketState::IterT>
 InMemoryBucketState::scan(IterT start, LedgerKey const& searchKey) const
 {
     ZoneScoped;
-    auto it = mEntries.find(searchKey);
-    // If we found the key
-    if (it != mEntries.end())
+    auto const searchHash = std::hash<LedgerKey>{}(searchKey);
+    auto const [rangeStart, rangeEnd] =
+        mEntryRanges[ledgerEntryTypeIndex(searchKey.type())];
+    auto const begin = mEntries.begin() + rangeStart;
+    auto const end = mEntries.begin() + rangeEnd;
+    auto it = std::lower_bound(
+        begin, end, searchHash,
+        [](InternalInMemoryBucketEntry const& entry, size_t hash) {
+            return entry.hash() < hash;
+        });
+
+    while (it != end && it->hash() == searchHash)
     {
-        return {IndexReturnT(it->get()), mEntries.begin()};
+        if (it->keyEquals(searchKey))
+        {
+            return {IndexReturnT(it->get()), mEntries.begin()};
+        }
+        ++it;
     }
 
     return {IndexReturnT(), mEntries.begin()};
@@ -287,6 +361,7 @@ InMemoryIndex::InMemoryIndex(BucketManager& bm,
     std::map<LedgerEntryType, std::streamoff> typeStartOffsets;
     std::map<LedgerEntryType, std::streamoff> typeEndOffsets;
     std::optional<LedgerEntryType> lastTypeSeen = std::nullopt;
+    mInMemoryState.reserve(inMemoryState.size());
 
     for (auto const& be : inMemoryState)
     {
@@ -297,6 +372,8 @@ InMemoryIndex::InMemoryIndex(BucketManager& bm,
 
         lastOffset += xdr::xdr_size(be) + xdrOverheadBetweenEntries;
     }
+
+    mInMemoryState.finalize();
 
     // Build the final type ranges map
     mTypeRanges = buildTypeRangesMap(typeStartOffsets, typeEndOffsets);
@@ -338,6 +415,8 @@ InMemoryIndex::InMemoryIndex(BucketManager const& bm,
                      typeStartOffsets, typeEndOffsets, lastTypeSeen);
         lastOffset = in.pos();
     }
+
+    mInMemoryState.finalize();
 
     // Build the final type ranges map
     mTypeRanges = buildTypeRangesMap(typeStartOffsets, typeEndOffsets);

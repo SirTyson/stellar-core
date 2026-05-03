@@ -9,7 +9,8 @@
 #include "xdr/Stellar-ledger-entries.h"
 
 #include "ledger/LedgerHashUtils.h"
-#include <unordered_set>
+#include <array>
+#include <vector>
 
 namespace stellar
 {
@@ -17,13 +18,14 @@ namespace stellar
 class SHA256;
 
 // LedgerKey sizes usually dominate LedgerEntry size, so we don't want to store
-// a key-value map. Instead, we store the cached BucketEntry and use C++20
-// heterogeneous lookup to find it by LedgerKey without constructing a wrapper.
+// a key-value map. Instead, we store the cached BucketEntry with its key hash
+// and type in a flat lookup index.
 class InternalInMemoryBucketEntry
 {
   private:
     IndexPtrT mEntry;
     size_t mHash;
+    LedgerEntryType mType;
 
   public:
     explicit InternalInMemoryBucketEntry(IndexPtrT entry);
@@ -37,6 +39,12 @@ class InternalInMemoryBucketEntry
     bool keyEquals(LedgerKey const& key) const;
     bool operator==(InternalInMemoryBucketEntry const& other) const;
 
+    LedgerEntryType
+    type() const
+    {
+        return mType;
+    }
+
     IndexPtrT const&
     get() const
     {
@@ -44,52 +52,30 @@ class InternalInMemoryBucketEntry
     }
 };
 
-struct InternalInMemoryBucketEntryHash
-{
-    using is_transparent = void;
-
-    size_t
-    operator()(InternalInMemoryBucketEntry const& entry) const
-    {
-        return entry.hash();
-    }
-
-    size_t
-    operator()(LedgerKey const& key) const
-    {
-        return std::hash<LedgerKey>{}(key);
-    }
-};
-
-struct InternalInMemoryBucketEntryEqual
-{
-    using is_transparent = void;
-
-    bool operator()(InternalInMemoryBucketEntry const& lhs,
-                    InternalInMemoryBucketEntry const& rhs) const;
-    bool operator()(InternalInMemoryBucketEntry const& lhs,
-                    LedgerKey const& rhs) const;
-    bool operator()(LedgerKey const& lhs,
-                    InternalInMemoryBucketEntry const& rhs) const;
-};
-
 // For small Buckets, we can cache all contents in memory. Because we cache all
 // entries, the index is just as large as the Bucket itself, so we never persist
 // this index type. It is always recreated on startup.
 class InMemoryBucketState : public NonMovableOrCopyable
 {
-    using InMemorySet =
-        std::unordered_set<InternalInMemoryBucketEntry,
-                           InternalInMemoryBucketEntryHash,
-                           InternalInMemoryBucketEntryEqual>;
+    static constexpr size_t kLedgerEntryTypeCount = 10;
 
-    InMemorySet mEntries;
+    using InMemoryEntries = std::vector<InternalInMemoryBucketEntry>;
+    using EntryRange = std::pair<size_t, size_t>;
+
+    InMemoryEntries mEntries;
+    std::array<EntryRange, kLedgerEntryTypeCount> mEntryRanges{};
 
   public:
-    using IterT = InMemorySet::const_iterator;
+    using IterT = InMemoryEntries::const_iterator;
 
     // Insert a LedgerEntry (INIT/LIVE) into the cache.
     void insert(BucketEntry const& be);
+
+    // Sort entries into a cache-local immutable lookup index and assert no
+    // duplicate keys were inserted.
+    void finalize();
+
+    void reserve(size_t size);
 
     // Find a LedgerEntry. IterT::begin is always returned, and start is
     // ignored. This interface just helps maintain consistency with
