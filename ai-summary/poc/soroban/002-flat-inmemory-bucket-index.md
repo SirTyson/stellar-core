@@ -194,3 +194,93 @@ and `All 2 tests passed`. No test files were modified.
 - Submodule `src/rust/soroban/p26` is clean at `fa1226b3`.
 - Branch pushed to `origin/poc/002-flat-inmemory-bucket-index` on the SirTyson
   stellar-core fork; no submodule branch required.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-03
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The revised handoff is reproducible and the implementation is plausibly
+correct, but the authoritative benchmark gate does not show a consistent
+soroswap apply-time improvement. The full unit-test gate passed cleanly, and no
+test files were modified, so this is not a correctness rejection. However,
+promotion requires the headline soroswap metric to improve consistently across
+all three non-Tracy `scripts/run_apply_load_matrix.py` runs.
+
+Baseline soroswap medians from `ai-summary/CURRENT_STATE.md` are
+272.249541 ms, 275.885919 ms, and 270.551362 ms (average 272.895607 ms).
+The optimized non-Tracy runs measured:
+
+| run | artifact | sac median_ms | soroswap median_ms | soroswap vs baseline avg |
+|-----|----------|---------------|--------------------|--------------------------|
+| 1 | `/mnt/nvme2/apply-load/8ad9a1220e60-20260503-025758` | 304.983557 | 269.774374 | +1.14% |
+| 2 | `/mnt/nvme2/apply-load/8ad9a1220e60-20260503-030414` | 302.265628 | 271.233819 | +0.61% |
+| 3 | `/mnt/nvme2/apply-load/8ad9a1220e60-20260503-031030` | 304.240763 | 280.439023 | -2.76% |
+
+The optimized soroswap average is 273.815739 ms, a 0.34% regression relative to
+the accepted baseline average. SAC improved slightly on average (303.829982 ms
+vs 306.542755 ms, +0.88%), but SAC is secondary for this objective and cannot
+rescue an inconsistent/regressing soroswap result. Because the three non-Tracy
+runs did not show an eligible improvement, no diagnostic `--tracy` run was
+captured.
+
+### Revision Instructions
+
+Rework the optimization so it produces a reproducible soroswap apply-time win
+above noise. The current flat sorted-vector lookup may be trading away the
+constant-time behavior of `std::unordered_set` for `O(log n)` lower-bound work
+and extra sort/finalize cost that does not consistently help this workload.
+Consider profiling bucket sizes and lookup distributions in the apply-load
+trace, then trying a hybrid representation that keeps the existing
+`unordered_set` for larger in-memory buckets or uses a flatter hash table /
+bucketed vector design that avoids both node chasing and binary-search overhead.
+
+After revising, rerun the same clean handoff gate: build with the configured
+Tracy-enabled flags, run
+`env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`,
+then run `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py`
+three times without `--tracy`. Only run the diagnostic `--tracy` capture if all
+three non-Tracy soroswap runs show an eligible improvement within the max-sac
+tradeoff envelope.
+
+### Checks Passed So Far
+
+1. Source handoff is committed on `poc/002-flat-inmemory-bucket-index`; the p26
+   submodule is clean at `fa1226b3068605c5376efe56c6cf809ca225a036`.
+2. Source audit found the change limited to `src/bucket/InMemoryIndex.cpp` and
+   `src/bucket/InMemoryIndex.h`, replacing the node-based in-memory index with a
+   type-grouped hash-sorted vector while retaining exact key comparisons.
+3. No test-file edits were present.
+4. Build completed with
+   `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production`
+   and `make -j30`.
+5. Full tests passed with
+   `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`.
+
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-03
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/bucket/InMemoryIndex.h:60-90` — replaced the previous per-type range metadata with per-type flat open-addressed lookup tables. Each slot stores the cached `LedgerKey` hash and an index into the contiguous entry vector, keeping entries immutable and cache-local without sorting them.
+- `src/bucket/InMemoryIndex.cpp:195-209` — replaced the sorted-vector comparator with a power-of-two lookup-table sizing helper that targets a 50% maximum load factor for short linear-probe chains.
+- `src/bucket/InMemoryIndex.cpp:272-310` — changed `InMemoryBucketState::finalize` to count entries by `LedgerEntryType`, allocate one flat lookup table per non-empty type, populate those tables once, and retain exact duplicate-key detection using cached hashes plus bucket-entry identity equality.
+- `src/bucket/InMemoryIndex.cpp:313-346` — changed `scan` from binary search over a hash-sorted type range to an O(1)-expected open-addressed probe over the matching type table, still requiring exact `keyEquals` before returning `IndexReturnT(IndexPtrT)`.
+
+### Demonstration
+
+This revision preserves the flat in-memory representation but avoids the prior sorted-vector attempt's `O(log n)` lower-bound lookup and construction-time sort. Each in-memory bucket probe now hashes the query once, selects the matching entry-type table, and linearly probes contiguous slots until it finds either an empty slot or a cached-hash candidate that passes exact key comparison, preserving tombstone and hash-collision semantics while reducing residual lookup work.
+
+### Test Results
+
+Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production`, then built with `make -j $(nproc)`. Focused bucket-index tests passed: `./src/stellar-core test --ll fatal -r simple --abort --disable-dots "[bucket][bucketindex]"` reported 366489 assertions in 12 test cases. Full regression suite passed: `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` completed with `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.
