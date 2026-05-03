@@ -86,3 +86,26 @@ Correctness is the main constraint. The PoC must either explicitly preserve the 
 - **Change description**: Introduce a transfer-local contract balance slot that builds the balance key once, loads `EntryWithLiveUntil` once with `try_get_full`, decodes `BalanceValue` once, and exposes methods for authorization, amount mutation, writeback, and TTL extension. Route only the `ScAddress::Contract` branches of `receive_balance` and `spend_balance_no_authorization_check` through this slot; keep account/trustline behavior unchanged.
 - **Correctness check**: Preserve missing-balance authorization semantics (`!is_asset_auth_required`), deauthorized-balance rejection, insufficient-balance errors, overflow checks, clawback flag initialization, existing-entry live-until preservation, new-entry min live-until initialization, TTL threshold/clamping behavior, footprint enforcement, and event order.
 - **Benchmark focus**: Add narrow temporary counters around contract-balance `contract_balance_ledger_key`, `read_contract_balance`, `try_get_full`, and TTL-extension reads for the soroswap `TX=2000, T=8` apply-load benchmark. The expected metric is fewer same-key storage reads/key builds per contract transfer side and a reproducible 3-10% reduction in top-line apply time relative to the current post-storage-index baseline.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-03
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/balance.rs:170-288` — added `ContractBalanceSlot`, which builds the SAC contract-balance key once, loads `EntryWithLiveUntil` once, decodes `BalanceValue` once, and writes/extends TTL from the carried entry.
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/balance.rs:401-544` — routed contract branches of `receive_balance`, `spend_balance`, and `spend_balance_no_authorization_check` through the slot while leaving account/trustline behavior on the existing path.
+- `src/rust/soroban/p26/soroban-env-host/src/storage.rs:531-653` — factored TTL preparation and added `extend_ttl_from_entry` so SAC writeback can preserve the existing TTL threshold, liveness, clamping, and footprint checks without rereading the same storage entry.
+- `src/rust/soroban/p26/soroban-env-host/observations/26/test__stellar_asset_contract__*.json` — regenerated SAC observation CPU values after the intentional cheaper host path changed metered CPU counts.
+
+### Demonstration
+
+The optimization carries a transfer-local SAC contract-balance slot through authorization, balance mutation, writeback, and TTL extension. For contract-address transfer endpoints this removes the duplicate authorization/mutation balance read, avoids reconstructing the balance `LedgerKey` in writeback, and extends TTL from the freshly written entry instead of fetching the same storage slot again, while keeping account/trustline paths unchanged.
+
+### Test Results
+
+Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`; `make -j30` completed successfully. `UPDATE_OBSERVATIONS=1 NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make -j30 check` regenerated expected SAC CPU observations, and the final `NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make -j30 check` passed with `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.
