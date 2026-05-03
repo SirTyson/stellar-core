@@ -85,3 +85,26 @@ The proposed fix is correctness-preserving if implemented carefully. It must pre
 - **Change description**: replace `InMemoryBucketState::mEntries` with a flat immutable representation grouped by `LedgerEntryType`, sorted by cached `std::hash<LedgerKey>` with an exact key-order tie-breaker or duplicate check, and searched by lower-bound over the relevant type vector followed by exact `keyEquals` on all equal hashes. Preserve `IndexReturnT(IndexPtrT)` on hits and `IndexReturnT()` on misses, and keep the in-memory iterator contract degenerate because callers already cannot rely on ordered progress.
 - **Correctness check**: existing bucket index coverage in `src/bucket/test/BucketIndexTests.cpp` should exercise in-memory index construction, lookup, cutoff behavior, equality, type ranges, and cache-hit semantics. Add focused tests only if the representation introduces new collision or hybrid-threshold branches that existing tests do not cover.
 - **Benchmark focus**: run the soroswap apply-load matrix multiple times against the `ai-summary/CURRENT_STATE.md` baseline, and inspect Tracy for `bucket/InMemoryIndex.cpp:253` or the updated `scan` zone. The PoC should report both top-line median apply time and normalized `scan` self-time/call; promotion requires a reproducible 3-10% apply-time improvement, not just lower aggregate CPU in parallel worker threads.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-03
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/bucket/InMemoryIndex.h:20-104` — replaced the node-based `std::unordered_set` storage with a contiguous vector of `InternalInMemoryBucketEntry` records plus per-`LedgerEntryType` index ranges; retained the degenerate iterator API used by callers.
+- `src/bucket/InMemoryIndex.cpp:24-53` and `195-209` — added type-to-range indexing and a sort comparator that orders entries by type, cached hash, then exact bucket-entry identity ordering.
+- `src/bucket/InMemoryIndex.cpp:246-335` — cached each entry's type with its hash, changed insertion to append to the flat vector, finalized the immutable index by sorting and duplicate-checking, and implemented `scan` as a lower-bound over the matching type range followed by exact `keyEquals` checks for hash collisions.
+- `src/bucket/InMemoryIndex.cpp:338-422` — finalized the flat index in both in-memory constructors after all bucket entries are observed, with reservation for vector-backed construction from an existing entry vector.
+
+### Demonstration
+
+The optimization removes the per-lookup `std::unordered_set` bucket and node walk from in-memory bucket probes while preserving the existing `IndexReturnT` cache-hit/not-found contract. Bucket entries remain owned by shared pointers and every candidate returned by the hash lower-bound is still verified with exact key identity, so tombstones, INIT/LIVE entries, and hash collisions retain the same lookup semantics.
+
+### Test Results
+
+Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`, built with `make -j $(nproc)`, and ran the focused bucket-index tests plus the full suite. Focused `[bucket][bucketindex]` passed 366489 assertions in 12 test cases; `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` completed successfully with `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.
