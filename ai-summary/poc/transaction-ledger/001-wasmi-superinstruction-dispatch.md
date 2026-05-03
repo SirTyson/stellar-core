@@ -89,3 +89,27 @@ The proposed fix can preserve correctness, but only with stricter constraints th
 - **Change description**: first add temporary deterministic counters for adjacent instruction pairs/triples executed under soroswap, excluding `ConsumeFuel`, control-flow, calls/imports, fallible traps, and memory/table resource-limiter operations. Then add only the top measured fused variants, preferably encoded as first-word fused instructions that skip preserved payload words so branch offsets and function instruction references remain stable.
 - **Correctness check**: existing Soroban VM / host tests should continue to cover traps, fuel exhaustion, host imports, and invoke-host behavior; add wasmi-level tests in the patched dependency for branch targets at fusion boundaries, fuel-before/after fused runs, and trap timing for excluded instructions.
 - **Benchmark focus**: compare three non-Tracy `soroswap, TX=2000, T=8` runs against the `ai-summary/CURRENT_STATE.md` baseline medians of 272.250 / 275.886 / 270.551 ms. The PoC must show at least a reproducible 3% top-line apply-time reduction and should report the instruction histogram plus the percentage of executed guest bytecode covered by each fused variant.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-03
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/wasmi/crates/wasmi/src/engine/bytecode/mod.rs:37-45` — added compact fused bytecode variants for deterministic straight-line local access and arithmetic sequences (`LocalGet2`, `LocalGetI32Add`, `LocalGetI64Add`, `LocalGetI32Sub`, `LocalGetI64Sub`).
+- `src/rust/soroban/wasmi/crates/wasmi/src/engine/executor.rs:230-240,988-1027` — dispatched the fused variants in the interpreter loop and executed the preserved primitive stack operations while advancing the instruction pointer by two words.
+- `src/rust/soroban/wasmi/crates/wasmi/src/engine/func_builder/inst_builder.rs:193-235` — fused only deterministic, infallible adjacent instruction pairs after branch offsets are resolved, preserving the original second instruction word as skipped payload so branch indices remain stable.
+- `src/rust/soroban/p26/Cargo.toml:46-58` and `src/rust/soroban/p26/Cargo.lock:1755-1762,2151-2158` — wired p26 to the patched local `soroban-wasmi`, `wasmi_arena`, and `wasmi_core` crates.
+- `src/rust/src/dep-trees/p26-expect.txt:281-310` — updated the checked dependency-tree expectation to match the patched local wasmi dependency used by p26.
+
+### Demonstration
+
+The PoC adds first-word superinstructions for common infallible local-get plus local-get/add/sub sequences in the pinned wasmi executor. Each fused instruction performs the same stack operations as the original two instruction words but removes one interpreter-loop fetch, match dispatch, and instruction-pointer step on the fall-through path, while avoiding fuel, control-flow, call, memory, and trap boundaries.
+
+### Test Results
+
+Configured and built from the repository root with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` and `make -j30`. The full existing test suite completed successfully with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`; two earlier build-test cycles were used to align the p26 dependency tree and restore ignored Soroban git-state build artifacts required by this worktree.
