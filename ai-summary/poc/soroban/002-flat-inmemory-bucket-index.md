@@ -393,3 +393,99 @@ passed`. No test files were modified.
 - `src/rust/soroban/p26` submodule is clean at the recorded
   `fa1226b3068605c5376efe56c6cf809ca225a036` (no submodule branch
   required for this PoC since no submodule edits were made).
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-03
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The clean committed open-addressed handoff is reproducible and passes the full
+correctness gate, but the authoritative benchmark result is still below the
+objective's minimum performance bar. Soroswap apply time improves on average by
+only **0.614%** versus `ai-summary/CURRENT_STATE.md`, which is within benchmark
+noise and below the required 1% threshold for a valid finding. The result is
+therefore not eligible for confirmation even though all three soroswap runs are
+below the accepted baseline average.
+
+Baseline soroswap medians from `ai-summary/CURRENT_STATE.md` are 272.249541 ms,
+275.885919 ms, and 270.551362 ms (average 272.895607 ms). The optimized
+non-Tracy runs measured:
+
+| run | artifact | sac median_ms | soroswap median_ms | soroswap vs baseline avg |
+|-----|----------|---------------|--------------------|--------------------------|
+| 1 | `/mnt/nvme2/apply-load/48636612e5b0-20260503-034356` | 301.923051 | 269.849370 | +1.12% |
+| 2 | `/mnt/nvme2/apply-load/48636612e5b0-20260503-035009` | 299.883018 | 271.922498 | +0.36% |
+| 3 | `/mnt/nvme2/apply-load/48636612e5b0-20260503-035627` | 300.450306 | 271.891498 | +0.37% |
+
+Optimized soroswap average: 271.221122 ms, a **0.614% improvement** relative to
+the accepted baseline average. SAC improves more clearly on average
+(300.752125 ms vs 306.542755 ms, **1.889%**), but SAC is secondary for this
+objective and cannot promote a sub-1% soroswap result. Because the three
+non-Tracy runs did not show an eligible soroswap improvement, no diagnostic
+`--tracy` run was captured.
+
+### Revision Instructions
+
+Rework the lookup representation or surrounding bucket-load path so the
+soroswap headline metric clears the 1% threshold reproducibly across the three
+required non-Tracy matrix runs. The current open-addressed table likely reduces
+some CPU work, but the wall-clock impact is too small for this objective. Before
+the next handoff, profile the lookup distribution by bucket size/type and focus
+on changes that either reduce the synchronous bucket-walk call count or deliver
+a larger per-lookup gain on the specific account/trustline fee/source-load path
+exercised by soroswap.
+
+After revising, provide the same clean committed handoff and rerun:
+`./configure --enable-ccache --enable-sdfprefs --enable-tracy
+--enable-tracy-capture --disable-postgres
+--enable-next-protocol-version-unsafe-for-production`, `make -j $(nproc)`,
+`env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort
+--disable-dots' make check`, and three
+`PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` invocations
+without `--tracy`. Only capture the diagnostic Tracy run if those three
+non-Tracy runs clear the objective threshold and max-sac tradeoff envelope.
+
+### Checks Passed So Far
+
+1. The source handoff is committed at outer branch tip `f84878184`
+   (`poc/002-flat-inmemory-bucket-index`), with no dirty source edits.
+2. The p26 submodule is clean at
+   `fa1226b3068605c5376efe56c6cf809ca225a036`; no submodule changes are part of
+   this PoC.
+3. The diff is limited to `src/bucket/InMemoryIndex.cpp` and
+   `src/bucket/InMemoryIndex.h`; no test files were modified.
+4. Source audit found the open-addressed table preserves exact key comparison,
+   tombstone cache-hit semantics, hash-collision checks, and duplicate-key
+   rejection during index construction.
+5. Build completed with the required Tracy/next-protocol configuration and
+   `make -j $(nproc)`.
+6. Full regression gate passed with
+   `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort
+   --disable-dots' make check`.
+
+---
+
+## PoC Attempt (Direct point-lookup hash reuse)
+
+**Result**: POC_PASS
+**Date**: 2026-05-03
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/bucket/InMemoryIndex.h:32,84-98,162-170` — extended `InternalInMemoryBucketEntry` and `InMemoryBucketState` so callers can provide an already-derived `LedgerKey` and an already-computed query hash, while retaining the existing `scan` API for bulk callers.
+- `src/bucket/InMemoryIndex.cpp:220-267,314-350` — reused the `LedgerKey` already extracted by `processEntry` when constructing cached entries, added direct `lookup(searchKey, searchHash)`, and kept `scan` as a compatibility wrapper that computes the hash only for callers that still use the iterator API.
+- `src/bucket/LiveBucketIndex.h:135-136` and `src/bucket/LiveBucketIndex.cpp:223-244` — added a `lookup(k, keyHash)` overload that routes in-memory buckets directly to the new flat-table lookup while preserving the existing `lookup(k)` entry point.
+- `src/bucket/BucketListSnapshot.h:124-128` and `src/bucket/BucketListSnapshot.cpp:10,170-191,335-344` — changed point loads to compute the live `LedgerKey` hash once per `SearchableBucketListSnapshot::load` call and pass it through each bucket probe, avoiding repeated hashing across the bucket walk.
+
+### Demonstration
+
+This revision builds on the existing open-addressed in-memory bucket index by removing redundant work around the hot point-load path. A live bucket-list point lookup now computes the `LedgerKey` hash once at the snapshot-load level and reuses it for every in-memory bucket probed; index construction also reuses the key already extracted for counters/type ranges instead of extracting it again inside each cached entry. The lookup still probes only the matching `LedgerEntryType` table, still checks cached hashes before exact `keyEquals`, and still returns the same cache-hit/not-found states, preserving tombstone and collision semantics.
+
+### Test Results
+
+Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production` and built with `make -j $(nproc)`. Focused bucket-index coverage passed: `./src/stellar-core test --ll fatal -r simple --abort --disable-dots "[bucket][bucketindex]"` reported **All tests passed (366489 assertions in 12 test cases)**. The first full `make check` attempt failed before stellar-core tests in vendored `gperftools` (`tcm_min_asserts_unittest`, OOM tolerance assertion), then the required full regression gate was rerun with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` and completed successfully with `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.
