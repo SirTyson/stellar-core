@@ -294,3 +294,32 @@ all.
   invocation.
 - Cleanliness post-build/test: `git status --short -- ':!ai-summary'` and
   `git -C src/rust/soroban/p26 status --short` are both empty.
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-05-03
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** PASS — source review confirmed that `ContractBalanceSlot` carries the contract-balance key, loaded entry, decoded balance, and fused writeback/TTL live-until calculation through the SAC contract endpoint path.
+2. **Are the preconditions realistic?** PASS — soroswap SAC transfers do exercise contract balance endpoints in the ledger apply path.
+3. **Is the original code inefficient or working as designed?** PASS — the old path did repeat same-key storage/key/value work for the contract endpoint; the optimization is not merely targeting background or TX-set construction work.
+4. **Does the benchmark improvement match the claimed severity?** FAIL — the required non-Tracy matrix runs show a soroswap regression, not an improvement. Baseline soroswap medians from `CURRENT_STATE.md` were 272.249541 ms, 275.885919 ms, and 270.551362 ms (average 272.895607 ms). Optimized medians measured in final review were 280.810442 ms, 282.100412 ms, and 272.088182 ms (average 278.333012 ms), a 1.99% average regression. Max-sac improved only 0.67% on average, which cannot offset the headline soroswap regression.
+5. **Is the optimization in scope?** PASS — the modified code is in SAC storage/balance handling reached from `closeLedger`/Soroban apply, not TX-set creation or background bucket merge work.
+6. **Is the benchmark methodology correct?** PASS — final review rebuilt the optimized branch, ran the full test gate, then ran `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` exactly three times without `--tracy`, comparing against the accepted `ai-summary/CURRENT_STATE.md` baseline.
+7. **Can the improvement be explained without the optimization?** FAIL — there is no confirmed improvement to explain; the observed soroswap result is a regression across the three-run set.
+8. **Is this optimization novel?** PASS — the carried SAC balance slot and fused TTL writeback are distinct from the accepted baseline optimizations, but novelty does not overcome the failed benchmark gate.
+
+### Rejection Reason
+
+The optimization fails the objective's headline metric. Despite a clean build and full test pass, the independent three-run benchmark set regressed soroswap apply time by 1.99% on average relative to the accepted baseline, with two of three optimized runs slower than every baseline soroswap run. The final-review criteria require consistent soroswap improvement; a max-sac-only improvement is insufficient.
+
+### Failed Checks
+
+- Check 4: benchmark improvement/severity gate failed.
+- Check 7: no confirmed improvement; observed result is a soroswap regression.
