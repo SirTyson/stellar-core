@@ -10,6 +10,7 @@
 
 #include "ledger/LedgerHashUtils.h"
 #include <array>
+#include <limits>
 #include <vector>
 
 namespace stellar
@@ -59,11 +60,23 @@ class InMemoryBucketState : public NonMovableOrCopyable
 {
     static constexpr size_t kLedgerEntryTypeCount = 10;
 
+    struct LookupSlot
+    {
+        size_t mHash{0};
+        size_t mEntryIndex{std::numeric_limits<size_t>::max()};
+
+        bool
+        occupied() const
+        {
+            return mEntryIndex != std::numeric_limits<size_t>::max();
+        }
+    };
+
     using InMemoryEntries = std::vector<InternalInMemoryBucketEntry>;
-    using EntryRange = std::pair<size_t, size_t>;
+    using LookupTable = std::vector<LookupSlot>;
 
     InMemoryEntries mEntries;
-    std::array<EntryRange, kLedgerEntryTypeCount> mEntryRanges{};
+    std::array<LookupTable, kLedgerEntryTypeCount> mLookupTables{};
 
   public:
     using IterT = InMemoryEntries::const_iterator;
@@ -71,8 +84,8 @@ class InMemoryBucketState : public NonMovableOrCopyable
     // Insert a LedgerEntry (INIT/LIVE) into the cache.
     void insert(BucketEntry const& be);
 
-    // Sort entries into a cache-local immutable lookup index and assert no
-    // duplicate keys were inserted.
+    // Build cache-local immutable lookup tables and assert no duplicate keys
+    // were inserted.
     void finalize();
 
     void reserve(size_t size);

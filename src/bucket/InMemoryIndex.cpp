@@ -192,20 +192,16 @@ bucketEntriesKeyEqual(BucketEntry const& lhs, BucketEntry const& rhs)
     return false;
 }
 
-bool
-inMemoryEntryLess(InternalInMemoryBucketEntry const& lhs,
-                  InternalInMemoryBucketEntry const& rhs)
+size_t
+lookupTableSize(size_t entryCount)
 {
-    if (lhs.type() != rhs.type())
+    size_t tableSize = 2;
+    while (tableSize < entryCount * 2)
     {
-        return lhs.type() < rhs.type();
-    }
-    if (lhs.hash() != rhs.hash())
-    {
-        return lhs.hash() < rhs.hash();
+        tableSize <<= 1;
     }
 
-    return BucketEntryIdCmp<LiveBucket>{}(*lhs.get(), *rhs.get());
+    return tableSize;
 }
 
 // Helper function to process a single bucket entry for InMemoryIndex
@@ -276,27 +272,38 @@ InMemoryBucketState::insert(BucketEntry const& be)
 void
 InMemoryBucketState::finalize()
 {
-    std::sort(mEntries.begin(), mEntries.end(), inMemoryEntryLess);
-    mEntryRanges.fill({0, 0});
-
-    for (size_t i = 1; i < mEntries.size(); ++i)
+    std::array<size_t, kLedgerEntryTypeCount> entryCounts{};
+    for (auto const& entry : mEntries)
     {
-        releaseAssertOrThrow(!(mEntries[i - 1].hash() == mEntries[i].hash() &&
-                               mEntries[i - 1] == mEntries[i]));
+        ++entryCounts[ledgerEntryTypeIndex(entry.type())];
     }
 
-    size_t rangeStart = 0;
-    while (rangeStart < mEntries.size())
+    for (size_t i = 0; i < kLedgerEntryTypeCount; ++i)
     {
-        auto const type = mEntries[rangeStart].type();
-        auto rangeEnd = rangeStart + 1;
-        while (rangeEnd < mEntries.size() && mEntries[rangeEnd].type() == type)
+        mLookupTables[i].clear();
+        if (entryCounts[i] != 0)
         {
-            ++rangeEnd;
+            mLookupTables[i].assign(lookupTableSize(entryCounts[i]), {});
+        }
+    }
+
+    for (size_t entryIndex = 0; entryIndex < mEntries.size(); ++entryIndex)
+    {
+        auto const& entry = mEntries[entryIndex];
+        auto& table = mLookupTables[ledgerEntryTypeIndex(entry.type())];
+        auto const mask = table.size() - 1;
+        auto slotIndex = entry.hash() & mask;
+
+        while (table[slotIndex].occupied())
+        {
+            auto const& existingEntry =
+                mEntries[table[slotIndex].mEntryIndex];
+            releaseAssertOrThrow(!(table[slotIndex].mHash == entry.hash() &&
+                                    existingEntry == entry));
+            slotIndex = (slotIndex + 1) & mask;
         }
 
-        mEntryRanges[ledgerEntryTypeIndex(type)] = {rangeStart, rangeEnd};
-        rangeStart = rangeEnd;
+        table[slotIndex] = {entry.hash(), entryIndex};
     }
 }
 
@@ -306,30 +313,33 @@ InMemoryBucketState::reserve(size_t size)
     mEntries.reserve(size);
 }
 
-// Perform a hash lookup over the type-specific flat index; start is ignored for
-// in-memory indexes.
+// Perform an open-addressed hash lookup over the type-specific flat index;
+// start is ignored for in-memory indexes.
 std::pair<IndexReturnT, InMemoryBucketState::IterT>
 InMemoryBucketState::scan(IterT start, LedgerKey const& searchKey) const
 {
     ZoneScoped;
     auto const searchHash = std::hash<LedgerKey>{}(searchKey);
-    auto const [rangeStart, rangeEnd] =
-        mEntryRanges[ledgerEntryTypeIndex(searchKey.type())];
-    auto const begin = mEntries.begin() + rangeStart;
-    auto const end = mEntries.begin() + rangeEnd;
-    auto it = std::lower_bound(
-        begin, end, searchHash,
-        [](InternalInMemoryBucketEntry const& entry, size_t hash) {
-            return entry.hash() < hash;
-        });
-
-    while (it != end && it->hash() == searchHash)
+    auto const& table = mLookupTables[ledgerEntryTypeIndex(searchKey.type())];
+    if (table.empty())
     {
-        if (it->keyEquals(searchKey))
+        return {IndexReturnT(), mEntries.begin()};
+    }
+
+    auto const mask = table.size() - 1;
+    auto slotIndex = searchHash & mask;
+    while (table[slotIndex].occupied())
+    {
+        if (table[slotIndex].mHash == searchHash)
         {
-            return {IndexReturnT(it->get()), mEntries.begin()};
+            auto const& entry = mEntries[table[slotIndex].mEntryIndex];
+            if (entry.keyEquals(searchKey))
+            {
+                return {IndexReturnT(entry.get()), mEntries.begin()};
+            }
         }
-        ++it;
+
+        slotIndex = (slotIndex + 1) & mask;
     }
 
     return {IndexReturnT(), mEntries.begin()};
