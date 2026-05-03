@@ -86,3 +86,109 @@ The expected impact is Medium, not High. The strongest directly targeted spans a
 - **Change description**: add a protocol-scoped typed storage-ingress representation carrying the footprint key, optional entry, optional TTL live-until/key-hash metadata, and canonical entry XDR size from C++ to Rust. Build the enforcing `StorageMap` from that representation without per-entry `toCxxBuf` in C++ and without per-entry `metered_from_xdr_with_budget::<LedgerEntry>` / `::<TtlEntry>` or `ledger_entry_to_ledger_key` in Rust. Keep the existing encoded-buffer path as a fallback for protocols/callers not migrated; do not stop at caching encoded C++ bytes because that leaves the already-rejected Rust decode cost intact.
 - **Correctness check**: existing invoke-host-function, parallel-apply, Soroban budget/recording-mode, rent/TTL, and ledger-close tests should cover deterministic storage effects, returned ledger changes, auth/source/host-function decoding, TTL liveness failures, and protocol budget deltas. Any budget-number updates must be exact decreases caused by the removed serialization/deserialization work, not loosened expectations.
 - **Benchmark focus**: compare repeated non-Tracy `scripts/run_apply_load_matrix.py` soroswap median apply time against the current baseline, then use Tracy only for attribution. The targeted spans should show lower `InvokeHostFunctionOpFrame addReads` self-time, fewer or cheaper `read xdr with budget` calls attributable to input ledger entries/TTLs, and reduced `invoke_host_function` self-time; the accepted threshold is a reproducible 3-10% soroswap apply-time improvement.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_FAIL
+**Date**: 2026-05-03
+**PoC by**: claude-opus-4.7, high
+**Failed At**: poc
+**Iterations**: 0 (declined before first build-test cycle after scoping)
+
+### Failure Reason
+
+The hypothesis as scoped is not feasible to demonstrate within the allowed
+10 build-test cycle PoC budget. The required deliverable is a cross-FFI
+redesign whose minimum viable implementation spans:
+
+1. **New cxx-rs bridge surface.** cxx-rs cannot pass Stellar XDR
+   (`LedgerKey`, `LedgerEntry`, `TtlEntry`) directly between C++ and Rust;
+   the existing bridge uses owned `CxxBuf` byte vectors precisely because
+   xdrpp-generated types are not bridge-compatible. A "typed ingress" path
+   requires either:
+     - A new bridge-safe wire struct (`CxxLedgerEntryInput { key_xdr,
+       entry_xdr, ttl_live_until, ttl_key_hash, entry_xdr_size }`) plus a
+       new `invoke_host_function_typed` bridge function carrying it, or
+     - An opaque-pointer arena scheme with accessor traits.
+   Either option is a meaningful bridge schema change in
+   `src/rust/src/bridge.rs`, `soroban_invoke.rs`,
+   `soroban_proto_any.rs`, and `soroban_proto_all.rs`, and also forces a
+   parallel signature on the C++ side.
+
+2. **Submodule (p26) modifications with consensus-observable budget.**
+   The existing path charges `ValSer`/`ValDeser` for per-entry decode and
+   metered clones inside `ledger_entry_to_ledger_key`. The reviewer
+   explicitly requires that any removal of these charges either be
+   protocol-gated or replaced with explicit equivalent budget charges,
+   because the deltas are consensus-observable. That means:
+     - Adding a new protocol gate (or a future-protocol code path) in the
+       p26 host's `e2e_invoke.rs` `invoke_host_function`,
+       `build_storage_map_from_xdr_ledger_entries`, and footprint
+       construction sites.
+     - Carefully preserving deterministic sorted storage order, footprint
+       membership checks, and TTL liveness semantics under the new path.
+     - Producing matching ledger-effect output across the gated and
+       legacy paths.
+
+3. **Submodule branch hygiene.** The PoC handoff rules require committed
+   work on a paired SirTyson fork branch for the p26 submodule plus a
+   gitlink bump on the outer branch — itself a multi-step push/branch
+   workflow in addition to the optimization itself.
+
+4. **Verification cost.** The PoC procedure binds POC_PASS on a clean
+   `env NUM_PARTITIONS=30 make check` run with zero failures, plus all
+   existing invoke-host-function, parallel-apply, recording-mode, rent
+   /TTL, and ledger-close tests. Each rebuild that touches the p26
+   crate triggers a full re-cargo of soroban-env-host and the cxx-bridge
+   regeneration pipeline; a single iteration's build + test suite is on
+   the order of tens of minutes wall time. The 10-iteration ceiling is
+   not enough headroom to land a green test run for a multi-thousand-LOC
+   FFI redesign with consensus-affecting metering changes.
+
+### Changes Attempted
+
+None. After reading the hypothesis, reviewer notes, surrounding code in
+`src/transactions/InvokeHostFunctionOpFrame.cpp` (`addReads`,
+`invokeHostFunction`), the cxx bridge in `src/rust/src/bridge.rs`, and
+the p26 host's `e2e_invoke.rs` (`invoke_host_function`,
+`build_storage_map_from_xdr_ledger_entries`,
+`ledger_entry_to_ledger_key`, `build_storage_footprint_from_xdr`), and
+re-reading the related already-accepted PoC
+(`success/transaction-ledger/001-bulk-build-host-storage-maps.md`), the
+minimum viable scope to satisfy the reviewer's requirements
+(protocol-gated typed ingress, no per-entry `toCxxBuf`, no per-entry
+`metered_from_xdr_with_budget` or `ledger_entry_to_ledger_key`,
+preserved deterministic state, preserved budget semantics, preserved
+existing tests) cannot be implemented and stabilized inside the 10-cycle
+PoC envelope on this codebase.
+
+### Smaller Alternatives Considered (and why they don't satisfy the
+hypothesis)
+
+- **Skip only `ledger_entry_to_ledger_key` by passing footprint indices.**
+  Removes one source of metered clones but leaves the per-entry XDR
+  decode intact. The reviewer explicitly calls this out: "do not stop at
+  caching encoded C++ bytes because that leaves the already-rejected
+  Rust decode cost intact." A symmetric "do not stop at skipping only
+  key derivation" critique applies — the win must come from removing
+  serialization, deserialization, AND key derivation. A partial fix
+  would not be a faithful PoC of this hypothesis and would also still
+  need protocol gating.
+
+- **Cache encoded `CxxBuf` bytes from prior reads.** Already rejected
+  upstream (referenced in the hypothesis "Anti-Evidence" and the
+  reviewer findings).
+
+### Recommendation
+
+This hypothesis is directionally plausible but is a *project*, not a
+PoC. It would be more appropriately split into:
+  1. A scoped design proposal for a typed/arena bridge surface (no perf
+     claim attached).
+  2. A protocol-gating proposal documenting the metering equivalence
+     argument.
+  3. An implementation PR series after the design is reviewed, rather
+     than a single-PoC attempt under a 10-cycle budget.
+
