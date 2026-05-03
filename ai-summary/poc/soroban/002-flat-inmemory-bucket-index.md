@@ -489,3 +489,143 @@ This revision builds on the existing open-addressed in-memory bucket index by re
 ### Test Results
 
 Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production` and built with `make -j $(nproc)`. Focused bucket-index coverage passed: `./src/stellar-core test --ll fatal -r simple --abort --disable-dots "[bucket][bucketindex]"` reported **All tests passed (366489 assertions in 12 test cases)**. The first full `make check` attempt failed before stellar-core tests in vendored `gperftools` (`tcm_min_asserts_unittest`, OOM tolerance assertion), then the required full regression gate was rerun with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` and completed successfully with `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-03
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The latest "Direct point-lookup hash reuse" PoC is not reproducible from committed branch state. The checked-out outer branch is `poc/002-flat-inmemory-bucket-index` at pushed tip `f84878184` (`viable poc 002-flat-inmemory-bucket-index (open-addressed)`), but `git status --short --branch` reports unstaged source edits in:
+
+- `src/bucket/BucketListSnapshot.cpp`
+- `src/bucket/BucketListSnapshot.h`
+- `src/bucket/InMemoryIndex.cpp`
+- `src/bucket/InMemoryIndex.h`
+- `src/bucket/LiveBucketIndex.cpp`
+- `src/bucket/LiveBucketIndex.h`
+
+Those dirty edits are the direct point-lookup hash-reuse revision described in the latest PoC attempt. The performance final-review handoff rules require the complete optimization to be committed before independent build/test/benchmark validation. Benchmarking dirty local source would produce results that cannot be reproduced by checking out `origin/poc/002-flat-inmemory-bucket-index`, so the required correctness and benchmark gates were not started.
+
+### Revision Instructions
+
+Commit the direct point-lookup hash-reuse changes onto `poc/002-flat-inmemory-bucket-index`, push the branch, and provide a clean outer worktree plus a clean `src/rust/soroban/p26` submodule. The revised handoff should have `git status --short --branch` clean in the outer repo except for pipeline-managed `ai-summary` artifacts, and `git -C src/rust/soroban/p26 status --short --branch` clean in the submodule.
+
+After that clean committed handoff exists, rerun the required gate from the branch tip: configure/build with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production`, run `make -j $(nproc)`, run `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`, then run `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` three times without `--tracy`. Only capture the diagnostic `--tracy` run if all three non-Tracy soroswap runs clear the objective threshold and the max-sac tradeoff envelope.
+
+### Checks Passed So Far
+
+1. The p26 submodule is clean at `fa1226b3068605c5376efe56c6cf809ca225a036`.
+2. Source inspection found no test-file edits in the dirty working-tree diff.
+3. The dirty revised source diff matches the latest PoC description at a high level: it reuses a `LedgerKey` hash computed once in `SearchableBucketListSnapshot::load`, routes live bucket point lookups through a `LiveBucketIndex::lookup(k, keyHash)` overload, and keeps the existing `scan` API as a compatibility wrapper.
+4. The committed branch tip is reachable from `origin/poc/002-flat-inmemory-bucket-index`, but it does not contain the dirty direct point-lookup hash-reuse revision, so final-review correctness and benchmark gates remain blocked.
+
+---
+
+## PoC Attempt (Re-handoff: direct point-lookup hash reuse, committed)
+
+**Result**: POC_PASS
+**Date**: 2026-05-03
+**PoC by**: claude-opus-4.7, high
+
+### Revision Summary
+
+Addresses the prior final-review revision request that the direct
+point-lookup hash-reuse changes exist as committed branch state (not
+dirty working-tree edits) before final benchmark validation. The
+underlying optimization is unchanged from the previous "Direct
+point-lookup hash reuse" PoC attempt — `LedgerKey` hash computed once
+in `SearchableBucketListSnapshot::load` and reused across every
+in-memory bucket probe, plus `InternalInMemoryBucketEntry` reusing the
+`LedgerKey` already extracted by `processEntry` rather than re-deriving
+it. The source diff is now committed onto the PoC outer branch at
+`485dac0b2`.
+
+### Changes Made (committed at 485dac0b2)
+
+- `src/bucket/BucketListSnapshot.cpp:170-201,335-345` and
+  `src/bucket/BucketListSnapshot.h:124-128` — `getBucketEntry` takes a
+  `keyHash` parameter and routes `LiveBucket` indices through the new
+  `lookup(k, keyHash)` overload via `if constexpr`; `load` computes
+  `std::hash<LedgerKey>{}(k)` once for live snapshots and threads the
+  cached hash through each bucket probe (HotArchive snapshots ignore
+  it, preserving their existing path).
+- `src/bucket/LiveBucketIndex.h:135-136` and
+  `src/bucket/LiveBucketIndex.cpp:223-244` — added a
+  `lookup(k, keyHash)` overload that routes in-memory buckets directly
+  to `InMemoryBucketState::lookup(k, keyHash)`, and kept the existing
+  `lookup(k)` entry point as a wrapper that hashes once for callers
+  without a precomputed hash.
+- `src/bucket/InMemoryIndex.h:32,82-98,164-169` and
+  `src/bucket/InMemoryIndex.cpp:233-310,313-353` — added
+  `InMemoryBucketState::lookup(searchKey, searchHash)` returning
+  `IndexReturnT` directly; refactored `scan` to delegate to `lookup`
+  with a freshly computed hash for compatibility callers; changed
+  `insert` and `InternalInMemoryBucketEntry`'s constructor to accept
+  the `LedgerKey` already extracted in `processEntry`, avoiding the
+  redundant `getBucketLedgerKey` call during index construction.
+
+### Demonstration
+
+Each live bucket-list point load now hashes the `LedgerKey` exactly
+once at the snapshot-load level and reuses that hash for every
+in-memory bucket probed. The lookup still selects the matching
+`LedgerEntryType` table, still validates cached hashes before exact
+`keyEquals`, and still returns the same cache-hit / not-found states,
+preserving tombstone, INIT/LIVE, and hash-collision semantics. Index
+construction also avoids redundantly re-extracting the `LedgerKey`
+inside each cached entry by reusing the key produced by
+`processEntry`.
+
+### Test Results
+
+Configured (already on disk) with
+`./configure --enable-ccache --enable-sdfprefs --enable-tracy
+--enable-tracy-capture --disable-postgres
+--enable-next-protocol-version-unsafe-for-production` and built with
+`make -j $(nproc)`. Focused
+`./src/stellar-core test --ll fatal -r simple --abort --disable-dots
+"[bucket][bucketindex]"` reported **All tests passed (366489
+assertions in 12 test cases)**. Full regression gate
+`env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple
+--abort --disable-dots' make check` completed with `PASS:
+test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests
+passed`. No test files were modified.
+
+### Handoff State
+
+- Outer branch `poc/002-flat-inmemory-bucket-index` tip is `485dac0b2`
+  (`viable poc 002-flat-inmemory-bucket-index (point-lookup hash
+  reuse)`); pushed to `origin/poc/002-flat-inmemory-bucket-index` on
+  the SirTyson stellar-core fork.
+- `git status --short --branch` in the outer worktree is clean except
+  for the pipeline-managed untracked `ai-summary` directory.
+- `src/rust/soroban/p26` submodule is clean at the recorded
+  `fa1226b3068605c5376efe56c6cf809ca225a036` (no submodule edits were
+  made in this PoC).
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-03
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/bucket/InMemoryIndex.h:21-99` — replaced the node-based `std::unordered_set` in-memory bucket state with a contiguous entry vector plus per-`LedgerEntryType` open-addressed lookup tables, and added a direct `lookup(searchKey, searchHash)` API while preserving the existing `scan` compatibility API.
+- `src/bucket/InMemoryIndex.cpp:24-52,195-350,375-391,429-434` — added stable entry-type table indexing, power-of-two lookup-table sizing, construction-time `reserve()`/`finalize()`, duplicate-key checks using cached hashes plus exact key equality, and direct lookup that probes only the matching type table.
+- `src/bucket/LiveBucketIndex.h:135-136` and `src/bucket/LiveBucketIndex.cpp:223-245` — added a `lookup(k, keyHash)` overload so live in-memory bucket probes can reuse a caller-provided key hash while disk-index and cache behavior remain unchanged.
+- `src/bucket/BucketListSnapshot.h:124-128` and `src/bucket/BucketListSnapshot.cpp:170-191,335-344` — changed point loads to compute a live `LedgerKey` hash once per `SearchableBucketListSnapshot::load` call and pass it through every live bucket probe; hot-archive snapshots continue to use their existing lookup path.
+
+### Demonstration
+
+The optimization removes the residual unordered-set node walk for small live buckets and avoids rehashing the same `LedgerKey` for every bucket in a point-load walk. Each in-memory live-bucket probe now selects a type-specific contiguous open-addressed table, compares cached hashes first, and performs exact `keyEquals` only for matching-hash candidates, preserving tombstone, INIT/LIVE, duplicate-key, and hash-collision semantics.
+
+### Test Results
+
+Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production`, built with `make -j $(nproc)`, and verified focused bucket-index coverage with `./src/stellar-core test --ll fatal -r simple --abort --disable-dots "[bucket][bucketindex]"`, which reported `All tests passed (366489 assertions in 12 test cases)`. The full regression gate `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` completed successfully with `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.
