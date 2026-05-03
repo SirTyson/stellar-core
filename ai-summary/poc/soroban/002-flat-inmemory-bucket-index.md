@@ -284,3 +284,112 @@ This revision preserves the flat in-memory representation but avoids the prior s
 ### Test Results
 
 Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production`, then built with `make -j $(nproc)`. Focused bucket-index tests passed: `./src/stellar-core test --ll fatal -r simple --abort --disable-dots "[bucket][bucketindex]"` reported 366489 assertions in 12 test cases. Full regression suite passed: `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` completed with `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-03
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The current revised PoC handoff is not reproducible from committed branch state. The checked-out outer branch is `poc/002-flat-inmemory-bucket-index` at pushed commit `cb8ac0502dc6dffadbac1ec1a2cd072cc628c018`, but `git status --short --branch` still reports unstaged source edits to `src/bucket/InMemoryIndex.cpp` and `src/bucket/InMemoryIndex.h`. Those dirty edits are the open-addressed lookup-table revision described in this latest PoC attempt; the branch commit itself contains the earlier hash-sorted-vector implementation.
+
+The performance final-review handoff rules require the complete optimization to be committed before independent build/test/benchmark validation. Benchmarking dirty local source would produce results that cannot be reproduced by checking out `origin/poc/002-flat-inmemory-bucket-index`, so the required three authoritative `scripts/run_apply_load_matrix.py` runs were not started.
+
+### Revision Instructions
+
+Commit the open-addressed `InMemoryBucketState` implementation in `src/bucket/InMemoryIndex.cpp` and `src/bucket/InMemoryIndex.h` onto `poc/002-flat-inmemory-bucket-index`, push the branch, and provide a clean outer worktree plus a clean `src/rust/soroban/p26` submodule. The revised handoff should have `git status --short --branch` clean in the outer repo except for pipeline-managed `ai-summary` artifacts, and `git -C src/rust/soroban/p26 status --short --branch` clean in the submodule.
+
+After that clean committed handoff exists, rerun the required gate from the branch tip: configure/build with the objective flags, run `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`, then run `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` three times without `--tracy`. Only run the diagnostic `--tracy` capture if all three non-Tracy soroswap runs show an eligible improvement within the max-sac tradeoff envelope.
+
+### Checks Passed So Far
+
+1. The p26 submodule is clean at `fa1226b3068605c5376efe56c6cf809ca225a036`.
+2. Source inspection found no test-file edits in the working-tree diff.
+3. The dirty revised source diff matches the latest PoC description at a high level: it replaces the prior sorted-vector lower-bound index with per-entry-type open-addressed lookup tables while retaining cached hashes and exact `keyEquals` checks.
+4. The committed branch tip is reachable from `origin/poc/002-flat-inmemory-bucket-index`, but it does not contain the dirty open-addressed revision, so final-review correctness and benchmark gates remain blocked.
+
+---
+
+## PoC Attempt (Re-handoff: open-addressed lookup tables, committed)
+
+**Result**: POC_PASS
+**Date**: 2026-05-03
+**PoC by**: claude-opus-4.7, high
+
+### Revision Summary
+
+This iteration addresses the prior final-review revision request that the
+open-addressed `InMemoryBucketState` revision exist as committed branch state
+(not dirty working-tree edits) before final benchmark validation. The
+underlying optimization is unchanged from the previous PoC attempt — flat
+contiguous entry vector plus per-`LedgerEntryType` open-addressed lookup
+tables — but the source diff is now committed onto the PoC outer branch.
+
+### Changes Made
+
+- `src/bucket/InMemoryIndex.h:60-90` — per-type flat open-addressed
+  `LookupSlot` tables (cached hash + entry index) over a contiguous
+  `std::vector<InternalInMemoryBucketEntry>`. Adds `finalize()` and
+  `reserve()` to `InMemoryBucketState`. Cached `LedgerEntryType mType`
+  on `InternalInMemoryBucketEntry`.
+- `src/bucket/InMemoryIndex.cpp:24-53,195-205` — `ledgerEntryTypeIndex`
+  helper and `lookupTableSize` power-of-two sizing helper targeting a
+  ~50% maximum load factor.
+- `src/bucket/InMemoryIndex.cpp:242-264` — `InternalInMemoryBucketEntry`
+  ctor caches both `std::hash<LedgerKey>` and `LedgerKey::type()` once;
+  `keyEquals` and `operator==` retain exact identity equality.
+- `src/bucket/InMemoryIndex.cpp:266-308` — `insert` is `emplace_back`;
+  `finalize` counts entries by type, allocates one power-of-two table
+  per non-empty type, and populates each table by linear probing while
+  asserting no duplicate keys (via cached hash + exact entry equality).
+- `src/bucket/InMemoryIndex.cpp:316-346` — `scan` hashes the query once,
+  selects the matching type table, and linearly probes contiguous slots
+  until either an empty slot or a cached-hash candidate that passes
+  exact `keyEquals`. Preserves the `IndexReturnT(IndexPtrT)` cache-hit
+  / `IndexReturnT()` not-found contract and the degenerate
+  `mEntries.begin()` iterator return.
+- Both `InMemoryIndex` constructors `reserve(inMemoryState.size())` (or
+  build incrementally for the file-backed ctor) and call `finalize()`
+  once after observing all entries.
+
+### Demonstration
+
+The optimization removes both the prior `std::unordered_set` node-walk
+and the previous flat-vector revision's `O(log n)` lower-bound. Each
+in-memory bucket probe now performs one query hash, one type-indexed
+table dereference, and an open-addressed linear probe over contiguous
+slots, with exact `keyEquals` only on cached-hash matches. Tombstones,
+INIT/LIVE entries, hash collisions, and duplicate-key detection during
+construction all retain identical semantics, and iteration order over
+`mEntries` remains the bucket-file order observed at construction.
+
+### Test Results
+
+Configured with the objective Tracy flags
+(`./configure --enable-ccache --enable-sdfprefs --enable-tracy
+--enable-tracy-capture --disable-postgres
+--enable-next-protocol-version-unsafe-for-production`) and built with
+`make -j $(nproc)`. Focused
+`./src/stellar-core test --ll fatal -r simple --abort --disable-dots
+"[bucket][bucketindex]"` reported **All tests passed (366489 assertions
+in 12 test cases)**. Full regression gate
+`env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple
+--abort --disable-dots' make check` completed with `PASS:
+test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests
+passed`. No test files were modified.
+
+### Handoff State
+
+- Outer branch `poc/002-flat-inmemory-bucket-index` tip is
+  `f84878184` (`viable poc 002-flat-inmemory-bucket-index
+  (open-addressed)`); pushed to
+  `origin/poc/002-flat-inmemory-bucket-index` on the SirTyson
+  stellar-core fork.
+- `git status --short --branch` in the outer worktree is clean except
+  for the pipeline-managed untracked `ai-summary` directory.
+- `src/rust/soroban/p26` submodule is clean at the recorded
+  `fa1226b3068605c5376efe56c6cf809ca225a036` (no submodule branch
+  required for this PoC since no submodule edits were made).
