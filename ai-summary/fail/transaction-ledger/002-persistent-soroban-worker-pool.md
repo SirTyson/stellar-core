@@ -47,3 +47,41 @@ A prior investigation of `applySorobanStageClustersInParallel` failed because it
 Persistent workers must not exceed `NUM_CLUSTERS`, must not retain scoped ledger entries across jobs, and must not let one stage's `ThreadParallelApplyLedgerState` leak into the next stage. The implementation also has to handle exceptions with the same fail-fast behavior as the current `future.get()` loop.
 
 The worker pool does not address true intra-cluster serialization, which remains the dominant soroswap constraint. If the measured overhead is mostly contract execution time or unavoidable load imbalance among true pair clusters, this will fall below the Medium threshold.
+
+---
+
+## Review
+
+**Verdict**: NOT_VIABLE
+**Date**: 2026-05-03
+**Reviewed by**: gpt-5.5, high
+**Novelty**: PASS
+**Failed At**: reviewer
+
+### Trace Summary
+
+The soroswap apply-load benchmark generates transactions before the timed interval and measures `closeLedger`; for the target `TX=2000, T=8` run it verifies exactly one Soroban stage with the configured eight clusters. That stage reaches `applySorobanStageClustersInParallel`, where the apply thread constructs each `ThreadParallelApplyLedgerState`, launches one `std::async` task per cluster, then waits on the futures while workers execute all transactions in each cluster sequentially. A persistent worker pool would only remove the launch/teardown/scheduler handoff around those eight tasks; it would not remove serial thread-state construction, per-cluster contract execution behind `future.get()`, invariant checks, ordered thread-state merge, or true intra-cluster serialization.
+
+### Code Paths Examined
+
+- `ai-summary/fail/transaction-ledger/summary.md:11` — prior `001-parallelize-thread-state-construction.md` failed because `applySorobanStageClustersInParallel` self-time includes worker execution behind `future.get()`, so broad zone time cannot be attributed to serial setup or orchestration.
+- `ai-summary/CURRENT_STATE.md:41-54` — the accepted current soroswap non-Tracy baseline is 272.250 / 275.886 / 270.551 ms, so the objective's 3% Medium floor is roughly 8.2 ms per ledger.
+- `scripts/run_apply_load_matrix.py:417-425` — the benchmark writes scenario thread count into `APPLY_LOAD_LEDGER_MAX_DEPENDENT_TX_CLUSTERS`; for the target `T=8` scenario this caps the Soroban stage at eight clusters.
+- `src/simulation/ApplyLoad.cpp:2261-2334` — benchmark timing brackets `closeLedger`, excludes transaction generation, and asserts one Soroban stage with `APPLY_LOAD_LEDGER_MAX_DEPENDENT_TX_CLUSTERS` clusters.
+- `src/simulation/ApplyLoad.cpp:2672-2678` — soroswap setup creates exactly one token pair per configured cluster/bin.
+- `src/simulation/ApplyLoad.cpp:3389-3393,3458-3475` — swap generation round-robins transactions across those pairs and gives each transaction pair-specific read-write keys, producing the intended true-conflict cluster shape.
+- `src/ledger/LedgerManagerImpl.cpp:2871-3029` — `applyTransactions` builds `ApplyStage` / `TxBundle` data, then calls `applySorobanStages` from `applyParallelPhase`.
+- `src/ledger/LedgerManagerImpl.cpp:2673-2709` — `applySorobanStages` constructs one `GlobalParallelApplyLedgerState`, loops over stages, and later commits global changes to the main `LedgerTxn`.
+- `src/ledger/LedgerManagerImpl.cpp:2622-2670` — `applySorobanStage` waits for cluster workers, performs invariant processing, commits completed thread states, and destroys them.
+- `src/ledger/LedgerManagerImpl.cpp:2530-2574` — current orchestration creates one future per cluster with `std::async(std::launch::async, ...)` and then calls `future.get()` for each result.
+- `src/ledger/LedgerManagerImpl.cpp:2483-2520` — each worker applies every transaction in its cluster sequentially and flushes remaining read-only TTL bumps before returning its thread state.
+- `src/transactions/ParallelApplyUtils.cpp:925-1001` — `ThreadParallelApplyLedgerState` construction, including footprint collection from global state, happens before the async launch on the apply thread and would still be required with a worker pool.
+- `src/transactions/ParallelApplyUtils.cpp:907-922` — `commitChangesFromThreads` folds returned thread states in vector order after all workers finish, so ordered merge remains serial glue outside the worker launch mechanism.
+
+### Why It Failed
+
+The local inefficiency exists, but it is too small for this objective's Medium-or-higher threshold. In the measured soroswap shape there is one hot stage and eight cluster tasks, so a worker pool must save more than about 8.2 ms per ledger, or over 1 ms per task launch, before it reaches the 3% floor on the current 272.9 ms baseline. The code trace shows that the broad `applySorobanStageClustersInParallel` time is dominated by the work waited on by `future.get()` rather than launch overhead: per-cluster Soroban execution remains inside `applyThread`, thread-state construction remains serial before launch, and the ordered post-worker merge remains unchanged. Without narrow evidence that eight `std::async` launches cost multiple milliseconds in non-Tracy production runs, the proposed pool is a real but Low/sub-Low orchestration optimization and must be rejected under the optimize-soroswap reviewer criteria.
+
+### Lesson Learned
+
+For parallel Soroban apply orchestration, first count how many one-shot operations occur per measured ledger and compare that count to the top-line apply-time threshold. Broad zones that include `future.get()` waits should be treated as worker execution envelopes, not as evidence that C++ scheduling or setup glue is a Medium-sized bottleneck.

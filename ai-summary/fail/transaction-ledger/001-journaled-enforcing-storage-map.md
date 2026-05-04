@@ -234,3 +234,57 @@ sharing) and resulting `D ai-summary/...` entries in the outer
 `git status --short` are an orchestration setup detail that predates this
 PoC and is not produced by the source change; the source-tracked tree under
 `src/` is clean apart from the staged-and-committed gitlink bump.
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-05-03
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** YES — the p26
+   submodule diff targets the stated enforcing-storage hot path by replacing
+   full-map frame rollback snapshots with a journal and replacing
+   known-position storage-map rebuilds with in-place value replacement while
+   charging the legacy budget profile.
+2. **Are the preconditions realistic?** YES — the change is limited to
+   enforcing Soroban storage, which is the mode exercised by apply-load
+   Soroban execution under `closeLedger`.
+3. **Is the original code inefficient or working as designed?** INEFFICIENCY —
+   fixed enforcing storage positions make value replacement and rollback
+   journaling structurally feasible without changing deterministic key order.
+4. **Does the benchmark improvement match the claimed severity?** NOT TESTED —
+   benchmarking is not allowed because the required full-suite test gate did
+   not complete cleanly on the first independent run.
+5. **Is the optimization in scope?** YES — the touched code is inside the
+   Soroban host storage/frame rollback path used during ledger apply, not TX-set
+   construction or background bucket merge work.
+6. **Is the benchmark methodology correct?** NOT REACHED — no benchmark results
+   are accepted for this final review because the test gate failed first.
+7. **Can the improvement be explained without the optimization?** NOT ASSESSED —
+   no valid benchmark measurements were taken.
+8. **Is this optimization novel?** YES — it combines rollback journaling and
+   in-place enforcing-storage replacement, distinct from prior standalone
+   reviewed attempts.
+
+### Rejection Reason
+
+The required regression-test command failed during independent final review.
+The first `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`
+run exited with status 2 because `lib/gperftools` reported
+`FAIL: tcm_min_asserts_unittest` (`# FAIL: 1`) in `test-suite.log`. A later
+rerun completed cleanly, and the failure appears unrelated to the source diff,
+but the objective-specific final-review rules state that any test failure or
+flake blocks `CONFIRMED`. Therefore the PoC cannot be promoted or benchmarked
+in this final-review pass.
+
+### Failed Checks
+
+- Step 4 / Regression test gate: first independent full-suite `make check`
+  invocation failed in `lib/gperftools` (`tcm_min_asserts_unittest`).
+- Step 5 / Benchmark gate: not run, because all existing tests must pass
+  cleanly before benchmarking.
