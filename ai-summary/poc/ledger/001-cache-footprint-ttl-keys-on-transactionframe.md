@@ -197,3 +197,28 @@ The projected impact is plausibly Medium. The prior failures correctly rejected 
 - **Change description**: Add a positional TTL-key accessor for Soroban footprint entries, backed by cached RO/RW vectors on `TransactionFrame` and delegating through fee-bump wrappers where needed. Replace range loops at the call sites with indexed loops where the originating transaction is in scope. Leave the restored-entry marker loops in `commitChangesToLedgerTxn` on the direct `getTTLKey(kvp.first)` path unless a small restored-key memo is introduced; those keys are not naturally transaction-positioned and are rare for soroswap.
 - **Correctness check**: Existing invoke-host-function and parallel-apply tests should cover read-only/read-write footprint loading, TTL bumping, restore/autorestore, and fee-bump Soroban behavior. If the cache is mutable, update `clearCached()` for test-mutated envelopes; preferably pre-warm during `TxBundle` construction or before cluster launch to avoid any data race from lazy initialization in worker threads.
 - **Benchmark focus**: Measure top-line soroswap apply time with `scripts/run_apply_load_matrix.py` across repeated non-Tracy runs. Diagnostic Tracy should show fewer `sha256` calls, especially under serial cluster setup and invoke-host-function footprint/recording zones; promotion requires the soroswap median improvement to clear the objective's 3% Medium threshold.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-04
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/transactions/TransactionFrameBase.h:367-369` adds the virtual TTL-key precompute/accessor interface.
+- `src/transactions/TransactionFrame.h:74-75,403-405` and `src/transactions/TransactionFrame.cpp:180-181,693-742` add cached RO/RW footprint TTL-key vectors, reset them for test-mutated envelopes, and populate/access them positionally.
+- `src/transactions/FeeBumpTransactionFrame.h:193-195`, `src/transactions/FeeBumpTransactionFrame.cpp:67-76`, `src/transactions/test/TransactionTestFrame.h:197-199`, and `src/transactions/test/TransactionTestFrame.cpp:467-475` delegate the new interface through wrappers.
+- `src/transactions/ParallelApplyStage.h:84-85` prewarms each bundle transaction cache during bundle construction before parallel workers can read it.
+- `src/transactions/ParallelApplyUtils.cpp:119-131,242-255,698-713,982-996,1024-1034` replaces position-aware parallel-apply TTL-key derivations with cached `getFootprintTTLKey` lookups while leaving restored-entry marker loops on direct `getTTLKey` as guided.
+- `src/transactions/InvokeHostFunctionOpFrame.cpp:403-407,684-687,760-766,1162-1164` uses the transaction cache for addReads, TTL-output matching, TTL deletion, and autorestore/restore TTL updates.
+
+### Demonstration
+
+The change computes each Soroban footprint TTL key once per transaction when the `TxBundle` is constructed, then all later apply consumers read the cached positional `LedgerKey`. This removes repeated XDR encoding and SHA256 work from stage RW/RO set construction, global RO preloading, serial cluster footprint import before `std::async` launch, RW TTL bump flushing, and invoke-host-function footprint/result handling.
+
+### Test Results
+
+`./autogen.sh` and `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` completed successfully, followed by `make -j $(nproc)` successfully building `src/stellar-core`. The full regression suite `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS="--ll fatal -r simple --abort --disable-dots" make -j $(nproc) check` exited 0; a local generated `src/Makefile` git-state dependency workaround was needed in this worktree because submodule gitdirs live under the outer repository worktree metadata rather than `.git/modules`.
