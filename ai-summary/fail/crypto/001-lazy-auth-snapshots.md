@@ -206,3 +206,33 @@ deterministically.
   `src/rust/soroban/p26` after this commit show no uncommitted source
   changes (outer only carries the gitlink bump and the ai-summary file
   deltas managed by the orchestrator).
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-05-04
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** YES — the p26 submodule commit replaces eager full authorization snapshots on frame push with lazy per-frame snapshot state, and source inspection confirms it targets `AuthorizationManager::push_frame`, `snapshot`, and rollback handling.
+2. **Are the preconditions realistic?** YES — `Host::with_frame` remains hot in the soroswap apply path and the original trace evidence places the authorization snapshot zones inside `applyLedger`.
+3. **Is the original code inefficient or working as designed?** INEFFICIENCY, but consensus-sensitive — the eager snapshot is real rollback-defense work that can be optimized only if rollback and metering remain correct. The committed implementation passed the full suite in this review, and test edits were numeric budget/observation updates rather than weakened behavior assertions.
+4. **Does the benchmark improvement match the claimed severity?** NO — independent non-Tracy matrix runs did not show a reproducible soroswap apply-time reduction. Accepted baseline soroswap medians are 272.249541, 275.885919, and 270.551362 ms (average 272.895607 ms). Optimized medians were 283.407905, 272.621032, and 270.421326 ms (average 275.483421 ms), an average regression of about 0.95%.
+5. **Is the optimization in scope?** YES — the modified code is in the Soroban host authorization path reached from `closeLedger`/`applyLedger`, not TX-set construction or background bucket merge work.
+6. **Is the benchmark methodology correct?** YES — the final review used the project benchmark command `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` three times without `--tracy`, compared against `ai-summary/CURRENT_STATE.md`, and did not run a diagnostic Tracy capture because the non-Tracy runs were not eligible for confirmation.
+7. **Can the improvement be explained without the optimization?** YES / NOT APPLICABLE — there was no confirmed headline improvement. The mixed result is consistent with normal benchmark variance and the optimized average regressed.
+8. **Is this optimization novel?** YES — no duplicate finding was identified during this review, but novelty does not overcome the failed performance gate.
+
+### Rejection Reason
+
+The PoC fails the objective-specific performance gate: soroswap apply time did not improve consistently across the three required non-Tracy benchmark runs and regressed on average versus the accepted baseline. Because soroswap is the headline metric, the change is not eligible for CONFIRMED regardless of full-suite correctness or max-sac improvement.
+
+### Failed Checks
+
+- Performance final-review check 5 / verdict criterion: required benchmark improvement was not demonstrated.
+- Adversarial check 4: benchmark improvement does not match the claimed Medium severity or even the minimum >1% valid-finding threshold.
+- Objective verdict criterion: soroswap regressed on average (275.483421 ms optimized average vs 272.895607 ms baseline average).
