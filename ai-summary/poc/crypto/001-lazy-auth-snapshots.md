@@ -147,3 +147,62 @@ The change converts `push_frame` from an unconditional recursive snapshot into a
 ### Test Results
 
 `make -j30` completed successfully. `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` initially exposed one budget-expectation update in `test::hostile::excessive_logging`; after updating only the numeric budget counters, the same full-suite command completed successfully with `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.
+
+
+---
+
+## Final Review Revision (Recommit)
+
+**Date**: 2026-05-04
+**Recommit by**: claude-opus-4.7, high
+
+### What Was Fixed
+
+The previous PoC handoff left the p26 submodule as an uncommitted dirty
+checkout. This revision commits and pushes the same source changes on
+properly paired branches, so a fresh worktree can reproduce the artifact
+deterministically.
+
+### Branches and SHAs
+
+- **Submodule branch**: `poc/001-lazy-auth-snapshots` on
+  https://github.com/SirTyson/rs-soroban-env
+- **Submodule commit**: `a1e87b22a09bef5422953829b3945ad7ef4e2fa0`
+  (parent: `fa1226b3068605c5376efe56c6cf809ca225a036`,
+  the previously accepted baseline tip on the fork)
+- **Outer branch**: `poc/001-lazy-auth-snapshots` on
+  https://github.com/SirTyson/stellar-core
+- **Outer gitlink**: bumped from `fa1226b3...` to `a1e87b22...`
+- **Outer commit SHA**: `cc39eb2029ef5b438d7158c5035df94c0724ea1d`
+
+### Audit of Committed Diff
+
+- Source changes (`auth.rs`, `host/frame.rs`, `host/lifecycle.rs`,
+  `host/invocation_metering.rs`) match the optimization described above:
+  lazy per-frame auth snapshots + a renamed
+  `pop_create_contract_host_fn_frame` helper for the deployer-auth path.
+- Test changes are restricted to numeric budget-counter updates (lower
+  `instructions`, `mem_bytes`, `MemAlloc`, `MemCpy`, `cpu`) reflecting
+  the avoided eager allocations. No assertion logic, fixture, or
+  pass/fail outcome was modified. This is the budget-number exception
+  permitted by the PoC procedure.
+- 376 regenerated `observations/26/*.json` files contain only
+  numeric cpu/mem deltas (regenerated with `UPDATE_OBSERVATIONS=1`),
+  consistent with intentionally lower metering of the success path.
+
+### Verification
+
+- `./configure --enable-ccache --enable-sdfprefs --enable-tracy
+  --enable-tracy-capture --disable-postgres` (already configured).
+- `make -j30` built cleanly.
+- `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple
+  --abort --disable-dots' make check` reports
+  `PASS: test/selftest-nopg`, `PASS: test/check-nondet`,
+  `All 2 tests passed`. (One transient `tcm_min_asserts_unittest`
+  failure in vendored `lib/gperftools` was confirmed flaky: a clean
+  re-run of `make check` in `lib/gperftools` passed all 29 tests, and
+  the failure is unrelated to soroban-env-host.)
+- `git status --short --branch` in both the outer worktree and
+  `src/rust/soroban/p26` after this commit show no uncommitted source
+  changes (outer only carries the gitlink bump and the ai-summary file
+  deltas managed by the orchestrator).
