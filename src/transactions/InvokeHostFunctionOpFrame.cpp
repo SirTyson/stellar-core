@@ -403,7 +403,8 @@ class InvokeHostFunctionApplyHelper : virtual LedgerAccessHelper
             // For soroban entries, check if the entry is expired before loading
             if (isSorobanEntry(lk))
             {
-                auto ttlKey = getTTLKey(lk);
+                auto const& ttlKey =
+                    mOpFrame.mParentTx.getFootprintTTLKey(!isReadOnly, i);
 
                 // handleArchivedEntry may need to load the TTL key to write the
                 // restored TTL, so make sure any TTL ltxe destructs before
@@ -682,7 +683,8 @@ class InvokeHostFunctionApplyHelper : virtual LedgerAccessHelper
                     }
                 }
                 else if (lk.type() == TTL && isSorobanEntry(rwKeys[j]) &&
-                         getTTLKey(rwKeys[j]) == lk)
+                         mOpFrame.mParentTx.getFootprintTTLKey(
+                             /*readWrite=*/true, j) == lk)
                 {
                     relatedRwKey = j;
                 }
@@ -758,7 +760,9 @@ class InvokeHostFunctionApplyHelper : virtual LedgerAccessHelper
                     releaseAssertOrThrow(isSorobanEntry(lk));
 
                     // Also delete associated ttlEntry
-                    auto ttlLK = getTTLKey(lk);
+                    auto const& ttlLK =
+                        mOpFrame.mParentTx.getFootprintTTLKey(
+                            /*readWrite=*/true, j);
                     releaseAssertOrThrow(eraseLedgerEntryIfExists(ttlLK));
                 }
             }
@@ -1156,7 +1160,8 @@ class InvokeHostFunctionParallelApplyHelper
             }
 
             // Restore the entry to the live BucketList
-            auto ttlKey = getTTLKey(lk);
+            auto const& ttlKey =
+                mOpFrame.mParentTx.getFootprintTTLKey(!isReadOnly, index);
             LedgerEntry ttlEntry;
             if (isHotArchiveEntry)
             {

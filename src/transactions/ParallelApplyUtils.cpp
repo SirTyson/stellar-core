@@ -118,13 +118,16 @@ getReadWriteKeysForStage(ApplyStage const& stage)
 
     for (auto const& txBundle : stage)
     {
-        for (auto const& lk :
-             txBundle.getTx()->sorobanResources().footprint.readWrite)
+        auto const& readWrite =
+            txBundle.getTx()->sorobanResources().footprint.readWrite;
+        for (size_t i = 0; i < readWrite.size(); ++i)
         {
+            auto const& lk = readWrite[i];
             res.emplace(lk);
             if (isSorobanEntry(lk))
             {
-                res.emplace(getTTLKey(lk));
+                res.emplace(txBundle.getTx()->getFootprintTTLKey(
+                    /*readWrite=*/true, i));
             }
         }
     }
@@ -239,14 +242,17 @@ ParallelApplyLedgerKeySet
 buildRoTTLSet(TxBundle const& txBundle)
 {
     ParallelApplyLedgerKeySet isReadOnlyTTLSet;
-    for (auto const& ro :
-         txBundle.getTx()->sorobanResources().footprint.readOnly)
+    auto const& readOnly =
+        txBundle.getTx()->sorobanResources().footprint.readOnly;
+    for (size_t i = 0; i < readOnly.size(); ++i)
     {
+        auto const& ro = readOnly[i];
         if (!isSorobanEntry(ro))
         {
             continue;
         }
-        isReadOnlyTTLSet.emplace(getTTLKey(ro));
+        isReadOnlyTTLSet.emplace(
+            txBundle.getTx()->getFootprintTTLKey(/*readWrite=*/false, i));
     }
     return isReadOnlyTTLSet;
 }
@@ -658,9 +664,11 @@ GlobalParallelApplyLedgerState::collectModifiedClassicEntries(
         {
             for (auto const& txBundle : stage)
             {
-                for (auto const& lk :
-                     txBundle.getTx()->sorobanResources().footprint.readOnly)
+                auto const& readOnly =
+                    txBundle.getTx()->sorobanResources().footprint.readOnly;
+                for (size_t i = 0; i < readOnly.size(); ++i)
                 {
+                    auto const& lk = readOnly[i];
                     if (!isSorobanEntry(lk))
                     {
                         continue;
@@ -688,7 +696,9 @@ GlobalParallelApplyLedgerState::collectModifiedClassicEntries(
                             lk, GlobalParallelApplyEntry{entry, false});
 
                         // Also pre-load the TTL entry
-                        auto ttlKey = getTTLKey(lk);
+                        auto const& ttlKey =
+                            txBundle.getTx()->getFootprintTTLKey(
+                                /*readWrite=*/false, i);
                         if (mGlobalEntryMap.find(ttlKey) ==
                             mGlobalEntryMap.end())
                         {
@@ -970,14 +980,18 @@ ThreadParallelApplyLedgerState::collectClusterFootprintEntriesFromGlobal(
     for (auto const& txBundle : cluster)
     {
         auto const& footprint = txBundle.getTx()->sorobanResources().footprint;
-        for (auto const& keys : {footprint.readWrite, footprint.readOnly})
+        for (auto readWrite : {true, false})
         {
-            for (auto const& key : keys)
+            auto const& keys =
+                readWrite ? footprint.readWrite : footprint.readOnly;
+            for (size_t i = 0; i < keys.size(); ++i)
             {
+                auto const& key = keys[i];
                 fetchFromGlobal(key);
                 if (isSorobanEntry(key))
                 {
-                    auto ttlKey = getTTLKey(key);
+                    auto const& ttlKey =
+                        txBundle.getTx()->getFootprintTTLKey(readWrite, i);
                     fetchFromGlobal(ttlKey);
                 }
             }
@@ -1007,14 +1021,16 @@ ThreadParallelApplyLedgerState::flushRoTTLBumpsInTxWriteFootprint(
     auto const& readWrite =
         txBundle.getTx()->sorobanResources().footprint.readWrite;
 
-    for (auto const& lk : readWrite)
+    for (size_t i = 0; i < readWrite.size(); ++i)
     {
+        auto const& lk = readWrite[i];
         if (!isSorobanEntry(lk))
         {
             continue;
         }
 
-        auto ttlKey = getTTLKey(lk);
+        auto const& ttlKey =
+            txBundle.getTx()->getFootprintTTLKey(/*readWrite=*/true, i);
         ParallelApplyLedgerKey ttlParallelKey(ttlKey);
         auto b = mRoTTLBumps.find(ttlParallelKey);
         if (b != mRoTTLBumps.end())

@@ -71,6 +71,8 @@ class TransactionFrame : public TransactionFrameBase
     Hash const& mNetworkID;     // used to change the way we compute signatures
     mutable Hash mContentsHash; // the hash of the contents
     mutable Hash mFullHash;     // the hash of the contents and the sig.
+    mutable std::optional<std::vector<LedgerKey>> mFootprintReadOnlyTTLKeys;
+    mutable std::optional<std::vector<LedgerKey>> mFootprintReadWriteTTLKeys;
 
     std::vector<std::shared_ptr<OperationFrame const>> mOperations;
 
@@ -398,6 +400,9 @@ class TransactionFrame : public TransactionFrameBase
     bool isSoroban() const override;
     SorobanResources const& sorobanResources() const override;
     SorobanTransactionData::_ext_t const& getResourcesExt() const override;
+    void precomputeFootprintTTLKeys() const override;
+    LedgerKey const& getFootprintTTLKey(bool readWrite,
+                                        size_t index) const override;
 
     static FeePair computeSorobanResourceFee(
         uint32_t protocolVersion, SorobanResources const& txResources,

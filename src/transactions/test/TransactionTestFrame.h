@@ -194,6 +194,9 @@ class TransactionTestFrame : public TransactionFrameBase
     bool isSoroban() const override;
     SorobanResources const& sorobanResources() const override;
     SorobanTransactionData::_ext_t const& getResourcesExt() const override;
+    void precomputeFootprintTTLKeys() const override;
+    LedgerKey const& getFootprintTTLKey(bool readWrite,
+                                        size_t index) const override;
     int64 declaredSorobanResourceFee() const override;
     bool XDRProvidesValidFee() const override;
     bool isRestoreFootprintTx() const override;

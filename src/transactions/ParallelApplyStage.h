@@ -82,6 +82,7 @@ class TxBundle
         , mTxNum(txNum)
         , mEffects(new TxEffects(enableTxMeta, *tx, ledgerVersion, app))
     {
+        mTx->precomputeFootprintTTLKeys();
     }
 
     TransactionFrameBasePtr

@@ -177,6 +177,8 @@ TransactionFrame::clearCached() const
     Hash zero;
     mContentsHash = zero;
     mFullHash = zero;
+    mFootprintReadOnlyTTLKeys.reset();
+    mFootprintReadWriteTTLKeys.reset();
 }
 #endif
 
@@ -684,6 +686,60 @@ TransactionFrame::getResourcesExt() const
 {
     releaseAssertOrThrow(isSoroban());
     return mEnvelope.v1().tx.ext.sorobanData().ext;
+}
+
+namespace
+{
+void
+populateFootprintTTLKeys(xdr::xvector<LedgerKey> const& footprintKeys,
+                         std::optional<std::vector<LedgerKey>>& ttlKeys)
+{
+    if (ttlKeys)
+    {
+        return;
+    }
+
+    ttlKeys.emplace();
+    ttlKeys->reserve(footprintKeys.size());
+    for (auto const& key : footprintKeys)
+    {
+        if (isSorobanEntry(key))
+        {
+            ttlKeys->emplace_back(getTTLKey(key));
+        }
+        else
+        {
+            ttlKeys->emplace_back();
+        }
+    }
+}
+}
+
+void
+TransactionFrame::precomputeFootprintTTLKeys() const
+{
+    if (!isSoroban())
+    {
+        return;
+    }
+
+    auto const& footprint = sorobanResources().footprint;
+    populateFootprintTTLKeys(footprint.readOnly, mFootprintReadOnlyTTLKeys);
+    populateFootprintTTLKeys(footprint.readWrite, mFootprintReadWriteTTLKeys);
+}
+
+LedgerKey const&
+TransactionFrame::getFootprintTTLKey(bool readWrite, size_t index) const
+{
+    auto const& keys = readWrite ? sorobanResources().footprint.readWrite
+                                 : sorobanResources().footprint.readOnly;
+    releaseAssertOrThrow(index < keys.size());
+    releaseAssertOrThrow(isSorobanEntry(keys.at(index)));
+
+    auto& ttlKeys =
+        readWrite ? mFootprintReadWriteTTLKeys : mFootprintReadOnlyTTLKeys;
+    populateFootprintTTLKeys(keys, ttlKeys);
+    return ttlKeys->at(index);
 }
 
 MutableTxResultPtr

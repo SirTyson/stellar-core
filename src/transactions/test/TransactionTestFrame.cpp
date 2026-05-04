@@ -463,6 +463,18 @@ TransactionTestFrame::getResourcesExt() const
     return mTransactionFrame->getResourcesExt();
 }
 
+void
+TransactionTestFrame::precomputeFootprintTTLKeys() const
+{
+    mTransactionFrame->precomputeFootprintTTLKeys();
+}
+
+LedgerKey const&
+TransactionTestFrame::getFootprintTTLKey(bool readWrite, size_t index) const
+{
+    return mTransactionFrame->getFootprintTTLKey(readWrite, index);
+}
+
 int64
 TransactionTestFrame::declaredSorobanResourceFee() const
 {

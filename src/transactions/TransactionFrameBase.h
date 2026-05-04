@@ -364,6 +364,9 @@ class TransactionFrameBase
     virtual bool isSoroban() const = 0;
     virtual SorobanResources const& sorobanResources() const = 0;
     virtual SorobanTransactionData::_ext_t const& getResourcesExt() const = 0;
+    virtual void precomputeFootprintTTLKeys() const = 0;
+    virtual LedgerKey const& getFootprintTTLKey(bool readWrite,
+                                                size_t index) const = 0;
     virtual int64 declaredSorobanResourceFee() const = 0;
     virtual bool XDRProvidesValidFee() const = 0;
 

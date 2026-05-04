@@ -64,6 +64,18 @@ FeeBumpTransactionFrame::getResourcesExt() const
     return mInnerTx->getResourcesExt();
 }
 
+void
+FeeBumpTransactionFrame::precomputeFootprintTTLKeys() const
+{
+    mInnerTx->precomputeFootprintTTLKeys();
+}
+
+LedgerKey const&
+FeeBumpTransactionFrame::getFootprintTTLKey(bool readWrite, size_t index) const
+{
+    return mInnerTx->getFootprintTTLKey(readWrite, index);
+}
+
 FeeBumpTransactionFrame::FeeBumpTransactionFrame(
     Hash const& networkID, TransactionEnvelope const& envelope)
     : mEnvelope(envelope)
