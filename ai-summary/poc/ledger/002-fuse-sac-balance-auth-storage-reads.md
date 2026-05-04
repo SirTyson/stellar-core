@@ -80,3 +80,25 @@ The expected impact is Medium, not High. The supplied trace shows `storage get` 
 - **Change description**: Add fused SAC helpers for the transfer path. For contract holders, derive the balance key once, read/decode once for authorization, reuse the decoded value for amount mutation, and update the ledger entry without an avoidable second `read_contract_balance`; if practical, pass full-entry/live-until information into the write path to eliminate the current `try_get_full` reread as well. For credit-asset account holders, read the trustline once when checking authorization and reuse the same decoded trustline for balance mutation when the holder is not the issuer.
 - **Correctness check**: Existing SAC transfer, trustline authorization, issuer, missing-balance, overflow, and TTL-extension tests should still cover behavior. Pay special attention to preserving the current order of `BalanceDeauthorizedError`, overflow errors, missing trustline errors, and `write_contract_balance` TTL extension.
 - **Benchmark focus**: Run `scripts/run_apply_load_matrix.py` for the active `soroswap, TX=2000, T=8` scenario and compare repeated non-Tracy medians. Expected improvement should show as fewer `storage get` calls/time under `SAC transfer` and a 3-10% reduction in soroswap apply time; if the final median reduction is below 3%, this should be rejected by the objective threshold despite the real micro-optimization.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-04
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/balance.rs:169-669` — added fused SAC update helpers that read contract balance entries with live-until metadata once, reuse decoded authorization/balance state through spend/receive mutation, and reuse a single trustline read for credit-asset authorization plus balance mutation.
+- `src/rust/soroban/p26/soroban-env-host/src/test/stellar_asset_contract.rs:3631-3632` — updated the `test_custom_account_auth` resource expectation to the lower measured instruction/memory values caused by the fused SAC path.
+- `src/rust/soroban/p26/soroban-env-host/observations/26/test__stellar_asset_contract__*.json` — refreshed 45 affected p26 Stellar Asset Contract observation baselines after the intentional host trace/resource changes from removing redundant reads.
+
+### Demonstration
+
+The transfer path now avoids the duplicate SAC-level storage read for contract-address balances: `spend_balance` and `receive_balance` read the full contract-data entry once, use that decoded `BalanceValue` for authorization and amount mutation, and write back using the already-read live-until metadata before preserving the existing TTL extension. Credit-asset account transfers similarly reuse the trustline entry read during authorization for the subsequent balance mutation, removing the second trustline lookup on authorized transfer sides while preserving issuer, missing-trustline, overflow, and deauthorization ordering.
+
+### Test Results
+
+Configured and built with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` followed by `make -j30`. The full regression suite passed with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`; final output reported `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.
