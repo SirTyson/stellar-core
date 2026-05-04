@@ -337,3 +337,66 @@ cached positional vector rather than re-running XDR-encode + SHA256.
 Benchmarking with `scripts/run_apply_load_matrix.py` is left to the
 final reviewer per the performance PoC procedure (PoC verifies regression
 only).
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-05-04
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** YES. The diff adds positional RO/RW footprint TTL-key caches to `TransactionFrame`, prewarms them during `TxBundle` construction, and replaces repeated `getTTLKey()` calls in the claimed parallel-apply and invoke-host-function call sites where the transaction footprint index is available.
+2. **Are the preconditions realistic?** YES. Soroswap apply-load transactions carry Soroban code/data footprint entries, and those entries are visited repeatedly during global setup, thread-state setup, host reads, output matching, TTL deletion, and autorestore/restore handling.
+3. **Is the original code inefficient or working as designed?** INEFFICIENCY. The repeated TTL key derivations are pure functions of immutable footprint keys; caching them after transaction construction is correctness-preserving when precomputed before worker futures launch.
+4. **Does the benchmark improvement match the claimed severity?** NO. The independently measured optimized soroswap medians were 276.186172 ms, 276.674017 ms, and 276.604893 ms. The accepted baseline soroswap medians in `ai-summary/CURRENT_STATE.md` are 272.249541 ms, 275.885919 ms, and 270.551362 ms, so all three optimized runs are slower than the corresponding accepted baseline distribution and the optimized average regresses from 272.895607 ms to 276.488361 ms (~1.32% slower).
+5. **Is the optimization in scope?** YES. The touched code is in the closeLedger / parallel Soroban apply path, not tx-set construction or background bucket merge work.
+6. **Is the benchmark methodology correct?** YES. The optimized binary was built locally and measured with `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` exactly three times without `--tracy`, comparing against the accepted baseline in `ai-summary/CURRENT_STATE.md`.
+7. **Can the improvement be explained WITHOUT the optimization?** NOT APPLICABLE. There was no measured improvement to explain; the headline soroswap metric regressed.
+8. **Is this optimization novel?** YES. The specific transaction-frame TTL-key cache was not a duplicate of the prior single-site failed TTL-key hypotheses, but novelty does not overcome the measured regression.
+
+Regression testing passed before benchmarking: `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make -j $(nproc) check` exited 0. The change still fails the performance gate because the objective requires consistent soroswap apply-time improvement across the three non-Tracy matrix runs.
+
+### Rejection Reason
+
+The optimization is reproducible and appears correctness-preserving, but it does not improve the objective's headline metric. Independent final-review measurements show a consistent soroswap apply-time regression versus the accepted baseline, which maps to REJECTED under the optimize-soroswap verdict criteria.
+
+### Failed Checks
+
+- Performance Step 5 / Benchmark improvement: FAILED — no measurable improvement; soroswap median regressed in all three non-Tracy runs.
+- Adversarial check 4: FAILED — measured benchmark results do not support Low/Medium/High severity, or even a sub-1% improvement.
+- Verdict criteria: FAILED — soroswap regression blocks CONFIRMED.
+
+### Independent Benchmark Results
+
+Baseline from `ai-summary/CURRENT_STATE.md`:
+
+| run | scenario | median_ms | p95_ms | p99_ms |
+|-----|----------|-----------|--------|--------|
+| 1 | sac, TX=6000, T=8 | 306.357371 | 323.520286 | 342.969893 |
+| 1 | soroswap, TX=2000, T=8 | 272.249541 | 277.125824 | 284.216066 |
+| 2 | sac, TX=6000, T=8 | 300.543791 | 318.326585 | 334.658452 |
+| 2 | soroswap, TX=2000, T=8 | 275.885919 | 280.428445 | 291.406201 |
+| 3 | sac, TX=6000, T=8 | 312.727103 | 332.254466 | 350.911892 |
+| 3 | soroswap, TX=2000, T=8 | 270.551362 | 274.494149 | 281.500531 |
+
+Optimized final-review runs:
+
+| run | run id | scenario | median_ms | p95_ms | p99_ms |
+|-----|--------|----------|-----------|--------|--------|
+| 1 | `7a40d38c2423-20260504-074929` | sac, TX=6000, T=8 | 302.435887 | 320.196082 | 335.504111 |
+| 1 | `7a40d38c2423-20260504-074929` | soroswap, TX=2000, T=8 | 276.186172 | 280.368452 | 283.711093 |
+| 2 | `7a40d38c2423-20260504-075603` | sac, TX=6000, T=8 | 305.630327 | 324.596812 | 347.595284 |
+| 2 | `7a40d38c2423-20260504-075603` | soroswap, TX=2000, T=8 | 276.674017 | 280.673756 | 282.687817 |
+| 3 | `7a40d38c2423-20260504-080220` | sac, TX=6000, T=8 | 312.586770 | 330.582213 | 353.662951 |
+| 3 | `7a40d38c2423-20260504-080220` | soroswap, TX=2000, T=8 | 276.604893 | 280.948351 | 282.902843 |
+
+Summary:
+
+| metric | baseline average | optimized average | result |
+|--------|------------------|-------------------|--------|
+| soroswap median | 272.895607 ms | 276.488361 ms | 1.32% slower |
+| sac median | 306.542755 ms | 306.884328 ms | 0.11% slower |
