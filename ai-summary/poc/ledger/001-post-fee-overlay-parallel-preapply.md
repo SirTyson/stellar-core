@@ -86,3 +86,26 @@ Existing optimizations do not cover this. The p26 split path exists, but it curr
 - **Change description**: collect the post-fee classic entries needed for read-only validation (at minimum source account, fee source account, operation source accounts, and relevant classic footprint entries) from the current `LedgerTxn`, and allow p26 transactions to use the parallel read-only path when the only current-vs-LCL divergence is deterministic fee-processing state that the overlay supplies. Keep `preParallelApplyWrite` ordered on the real `LedgerTxn`; do not parallelize `LedgerTxn` writes.
 - **Correctness check**: preserve sequential fallback for same-source transaction sequences, fee-bump Soroban transactions until both outer fee-source and inner source semantics are covered, pre-auth signer removal dependencies, missing account/footprint behavior, and classic footprint keys changed by earlier phases. Existing coverage to run in PoC includes Soroban invoke-host-function tests around pre-auth signer removal and fee-bump handling, plus apply-load soroswap.
 - **Benchmark focus**: measure `scripts/run_apply_load_matrix.py` for `soroswap, TX=2000, T=8` over multiple runs, with attention to top-line apply median and `soroban_setup_glbl`. A successful PoC should reduce `soroban_setup_glbl` by a large fraction and translate to a reproducible 3-10% apply-time reduction; if the setup drop is absorbed by ordered writes or overlay construction, the finding should be rejected at PoC.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-05
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/ledger/LedgerStateSnapshot.h:10-14,250-254` and `src/ledger/LedgerStateSnapshot.cpp:274-279`: added a constructor that lets callers wrap a custom `AbstractLedgerStateSnapshot` in a `LedgerSnapshot`.
+- `src/transactions/ParallelApplyUtils.h:21-26,232-236`: added shared post-fee overlay map types and threaded the overlay through read-only pre-apply.
+- `src/transactions/ParallelApplyUtils.cpp:30-224`: added a read-only post-fee overlay snapshot plus conservative dependency collection for source, fee-source, op-source, and classic footprint keys.
+- `src/transactions/ParallelApplyUtils.cpp:329-361,650-681,743-780`: routed eligible protocol-26 Soroban transactions through parallel read-only pre-apply against the post-fee overlay while preserving sequential fallback for fee-bump and repeated-dependency cases, then kept ordered `preParallelApplyWrite` on the real `LedgerTxn`.
+
+### Demonstration
+
+The change supplies read-only protocol-26 pre-apply with a deterministic post-fee classic ledger view, so source and fee-source account balance changes from fee processing no longer force unique-account Soroban transactions down the fully sequential pre-apply path. Writes that update sequence numbers and one-time signers still commit to the real `LedgerTxn` in transaction order, while fee-bump transactions and transactions sharing source/op/classic dependency keys retain the original sequential fallback.
+
+### Test Results
+
+`./autogen.sh && ./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres && make -j $(nproc)` completed successfully. `set -o pipefail; env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check 2>&1 | tail -200` completed successfully; the captured tail includes `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and Rust test summaries with zero failures.
