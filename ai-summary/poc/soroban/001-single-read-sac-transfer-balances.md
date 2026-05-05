@@ -98,3 +98,135 @@ The implementation constructs and reads the persistent contract-balance ledger k
 ### Test Results
 
 Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`, built with `make -j30`, and ran `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`; all tests passed.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-05
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The handoff is not reproducible in its current form. The outer worktree is on
+`poc/001-single-read-sac-transfer-balances`, but the `src/rust/soroban/p26`
+gitlink still resolves to the prior accepted baseline
+`fa1226b3068605c5376efe56c6cf809ca225a036`, and the actual PoC source changes
+are left as uncommitted dirty state inside the detached p26 submodule. Final
+review cannot build, test, benchmark, or promote an optimization that is not
+recorded as commits on the required PoC branches.
+
+The implementation also changes `observations/26/...` fixtures, which shows the
+protocol-26 host observation / budget trace changed. The original viability
+condition required either exact p26 metering preservation or a protocol-gated
+next-protocol metering change. This PoC needs to make that contract explicit:
+either keep p26 observations byte-identical by replaying the skipped logical
+metering, or gate the cheaper single-read path to the next protocol and update
+only the corresponding next-protocol expectations.
+
+### Revision Instructions
+
+1. Commit the p26 submodule changes to
+   `github.com/SirTyson/rs-soroban-env` on branch
+   `poc/001-single-read-sac-transfer-balances`.
+2. Update the outer `src/rust/soroban/p26` gitlink to that committed submodule
+   SHA and commit the gitlink bump on the outer
+   `poc/001-single-read-sac-transfer-balances` branch.
+3. Ensure both the outer repository and p26 submodule are clean before handing
+   back to final review (`git status --short` empty except orchestrator-managed
+   `ai-summary` artifacts).
+4. Resolve the protocol/metering issue: either preserve p26 observation output
+   exactly, or make the single-read optimization protocol-gated to the next
+   protocol and document that the changed observations are only for the
+   next-protocol path.
+5. Re-run the required build and full test gate from a clean committed handoff,
+   then include the exact submodule SHA and test command/results in the PoC
+   notes. Final review will only run the benchmark matrix after this clean
+   handoff check passes.
+
+### Checks Passed So Far
+
+- The source-level duplicate contract-balance read/decode is real: the dirty
+  p26 diff collapses the `is_authorized` read and mutation read for
+  contract-address SAC balances.
+- The optimization target is in scope for soroswap apply-path review when
+  exercised during `closeLedger`.
+- No benchmarking verdict was attempted because the handoff failed before the
+  build/test/benchmark gates.
+
+---
+
+## PoC Attempt (Revised)
+
+**Result**: POC_PASS
+**Date**: 2026-05-05
+**PoC by**: claude-opus-4.7, high
+**Submodule SHA**: 7d69b5d8a1c1b5c7ae761ce0a8f00e576c23b31f
+**Submodule branch**: `poc/001-single-read-sac-transfer-balances` on `github.com/SirTyson/rs-soroban-env`
+**Outer branch**: `poc/001-single-read-sac-transfer-balances` on `github.com/SirTyson/stellar-core`
+
+### Revisions vs Prior Attempt
+
+The prior attempt left the SAC single-read fast path enabled unconditionally
+on the p26 host, which changed protocol-26 host observation traces and was
+flagged by final review. The handoff was also dirty: the submodule edits were
+not committed and the outer gitlink still pointed at the old baseline.
+
+This revision:
+
+1. Gates the single-read fast path on `Budget::coalesced_host_metering()`,
+   which the existing protocol gate in `Host::set_ledger_info` (committed
+   as part of the `fa1226b3` baseline) enables only when the active ledger
+   protocol exceeds `MIN_LEDGER_PROTOCOL_VERSION = 26` (i.e. the next
+   protocol, 27, available under `--features next`). On p26 ledgers the
+   helpers fall back to the original two-read implementation, so p26 host
+   metering observations remain byte-identical to baseline. The previously
+   modified `observations/26/...` fixtures are reverted.
+2. Commits the p26 SAC change as a real submodule commit on
+   `poc/001-single-read-sac-transfer-balances` of the SirTyson fork and
+   bumps the outer gitlink in a paired commit on the matching outer branch,
+   so final review can pull both branches and reproduce the build.
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/balance.rs`
+  - Added `balance_deauthorized_error`, `is_contract_balance_authorized`,
+    `AuthorizedBalance`, `read_authorized_balance`, and
+    `spend_contract_balance` helpers.
+  - Split `receive_balance` into `receive_balance_legacy` (original
+    two-read path, used at p26) and `receive_balance_coalesced` (the new
+    single-read path, used only when the active ledger protocol exceeds
+    `MIN_LEDGER_PROTOCOL_VERSION`). `receive_balance` dispatches based on
+    `Budget::coalesced_host_metering()`.
+  - Made `spend_balance` dispatch on the same gate: at p26 it does the
+    original `is_authorized` check followed by
+    `spend_balance_no_authorization_check`; at next protocol it goes
+    through `read_authorized_balance` + `spend_contract_balance` so the
+    contract-balance read/decode happens once.
+  - Restored `is_authorized` to its original inlined form to keep its
+    metering identical to baseline at every protocol.
+- `src/rust/soroban/p26` gitlink bumped from
+  `fa1226b3068605c5376efe56c6cf809ca225a036` to
+  `7d69b5d8a1c1b5c7ae761ce0a8f00e576c23b31f`.
+
+### Demonstration
+
+For the contract-address branches of `receive_balance` and `spend_balance`,
+the next-protocol path now constructs `DataKey::Balance(addr)`, calls
+`try_get_contract_data`, and decodes `BalanceValue` once during the
+authorization check and reuses the decoded `BalanceValue` for the
+debit/credit + `write_contract_balance`. This removes one persistent
+storage `MeteredOrdMap` lookup, one `ScVal`-to-`Val` conversion, and one
+`BalanceValue` decode per contract-side balance per SAC transfer on every
+soroswap swap that hits a pair-contract balance. The legacy p26 path is
+unchanged, so no observed p26 budget charges are affected.
+
+### Test Results
+
+Configured with
+`./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`,
+built with `make -j$(nproc)`, and ran
+`env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`.
+All unit tests passed (the run completes with `All 2 tests passed` from the
+`selftest-nopg` + `check-nondet` driver, with every sub-suite green and no
+observation diffs).
