@@ -109,3 +109,84 @@ The change supplies read-only protocol-26 pre-apply with a deterministic post-fe
 ### Test Results
 
 `./autogen.sh && ./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres && make -j $(nproc)` completed successfully. `set -o pipefail; env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check 2>&1 | tail -200` completed successfully; the captured tail includes `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and Rust test summaries with zero failures.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-05
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+Final review cannot benchmark or confirm this PoC because the handoff is not reproducible from committed state. The outer branch `poc/001-post-fee-overlay-parallel-preapply` is at commit `bd1487c0c` (`viable review 001-post-fee-overlay-parallel-preapply`), but the production source changes described in the PoC are still uncommitted working-tree modifications:
+
+- `src/ledger/LedgerStateSnapshot.cpp`
+- `src/ledger/LedgerStateSnapshot.h`
+- `src/transactions/ParallelApplyUtils.cpp`
+- `src/transactions/ParallelApplyUtils.h`
+
+The p26 submodule is clean at `fa1226b3068605c5376efe56c6cf809ca225a036`, so the blocker is the dirty outer source state. Under the optimize-soroswap final-review handoff rules, final review must refuse a PoC whose source changes are left as uncommitted working-tree state; otherwise fresh worktrees and future benchmark runs would not inherit the exact implementation being measured.
+
+### Revision Instructions
+
+Commit the four outer source-file changes to the PoC branch `poc/001-post-fee-overlay-parallel-preapply`, push that branch, and leave both the outer repository and `src/rust/soroban/p26` submodule clean. The revised PoC notes should also record the committed outer SHA that contains the optimization. After that, final review can check out the committed PoC, run the full unit suite, and run the required three non-Tracy `scripts/run_apply_load_matrix.py` measurements against reproducible code.
+
+### Checks Passed So Far
+
+- The hypothesis and PoC notes identify an in-scope close-ledger optimization path: protocol-26 Soroban pre-apply setup after fee processing.
+- The p26 submodule handoff is clean and points at an existing accepted baseline SHA.
+- The source diff shape matches the PoC description at a high level, but it was not eligible for deeper correctness review or benchmarking because it was not committed.
+
+---
+
+## PoC Attempt (Revision)
+
+**Result**: POC_PASS
+**Date**: 2026-05-05
+**PoC by**: claude-opus-4.7, high
+
+### Revision Summary
+
+Final review on the prior PoC attempt flagged that the four production
+source-file changes were left as uncommitted working-tree state on the
+PoC branch. This revision commits those exact changes to the PoC branch
+so that fresh worktrees and benchmark runs reproduce the implementation.
+
+No source modifications were introduced beyond what was already in the
+working tree from the prior attempt; the diff is identical to what the
+prior PoC notes describe.
+
+### Committed State
+
+- Outer branch `poc/001-post-fee-overlay-parallel-preapply` on
+  `github.com/SirTyson/stellar-core` now contains the optimization at
+  commit `675e5a4f1ad897d3e30bacd27556c7be653740e4`
+  ("viable poc 001-post-fee-overlay-parallel-preapply").
+- Submodule `src/rust/soroban/p26` is unchanged and clean at
+  `fa1226b3068605c5376efe56c6cf809ca225a036` (the accepted baseline).
+- Outer worktree and submodule are both clean (modulo the
+  `ai-summary` symlink which points outside the repo and is not
+  tracked by stellar-core).
+
+### Files Changed in the PoC Commit
+
+- `src/ledger/LedgerStateSnapshot.cpp`
+- `src/ledger/LedgerStateSnapshot.h`
+- `src/transactions/ParallelApplyUtils.cpp`
+- `src/transactions/ParallelApplyUtils.h`
+
+Total diff: 4 files changed, 249 insertions(+), 14 deletions(-).
+
+### Test Results
+
+- Build: `make -j $(nproc)` succeeded against the Tracy-enabled
+  configure flags (`--enable-ccache --enable-sdfprefs --enable-tracy
+  --enable-tracy-capture --disable-postgres`); incremental build was a
+  no-op (binary already up to date for the committed source).
+- Unit tests: `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll
+  fatal -r simple --abort --disable-dots' make check` ran to
+  completion. Tail shows `PASS: test/selftest-nopg`,
+  `PASS: test/check-nondet`, "All 2 tests passed", and Rust test
+  summaries with zero failures (e.g. soroban-env-host: 751 passed;
+  0 failed).
