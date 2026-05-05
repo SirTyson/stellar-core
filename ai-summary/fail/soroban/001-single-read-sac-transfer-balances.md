@@ -230,3 +230,82 @@ built with `make -j$(nproc)`, and ran
 All unit tests passed (the run completes with `All 2 tests passed` from the
 `selftest-nopg` + `check-nondet` driver, with every sub-suite green and no
 observation diffs).
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-05-05
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** YES — the p26
+   submodule diff is localized to
+   `soroban-env-host/src/builtin_contracts/stellar_asset_contract/balance.rs` and
+   the next-protocol `coalesced_host_metering` path reuses the decoded contract
+   `BalanceValue` for authorization and debit/credit mutation instead of calling
+   `read_contract_balance` twice.
+2. **Are the preconditions realistic?** YES — soroswap swaps exercise SAC
+   transfers involving pair-contract balances during `closeLedger`, so the
+   optimized path is in the measured apply workload for the configured
+   next-protocol build.
+3. **Is the original code inefficient or working as designed?** INEFFICIENCY —
+   the duplicate contract-balance read/decode was real. The revised PoC avoided
+   the earlier p26 metering problem by keeping the legacy two-read path when
+   `coalesced_host_metering` is disabled.
+4. **Does the benchmark improvement match the claimed severity?** NO — the
+   independent benchmark run showed a regression, not an improvement. Accepted
+   baseline soroswap medians were `272.249541`, `275.885919`, and `270.551362`
+   ms (average `272.895607` ms). Optimized medians were `273.406103`,
+   `287.129842`, and `278.014692` ms (average `279.516879` ms), a `2.43%`
+   regression. SAC also regressed on average from `306.542755` ms to
+   `310.010144` ms (`1.13%` regression).
+5. **Is the optimization in scope?** YES — the touched code is the Soroban SAC
+   transfer apply path and is reached under `closeLedger`.
+6. **Is the benchmark methodology correct?** YES — built with the required
+   next-protocol Tracy-capable configuration, ran the full test gate, then ran
+   `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` three times
+   without `--tracy`. No diagnostic Tracy run was performed because the
+   non-Tracy results were not eligible for confirmation.
+7. **Can the improvement be explained without the optimization?** NOT
+   APPLICABLE — there was no improvement to explain. The observed top-line
+   result is worse than the accepted baseline and fails the objective's
+   reproducibility requirement.
+8. **Is this optimization novel?** NOVEL, but novelty does not overcome the
+   measured regression.
+
+### Benchmark Results
+
+| run | scenario | baseline median_ms | optimized median_ms | result |
+|-----|----------|--------------------|---------------------|--------|
+| 1 | sac, TX=6000, T=8 | 306.357371 | 311.100236 | regression |
+| 1 | soroswap, TX=2000, T=8 | 272.249541 | 273.406103 | regression |
+| 2 | sac, TX=6000, T=8 | 300.543791 | 310.643798 | regression |
+| 2 | soroswap, TX=2000, T=8 | 275.885919 | 287.129842 | regression |
+| 3 | sac, TX=6000, T=8 | 312.727103 | 308.286396 | improvement |
+| 3 | soroswap, TX=2000, T=8 | 270.551362 | 278.014692 | regression |
+
+Optimized artifact directories were removed during final-review cleanup because
+the PoC was rejected and `ai-summary/CURRENT_STATE.md` remains the accepted
+baseline.
+
+### Rejection Reason
+
+The required three non-Tracy matrix runs do not show an eligible soroswap
+apply-time improvement. All three optimized soroswap medians are worse than
+their accepted baseline counterparts, and the optimized soroswap average is
+`2.43%` slower. The objective explicitly rejects soroswap regressions, so this
+PoC cannot be confirmed even though the source-level duplicate read exists and
+the full test suite passed.
+
+### Failed Checks
+
+- Benchmark Step 5: no measurable improvement; soroswap regressed.
+- Adversarial check 4: benchmark improvement does not support Low/Medium/High
+  severity.
+- Verdict criteria: `CONFIRMED` requires consistent soroswap apply-time
+  improvement across all three non-Tracy runs; this PoC produced consistent
+  soroswap regressions instead.
