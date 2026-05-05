@@ -76,3 +76,25 @@ The proposed fix is correctness-preserving if it is kept local to SAC contract-b
 - **Change description**: Add a local contract-balance read helper used by the contract-address branches of `receive_balance` and `spend_balance`/`spend_balance_no_authorization_check`. It should construct `DataKey::Balance(addr)` once, call `try_get_contract_data` once, decode `BalanceValue` once, use the decoded `authorized` bit for the authorization check, then reuse the same decoded value for the amount update and final `write_contract_balance`.
 - **Correctness check**: Preserve current behavior for existing authorized, existing deauthorized, missing with auth-required asset, missing with auth-not-required asset, zero-amount spend from missing balance, insufficient balance, overflow, and TTL extension. Existing SAC tests in `test_stellar_asset_contract.rs` should cover most semantic cases; add focused next-protocol metering/behavior tests only if the implementation changes budget observations.
 - **Benchmark focus**: Run the soroswap apply-load matrix against a next-protocol build and compare median apply time across repeated runs. The expected direct attribution is lower `SAC transfer`, `storage get`, `map lookup`, `ScVal to Val`, and `Val to ScVal` time, with a target top-line soroswap median improvement of at least 3%.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-05
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/balance.rs:169-217` — added local helpers for checking an already-decoded contract balance's authorization state and returning the decoded balance with the address kind.
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/balance.rs:330-454` — changed `receive_balance` and `spend_balance` to reuse the authorization read for contract-address balances, while retaining the existing no-auth clawback helper path and account/trustline mutation path.
+- `src/rust/soroban/p26/soroban-env-host/observations/26/test__stellar_asset_contract__test_auth_required.json`, `test__stellar_asset_contract__test_clawback_on_contract.json`, `test__stellar_asset_contract__test_contract_invoker_auth.json`, `test__stellar_asset_contract__test_greater_than_i64_balances.json`, `test__stellar_asset_contract__test_sac_reentry_is_not_allowed.json`, `test__stellar_asset_contract__test_zero_amounts.json`, and `test__stellar_asset_contract__verify_nested_try_call_rollback.json` — updated expected p26 host observations for the cheaper contract-balance path.
+
+### Demonstration
+
+The implementation constructs and reads the persistent contract-balance ledger key once during the authorization check, then carries the decoded `BalanceValue` into the debit or credit mutation logic. This removes the second same-key storage lookup and second balance decoding on successful contract-address SAC transfers while preserving existing deauthorization, missing-balance, insufficient-balance, overflow, write, and TTL-extension behavior.
+
+### Test Results
+
+Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`, built with `make -j30`, and ran `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`; all tests passed.
