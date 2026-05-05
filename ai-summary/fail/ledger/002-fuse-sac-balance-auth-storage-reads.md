@@ -211,3 +211,33 @@ All 2 tests passed
 All p26 Rust unit tests (including the 45 refreshed SAC observation
 baselines and the updated `test_custom_account_auth` budget number) pass.
 The C++ regression suite passes across all 30 partitions.
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-05-04
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** YES — the p26 diff fuses SAC transfer-side contract-balance reads and trustline authorization/update reads in `balance.rs`, and the observation/resource updates are consistent with changed host traces and lower per-call resource accounting.
+2. **Are the preconditions realistic?** YES — the soroswap apply-load workload exercises SAC transfer paths with account trustlines and contract balance entries, so the optimized code path is in scope for the benchmark.
+3. **Is the original code inefficient or working as designed?** INEFFICIENCY — the duplicate SAC-level reads are not required for determinism or output ordering; the source-level optimization is plausible and tests passed.
+4. **Does the benchmark improvement match the claimed severity?** FAIL — independent non-Tracy `scripts/run_apply_load_matrix.py` runs showed regression, not improvement. Baseline soroswap medians from `CURRENT_STATE.md` were 272.249541 / 275.885919 / 270.551362 ms (avg 272.895607 ms). Optimized soroswap medians were 281.408668 / 278.415895 / 279.563021 ms (avg 279.795861 ms), a 2.53% regression. Baseline max-sac medians were 306.357371 / 300.543791 / 312.727103 ms (avg 306.542755 ms). Optimized max-sac medians were 335.921945 / 336.906473 / 338.784317 ms (avg 337.204245 ms), a 10.00% regression.
+5. **Is the optimization in scope?** YES — the modified SAC balance code is in the closeLedger/Soroban apply hot path.
+6. **Is the benchmark methodology correct?** YES — final review built the PoC with the objective-required Tracy/next-protocol configuration, ran the full regression suite, and ran the authoritative matrix three times with `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` without `--tracy`. No diagnostic Tracy run was collected because the non-Tracy runs did not show an eligible improvement.
+7. **Can the improvement be explained without the optimization?** NOT APPLICABLE / FAIL — there was no improvement to explain; all three soroswap samples were slower than the accepted baseline's worst soroswap sample.
+8. **Is this optimization novel?** YES — no duplicate-final-review issue found; rejection is solely due to measured performance regression.
+
+### Rejection Reason
+
+The optimization is source-plausible and passes tests, but it fails the objective's benchmark gate. The headline soroswap apply time regressed consistently across all three independent non-Tracy matrix runs, and the secondary max-sac workload regressed substantially as well. Under the optimize-soroswap verdict criteria, a soroswap regression blocks confirmation.
+
+### Failed Checks
+
+- Check 4: benchmark improvement / severity — no improvement; soroswap regressed by 2.53% on average.
+- Soroswap-vs-max-sac tradeoff gate — max-sac also regressed by 10.00%, so there is no acceptable tradeoff.
+- Verdict criteria: `CONFIRMED` requires consistent soroswap improvement across all three non-Tracy runs; this PoC produced consistent regression.
