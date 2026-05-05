@@ -12,6 +12,7 @@
 #include "transactions/ParallelApplyStage.h"
 #include "transactions/TransactionFrameBase.h"
 #include "xdr/Stellar-ledger-entries.h"
+#include <memory>
 #include <unordered_set>
 
 namespace stellar
@@ -19,6 +20,10 @@ namespace stellar
 
 class InMemorySorobanState;
 class GlobalParallelApplyLedgerState;
+
+using LedgerEntryOverlayMap =
+    UnorderedMap<LedgerKey, std::shared_ptr<LedgerEntry const>>;
+using LedgerEntryOverlayMapPtr = std::shared_ptr<LedgerEntryOverlayMap const>;
 
 class ParallelLedgerInfo
 {
@@ -227,7 +232,8 @@ class GlobalParallelApplyLedgerState
 
     void
     readOnlyPreParallelApply(AppConnector& app,
-                             std::vector<TxBundle const*> const& txBundles);
+                             std::vector<TxBundle const*> const& txBundles,
+                             LedgerEntryOverlayMapPtr overlay);
 
     void commitBufferedPreParallelApplyWrites(
         AppConnector& app, AbstractLedgerTxn& ltx,

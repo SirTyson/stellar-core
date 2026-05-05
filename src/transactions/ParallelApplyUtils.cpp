@@ -20,11 +20,205 @@
 #include <fmt/core.h>
 #include <fmt/std.h>
 #include <future>
+#include <memory>
 #include <thread>
 
 namespace
 {
 using namespace stellar;
+
+class PostFeeOverlayLedgerStateSnapshot : public AbstractLedgerStateSnapshot
+{
+    ApplyLedgerStateSnapshot mBaseSnapshot;
+    std::shared_ptr<LedgerHeader> mLedgerHeader;
+    LedgerEntryOverlayMapPtr mOverlay;
+
+  public:
+    PostFeeOverlayLedgerStateSnapshot(ApplyLedgerStateSnapshot const& base,
+                                      LedgerEntryOverlayMapPtr overlay)
+        : mBaseSnapshot(base)
+        , mLedgerHeader(
+              std::make_shared<LedgerHeader>(base.getLedgerHeader()))
+        , mOverlay(std::move(overlay))
+    {
+        releaseAssert(mOverlay);
+    }
+
+    LedgerHeaderWrapper
+    getLedgerHeader() const override
+    {
+        return LedgerHeaderWrapper(mLedgerHeader);
+    }
+
+    LedgerEntryWrapper
+    getAccount(AccountID const& account) const override
+    {
+        return load(accountKey(account));
+    }
+
+    LedgerEntryWrapper
+    getAccount(LedgerHeaderWrapper const& header,
+               TransactionFrame const& tx) const override
+    {
+        return getAccount(tx.getSourceID());
+    }
+
+    LedgerEntryWrapper
+    getAccount(LedgerHeaderWrapper const& header, TransactionFrame const& tx,
+               AccountID const& account) const override
+    {
+        return getAccount(account);
+    }
+
+    LedgerEntryWrapper
+    load(LedgerKey const& key) const override
+    {
+        auto const iter = mOverlay->find(key);
+        if (iter != mOverlay->end())
+        {
+            return LedgerEntryWrapper(iter->second);
+        }
+        return LedgerEntryWrapper(mBaseSnapshot.loadLiveEntry(key));
+    }
+
+    void
+    executeWithMaybeInnerSnapshot(
+        std::function<void(LedgerSnapshot const&)> f) const override
+    {
+        throw std::runtime_error(
+            "PostFeeOverlayLedgerStateSnapshot has no nested snapshots");
+    }
+};
+
+bool
+hasInnerTx(TransactionFrameBase const& tx)
+{
+    bool res = false;
+    tx.withInnerTx([&res](TransactionFrameBaseConstPtr) { res = true; });
+    return res;
+}
+
+void
+addPreParallelApplyDependencyKeys(TransactionFrameBase const& tx,
+                                  UnorderedSet<LedgerKey>& keys)
+{
+    keys.emplace(accountKey(tx.getSourceID()));
+    keys.emplace(accountKey(tx.getFeeSourceID()));
+
+    for (auto const& op : tx.getOperationFrames())
+    {
+        keys.emplace(accountKey(op->getSourceID()));
+    }
+
+    auto addClassicFootprintKeys = [&keys](xdr::xvector<LedgerKey> const& fp) {
+        for (auto const& key : fp)
+        {
+            if (!isSorobanEntry(key))
+            {
+                keys.emplace(key);
+            }
+        }
+    };
+
+    auto const& footprint = tx.sorobanResources().footprint;
+    addClassicFootprintKeys(footprint.readOnly);
+    addClassicFootprintKeys(footprint.readWrite);
+}
+
+UnorderedMap<LedgerKey, size_t>
+countPreParallelApplyDependencyKeys(std::vector<ApplyStage> const& stages)
+{
+    UnorderedMap<LedgerKey, size_t> res;
+    for (auto const& stage : stages)
+    {
+        for (auto const& txBundle : stage)
+        {
+            UnorderedSet<LedgerKey> keys;
+            addPreParallelApplyDependencyKeys(*txBundle.getTx(), keys);
+            for (auto const& key : keys)
+            {
+                ++res[key];
+            }
+        }
+    }
+    return res;
+}
+
+bool
+hasOnlyUniquePreParallelApplyDependencies(
+    TransactionFrameBase const& tx,
+    UnorderedMap<LedgerKey, size_t> const& dependencyCounts)
+{
+    UnorderedSet<LedgerKey> keys;
+    addPreParallelApplyDependencyKeys(tx, keys);
+    for (auto const& key : keys)
+    {
+        auto const iter = dependencyCounts.find(key);
+        releaseAssert(iter != dependencyCounts.end());
+        if (iter->second != 1)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+void
+addPostFeeOverlayEntry(AbstractLedgerTxn& ltx, LedgerKey const& key,
+                       LedgerEntryOverlayMap& overlay)
+{
+    if (isSorobanEntry(key) || overlay.find(key) != overlay.end())
+    {
+        return;
+    }
+
+    auto entryPair = ltx.getNewestVersionBelowRoot(key);
+    if (!entryPair.first)
+    {
+        return;
+    }
+
+    overlay.emplace(key, entryPair.second
+                             ? std::make_shared<LedgerEntry const>(
+                                   entryPair.second->ledgerEntry())
+                             : nullptr);
+}
+
+LedgerEntryOverlayMapPtr
+buildPostFeeOverlay(AbstractLedgerTxn& ltx,
+                    std::vector<ApplyStage> const& stages)
+{
+    auto overlay = std::make_shared<LedgerEntryOverlayMap>();
+    for (auto const& stage : stages)
+    {
+        for (auto const& txBundle : stage)
+        {
+            auto const& tx = *txBundle.getTx();
+            addPostFeeOverlayEntry(ltx, accountKey(tx.getSourceID()),
+                                   *overlay);
+            addPostFeeOverlayEntry(ltx, accountKey(tx.getFeeSourceID()),
+                                   *overlay);
+
+            for (auto const& op : tx.getOperationFrames())
+            {
+                addPostFeeOverlayEntry(ltx, accountKey(op->getSourceID()),
+                                       *overlay);
+            }
+
+            auto const& footprint = tx.sorobanResources().footprint;
+            for (auto const& key : footprint.readOnly)
+            {
+                addPostFeeOverlayEntry(ltx, key, *overlay);
+            }
+            for (auto const& key : footprint.readWrite)
+            {
+                addPostFeeOverlayEntry(ltx, key, *overlay);
+            }
+        }
+    }
+
+    return overlay;
+}
 
 // Notes on parallelism and TTL bumps
 // ==================================
@@ -134,17 +328,32 @@ getReadWriteKeysForStage(ApplyStage const& stage)
 void
 readOnlyPreParallelApplyRange(AppConnector& app,
                               ApplyLedgerStateSnapshot const& snapshot,
+                              LedgerEntryOverlayMapPtr overlay,
                               std::vector<TxBundle const*> const& txBundles,
                               size_t begin, size_t end,
                               SorobanNetworkConfig const& sorobanConfig)
 {
-    LedgerSnapshot ls(snapshot);
-    for (size_t i = begin; i < end; ++i)
+    auto run = [&](LedgerSnapshot const& ls) {
+        for (size_t i = begin; i < end; ++i)
+        {
+            auto const& txBundle = *txBundles.at(i);
+            txBundle.getTx()->preParallelApplyReadOnly(
+                app, ls, txBundle.getEffects().getMeta(),
+                txBundle.getResPayload(), sorobanConfig,
+                txBundle.getEffects().getParallelPreApplyInfo());
+        }
+    };
+
+    if (overlay)
     {
-        auto const& txBundle = *txBundles.at(i);
-        txBundle.getTx()->preParallelApplyReadOnly(
-            app, ls, txBundle.getEffects().getMeta(), txBundle.getResPayload(),
-            sorobanConfig, txBundle.getEffects().getParallelPreApplyInfo());
+        LedgerSnapshot ls(std::make_unique<PostFeeOverlayLedgerStateSnapshot>(
+            snapshot, std::move(overlay)));
+        run(ls);
+    }
+    else
+    {
+        LedgerSnapshot ls(snapshot);
+        run(ls);
     }
 }
 
@@ -441,14 +650,22 @@ GlobalParallelApplyLedgerState::
                                   ProtocolVersion::V_26))
     {
         std::vector<TxBundle const*> txBundles;
+        auto const dependencyCounts =
+            countPreParallelApplyDependencyKeys(stages);
+        auto overlay = buildPostFeeOverlay(ltx, stages);
         LedgerSnapshot current(ltx);
-        LedgerSnapshot previous(mLCLSnapshot);
+        LedgerSnapshot previous(
+            std::make_unique<PostFeeOverlayLedgerStateSnapshot>(mLCLSnapshot,
+                                                                overlay));
         for (auto const& stage : stages)
         {
             for (auto const& txBundle : stage)
             {
-                if (requiresSequentialPreParallelApply(current, previous,
-                                                       *txBundle.getTx()))
+                auto const& tx = *txBundle.getTx();
+                if (hasInnerTx(tx) ||
+                    !hasOnlyUniquePreParallelApplyDependencies(
+                        tx, dependencyCounts) ||
+                    requiresSequentialPreParallelApply(current, previous, tx))
                 {
                     txBundle.getTx()->preParallelApply(
                         app, ltx, txBundle.getEffects().getMeta(),
@@ -461,7 +678,7 @@ GlobalParallelApplyLedgerState::
             }
         }
 
-        readOnlyPreParallelApply(app, txBundles);
+        readOnlyPreParallelApply(app, txBundles, overlay);
         commitBufferedPreParallelApplyWrites(app, ltx, txBundles);
         collectModifiedClassicEntries(ltx, stages);
         return;
@@ -524,7 +741,8 @@ GlobalParallelApplyLedgerState::
 
 void
 GlobalParallelApplyLedgerState::readOnlyPreParallelApply(
-    AppConnector& app, std::vector<TxBundle const*> const& txBundles)
+    AppConnector& app, std::vector<TxBundle const*> const& txBundles,
+    LedgerEntryOverlayMapPtr overlay)
 {
     ZoneScoped;
 
@@ -539,7 +757,8 @@ GlobalParallelApplyLedgerState::readOnlyPreParallelApply(
 
     if (workerCount == 1)
     {
-        readOnlyPreParallelApplyRange(app, mLCLSnapshot, txBundles, 0,
+        readOnlyPreParallelApplyRange(app, mLCLSnapshot, std::move(overlay),
+                                      txBundles, 0,
                                       txBundles.size(), mSorobanConfig);
         return;
     }
@@ -557,7 +776,7 @@ GlobalParallelApplyLedgerState::readOnlyPreParallelApply(
         auto const end = begin + chunkSize;
         futures.emplace_back(std::async(
             std::launch::async, readOnlyPreParallelApplyRange, std::ref(app),
-            std::cref(mLCLSnapshot), std::cref(txBundles), begin, end,
+            std::cref(mLCLSnapshot), overlay, std::cref(txBundles), begin, end,
             std::cref(mSorobanConfig)));
         begin = end;
     }

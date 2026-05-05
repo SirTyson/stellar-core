@@ -10,6 +10,7 @@
 #include "ledger/NetworkConfig.h"
 #include "util/NonCopyable.h"
 #include <functional>
+#include <memory>
 #include <variant>
 
 namespace stellar
@@ -249,6 +250,8 @@ class LedgerSnapshot : public NonMovableOrCopyable
     LedgerSnapshot(Application& app);
     explicit LedgerSnapshot(LedgerStateSnapshot const& snap);
     explicit LedgerSnapshot(ApplyLedgerStateSnapshot const& snap);
+    explicit LedgerSnapshot(
+        std::unique_ptr<AbstractLedgerStateSnapshot const> getter);
     // Construct from a lightweight live bucket snapshot + header,
     // without requiring a full CompleteConstLedgerState.
     LedgerSnapshot(

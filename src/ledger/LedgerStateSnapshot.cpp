@@ -272,6 +272,13 @@ LedgerSnapshot::LedgerSnapshot(ApplyLedgerStateSnapshot const& snap)
 }
 
 LedgerSnapshot::LedgerSnapshot(
+    std::unique_ptr<AbstractLedgerStateSnapshot const> getter)
+    : mGetter(std::move(getter))
+{
+    releaseAssert(mGetter);
+}
+
+LedgerSnapshot::LedgerSnapshot(
     MetricsRegistry& metrics,
     std::shared_ptr<BucketListSnapshotData<LiveBucket> const> liveData,
     LedgerHeader const& header)
