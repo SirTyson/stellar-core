@@ -99,6 +99,10 @@ pub(crate) mod p26 {
         v.interface.protocol
     }
 
+    pub(crate) fn set_full_cost_tracking(budget: &Budget, enabled: bool) -> Result<(), HostError> {
+        budget.set_full_cost_tracking(enabled)
+    }
+
     pub fn invoke_host_function_with_trace_hook_and_module_cache<
         T: AsRef<[u8]>,
         I: ExactSizeIterator<Item = T>,
@@ -259,6 +263,13 @@ pub(crate) mod p25 {
 
     pub(crate) const fn get_version_protocol(v: &soroban_env_host::Version) -> u32 {
         v.interface.protocol
+    }
+
+    pub(crate) fn set_full_cost_tracking(
+        _budget: &Budget,
+        _enabled: bool,
+    ) -> Result<(), HostError> {
+        Ok(())
     }
 
     pub fn invoke_host_function_with_trace_hook_and_module_cache<
@@ -423,6 +434,13 @@ pub(crate) mod p24 {
         v.interface.protocol
     }
 
+    pub(crate) fn set_full_cost_tracking(
+        _budget: &Budget,
+        _enabled: bool,
+    ) -> Result<(), HostError> {
+        Ok(())
+    }
+
     pub fn invoke_host_function_with_trace_hook_and_module_cache<
         T: AsRef<[u8]>,
         I: ExactSizeIterator<Item = T>,
@@ -583,6 +601,13 @@ pub(crate) mod p23 {
 
     pub(crate) const fn get_version_protocol(v: &soroban_env_host::Version) -> u32 {
         v.interface.protocol
+    }
+
+    pub(crate) fn set_full_cost_tracking(
+        _budget: &Budget,
+        _enabled: bool,
+    ) -> Result<(), HostError> {
+        Ok(())
     }
 
     pub fn invoke_host_function_with_trace_hook_and_module_cache<
@@ -787,6 +812,13 @@ pub(crate) mod p22 {
         v.interface.protocol
     }
 
+    pub(crate) fn set_full_cost_tracking(
+        _budget: &Budget,
+        _enabled: bool,
+    ) -> Result<(), HostError> {
+        Ok(())
+    }
+
     pub fn invoke_host_function_with_trace_hook_and_module_cache<
         T: AsRef<[u8]>,
         I: ExactSizeIterator<Item = T>,
@@ -982,6 +1014,13 @@ pub(crate) mod p21 {
 
     pub(crate) const fn get_version_protocol(v: &soroban_env_host::Version) -> u32 {
         soroban_env_host::meta::get_ledger_protocol_version(v.interface)
+    }
+
+    pub(crate) fn set_full_cost_tracking(
+        _budget: &Budget,
+        _enabled: bool,
+    ) -> Result<(), HostError> {
+        Ok(())
     }
 
     pub fn invoke_host_function_with_trace_hook_and_module_cache<
