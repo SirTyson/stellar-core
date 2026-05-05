@@ -420,8 +420,10 @@ fn invoke_host_function_or_maybe_panic(
     )?;
     let mut diagnostic_events = vec![];
     let ledger_seq_num = ledger_info.sequence_number;
+    let tx_tracing_enabled = crate::log::is_tx_tracing_enabled();
+    super::set_full_cost_tracking(&budget, enable_diagnostics || tx_tracing_enabled)?;
     let trace_hook: Option<super::soroban_env_host::TraceHook> =
-        if crate::log::is_tx_tracing_enabled() {
+        if tx_tracing_enabled {
             Some(make_trace_hook_fn())
         } else {
             None

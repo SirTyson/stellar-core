@@ -78,6 +78,13 @@ pub(crate) mod p26 {
 
     pub(crate) mod soroban_proto_any;
 
+    pub(crate) fn set_full_cost_tracking(
+        budget: &Budget,
+        enabled: bool,
+    ) -> Result<(), HostError> {
+        budget.set_full_cost_tracking(enabled)
+    }
+
     // We do some more local re-exports here of things used in soroban_proto_any.rs that
     // don't exist in older hosts (eg. the p21 & 22 hosts, where we define stubs for
     // these imports).
@@ -232,6 +239,13 @@ pub(crate) mod p25 {
     pub(crate) use soroban_env_host_p25 as soroban_env_host;
 
     pub(crate) mod soroban_proto_any;
+
+    pub(crate) fn set_full_cost_tracking(
+        _budget: &Budget,
+        _enabled: bool,
+    ) -> Result<(), HostError> {
+        Ok(())
+    }
 
     // We do some more local re-exports here of things used in soroban_proto_any.rs that
     // don't exist in older hosts (eg. the p21 & 22 hosts, where we define stubs for
@@ -388,6 +402,13 @@ pub(crate) mod p24 {
 
     pub(crate) mod soroban_proto_any;
 
+    pub(crate) fn set_full_cost_tracking(
+        _budget: &Budget,
+        _enabled: bool,
+    ) -> Result<(), HostError> {
+        Ok(())
+    }
+
     // We do some more local re-exports here of things used in soroban_proto_any.rs that
     // don't exist in older hosts (eg. the p21 & 22 hosts, where we define stubs for
     // these imports).
@@ -543,6 +564,13 @@ pub(crate) mod p23 {
 
     pub(crate) mod soroban_proto_any;
 
+    pub(crate) fn set_full_cost_tracking(
+        _budget: &Budget,
+        _enabled: bool,
+    ) -> Result<(), HostError> {
+        Ok(())
+    }
+
     // We do some more local re-exports here of things used in soroban_proto_any.rs that
     // don't exist in older hosts (eg. the p21 & 22 hosts, where we define stubs for
     // these imports).
@@ -677,6 +705,14 @@ pub(crate) mod p22 {
     pub(crate) extern crate soroban_env_host_p22;
     pub(crate) use soroban_env_host_p22 as soroban_env_host;
     pub(crate) mod soroban_proto_any;
+
+    pub(crate) fn set_full_cost_tracking(
+        _budget: &Budget,
+        _enabled: bool,
+    ) -> Result<(), HostError> {
+        Ok(())
+    }
+
     use crate::{
         bridge::rust_bridge::CxxLedgerEntryRentChange,
         rust_bridge::{
@@ -866,6 +902,14 @@ pub(crate) mod p21 {
     pub(crate) extern crate soroban_env_host_p21;
     pub(crate) use soroban_env_host_p21 as soroban_env_host;
     pub(crate) mod soroban_proto_any;
+
+    pub(crate) fn set_full_cost_tracking(
+        _budget: &Budget,
+        _enabled: bool,
+    ) -> Result<(), HostError> {
+        Ok(())
+    }
+
     use crate::{
         bridge::rust_bridge::CxxLedgerEntryRentChange,
         rust_bridge::{
