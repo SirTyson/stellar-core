@@ -78,3 +78,28 @@ The proposed change is correctness-preserving only if it is mode-gated and keeps
 - **Change description**: Add a production/enforcing budget tracking mode that skips full per-cost reporting accumulation on normal charges but continues to update aggregate CPU/memory dimensions and enforce limits at the same points. Preserve full tracking for tests, benches, calibration/cost-runner use, diagnostics/debug paths, and any mode that displays or inspects the tracker. Preserve `VmInstantiation` CPU and time accounting for `cpu_insns_excluding_vm_instantiation` and `time_nsecs_excluding_vm_instantiation`.
 - **Correctness check**: Existing Soroban invoke-host-function, budget-metering, VM-instantiation, and bridge-output tests should continue to pass with p26 exact behavior where required. Add or update focused tests only for the new gated mode: aggregate consumed CPU/memory remain unchanged, over-budget errors occur at the same charge, `VmInstantiation` exclusions match the fully tracked mode, and wrong input-shape charges still return the same internal error if that behavior is retained.
 - **Benchmark focus**: Run the soroswap apply-load matrix against the current `ai-summary/CURRENT_STATE.md` baseline. The metric is median apply time across multiple non-Tracy runs; expected improvement is Medium only if the result clears 3% reproducibly, with a diagnostic Tracy run confirming reduced physical time around budget charge bookkeeping.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-05
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/budget.rs:198-292` — added `full_cost_tracking` to `BudgetImpl` and changed `charge` so production-fast mode skips non-consensus per-cost tracker updates while preserving aggregate CPU/memory charges, budget-limit checks, input-shape internal errors, and `VmInstantiation` tracker accounting.
+- `src/rust/soroban/p26/soroban-env-host/src/budget.rs:342-360` — applied the same tracking gate to the batched `ValSer` charge path while preserving aggregate totals and input-shape validation.
+- `src/rust/soroban/p26/soroban-env-host/src/budget.rs:1435-1440` — exposed `Budget::set_full_cost_tracking` so the embedder can switch production invocations into lightweight tracking mode.
+- `src/rust/src/soroban_proto_any.rs:412-430` — disabled full cost tracking for bridge invocations unless diagnostics or transaction tracing are enabled, preserving full tracking for diagnostic/reporting paths.
+- `src/rust/src/soroban_proto_all.rs:81-86,243-248,405-410,567-572,709-714,906-911` — routed the new p26 control through the protocol-generic bridge and added no-op adapters for older protocol hosts.
+- `src/rust/soroban/p26/soroban-env-host/src/test/budget_metering.rs:237-286` — added a focused test showing production tracking mode keeps aggregate CPU/memory and `VmInstantiation` CPU/time equal to fully tracked mode, skips unrelated per-cost tracker updates, and retains wrong-input-shape internal errors.
+
+### Demonstration
+
+The optimization leaves consensus-relevant budget accounting in `BudgetDimension` unchanged: every charge still evaluates the cost model, updates aggregate CPU/memory totals, and checks limits at the same points. For production bridge calls without diagnostics or tx tracing, it avoids updating the reporting-only `BudgetTracker` table for non-`VmInstantiation` costs, removing repeated saturating arithmetic and per-cost array writes from the hot budget-charge path while keeping the VM-instantiation exclusion metrics needed by stellar-core.
+
+### Test Results
+
+Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`, built with `make -j $(nproc)`, and ran `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`. The full suite passed, including p26 Rust host tests (`752 passed; 0 failed; 2 ignored`) and top-level checks (`PASS: test/selftest-nopg`, `PASS: test/check-nondet`, `All 2 tests passed`).
