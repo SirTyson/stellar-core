@@ -378,7 +378,7 @@ class LedgerManagerImpl : public LedgerManager
     std::vector<std::unique_ptr<ThreadParallelApplyLedgerState>>
     applySorobanStageClustersInParallel(
         AppConnector& app, ApplyStage const& stage,
-        ParallelApplyFootprintIndex::StageFootprint const& stageFootprint,
+        ParallelApplyFootprintIndex const& footprintIndex, size_t stageIdx,
         GlobalParallelApplyLedgerState const& globalState,
         Hash const& sorobanBasePrngSeed, Config const& config,
         ParallelLedgerInfo const& ledgerInfo);
@@ -389,17 +389,16 @@ class LedgerManagerImpl : public LedgerManager
                                     LedgerHeader const& header);
 
     void applySorobanStage(AppConnector& app, LedgerHeader const& header,
-                            GlobalParallelApplyLedgerState& globalParState,
-                            ApplyStage const& stage,
-                            ParallelApplyFootprintIndex::StageFootprint const&
-                                stageFootprint,
-                            Hash const& sorobanBasePrngSeed);
+                           GlobalParallelApplyLedgerState& globalParState,
+                           ApplyStage const& stage,
+                           ParallelApplyFootprintIndex const& footprintIndex,
+                           size_t stageIdx, Hash const& sorobanBasePrngSeed);
 
     void applySorobanStages(AppConnector& app, AbstractLedgerTxn& ltx,
-                             std::vector<ApplyStage> const& stages,
-                             ParallelApplyFootprintIndex const& footprintIndex,
-                             SorobanNetworkConfig const& sorobanConfig,
-                             Hash const& sorobanBasePrngSeed);
+                            std::vector<ApplyStage> const& stages,
+                            ParallelApplyFootprintIndex const& footprintIndex,
+                            SorobanNetworkConfig const& sorobanConfig,
+                            Hash const& sorobanBasePrngSeed);
 
     // initialLedgerVers must be the ledger version at the start of the ledger.
     // On the ledger in which a protocol upgrade from vN to vN + 1 occurs,

@@ -69,25 +69,31 @@ class ParallelLedgerInfo
     Hash networkID;
 };
 
+// A compact per-ledger index built once while ApplyStages are materializing.
+// It records:
+//   - The deduped set of classic LedgerKeys touched by any tx footprint, used
+//     by the global-state classic-entry collection to avoid rescanning every
+//     stage's footprint and rebuilding a hash set during apply.
+//   - For each cluster, an ordered (non-deduped) vector of ParallelApplyLedgerKey
+//     covering RW + RO Soroban entries (and their TTL keys), with hashes and
+//     TTL keys precomputed once. Thread-state initialization consumes this
+//     directly, avoiding repeated getTTLKey/SHA-256 work during cluster setup.
+//
+// Stage-level read-write sets and Soroban read-only key lists are intentionally
+// not stored: stage commit uses the original on-the-fly getReadWriteKeysForStage
+// (called once per stage, not per ledger), and Soroban RO loading walks tx
+// footprints directly (its existing mGlobalEntryMap.find short-circuit already
+// dedupes RO keys at consumption time).
 class ParallelApplyFootprintIndex
 {
   public:
-    struct SorobanReadOnlyKey
-    {
-        ParallelApplyLedgerKey key;
-        ParallelApplyLedgerKey ttlKey;
-    };
-
     struct ClusterFootprint
     {
+        // Per-cluster footprint keys (RW + RO + TTL keys for any Soroban entry).
+        // Not deduplicated - duplicates are skipped on consumption via
+        // mThreadEntryMap.find().
         std::vector<ParallelApplyLedgerKey> keys;
         size_t estimatedEntries{0};
-    };
-
-    struct StageFootprint
-    {
-        ParallelApplyLedgerKeySet readWriteKeys;
-        std::vector<ClusterFootprint> clusters;
     };
 
     void reserve(size_t numStages);
@@ -98,23 +104,15 @@ class ParallelApplyFootprintIndex
 
     size_t estimatedGlobalEntryMapSize() const;
     std::vector<ParallelApplyLedgerKey> const& getClassicKeys() const;
-    std::vector<SorobanReadOnlyKey> const& getSorobanReadOnlyKeys() const;
-    StageFootprint const& getStage(size_t stageIdx) const;
     ClusterFootprint const& getCluster(size_t stageIdx,
                                        size_t clusterIdx) const;
 
   private:
-    void addClusterKey(ParallelApplyLedgerKey const& key);
     void addClassicKey(ParallelApplyLedgerKey const& key);
-    void addSorobanReadOnlyKey(ParallelApplyLedgerKey const& key,
-                               ParallelApplyLedgerKey const& ttlKey);
 
-    std::vector<StageFootprint> mStages;
+    std::vector<std::vector<ClusterFootprint>> mStages;
     std::vector<ParallelApplyLedgerKey> mClassicKeys;
-    std::vector<SorobanReadOnlyKey> mSorobanReadOnlyKeys;
     ParallelApplyLedgerKeySet mClassicKeySet;
-    ParallelApplyLedgerKeySet mSorobanReadOnlyKeySet;
-    ParallelApplyLedgerKeySet mCurrentClusterKeySet;
     size_t mEstimatedGlobalEntries{0};
 };
 
@@ -287,7 +285,7 @@ class GlobalParallelApplyLedgerState
         std::vector<TxBundle const*> const& txBundles);
 
     void collectModifiedClassicEntries(
-        AbstractLedgerTxn& ltx,
+        AbstractLedgerTxn& ltx, std::vector<ApplyStage> const& stages,
         ParallelApplyFootprintIndex const& footprintIndex);
 
     bool maybeMergeRoTTLBumps(ParallelApplyLedgerKey const& key,
@@ -321,7 +319,7 @@ class GlobalParallelApplyLedgerState
         AppConnector& app,
         std::vector<std::unique_ptr<ThreadParallelApplyLedgerState>> const&
             threads,
-        ParallelApplyFootprintIndex::StageFootprint const& stageFootprint);
+        ApplyStage const& stage);
 
     // Consumes the global entry map: moves entries into the LedgerTxn
     // instead of copying. Must only be called once, as the final operation

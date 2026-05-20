@@ -101,6 +101,36 @@ using namespace stellar;
 // total order, B could save this fee, but we would lose the ability to run A
 // and B in parallel in the future. CAP 0063 explicitly chose this tradeoff.
 
+ParallelApplyLedgerKeySet
+getReadWriteKeysForStage(ApplyStage const& stage)
+{
+    ZoneScoped;
+    ParallelApplyLedgerKeySet res;
+
+    // Pre-reserve to avoid rehashing. Each RW key may also have a TTL key.
+    size_t estimatedKeys = 0;
+    for (auto const& txBundle : stage)
+    {
+        estimatedKeys +=
+            txBundle.getTx()->sorobanResources().footprint.readWrite.size() * 2;
+    }
+    res.reserve(estimatedKeys);
+
+    for (auto const& txBundle : stage)
+    {
+        for (auto const& lk :
+             txBundle.getTx()->sorobanResources().footprint.readWrite)
+        {
+            res.emplace(lk);
+            if (isSorobanEntry(lk))
+            {
+                res.emplace(getTTLKey(lk));
+            }
+        }
+    }
+    return res;
+}
+
 void
 readOnlyPreParallelApplyRange(AppConnector& app,
                               ApplyLedgerStateSnapshot const& snapshot,
@@ -250,27 +280,14 @@ void
 ParallelApplyFootprintIndex::beginStage(size_t numClusters)
 {
     mStages.emplace_back();
-    mStages.back().clusters.reserve(numClusters);
+    mStages.back().reserve(numClusters);
 }
 
 void
 ParallelApplyFootprintIndex::beginCluster()
 {
     releaseAssertOrThrow(!mStages.empty());
-    mStages.back().clusters.emplace_back();
-    ParallelApplyLedgerKeySet().swap(mCurrentClusterKeySet);
-}
-
-void
-ParallelApplyFootprintIndex::addClusterKey(
-    ParallelApplyLedgerKey const& key)
-{
-    releaseAssertOrThrow(!mStages.empty());
-    releaseAssertOrThrow(!mStages.back().clusters.empty());
-    if (mCurrentClusterKeySet.emplace(key).second)
-    {
-        mStages.back().clusters.back().keys.emplace_back(key);
-    }
+    mStages.back().emplace_back();
 }
 
 void
@@ -283,59 +300,44 @@ ParallelApplyFootprintIndex::addClassicKey(ParallelApplyLedgerKey const& key)
 }
 
 void
-ParallelApplyFootprintIndex::addSorobanReadOnlyKey(
-    ParallelApplyLedgerKey const& key, ParallelApplyLedgerKey const& ttlKey)
-{
-    if (mSorobanReadOnlyKeySet.emplace(key).second)
-    {
-        mSorobanReadOnlyKeys.emplace_back(SorobanReadOnlyKey{key, ttlKey});
-    }
-}
-
-void
 ParallelApplyFootprintIndex::addTransaction(TransactionFrameBase const& tx)
 {
     releaseAssertOrThrow(!mStages.empty());
-    releaseAssertOrThrow(!mStages.back().clusters.empty());
+    releaseAssertOrThrow(!mStages.back().empty());
 
     auto const& footprint = tx.sorobanResources().footprint;
-    auto& stageFootprint = mStages.back();
-    auto& clusterFootprint = stageFootprint.clusters.back();
+    auto& clusterFootprint = mStages.back().back();
     auto const estimatedEntries =
         footprint.readWrite.size() * 2 + footprint.readOnly.size() * 2;
     clusterFootprint.estimatedEntries += estimatedEntries;
     mEstimatedGlobalEntries += estimatedEntries + 1;
 
+    auto& clusterKeys = clusterFootprint.keys;
+    clusterKeys.reserve(clusterKeys.size() + estimatedEntries);
+
     for (auto const& lk : footprint.readWrite)
     {
-        ParallelApplyLedgerKey key(lk);
-        stageFootprint.readWriteKeys.emplace(key);
-        addClusterKey(key);
+        clusterKeys.emplace_back(lk);
         if (isSorobanEntry(lk))
         {
-            ParallelApplyLedgerKey ttlKey(getTTLKey(lk));
-            stageFootprint.readWriteKeys.emplace(ttlKey);
-            addClusterKey(ttlKey);
+            clusterKeys.emplace_back(getTTLKey(lk));
         }
         else
         {
-            addClassicKey(key);
+            addClassicKey(clusterKeys.back());
         }
     }
 
     for (auto const& lk : footprint.readOnly)
     {
-        ParallelApplyLedgerKey key(lk);
-        addClusterKey(key);
+        clusterKeys.emplace_back(lk);
         if (isSorobanEntry(lk))
         {
-            ParallelApplyLedgerKey ttlKey(getTTLKey(lk));
-            addClusterKey(ttlKey);
-            addSorobanReadOnlyKey(key, ttlKey);
+            clusterKeys.emplace_back(getTTLKey(lk));
         }
         else
         {
-            addClassicKey(key);
+            addClassicKey(clusterKeys.back());
         }
     }
 }
@@ -344,8 +346,6 @@ void
 ParallelApplyFootprintIndex::finishBuilding()
 {
     ParallelApplyLedgerKeySet().swap(mClassicKeySet);
-    ParallelApplyLedgerKeySet().swap(mSorobanReadOnlyKeySet);
-    ParallelApplyLedgerKeySet().swap(mCurrentClusterKeySet);
 }
 
 size_t
@@ -360,25 +360,14 @@ ParallelApplyFootprintIndex::getClassicKeys() const
     return mClassicKeys;
 }
 
-std::vector<ParallelApplyFootprintIndex::SorobanReadOnlyKey> const&
-ParallelApplyFootprintIndex::getSorobanReadOnlyKeys() const
-{
-    return mSorobanReadOnlyKeys;
-}
-
-ParallelApplyFootprintIndex::StageFootprint const&
-ParallelApplyFootprintIndex::getStage(size_t stageIdx) const
+ParallelApplyFootprintIndex::ClusterFootprint const&
+ParallelApplyFootprintIndex::getCluster(size_t stageIdx,
+                                        size_t clusterIdx) const
 {
     releaseAssertOrThrow(stageIdx < mStages.size());
-    return mStages.at(stageIdx);
-}
-
-ParallelApplyFootprintIndex::ClusterFootprint const&
-ParallelApplyFootprintIndex::getCluster(size_t stageIdx, size_t clusterIdx) const
-{
-    auto const& stage = getStage(stageIdx);
-    releaseAssertOrThrow(clusterIdx < stage.clusters.size());
-    return stage.clusters.at(clusterIdx);
+    auto const& stage = mStages.at(stageIdx);
+    releaseAssertOrThrow(clusterIdx < stage.size());
+    return stage.at(clusterIdx);
 }
 
 PreV23LedgerAccessHelper::PreV23LedgerAccessHelper(AbstractLedgerTxn& ltx)
@@ -561,7 +550,7 @@ GlobalParallelApplyLedgerState::
 
         readOnlyPreParallelApply(app, txBundles);
         commitBufferedPreParallelApplyWrites(app, ltx, txBundles);
-        collectModifiedClassicEntries(ltx, footprintIndex);
+        collectModifiedClassicEntries(ltx, stages, footprintIndex);
         return;
     }
 
@@ -679,7 +668,8 @@ GlobalParallelApplyLedgerState::commitBufferedPreParallelApplyWrites(
 
 void
 GlobalParallelApplyLedgerState::collectModifiedClassicEntries(
-    AbstractLedgerTxn& ltx, ParallelApplyFootprintIndex const& footprintIndex)
+    AbstractLedgerTxn& ltx, std::vector<ApplyStage> const& stages,
+    ParallelApplyFootprintIndex const& footprintIndex)
 {
     ZoneScoped;
 
@@ -710,51 +700,63 @@ GlobalParallelApplyLedgerState::collectModifiedClassicEntries(
     {
         ZoneNamedN(fetchSorobanRoZone,
                    "fetchSorobanReadOnlyEntries from footprints", true);
-        for (auto const& ro : footprintIndex.getSorobanReadOnlyKeys())
+        for (auto const& stage : stages)
         {
-            auto const& lk = ro.key;
-            if (mGlobalEntryMap.find(lk) != mGlobalEntryMap.end())
+            for (auto const& txBundle : stage)
             {
-                continue;
-            }
-
-            std::shared_ptr<LedgerEntry const> res;
-            if (InMemorySorobanState::isInMemoryType(lk.ledgerKey()))
-            {
-                res = mInMemorySorobanState.get(lk.ledgerKey());
-            }
-            else
-            {
-                res = mLCLSnapshot.loadLiveEntry(lk.ledgerKey());
-            }
-
-            if (res)
-            {
-                GlobalParApplyLedgerEntryOpt entry =
-                    scopeAdoptEntryOpt(std::make_optional(*res));
-                mGlobalEntryMap.emplace(
-                    lk, GlobalParallelApplyEntry{entry, false});
-
-                auto const& ttlKey = ro.ttlKey;
-                if (mGlobalEntryMap.find(ttlKey) == mGlobalEntryMap.end())
+                for (auto const& lk :
+                     txBundle.getTx()->sorobanResources().footprint.readOnly)
                 {
-                    std::shared_ptr<LedgerEntry const> ttlRes;
-                    if (InMemorySorobanState::isInMemoryType(
-                            ttlKey.ledgerKey()))
+                    if (!isSorobanEntry(lk))
                     {
-                        ttlRes = mInMemorySorobanState.get(ttlKey.ledgerKey());
+                        continue;
+                    }
+                    if (mGlobalEntryMap.find(lk) != mGlobalEntryMap.end())
+                    {
+                        continue;
+                    }
+
+                    std::shared_ptr<LedgerEntry const> res;
+                    if (InMemorySorobanState::isInMemoryType(lk))
+                    {
+                        res = mInMemorySorobanState.get(lk);
                     }
                     else
                     {
-                        ttlRes = mLCLSnapshot.loadLiveEntry(ttlKey.ledgerKey());
+                        res = mLCLSnapshot.loadLiveEntry(lk);
                     }
-                    if (ttlRes)
+
+                    if (res)
                     {
-                        GlobalParApplyLedgerEntryOpt ttlEntry =
-                            scopeAdoptEntryOpt(std::make_optional(*ttlRes));
+                        GlobalParApplyLedgerEntryOpt entry =
+                            scopeAdoptEntryOpt(std::make_optional(*res));
                         mGlobalEntryMap.emplace(
-                            ttlKey,
-                            GlobalParallelApplyEntry{ttlEntry, false});
+                            lk, GlobalParallelApplyEntry{entry, false});
+
+                        // Also pre-load the TTL entry
+                        auto ttlKey = getTTLKey(lk);
+                        if (mGlobalEntryMap.find(ttlKey) ==
+                            mGlobalEntryMap.end())
+                        {
+                            std::shared_ptr<LedgerEntry const> ttlRes;
+                            if (InMemorySorobanState::isInMemoryType(ttlKey))
+                            {
+                                ttlRes = mInMemorySorobanState.get(ttlKey);
+                            }
+                            else
+                            {
+                                ttlRes = mLCLSnapshot.loadLiveEntry(ttlKey);
+                            }
+                            if (ttlRes)
+                            {
+                                GlobalParApplyLedgerEntryOpt ttlEntry =
+                                    scopeAdoptEntryOpt(
+                                        std::make_optional(*ttlRes));
+                                mGlobalEntryMap.emplace(
+                                    ttlKey,
+                                    GlobalParallelApplyEntry{ttlEntry, false});
+                            }
+                        }
                     }
                 }
             }
@@ -952,15 +954,16 @@ void
 GlobalParallelApplyLedgerState::commitChangesFromThreads(
     AppConnector& app,
     std::vector<std::unique_ptr<ThreadParallelApplyLedgerState>> const& threads,
-    ParallelApplyFootprintIndex::StageFootprint const& stageFootprint)
+    ApplyStage const& stage)
 {
     ZoneScoped;
     releaseAssert(threadIsMain() ||
                   app.threadIsType(Application::ThreadType::APPLY));
 
+    auto readWriteSet = getReadWriteKeysForStage(stage);
     for (auto const& thread : threads)
     {
-        commitChangesFromThread(app, *thread, stageFootprint.readWriteKeys);
+        commitChangesFromThread(app, *thread, readWriteSet);
     }
 }
 
