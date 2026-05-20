@@ -73,3 +73,26 @@ Correctness constraints are tight but manageable. The index must preserve stage/
 - **Change description**: Build a compact `ParallelApplyFootprintIndex` while `applyParallelPhase` is already materializing `TxBundle`s/`ApplyStage`s. Store per-ledger unique classic footprint keys, per-ledger unique Soroban read-only keys with TTL keys, per-stage read-write-plus-TTL sets for merge conflict checks, and optionally per-cluster ordered key/TTL vectors for thread-state initialization. Pass the index into `GlobalParallelApplyLedgerState` and stage commit paths so they consume precomputed vectors/sets instead of rescanning stage footprints.
 - **Correctness check**: Existing parallel-apply and Soroban transaction tests should cover merge semantics, TTL bumps, restores, and deterministic result/meta ordering. The PoC should also compare apply-load ledger hashes/results before benchmarking, because changed preloading order must not alter observable ledger output.
 - **Benchmark focus**: Run the normal three non-Tracy `scripts/run_apply_load_matrix.py` measurements and require at least a reproducible 3% soroswap apply-time reduction. Attribute with phase timing and Tracy afterward: expected improvements should appear in `soroban_setup_glbl`, `commit_from_thrds` via avoided `getReadWriteKeysForStage`, and possibly the pre-worker portion of `soroban_parallel` if cluster footprint collection is indexed.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-20
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/transactions/ParallelApplyUtils.h:72-119, 164-182, 276-324, 336-339` — added `ParallelApplyFootprintIndex` and threaded its per-stage/per-cluster data through the global and thread parallel-apply state interfaces.
+- `src/transactions/ParallelApplyUtils.cpp:240-382` — implemented index construction helpers that classify classic keys, Soroban read-only keys with precomputed TTL keys, per-stage read-write-plus-TTL sets, and per-cluster ordered key vectors.
+- `src/transactions/ParallelApplyUtils.cpp:497-603, 680-762, 952-1024` — changed global setup, Soroban read-only preloading, stage commit, and thread-state initialization to consume indexed keys instead of rescanning footprints and recomputing TTL keys.
+- `src/ledger/LedgerManagerImpl.h:379-402` and `src/ledger/LedgerManagerImpl.cpp:2530-2555, 2625-2712, 2973-3042` — built the index while `applyParallelPhase` materializes `TxBundle`s/`ApplyStage`s and passed the matching indexed stage/cluster footprints through parallel apply.
+
+### Demonstration
+
+The production change moves duplicate footprint classification and TTL-key derivation into a single pass performed while stages and clusters are already being materialized. Global setup now reserves from the precomputed estimate and reuses unique classic/Soroban read-only key vectors; per-stage thread merges reuse the precomputed read-write-plus-TTL set; and thread-state initialization reuses each cluster's ordered key vector, preserving deterministic stage and cluster behavior while removing repeated scans.
+
+### Test Results
+
+Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`. Built successfully with `make -j $(nproc)` using `ALL_SOROBAN_GIT_STATE_STAMPS=` to work around this linked-worktree submodule stamp path. Full regression suite passed with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make -j $(nproc) check ALL_SOROBAN_GIT_STATE_STAMPS=`; final output reported `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.
