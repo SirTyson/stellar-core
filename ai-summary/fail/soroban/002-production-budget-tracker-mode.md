@@ -542,3 +542,35 @@ submodule at `0e05767c` on the paired
 status and the optimization (including the duplicate-adapter-removal fix
 in `src/rust/src/soroban_proto_all.rs`) is fully present without any
 uncommitted edits.
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-05-20
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** YES — the diff gates `BudgetTracker` updates for production bridge invocations while preserving aggregate `BudgetDimension` charges and `VmInstantiation` tracking.
+2. **Are the preconditions realistic?** YES — soroswap apply-load executes many p26 budget charges through `invoke_host_function`.
+3. **Is the original code inefficient or working as designed?** MIXED — the skipped tracker fields are reporting-only for production apply, but retaining them in diagnostics/tracing is correctly necessary.
+4. **Does the benchmark improvement match the claimed severity?** NO — independent benchmark runs showed a consistent regression, not an improvement.
+5. **Is the optimization in scope?** YES — the changed path runs under Soroban `closeLedger` apply.
+6. **Is the benchmark methodology correct?** YES — built the PoC source, ran the full test suite, then ran `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` three times without `--tracy`, comparing against `ai-summary/CURRENT_STATE.md`.
+7. **Can the improvement be explained without the optimization?** NOT APPLICABLE — no improvement was observed.
+8. **Is this optimization novel?** YES — it is distinct from the prior accepted host-metering coalescing change.
+
+### Rejection Reason
+
+The optimization fails the objective's benchmark gate. The accepted baseline soroswap medians are 272.249541 ms, 275.885919 ms, and 270.551362 ms. The independently measured optimized soroswap medians were 287.637337 ms, 283.870609 ms, and 279.102654 ms; even the best optimized run is slower than the worst baseline run. The optimized average soroswap median was 283.536867 ms versus the 272.895607 ms baseline average, a 3.90% regression. Max-sac also regressed from a 306.542755 ms baseline average to 328.935869 ms, a 7.31% regression.
+
+Full suite correctness was not the blocker: `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` passed after applying the documented worktree-local generated-`Makefile` workaround for `git-state.txt`. The verdict is rejected solely because the required three non-Tracy benchmark runs moved apply time in the wrong direction.
+
+### Failed Checks
+
+- Check 4: benchmark improvement does not match claimed severity; soroswap regressed consistently.
+- Check 7: no observed improvement to attribute to the optimization.
+- Verdict criteria: soroswap regression maps to REJECTED.
