@@ -13,6 +13,7 @@
 #include "transactions/TransactionFrameBase.h"
 #include "xdr/Stellar-ledger-entries.h"
 #include <unordered_set>
+#include <vector>
 
 namespace stellar
 {
@@ -68,6 +69,55 @@ class ParallelLedgerInfo
     Hash networkID;
 };
 
+class ParallelApplyFootprintIndex
+{
+  public:
+    struct SorobanReadOnlyKey
+    {
+        ParallelApplyLedgerKey key;
+        ParallelApplyLedgerKey ttlKey;
+    };
+
+    struct ClusterFootprint
+    {
+        std::vector<ParallelApplyLedgerKey> keys;
+        size_t estimatedEntries{0};
+    };
+
+    struct StageFootprint
+    {
+        ParallelApplyLedgerKeySet readWriteKeys;
+        std::vector<ClusterFootprint> clusters;
+    };
+
+    void reserve(size_t numStages);
+    void beginStage(size_t numClusters);
+    void beginCluster();
+    void addTransaction(TransactionFrameBase const& tx);
+    void finishBuilding();
+
+    size_t estimatedGlobalEntryMapSize() const;
+    std::vector<ParallelApplyLedgerKey> const& getClassicKeys() const;
+    std::vector<SorobanReadOnlyKey> const& getSorobanReadOnlyKeys() const;
+    StageFootprint const& getStage(size_t stageIdx) const;
+    ClusterFootprint const& getCluster(size_t stageIdx,
+                                       size_t clusterIdx) const;
+
+  private:
+    void addClusterKey(ParallelApplyLedgerKey const& key);
+    void addClassicKey(ParallelApplyLedgerKey const& key);
+    void addSorobanReadOnlyKey(ParallelApplyLedgerKey const& key,
+                               ParallelApplyLedgerKey const& ttlKey);
+
+    std::vector<StageFootprint> mStages;
+    std::vector<ParallelApplyLedgerKey> mClassicKeys;
+    std::vector<SorobanReadOnlyKey> mSorobanReadOnlyKeys;
+    ParallelApplyLedgerKeySet mClassicKeySet;
+    ParallelApplyLedgerKeySet mSorobanReadOnlyKeySet;
+    ParallelApplyLedgerKeySet mCurrentClusterKeySet;
+    size_t mEstimatedGlobalEntries{0};
+};
+
 class ThreadParallelApplyLedgerState
     : public LedgerEntryScope<StaticLedgerEntryScope::ThreadParApply>
 {
@@ -113,7 +163,7 @@ class ThreadParallelApplyLedgerState
 
     void collectClusterFootprintEntriesFromGlobal(
         AppConnector& app, GlobalParallelApplyLedgerState const& global,
-        Cluster const& cluster);
+        ParallelApplyFootprintIndex::ClusterFootprint const& clusterFootprint);
 
     void upsertEntry(LedgerKey const& key,
                      ThreadParApplyLedgerEntry const& entry, uint32_t ledgerSeq,
@@ -126,8 +176,10 @@ class ThreadParallelApplyLedgerState
 
   public:
     ThreadParallelApplyLedgerState(AppConnector& app,
-                                   GlobalParallelApplyLedgerState const& global,
-                                   Cluster const& cluster, size_t clusterIdx);
+                                    GlobalParallelApplyLedgerState const& global,
+                                    ParallelApplyFootprintIndex::
+                                        ClusterFootprint const& clusterFootprint,
+                                    size_t clusterIdx);
 
     // For every soroban LE in `txBundle`s RW footprint, ensure we've flushed
     // any buffered RO TTL bumps stored in `mRoTTLBumps` to the
@@ -223,7 +275,8 @@ class GlobalParallelApplyLedgerState
 
     void preParallelApplyAndCollectModifiedClassicEntries(
         AppConnector& app, AbstractLedgerTxn& ltx,
-        std::vector<ApplyStage> const& stages);
+        std::vector<ApplyStage> const& stages,
+        ParallelApplyFootprintIndex const& footprintIndex);
 
     void
     readOnlyPreParallelApply(AppConnector& app,
@@ -233,8 +286,9 @@ class GlobalParallelApplyLedgerState
         AppConnector& app, AbstractLedgerTxn& ltx,
         std::vector<TxBundle const*> const& txBundles);
 
-    void collectModifiedClassicEntries(AbstractLedgerTxn& ltx,
-                                       std::vector<ApplyStage> const& stages);
+    void collectModifiedClassicEntries(
+        AbstractLedgerTxn& ltx,
+        ParallelApplyFootprintIndex const& footprintIndex);
 
     bool maybeMergeRoTTLBumps(ParallelApplyLedgerKey const& key,
                               GlobalParallelApplyEntry const& newEntry,
@@ -252,11 +306,13 @@ class GlobalParallelApplyLedgerState
 
   public:
     GlobalParallelApplyLedgerState(AppConnector& app,
-                                   ApplyLedgerStateSnapshot snapshot,
-                                   AbstractLedgerTxn& ltx,
-                                   std::vector<ApplyStage> const& stages,
-                                   InMemorySorobanState const& inMemoryState,
-                                   SorobanNetworkConfig const& sorobanConfig);
+                                    ApplyLedgerStateSnapshot snapshot,
+                                    AbstractLedgerTxn& ltx,
+                                    std::vector<ApplyStage> const& stages,
+                                    ParallelApplyFootprintIndex const&
+                                        footprintIndex,
+                                    InMemorySorobanState const& inMemoryState,
+                                    SorobanNetworkConfig const& sorobanConfig);
 
     ParallelApplyEntryMap<staticScope> const& getGlobalEntryMap() const;
     RestoredEntries const& getRestoredEntries() const;
@@ -265,7 +321,7 @@ class GlobalParallelApplyLedgerState
         AppConnector& app,
         std::vector<std::unique_ptr<ThreadParallelApplyLedgerState>> const&
             threads,
-        ApplyStage const& stage);
+        ParallelApplyFootprintIndex::StageFootprint const& stageFootprint);
 
     // Consumes the global entry map: moves entries into the LedgerTxn
     // instead of copying. Must only be called once, as the final operation
@@ -279,7 +335,8 @@ class GlobalParallelApplyLedgerState
     // Constructor requires access to mInMemorySorobanState
     friend ThreadParallelApplyLedgerState::ThreadParallelApplyLedgerState(
         AppConnector& app, GlobalParallelApplyLedgerState const& global,
-        Cluster const& cluster, size_t clusterIdx);
+        ParallelApplyFootprintIndex::ClusterFootprint const& clusterFootprint,
+        size_t clusterIdx);
 };
 
 class TxParallelApplyLedgerState

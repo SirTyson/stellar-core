@@ -2530,6 +2530,7 @@ getParallelLedgerInfo(AppConnector& app, LedgerHeader const& lh)
 std::vector<std::unique_ptr<ThreadParallelApplyLedgerState>>
 LedgerManagerImpl::applySorobanStageClustersInParallel(
     AppConnector& app, ApplyStage const& stage,
+    ParallelApplyFootprintIndex::StageFootprint const& stageFootprint,
     GlobalParallelApplyLedgerState const& globalState,
     Hash const& sorobanBasePrngSeed, Config const& config,
     ParallelLedgerInfo const& ledgerInfo)
@@ -2545,8 +2546,9 @@ LedgerManagerImpl::applySorobanStageClustersInParallel(
     for (size_t i = 0; i < stage.numClusters(); ++i)
     {
         auto const& cluster = stage.getCluster(i);
+        releaseAssertOrThrow(i < stageFootprint.clusters.size());
         auto threadStatePtr = std::make_unique<ThreadParallelApplyLedgerState>(
-            app, globalState, cluster, i);
+            app, globalState, stageFootprint.clusters.at(i), i);
         threadFutures.emplace_back(std::async(
             std::launch::async, &LedgerManagerImpl::applyThread, this,
             std::ref(app), std::move(threadStatePtr), std::cref(cluster),
@@ -2623,6 +2625,7 @@ void
 LedgerManagerImpl::applySorobanStage(
     AppConnector& app, LedgerHeader const& header,
     GlobalParallelApplyLedgerState& globalParState, ApplyStage const& stage,
+    ParallelApplyFootprintIndex::StageFootprint const& stageFootprint,
     Hash const& sorobanBasePrngSeed)
 {
     ZoneScoped;
@@ -2633,7 +2636,8 @@ LedgerManagerImpl::applySorobanStage(
     auto subStart = std::chrono::steady_clock::now();
 #endif
     auto threadStates = applySorobanStageClustersInParallel(
-        app, stage, globalParState, sorobanBasePrngSeed, config, ledgerInfo);
+        app, stage, stageFootprint, globalParState, sorobanBasePrngSeed, config,
+        ledgerInfo);
 #ifdef BUILD_TESTS
     auto subEnd = std::chrono::steady_clock::now();
     mLastPhaseTimings.sorobanParallelApplyMs +=
@@ -2653,7 +2657,7 @@ LedgerManagerImpl::applySorobanStage(
 #ifdef BUILD_TESTS
     subStart = std::chrono::steady_clock::now();
 #endif
-    globalParState.commitChangesFromThreads(app, threadStates, stage);
+    globalParState.commitChangesFromThreads(app, threadStates, stageFootprint);
 #ifdef BUILD_TESTS
     subEnd = std::chrono::steady_clock::now();
     mLastPhaseTimings.sorobanCommitFromThreadsMs +=
@@ -2672,6 +2676,8 @@ LedgerManagerImpl::applySorobanStage(
 void
 LedgerManagerImpl::applySorobanStages(AppConnector& app, AbstractLedgerTxn& ltx,
                                       std::vector<ApplyStage> const& stages,
+                                      ParallelApplyFootprintIndex const&
+                                          footprintIndex,
                                       SorobanNetworkConfig const& sorobanConfig,
                                       Hash const& sorobanBasePrngSeed)
 {
@@ -2682,7 +2688,8 @@ LedgerManagerImpl::applySorobanStages(AppConnector& app, AbstractLedgerTxn& ltx,
     {
         GlobalParallelApplyLedgerState globalParState(
             app, mApplyState.copyLedgerStateSnapshot(), ltx, stages,
-            mApplyState.getInMemorySorobanState(), sorobanConfig);
+            footprintIndex, mApplyState.getInMemorySorobanState(),
+            sorobanConfig);
 #ifdef BUILD_TESTS
         auto globalEnd = std::chrono::steady_clock::now();
         mLastPhaseTimings.sorobanSetupGlobalMs =
@@ -2698,10 +2705,10 @@ LedgerManagerImpl::applySorobanStages(AppConnector& app, AbstractLedgerTxn& ltx,
         mLastPhaseTimings.sorobanCommitFromThreadsMs = 0;
         mLastPhaseTimings.sorobanDestroyThreadStatesMs = 0;
 #endif
-        for (auto const& stage : stages)
+        for (size_t i = 0; i < stages.size(); ++i)
         {
-            applySorobanStage(app, header, globalParState, stage,
-                              sorobanBasePrngSeed);
+            applySorobanStage(app, header, globalParState, stages.at(i),
+                              footprintIndex.getStage(i), sorobanBasePrngSeed);
         }
 #ifdef BUILD_TESTS
         auto subStart = std::chrono::steady_clock::now();
@@ -2975,17 +2982,21 @@ LedgerManagerImpl::applyParallelPhase(
     auto const& txSetStages = phase.getParallelStages();
 
     applyStages.reserve(txSetStages.size());
+    ParallelApplyFootprintIndex footprintIndex;
+    footprintIndex.reserve(txSetStages.size());
 
 #ifdef BUILD_TESTS
     auto bundleStart = std::chrono::steady_clock::now();
 #endif
     for (auto const& stage : txSetStages)
     {
+        footprintIndex.beginStage(stage.size());
         std::vector<Cluster> applyClusters;
         applyClusters.reserve(stage.size());
 
         for (auto const& cluster : stage)
         {
+            footprintIndex.beginCluster();
             Cluster applyCluster;
             applyCluster.reserve(cluster.size());
 
@@ -3013,11 +3024,13 @@ LedgerManagerImpl::applyParallelPhase(
                                  mutableTxResult->getFeeCharged(),
                                  TransactionEventStage::
                                      TRANSACTION_EVENT_STAGE_BEFORE_ALL_TXS);
+                footprintIndex.addTransaction(*tx);
             }
             applyClusters.emplace_back(std::move(applyCluster));
         }
         applyStages.emplace_back(std::move(applyClusters));
     }
+    footprintIndex.finishBuilding();
 #ifdef BUILD_TESTS
     auto bundleEnd = std::chrono::steady_clock::now();
     mLastPhaseTimings.buildTxBundlesMs =
@@ -3025,8 +3038,8 @@ LedgerManagerImpl::applyParallelPhase(
             .count();
 #endif
 
-    applySorobanStages(mApp.getAppConnector(), ltx, applyStages, sorobanConfig,
-                       sorobanBasePrngSeed);
+    applySorobanStages(mApp.getAppConnector(), ltx, applyStages, footprintIndex,
+                       sorobanConfig, sorobanBasePrngSeed);
 
     // meta will be processed in processPostTxSetApply
 }
