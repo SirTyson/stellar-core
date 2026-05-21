@@ -75,3 +75,43 @@ The impact is plausibly High for this objective because the targeted phase is a 
 - **Change description**: Build a DAG over `(stageIndex, clusterIndex)` nodes using each cluster's unioned Soroban read-only/read-write footprints, treating RO/RW and RW/RW intersections as dependencies from earlier-stage clusters to later-stage clusters. Run at most `ledgerMaxDependentTxClusters()` worker tasks at a time. Construct each `ThreadParallelApplyLedgerState` only when the cluster becomes ready, apply it on a worker, then merge completed ready nodes on the apply thread in canonical order that preserves all conflicting predecessor relationships.
 - **Correctness check**: Existing parallel tx-set validation tests in `src/herder/test/TxSetTests.cpp` cover stage/cluster conflict rules; ledger apply tests covering v23+ Soroban parallel apply, metadata, refunds, restores, and invariant checks should remain unchanged. Add focused scheduler tests only if the PoC introduces observable helper APIs or alternate scheduling branches.
 - **Benchmark focus**: Use `scripts/run_apply_load_matrix.py` on soroswap `TX=2000, T=8` across repeated runs. Report top-line apply time, `applyParallelPhaseTotalMs`, `sorobanParallelApplyMs`, stage count, worker utilization, and the computed barrier critical path vs DAG critical path. The expected improvement should come from reduced per-stage tail idle and should clear the objective's 3% Medium floor, with High plausible if the measured reduction exceeds 10% or materially restructures the dominant `applySorobanStages` phase.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-21
+**PoC by**: claude-opus-4.7, high
+
+### Changes Made
+
+- `src/ledger/LedgerManagerImpl.cpp`
+  - Added `#include "ledger/LedgerTypeUtils.h"`.
+  - Extended `ParallelApplyWorkerPool` with `ensurePoolSize(size_t)` (public wrapper around `ensureSize`) and `submit(std::packaged_task<void()>&&)` so the apply thread can pre-warm workers and dispatch one task at a time.
+  - Refactored `checkAllTxBundleInvariants` to delegate per-bundle work to a new helper `checkSingleTxBundleInvariants`, allowing per-cluster invariant checks during DAG completion.
+  - Replaced the body of `applySorobanStages` with a deterministic dependency-DAG scheduler:
+    1. Compute per-cluster RO and RW key sets (including the corresponding TTL keys for any Soroban entries).
+    2. Build cross-stage edges between clusters whose footprints conflict (`rw1∩rw2`, `rw1∩ro2`, or `ro1∩rw2` non-empty); intra-stage clusters remain conflict-free by tx-set construction.
+    3. Submit ready clusters into the pre-warmed `ParallelApplyWorkerPool`, capped at `sorobanConfig.ledgerMaxDependentTxClusters()`.
+    4. The apply thread is the sole owner of `GlobalParallelApplyLedgerState`: it constructs each `ThreadParallelApplyLedgerState` (toggling `scopeDeactivate/Activate` around construction), receives completion notifications via a `mutex`+`condition_variable`+queue, then runs invariant checks and `commitChangesFromSingleThread` for the completed cluster, decrements child counters, and dispatches newly-ready nodes.
+  - Old `applySorobanStage` / `applySorobanStageClustersInParallel` left in place as unreferenced code for minimal diff (no callers remain).
+
+- `src/ledger/LedgerManagerImpl.h`
+  - Declared `checkSingleTxBundleInvariants` alongside `checkAllTxBundleInvariants`.
+
+- `src/transactions/ParallelApplyUtils.h`
+  - Exposed `getReadWriteKeysForStage(ApplyStage const&)` as a public free function (declaration in `namespace stellar`).
+  - Added `GlobalParallelApplyLedgerState::commitChangesFromSingleThread(app, thread, readWriteSet)` for per-cluster commits driven by the apply thread.
+
+- `src/transactions/ParallelApplyUtils.cpp`
+  - Renamed the anonymous-namespace implementation to `getReadWriteKeysForStageImpl` and added an external-linkage wrapper `stellar::getReadWriteKeysForStage` that calls it.
+  - Implemented `GlobalParallelApplyLedgerState::commitChangesFromSingleThread` as a thin wrapper around the existing private `commitChangesFromThread`.
+
+### Demonstration
+
+The DAG scheduler removes the per-stage barrier inside `applySorobanStages`. Independent later-stage clusters whose footprints do not conflict with a still-running earlier-stage cluster can now begin executing as soon as their true predecessors have committed, while the existing `ledgerMaxDependentTxClusters()` worker cap, deterministic apply-thread commit order, and `RestoredEntries` disjointness invariants are preserved exactly. Restore-conflicts continue to serialize because any two clusters that restore the same key K both have K's TTL in their RW set, forcing a DAG edge between them. The optimization should produce a measurable reduction in Soroban apply wall time on workloads with footprint heterogeneity across stages (e.g., the soroswap bench), with effect proportional to the longest-cluster slack each stage previously wasted at the barrier.
+
+### Test Results
+
+Full unit-test suite executed with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`: build succeeded, all partitions reported "All tests passed" with zero failures, including `selftest-nopg` and `check-nondet`. `make check` exited 0.
