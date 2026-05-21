@@ -35,3 +35,36 @@ This is not the rejected `InstancePre`/VM-template caching line: the proposal mu
 ## Anti-Evidence
 
 Wasmi may not expose an API that separates reusable import-resolution metadata from instance allocation; if the `instantiate` child zone is dominated by unavoidable fresh instance allocation rather than linker lookup, the recoverable fraction will fall below Medium. The cache must also remain protocol-aware: host imports are gated by protocol/interface version, and stale import plans across a protocol change would be incorrect. If implementation requires patching wasmi internals, the risk and maintenance cost may outweigh the projected 3-5% soroswap gain.
+
+---
+
+## Review
+
+**Verdict**: NOT_VIABLE
+**Date**: 2026-05-21
+**Reviewed by**: gpt-5.5, high
+**Novelty**: FAIL — duplicate of `ai-summary/fail/transactions/summary.md` entries `008-vm-instantiation-below-threshold.md` and `002-cache-minimal-wasmi-linkers-per-module.md`
+**Failed At**: reviewer
+
+### Trace Summary
+
+The apply path is real: `InvokeHostFunctionOpFrame::invokeHostFunction` calls `rust_bridge::invoke_host_function`, which dispatches to the protocol host and eventually reaches `Host::instantiate_vm`, `Vm::from_parsed_module_and_wasmi_linker`, and `Vm::instantiate_wasmi`. `ModuleCache` already provides a shared `wasmi::Engine`, cached `ParsedModule`s, and a maximal `wasmi::Linker`; the remaining `Linker::instantiate` path resolves imports and then immediately performs mandatory per-store instance construction. This exact optimization family has already been rejected in the transactions fail summary: broad Wasmi instantiation caching is unavailable/sub-threshold, and the narrower "cache minimal linker/import work" variant cannot clear Medium because the `instantiate` zone is only an upper bound and still contains unavoidable `Module::instantiate` work.
+
+### Code Paths Examined
+
+- `src/transactions/InvokeHostFunctionOpFrame.cpp:557-584` — every Soroban invocation on the C++ apply path calls `rust_bridge::invoke_host_function` with the shared module cache.
+- `src/rust/src/soroban_invoke.rs:7-38` — bridge dispatches to the protocol-specific host module implementation.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:760-801` — Wasm contract execution calls `instantiate_vm`; cache hits load a cached `ParsedModule` but still call `Vm::from_parsed_module_and_wasmi_linker`.
+- `src/rust/soroban/p26/soroban-env-host/src/vm/module_cache.rs:15-24,85-95` — cache already stores parsed modules, a shared engine, and a maximal linker.
+- `src/rust/soroban/p26/soroban-env-host/src/vm.rs:120-128,154-186,191-207` — the maximal linker is built once, while each invocation creates a fresh store, charges instantiation, checks import protocol compatibility, calls `wasmi_linker.instantiate`, and finalizes a fresh instance.
+- `src/rust/soroban/p26/soroban-env-host/src/vm/parsed_module.rs:403-445` — import protocol gating is a separate repeated check, already listed in the fail summary as sub-threshold.
+- `/home/garand/.cargo/git/checkouts/wasmi-301e6db337b3b2df/0ed3f3d/crates/wasmi/src/linker.rs:646-659,670-745` — `Linker::instantiate` walks `module.imports()`, resolves each import through linker definitions, type-checks it, allocates store-local host `Func`s for linker-defined functions, and then calls `Module::instantiate`.
+- `/home/garand/.cargo/git/checkouts/wasmi-301e6db337b3b2df/0ed3f3d/crates/wasmi/src/module/instantiate/mod.rs:49-78,161-224,227-330` — `Module::instantiate` allocates the instance, internal funcs, tables, memories, globals, exports, element segments, and data initialization into the fresh store.
+
+### Why It Failed
+
+This is not novel for the objective. The transactions failure summary already records the same Wasmi-instantiation optimization family as `008-vm-instantiation-below-threshold.md` and the narrower linker/import variant as `002-cache-minimal-wasmi-linkers-per-module.md`. The traced code also supports the prior rejection: wasmi does not expose a reusable immutable import-resolution artifact for the current API, and a cache that only avoids linker lookup/type checks is bounded by a child zone that still includes mandatory fresh per-store function allocation, instance construction, memory/global/table allocation, and data/table initialization. Under the objective-specific severity floor, that linker-only subset cannot be promoted as Medium.
+
+### Lesson Learned
+
+Do not repropose Wasmi instantiation/linker/import-resolution caching for soroswap unless there is a new wasmi API that cleanly separates reusable prelink metadata from store-owned instance state, or a new non-Tracy trace isolates a Medium-tier amount of removable linker-only work after excluding mandatory `Module::instantiate` costs.

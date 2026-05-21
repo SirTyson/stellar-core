@@ -115,3 +115,33 @@ The DAG scheduler removes the per-stage barrier inside `applySorobanStages`. Ind
 ### Test Results
 
 Full unit-test suite executed with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`: build succeeded, all partitions reported "All tests passed" with zero failures, including `selftest-nopg` and `check-nondet`. `make check` exited 0.
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-05-21
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** Partially. The implementation replaces the hard per-stage barrier with cross-stage conflict dependencies and commits completed clusters on the apply thread, so it targets the hypothesized scheduler barrier.
+2. **Are the preconditions realistic?** Not supported by measurement. The soroswap workload did not benefit from the finer-grained scheduler in the authoritative matrix runs.
+3. **Is the original code inefficient or working as designed?** The barrier may be conservative, but this implementation does not demonstrate an apply-time improvement over the accepted baseline.
+4. **Does the benchmark improvement match the claimed severity?** NO. Soroswap median apply time regressed in all three non-Tracy runs: baseline 272.249541 / 275.885919 / 270.551362 ms versus optimized 285.736956 / 298.416877 / 289.225226 ms. The optimized average was 291.126353 ms versus 272.895607 ms baseline, a 6.68% regression, not an improvement.
+5. **Is the optimization in scope?** Yes. The modified code is in the close-ledger Soroban parallel apply path.
+6. **Is the benchmark methodology correct?** Yes. I built the PoC with the required Tracy-enabled configuration, ran the full `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS=... make check` successfully, and then ran `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` exactly three times without `--tracy`.
+7. **Can the improvement be explained WITHOUT the optimization?** There is no improvement to explain. The observed result is a consistent regression in the headline metric.
+8. **Is this optimization novel?** Novelty is not disputed, but novelty does not overcome the benchmark regression.
+
+### Rejection Reason
+
+The optimization fails the objective verdict criteria: soroswap apply time regressed consistently across all three authoritative non-Tracy benchmark runs, and max-sac also regressed. Because the headline soroswap metric moved in the wrong direction, the finding cannot be confirmed regardless of test correctness or implementation novelty.
+
+### Failed Checks
+
+- Performance final-review benchmark gate / verdict criteria: soroswap regressed in every non-Tracy run.
+- Adversarial check 4: benchmark result does not match the claimed High severity or any valid severity tier.
+- Adversarial check 7: no measured improvement exists.
