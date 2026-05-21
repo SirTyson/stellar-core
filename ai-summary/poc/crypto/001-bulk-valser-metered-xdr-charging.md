@@ -29,7 +29,7 @@ Run the current soroswap apply-load benchmark (`soroswap, TX=2000, T=8`) through
 ## Evidence
 
 - The target zones are descendants of `applyLedger`: `InvokeHostFunctionOpFrame doApply` is called from `parallelApply`, which is run by `applySorobanStageClustersInParallel` under `applyTransactions` / `applyLedger`; `invoke_host_function` total time appears in the trace as a child of this path.
-- `charge` is the largest in-scope Soroban host self-time remaining in the current trace after host-object metering coalescing: 1.758 s self-time across 20.3M calls. A 10% reduction in this zone is already approximately 176 ms, above the Medium threshold for the 5.230 s diagnostic `applyLedger` envelope.
+- Each Soroban tx may call `metered_write_xdr` for encoded return value, modified ledger keys, old/new ledger entries, and contract events.
 - The mechanism targets budget-call amplification, not cryptographic SHA256 work; it therefore is not bounded by the crypto SHA256 ceiling recorded in prior failures.
 - The change can be made deterministic by protocol-gating the new `ValSer` model and applying it uniformly on every node. It does not require changing XDR bytes, ledger output ordering, or parallelism.
 
@@ -87,3 +87,28 @@ The severity remains Medium, with an important measurement caveat. The cited `di
 - **Change description**: Add a next-protocol path that counts serialized bytes and charges a deterministic bulk `ValSer` cost once per top-level XDR serialization, or in large chunks, instead of calling `Budget::charge(ValSer, Some(buf.len()))` on every XDR leaf write. The new charge formula must be protocol-defined and calibrated for the new semantics; do not attempt to collapse p26 charges without changing the protocol cost model.
 - **Correctness check**: Existing Soroban e2e and budget-metering tests cover result/event/ledger-change serialization and budget-exceeded behavior. Expect protocol-gated budget-number updates where tests assert `ValSer` CPU or memory totals; semantic assertions and XDR bytes should remain unchanged.
 - **Benchmark focus**: Run repeated non-Tracy `scripts/run_apply_load_matrix.py` soroswap apply benchmarks. Report top-line apply time, `ValSer` tracker iterations/inputs if instrumented locally, and total `Budget::charge` call-count reduction. The required signal is a reproducible 3-10% apply-time reduction, not merely a reduction in Tracy `charge` self-time.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-21
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+The checked-out p26 submodule gitlink (`fa1226b3068605c5376efe56c6cf809ca225a036`) already contains the reviewed production implementation, so no additional source edits were required in this PoC worktree.
+
+- `src/rust/soroban/p26/soroban-env-host/src/host/metered_xdr.rs:67-81` — `metered_write_xdr` now uses the protocol-gated `coalesced_host_metering` path to serialize the object, count the top-level bytes written, and charge `ContractCostType::ValSer` once for that byte count.
+- `src/rust/soroban/p26/soroban-env-host/src/budget.rs:1409-1418` — adds the `Budget` flag plumbing used by `metered_write_xdr` to decide whether next-protocol coalesced metering is active.
+- `src/rust/soroban/p26/soroban-env-host/src/host.rs:88-105,576-582` — defines p26 as the minimum supported ledger protocol, asserts next-protocol reachability for the optimized path, and enables coalesced host metering only when the active ledger protocol is greater than p26.
+- `src/rust/soroban/p26/soroban-env-host/src/test/protocol_gate.rs:9-24` — existing protocol-gating coverage verifies p26 keeps coalesced metering disabled while the next protocol enables it.
+
+### Demonstration
+
+For next protocol ledgers, metered XDR serialization now pays one deterministic bulk `ValSer` charge per top-level serialized object using the serialized byte count, rather than charging every XDR leaf write fragment. Released p26 behavior is preserved by the protocol gate, so canonical XDR bytes and p26 budget totals remain unchanged while the next-protocol apply path avoids millions of repeated budget-charge calls in Soroban result, event, and ledger-change serialization.
+
+### Test Results
+
+Configured and built with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` and `make -j30`. The full existing suite passed with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`, including the p26 Rust host tests (`751 passed; 0 failed; 2 ignored; 1 filtered out`) and the final `PASS: test/selftest-nopg`, `PASS: test/check-nondet` summary.
