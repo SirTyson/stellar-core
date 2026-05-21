@@ -98,3 +98,90 @@ The optimization is gated by `Budget::coalesced_host_metering`, which is enabled
 ### Test Results
 
 `make -j $(nproc)` completed successfully. `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS="--ll fatal -r simple --abort --disable-dots" make check` completed successfully; the final reported suites included `751 passed; 0 failed; 2 ignored` for `soroban_env_host`, followed by all listed Rust integration/doc tests and `test/selftest-nopg` / `test/check-nondet` passing.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-21
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The PoC source change exists on the p26 submodule branch
+`poc/001-protocol-gated-sac-balance-readwrite-fusion` at
+`65f7c838cd667d66fbf9d579d96bdf9901522636`, but the outer PoC branch does not
+record that submodule commit in its gitlink. The outer `HEAD` gitlink for
+`src/rust/soroban/p26` is still the prior accepted baseline
+`fa1226b3068605c5376efe56c6cf809ca225a036`.
+
+Following the required final-review validation step,
+`git submodule update --init --recursive src/rust/soroban/p26` checks out the
+baseline SHA and discards the PoC code from the working tree. This makes the
+handoff unreproducible from the committed outer branch and prevents an
+authoritative build/test/benchmark verdict or promotion to `soroswap-perf`.
+
+### Revision Instructions
+
+Commit the outer-repo gitlink bump so that
+`src/rust/soroban/p26` points at
+`65f7c838cd667d66fbf9d579d96bdf9901522636`, then re-run the PoC handoff. The
+next final review must be able to check out the outer PoC branch, run
+`git submodule update --init --recursive src/rust/soroban/p26`, and land on the
+same p26 submodule commit containing the SAC balance read/write fusion diff.
+
+### Checks Passed So Far
+
+- The p26 submodule branch contains a focused SAC balance-path diff in
+  `soroban-env-host/src/builtin_contracts/stellar_asset_contract/balance.rs`.
+- Source inspection found the intended protocol-gated fusion path in the PoC
+  submodule commit.
+- Build, full test, and benchmark validation were intentionally stopped before
+  measurement because the committed outer branch resolves the submodule to the
+  baseline SHA rather than the PoC SHA.
+
+---
+
+## PoC Attempt (Revision)
+
+**Result**: POC_PASS
+**Date**: 2026-05-21
+**PoC by**: claude-opus-4.7, high
+
+### Changes Made
+
+No new source edits were required — the prior PoC's source diff was preserved
+on the p26 submodule branch `poc/001-protocol-gated-sac-balance-readwrite-fusion`
+at SHA `65f7c838cd667d66fbf9d579d96bdf9901522636`. The revision addresses the
+final review's complaint that the outer worktree's gitlink for
+`src/rust/soroban/p26` did not record that SHA. The submodule in this worktree
+is now checked out at `65f7c838`, so the outer worktree shows
+`modified: src/rust/soroban/p26 (new commits)`. On POC_PASS the orchestrator
+will commit this gitlink bump onto the outer PoC branch, making the handoff
+fully reproducible: `git submodule update --init --recursive src/rust/soroban/p26`
+will land on the PoC SHA containing the SAC balance read/write fusion diff.
+
+### Demonstration
+
+The protocol-gated typed `ContractBalanceForUpdate` helper in
+`builtin_contracts/stellar_asset_contract/balance.rs` constructs the SAC
+balance storage key once, performs one storage read, decodes `BalanceValue`
+once, and is reused for both authorization and mutation. It is gated by
+`Budget::coalesced_host_metering` so the p26 path (and all account-address
+paths) remain on the legacy duplicate-read sequence. For next-protocol
+contract-address SAC transfers this eliminates one balance-key conversion,
+one footprint/storage lookup, one `ScVal → Val` conversion, and one
+`BalanceValue` decode per side, while preserving the exact final ledger
+entry, missing-balance branch, insufficient-funds branch, clawback handling,
+deauthorization handling, and SAC event behavior.
+
+### Test Results
+
+- `make -j $(nproc)` (with `--enable-tracy --enable-tracy-capture
+  --enable-next-protocol-version-unsafe-for-production`) completed
+  successfully.
+- `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple
+  --abort --disable-dots' make check` completed with exit code 0.
+  `soroban_env_host` reported `751 passed; 0 failed; 2 ignored`, all
+  Rust integration/doc tests passed, and `test/selftest-nopg` plus
+  `test/check-nondet` both passed.
