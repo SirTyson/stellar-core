@@ -101,32 +101,147 @@ using namespace stellar;
 // total order, B could save this fee, but we would lose the ability to run A
 // and B in parallel in the future. CAP 0063 explicitly chose this tradeoff.
 
+size_t
+getParallelCommitWorkerCount(AppConnector& app, size_t numClusters)
+{
+    if (numClusters == 0)
+    {
+        return 0;
+    }
+
+    return std::min(
+        static_cast<size_t>(app.getConfig().LEDGER_CLOSE_WORKER_THREADS),
+        numClusters);
+}
+
 ParallelApplyLedgerKeySet
-getReadWriteKeysForStage(ApplyStage const& stage)
+getReadWriteKeysForStageClusterRange(ApplyStage const& stage, size_t begin,
+                                     size_t end)
 {
     ZoneScoped;
     ParallelApplyLedgerKeySet res;
 
     // Pre-reserve to avoid rehashing. Each RW key may also have a TTL key.
     size_t estimatedKeys = 0;
-    for (auto const& txBundle : stage)
+    for (size_t clusterIndex = begin; clusterIndex < end; ++clusterIndex)
     {
-        estimatedKeys +=
-            txBundle.getTx()->sorobanResources().footprint.readWrite.size() * 2;
+        for (auto const& txBundle : stage.getCluster(clusterIndex))
+        {
+            estimatedKeys +=
+                txBundle.getTx()->sorobanResources().footprint.readWrite.size() *
+                2;
+        }
     }
     res.reserve(estimatedKeys);
 
-    for (auto const& txBundle : stage)
+    for (size_t clusterIndex = begin; clusterIndex < end; ++clusterIndex)
     {
-        for (auto const& lk :
-             txBundle.getTx()->sorobanResources().footprint.readWrite)
+        for (auto const& txBundle : stage.getCluster(clusterIndex))
         {
-            res.emplace(lk);
-            if (isSorobanEntry(lk))
+            for (auto const& lk :
+                 txBundle.getTx()->sorobanResources().footprint.readWrite)
             {
-                res.emplace(getTTLKey(lk));
+                res.emplace(lk);
+                if (isSorobanEntry(lk))
+                {
+                    res.emplace(getTTLKey(lk));
+                }
             }
         }
+    }
+    return res;
+}
+
+ParallelApplyLedgerKeySet
+getReadWriteKeysForStage(ApplyStage const& stage, size_t workerCount)
+{
+    ZoneScoped;
+    releaseAssert(workerCount > 0);
+    releaseAssert(workerCount <= stage.numClusters());
+
+    if (workerCount == 1)
+    {
+        return getReadWriteKeysForStageClusterRange(stage, 0,
+                                                   stage.numClusters());
+    }
+
+    std::vector<std::future<ParallelApplyLedgerKeySet>> futures;
+    futures.reserve(workerCount);
+
+    size_t begin = 0;
+    auto const baseChunkSize = stage.numClusters() / workerCount;
+    auto const remainder = stage.numClusters() % workerCount;
+    for (size_t workerIndex = 0; workerIndex < workerCount; ++workerIndex)
+    {
+        auto const chunkSize =
+            baseChunkSize + (workerIndex < remainder ? 1u : 0u);
+        auto const end = begin + chunkSize;
+        futures.emplace_back(std::async(std::launch::async,
+                                        getReadWriteKeysForStageClusterRange,
+                                        std::cref(stage), begin, end));
+        begin = end;
+    }
+
+    std::vector<ParallelApplyLedgerKeySet> partials;
+    partials.reserve(workerCount);
+    size_t estimatedKeys = 0;
+    for (auto& future : futures)
+    {
+        auto partial = future.get();
+        estimatedKeys += partial.size();
+        partials.emplace_back(std::move(partial));
+    }
+
+    ParallelApplyLedgerKeySet res;
+    res.reserve(estimatedKeys);
+    for (auto& partial : partials)
+    {
+        for (auto& key : partial)
+        {
+            res.emplace(std::move(key));
+        }
+    }
+    return res;
+}
+
+struct ThreadCommitChanges
+{
+    GlobalParallelApplyEntryMap mEntryMap;
+    RestoredEntries mRestoredEntries;
+};
+
+ThreadCommitChanges
+collectThreadCommitChanges(GlobalParallelApplyLedgerState const& global,
+                           ThreadParallelApplyLedgerState& thread)
+{
+    ZoneScoped;
+    ThreadCommitChanges res;
+    thread.scopeDeactivate();
+
+    res.mEntryMap.reserve(thread.getEntryMap().size());
+    for (auto& [key, entry] : thread.getEntryMap())
+    {
+        if (entry.mIsDirty)
+        {
+            res.mEntryMap.emplace(key, std::move(entry).rescope(thread, global));
+        }
+    }
+    res.mRestoredEntries = thread.getRestoredEntries();
+    return res;
+}
+
+std::vector<ThreadCommitChanges>
+collectThreadCommitChangesRange(
+    GlobalParallelApplyLedgerState const& global,
+    std::vector<std::unique_ptr<ThreadParallelApplyLedgerState>> const& threads,
+    size_t begin, size_t end)
+{
+    ZoneScoped;
+    std::vector<ThreadCommitChanges> res;
+    res.reserve(end - begin);
+    for (size_t i = begin; i < end; ++i)
+    {
+        res.emplace_back(collectThreadCommitChanges(global, *threads.at(i)));
     }
     return res;
 }
@@ -854,29 +969,27 @@ GlobalParallelApplyLedgerState::maybeMergeRoTTLBumps(
 }
 
 void
-GlobalParallelApplyLedgerState::commitChangeFromThread(
-    ThreadParallelApplyLedgerState const& thread,
-    ParallelApplyLedgerKey const& key, ThreadParallelApplyEntry&& parEntry,
+GlobalParallelApplyLedgerState::commitChange(
+    ParallelApplyLedgerKey const& key, GlobalParallelApplyEntry&& parEntry,
     ParallelApplyLedgerKeySet const& readWriteSet)
 {
     if (!parEntry.mIsDirty)
     {
         return;
     }
-    auto rescopedParEntry = std::move(parEntry).rescope(thread, *this);
     auto it = mGlobalEntryMap.find(key);
     if (it == mGlobalEntryMap.end())
     {
-        mGlobalEntryMap.emplace(key, std::move(rescopedParEntry));
+        mGlobalEntryMap.emplace(key, std::move(parEntry));
     }
     else
     {
-        if (!maybeMergeRoTTLBumps(key, rescopedParEntry, it->second,
+        if (!maybeMergeRoTTLBumps(key, parEntry, it->second,
                                   readWriteSet))
         {
             // Preserve mIsNew from the first stage that touched this entry.
             bool oldIsNew = it->second.mIsNew;
-            it->second = std::move(rescopedParEntry);
+            it->second = std::move(parEntry);
             it->second.mIsNew = oldIsNew;
         }
         else
@@ -888,6 +1001,20 @@ GlobalParallelApplyLedgerState::commitChangeFromThread(
             it->second.mIsDirty = true;
         }
     }
+}
+
+void
+GlobalParallelApplyLedgerState::commitChangeFromThread(
+    ThreadParallelApplyLedgerState const& thread,
+    ParallelApplyLedgerKey const& key, ThreadParallelApplyEntry&& parEntry,
+    ParallelApplyLedgerKeySet const& readWriteSet)
+{
+    if (!parEntry.mIsDirty)
+    {
+        return;
+    }
+    commitChange(key, std::move(parEntry).rescope(thread, *this),
+                 readWriteSet);
 }
 
 void
@@ -914,10 +1041,60 @@ GlobalParallelApplyLedgerState::commitChangesFromThreads(
     releaseAssert(threadIsMain() ||
                   app.threadIsType(Application::ThreadType::APPLY));
 
-    auto readWriteSet = getReadWriteKeysForStage(stage);
-    for (auto const& thread : threads)
+    if (threads.empty())
     {
-        commitChangesFromThread(app, *thread, readWriteSet);
+        return;
+    }
+
+    releaseAssert(threads.size() == stage.numClusters());
+    auto const workerCount = getParallelCommitWorkerCount(app, threads.size());
+    auto readWriteSet = getReadWriteKeysForStage(stage, workerCount);
+
+    if (workerCount == 1)
+    {
+        for (auto const& thread : threads)
+        {
+            commitChangesFromThread(app, *thread, readWriteSet);
+        }
+        return;
+    }
+
+    std::vector<std::future<std::vector<ThreadCommitChanges>>> futures;
+    futures.reserve(workerCount);
+
+    size_t begin = 0;
+    auto const baseChunkSize = threads.size() / workerCount;
+    auto const remainder = threads.size() % workerCount;
+    for (size_t workerIndex = 0; workerIndex < workerCount; ++workerIndex)
+    {
+        auto const chunkSize =
+            baseChunkSize + (workerIndex < remainder ? 1u : 0u);
+        auto const end = begin + chunkSize;
+        futures.emplace_back(std::async(std::launch::async,
+                                        collectThreadCommitChangesRange,
+                                        std::cref(*this), std::cref(threads),
+                                        begin, end));
+        begin = end;
+    }
+
+    std::vector<ThreadCommitChanges> threadChanges;
+    threadChanges.reserve(threads.size());
+    for (auto& future : futures)
+    {
+        auto partialChanges = future.get();
+        for (auto& changes : partialChanges)
+        {
+            threadChanges.emplace_back(std::move(changes));
+        }
+    }
+
+    for (auto& changes : threadChanges)
+    {
+        for (auto& [key, entry] : changes.mEntryMap)
+        {
+            commitChange(key, std::move(entry), readWriteSet);
+        }
+        mGlobalRestoredEntries.addRestoresFrom(changes.mRestoredEntries);
     }
 }
 

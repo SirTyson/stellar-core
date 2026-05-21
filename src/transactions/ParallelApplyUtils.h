@@ -241,6 +241,10 @@ class GlobalParallelApplyLedgerState
                               GlobalParallelApplyEntry& oldEntry,
                               ParallelApplyLedgerKeySet const& readWriteSet);
 
+    void commitChange(ParallelApplyLedgerKey const& key,
+                      GlobalParallelApplyEntry&& parEntry,
+                      ParallelApplyLedgerKeySet const& readWriteSet);
+
     void commitChangeFromThread(ThreadParallelApplyLedgerState const& thread,
                                 ParallelApplyLedgerKey const& key,
                                 ThreadParallelApplyEntry&& parEntry,
