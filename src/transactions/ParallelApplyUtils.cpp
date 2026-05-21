@@ -102,7 +102,7 @@ using namespace stellar;
 // and B in parallel in the future. CAP 0063 explicitly chose this tradeoff.
 
 ParallelApplyLedgerKeySet
-getReadWriteKeysForStage(ApplyStage const& stage)
+getReadWriteKeysForStageImpl(ApplyStage const& stage)
 {
     ZoneScoped;
     ParallelApplyLedgerKeySet res;
@@ -269,6 +269,12 @@ updateMaxOfRoTTLBump(ParallelApplyLedgerKeyMap<uint32_t>& roTTLBumps,
 
 namespace stellar
 {
+
+ParallelApplyLedgerKeySet
+getReadWriteKeysForStage(ApplyStage const& stage)
+{
+    return getReadWriteKeysForStageImpl(stage);
+}
 
 PreV23LedgerAccessHelper::PreV23LedgerAccessHelper(AbstractLedgerTxn& ltx)
     : mLtx(ltx)
@@ -919,6 +925,17 @@ GlobalParallelApplyLedgerState::commitChangesFromThreads(
     {
         commitChangesFromThread(app, *thread, readWriteSet);
     }
+}
+
+void
+GlobalParallelApplyLedgerState::commitChangesFromSingleThread(
+    AppConnector& app, ThreadParallelApplyLedgerState& thread,
+    ParallelApplyLedgerKeySet const& readWriteSet)
+{
+    ZoneScoped;
+    releaseAssert(threadIsMain() ||
+                  app.threadIsType(Application::ThreadType::APPLY));
+    commitChangesFromThread(app, thread, readWriteSet);
 }
 
 void

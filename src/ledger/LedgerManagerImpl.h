@@ -54,6 +54,8 @@ class LedgerManagerForBucketTests;
 }
 #endif
 
+class ParallelApplyWorkerPool;
+
 class LedgerManagerImpl : public LedgerManager
 {
   protected:
@@ -329,6 +331,11 @@ class LedgerManagerImpl : public LedgerManager
     // is currently closing a ledger or has ledgers queued to apply.
     bool mCurrentlyApplyingLedger{false};
 
+    // Persistent bounded worker pool for parallel Soroban stage execution.
+    // Reused across stages and ledgers to avoid repeated thread creation /
+    // join overhead. Sized lazily up to the maximum cluster count seen.
+    std::unique_ptr<ParallelApplyWorkerPool> mApplyWorkerPool;
+
     static std::vector<MutableTxResultPtr> processFeesSeqNums(
         ApplicableTxSetFrame const& txSet, AbstractLedgerTxn& ltxOuter,
         std::unique_ptr<LedgerCloseMetaFrame> const& ledgerCloseMeta,
@@ -386,6 +393,11 @@ class LedgerManagerImpl : public LedgerManager
                                     Config const& config,
                                     ParallelLedgerInfo const& ledgerInfo,
                                     LedgerHeader const& header);
+
+    void checkSingleTxBundleInvariants(AppConnector& app,
+                                       TxBundle const& txBundle,
+                                       bool hasInvariants,
+                                       LedgerHeader const& header);
 
     void applySorobanStage(AppConnector& app, LedgerHeader const& header,
                            GlobalParallelApplyLedgerState& globalParState,
@@ -495,6 +507,7 @@ class LedgerManagerImpl : public LedgerManager
 
   public:
     LedgerManagerImpl(Application& app);
+    ~LedgerManagerImpl() override;
 
     void moveToSynced() override;
     void beginApply() override;

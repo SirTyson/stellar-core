@@ -27,6 +27,7 @@
 #include "ledger/LedgerTxn.h"
 #include "ledger/LedgerTxnEntry.h"
 #include "ledger/LedgerTxnHeader.h"
+#include "ledger/LedgerTypeUtils.h"
 #include "ledger/P23HotArchiveBug.h"
 #include "ledger/SharedModuleCacheCompiler.h"
 #include "main/Application.h"
@@ -74,8 +75,11 @@
 
 #include "LedgerManagerImpl.h"
 #include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <regex>
 #include <sstream>
@@ -344,6 +348,125 @@ LedgerManagerImpl::ApplyState::manuallyAdvanceLedgerHeader(
     mInMemorySorobanState.manuallyAdvanceLedgerHeader(lh);
 }
 
+// Persistent bounded worker pool used by parallel Soroban stage apply.
+// Workers are spawned lazily up to the maximum cluster count seen and
+// reused across stages and ledgers, eliminating the per-stage thread
+// creation/join overhead that std::async incurs.
+class ParallelApplyWorkerPool
+{
+  public:
+    ParallelApplyWorkerPool() = default;
+    ~ParallelApplyWorkerPool()
+    {
+        {
+            std::lock_guard<std::mutex> g(mMu);
+            mStop = true;
+        }
+        mCv.notify_all();
+        for (auto& w : mWorkers)
+        {
+            if (w.joinable())
+            {
+                w.join();
+            }
+        }
+    }
+
+    ParallelApplyWorkerPool(ParallelApplyWorkerPool const&) = delete;
+    ParallelApplyWorkerPool&
+    operator=(ParallelApplyWorkerPool const&) = delete;
+
+    // Submit a batch of tasks and return their futures. Tasks may execute
+    // concurrently across workers, but the returned futures preserve
+    // submission order so callers can collect results deterministically.
+    std::vector<std::future<void>>
+    submitBatch(std::vector<std::packaged_task<void()>>&& tasks)
+    {
+        ensureSize(tasks.size());
+        std::vector<std::future<void>> futures;
+        futures.reserve(tasks.size());
+        for (auto& t : tasks)
+        {
+            futures.emplace_back(t.get_future());
+        }
+        {
+            std::lock_guard<std::mutex> g(mMu);
+            for (auto& t : tasks)
+            {
+                mQueue.emplace_back(std::move(t));
+            }
+        }
+        mCv.notify_all();
+        return futures;
+    }
+
+    // Ensure the pool has at least `n` workers spawned. Used by the DAG
+    // scheduler so it can submit single tasks one at a time without limiting
+    // the maximum concurrency to 1.
+    void
+    ensurePoolSize(size_t n)
+    {
+        ensureSize(n);
+    }
+
+    // Submit a single task; returns its future. Workers must already be
+    // sized via ensurePoolSize() to the desired concurrency cap.
+    std::future<void>
+    submit(std::packaged_task<void()>&& task)
+    {
+        auto fut = task.get_future();
+        {
+            std::lock_guard<std::mutex> g(mMu);
+            mQueue.emplace_back(std::move(task));
+        }
+        mCv.notify_one();
+        return fut;
+    }
+
+  private:
+    void
+    ensureSize(size_t n)
+    {
+        if (mWorkers.size() >= n)
+        {
+            return;
+        }
+        for (size_t i = mWorkers.size(); i < n; ++i)
+        {
+            mWorkers.emplace_back([this] { workerLoop(); });
+        }
+    }
+
+    void
+    workerLoop()
+    {
+        while (true)
+        {
+            std::packaged_task<void()> task;
+            {
+                std::unique_lock<std::mutex> lk(mMu);
+                mCv.wait(lk,
+                         [this] { return mStop || !mQueue.empty(); });
+                if (mStop && mQueue.empty())
+                {
+                    return;
+                }
+                task = std::move(mQueue.front());
+                mQueue.pop_front();
+            }
+            task();
+        }
+    }
+
+    std::vector<std::thread> mWorkers;
+    std::deque<std::packaged_task<void()>> mQueue;
+    std::mutex mMu;
+    std::condition_variable mCv;
+    bool mStop{false};
+};
+
+LedgerManagerImpl::~LedgerManagerImpl() = default;
+
 LedgerManagerImpl::LedgerManagerImpl(Application& app)
     : mApp(app)
     , mApplyState(app)
@@ -351,6 +474,7 @@ LedgerManagerImpl::LedgerManagerImpl(Application& app)
     , mLastClose(mApp.getClock().now())
     , mCatchupDuration(
           app.getMetrics().NewTimer({"ledger", "catchup", "duration"}))
+    , mApplyWorkerPool(std::make_unique<ParallelApplyWorkerPool>())
     , mState(LM_BOOTING_STATE)
 {
     // At this point, we haven't called assumeState yet, so the BucketLists are
@@ -2536,30 +2660,37 @@ LedgerManagerImpl::applySorobanStageClustersInParallel(
 {
     ZoneScoped;
 
-    std::vector<std::unique_ptr<ThreadParallelApplyLedgerState>> threadStates;
-    std::vector<std::future<std::unique_ptr<ThreadParallelApplyLedgerState>>>
-        threadFutures;
+    size_t const numClusters = stage.numClusters();
+    std::vector<std::unique_ptr<ThreadParallelApplyLedgerState>> threadStates(
+        numClusters);
 
     DeactivateScopeGuard globalStateDeactivateGuard(globalState);
 
-    for (size_t i = 0; i < stage.numClusters(); ++i)
+    std::vector<std::packaged_task<void()>> tasks;
+    tasks.reserve(numClusters);
+    for (size_t i = 0; i < numClusters; ++i)
     {
         auto const& cluster = stage.getCluster(i);
         auto threadStatePtr = std::make_unique<ThreadParallelApplyLedgerState>(
             app, globalState, cluster, i);
-        threadFutures.emplace_back(std::async(
-            std::launch::async, &LedgerManagerImpl::applyThread, this,
-            std::ref(app), std::move(threadStatePtr), std::cref(cluster),
-            std::cref(config), ledgerInfo, sorobanBasePrngSeed));
+        tasks.emplace_back(std::packaged_task<void()>(
+            [this, &app, &cluster, &config, ledgerInfo, sorobanBasePrngSeed,
+             threadStatePtr = std::move(threadStatePtr), &threadStates,
+             i]() mutable {
+                threadStates[i] = applyThread(
+                    app, std::move(threadStatePtr), cluster, config,
+                    ledgerInfo, sorobanBasePrngSeed);
+            }));
     }
 
-    for (auto& threadFuture : threadFutures)
+    auto futures = mApplyWorkerPool->submitBatch(std::move(tasks));
+
+    for (auto& f : futures)
     {
-        releaseAssert(threadFuture.valid());
+        releaseAssert(f.valid());
         try
         {
-            auto futureResult = threadFuture.get();
-            threadStates.emplace_back(std::move(futureResult));
+            f.get();
         }
         catch (std::exception const& e)
         {
@@ -2570,7 +2701,6 @@ LedgerManagerImpl::applySorobanStageClustersInParallel(
             printErrorAndAbort("Unknown exception on apply thread");
         }
     }
-    threadFutures.clear();
     return threadStates;
 }
 
@@ -2582,41 +2712,49 @@ LedgerManagerImpl::checkAllTxBundleInvariants(
     bool const hasInvariants = !config.INVARIANT_CHECKS.empty();
     for (auto const& txBundle : stage)
     {
-        // Only run invariant checks if any invariants are enabled.
-        // The delta is not built when invariants are disabled (see
-        // parallelApply), so we must not call getDelta() in that case.
-        if (hasInvariants && txBundle.getResPayload().isSuccess())
-        {
-            try
-            {
-                // Soroban transactions don't have access to the ledger
-                // header, so they can't modify it. Pass in the current
-                // header as both current and previous.
-                txBundle.getEffects().setDeltaHeader(header);
-
-                app.checkOnOperationApply(
-                    txBundle.getTx()->getRawOperations().at(0),
-                    txBundle.getResPayload().getOpResultAt(0),
-                    txBundle.getEffects().getDelta(),
-                    txBundle.getEffects()
-                        .getMeta()
-                        .getOperationMetaBuilderAt(0)
-                        .getEventManager()
-                        .getEvents());
-            }
-            catch (InvariantDoesNotHold& e)
-            {
-                printErrorAndAbort(
-                    "Invariant failure while applying operations: ", e.what());
-            }
-        }
-
-        // We don't call processPostApply for post v23 transactions at the
-        // moment because processPostApply is currently a no-op for those
-
-        txBundle.getEffects().getMeta().maybeSetRefundableFeeMeta(
-            txBundle.getResPayload().getRefundableFeeTracker());
+        checkSingleTxBundleInvariants(app, txBundle, hasInvariants, header);
     }
+}
+
+void
+LedgerManagerImpl::checkSingleTxBundleInvariants(
+    AppConnector& app, TxBundle const& txBundle, bool hasInvariants,
+    LedgerHeader const& header)
+{
+    // Only run invariant checks if any invariants are enabled.
+    // The delta is not built when invariants are disabled (see
+    // parallelApply), so we must not call getDelta() in that case.
+    if (hasInvariants && txBundle.getResPayload().isSuccess())
+    {
+        try
+        {
+            // Soroban transactions don't have access to the ledger
+            // header, so they can't modify it. Pass in the current
+            // header as both current and previous.
+            txBundle.getEffects().setDeltaHeader(header);
+
+            app.checkOnOperationApply(
+                txBundle.getTx()->getRawOperations().at(0),
+                txBundle.getResPayload().getOpResultAt(0),
+                txBundle.getEffects().getDelta(),
+                txBundle.getEffects()
+                    .getMeta()
+                    .getOperationMetaBuilderAt(0)
+                    .getEventManager()
+                    .getEvents());
+        }
+        catch (InvariantDoesNotHold& e)
+        {
+            printErrorAndAbort(
+                "Invariant failure while applying operations: ", e.what());
+        }
+    }
+
+    // We don't call processPostApply for post v23 transactions at the
+    // moment because processPostApply is currently a no-op for those
+
+    txBundle.getEffects().getMeta().maybeSetRefundableFeeMeta(
+        txBundle.getResPayload().getRefundableFeeTracker());
 }
 
 void
@@ -2692,18 +2830,326 @@ LedgerManagerImpl::applySorobanStages(AppConnector& app, AbstractLedgerTxn& ltx,
         // LedgerTxn is not passed into applySorobanStage, so there's no risk
         // of the header being updated while we apply the stages.
         auto const& header = ltx.loadHeader().current();
+        auto const& config = app.getConfig();
+        auto ledgerInfo = getParallelLedgerInfo(app, header);
+        bool const hasInvariants = !config.INVARIANT_CHECKS.empty();
+
 #ifdef BUILD_TESTS
         mLastPhaseTimings.sorobanParallelApplyMs = 0;
         mLastPhaseTimings.sorobanCheckInvariantsMs = 0;
         mLastPhaseTimings.sorobanCommitFromThreadsMs = 0;
         mLastPhaseTimings.sorobanDestroyThreadStatesMs = 0;
 #endif
-        for (auto const& stage : stages)
+        // -------- DAG scheduler over (stageIndex, clusterIndex) nodes --------
+        //
+        // Replaces the strict per-stage barrier with a deterministic
+        // dependency DAG: a cluster (s, c) can run as soon as every earlier
+        // cluster (s', c') with s' < s whose Soroban footprint conflicts
+        // with (s, c) (RW/RW, RW/RO, RO/RW including TTL keys) has committed
+        // its thread-local state into the global state.
+        //
+        // Correctness invariants preserved:
+        //  * ThreadParallelApplyLedgerState for a cluster is constructed only
+        //    after all of its conflicting predecessors have committed, so the
+        //    snapshot it reads from global is identical to what it would have
+        //    seen under the stage barrier.
+        //  * Commits are serialized to the apply thread, identical to the
+        //    existing per-stage flow. Worker tasks only mutate their own
+        //    thread-local state; they never touch the global state.
+        //  * Per-stage RW key sets (consumed by maybeMergeRoTTLBumps) are
+        //    pre-computed so each cluster commits with the same set the
+        //    barrier path would use.
+        //  * Within a stage, clusters' RW footprints are disjoint (validated
+        //    by tx-set rules); cross-stage RW conflicts are explicit DAG
+        //    edges. Restored entries are RW (they bump TTL) so any pair of
+        //    clusters that both restore the same key necessarily has a DAG
+        //    edge, preserving the disjointness asserted by addRestoresFrom.
+
+        struct Node
         {
-            applySorobanStage(app, header, globalParState, stage,
-                              sorobanBasePrngSeed);
+            size_t stageIdx;
+            size_t clusterIdx;
+            // Union of footprint readWrite + RO keys, with TTL keys included
+            // for every Soroban entry (matches the conflict surface used by
+            // the merge-vs-overwrite logic in maybeMergeRoTTLBumps).
+            ParallelApplyLedgerKeySet rwKeys;
+            ParallelApplyLedgerKeySet roKeys;
+            std::vector<size_t> children;
+            size_t pendingDeps{0};
+        };
+
+        // Flatten nodes and per-stage indexing.
+        size_t totalClusters = 0;
+        for (auto const& s : stages)
+        {
+            totalClusters += s.numClusters();
         }
+
+        std::vector<Node> nodes;
+        nodes.reserve(totalClusters);
+        // Maps (stageIdx, clusterIdx) -> flat node index.
+        std::vector<std::vector<size_t>> nodeIdxByStage(stages.size());
+        // Per-stage RW key set (matches getReadWriteKeysForStage).
+        std::vector<ParallelApplyLedgerKeySet> stageRwSets(stages.size());
+
+        for (size_t s = 0; s < stages.size(); ++s)
+        {
+            auto const& stage = stages[s];
+            stageRwSets[s] = getReadWriteKeysForStage(stage);
+            nodeIdxByStage[s].resize(stage.numClusters());
+            for (size_t c = 0; c < stage.numClusters(); ++c)
+            {
+                Node n;
+                n.stageIdx = s;
+                n.clusterIdx = c;
+                auto const& cluster = stage.getCluster(c);
+                size_t estRw = 0, estRo = 0;
+                for (auto const& tb : cluster)
+                {
+                    auto const& fp = tb.getTx()->sorobanResources().footprint;
+                    estRw += fp.readWrite.size() * 2;
+                    estRo += fp.readOnly.size() * 2;
+                }
+                n.rwKeys.reserve(estRw);
+                n.roKeys.reserve(estRo);
+                for (auto const& tb : cluster)
+                {
+                    auto const& fp = tb.getTx()->sorobanResources().footprint;
+                    for (auto const& k : fp.readWrite)
+                    {
+                        n.rwKeys.emplace(k);
+                        if (isSorobanEntry(k))
+                        {
+                            n.rwKeys.emplace(getTTLKey(k));
+                        }
+                    }
+                    for (auto const& k : fp.readOnly)
+                    {
+                        n.roKeys.emplace(k);
+                        if (isSorobanEntry(k))
+                        {
+                            n.roKeys.emplace(getTTLKey(k));
+                        }
+                    }
+                }
+                nodeIdxByStage[s][c] = nodes.size();
+                nodes.emplace_back(std::move(n));
+            }
+        }
+
+        // Build cross-stage edges. Within a stage, clusters are guaranteed
+        // non-conflicting by tx-set validation, so we only consider pairs
+        // with strictly increasing stage index. Edge from p -> q exists iff
+        // (p.rw ∩ q.rw) ∪ (p.rw ∩ q.ro) ∪ (p.ro ∩ q.rw) is non-empty.
+        auto intersects = [](ParallelApplyLedgerKeySet const& a,
+                             ParallelApplyLedgerKeySet const& b) {
+            auto const& small = a.size() <= b.size() ? a : b;
+            auto const& big = a.size() <= b.size() ? b : a;
+            for (auto const& k : small)
+            {
+                if (big.find(k) != big.end())
+                {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        for (size_t s2 = 1; s2 < stages.size(); ++s2)
+        {
+            for (size_t c2 = 0; c2 < stages[s2].numClusters(); ++c2)
+            {
+                size_t qIdx = nodeIdxByStage[s2][c2];
+                Node& q = nodes[qIdx];
+                for (size_t s1 = 0; s1 < s2; ++s1)
+                {
+                    for (size_t c1 = 0; c1 < stages[s1].numClusters(); ++c1)
+                    {
+                        size_t pIdx = nodeIdxByStage[s1][c1];
+                        Node& p = nodes[pIdx];
+                        if (intersects(p.rwKeys, q.rwKeys) ||
+                            intersects(p.rwKeys, q.roKeys) ||
+                            intersects(p.roKeys, q.rwKeys))
+                        {
+                            p.children.push_back(qIdx);
+                            ++q.pendingDeps;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Concurrency cap: respect the network-config bound (the same bound
+        // tx-set validation enforces on intra-stage cluster count).
+        size_t const maxInFlight =
+            std::max<size_t>(1, sorobanConfig.ledgerMaxDependentTxClusters());
+
+        // Pre-warm the worker pool to maxInFlight so single-task submissions
+        // can run concurrently up to the cap.
+        mApplyWorkerPool->ensurePoolSize(maxInFlight);
+
+        // Ready queue and completion signalling.
+        std::deque<size_t> readyQueue;
+        for (size_t i = 0; i < nodes.size(); ++i)
+        {
+            if (nodes[i].pendingDeps == 0)
+            {
+                readyQueue.push_back(i);
+            }
+        }
+
+        std::vector<std::unique_ptr<ThreadParallelApplyLedgerState>>
+            threadStates(nodes.size());
+
+        std::mutex completionMu;
+        std::condition_variable completionCv;
+        std::deque<size_t> completedQueue;
+
+        size_t inFlight = 0;
+        size_t completedCount = 0;
+
 #ifdef BUILD_TESTS
+        // Track wall-clock spent on the parallel apply portion of the loop
+        // (everything that runs concurrently with workers); commits and
+        // invariant checks remain serial on the apply thread and are timed
+        // separately below.
+        auto applyWallStart = std::chrono::steady_clock::now();
+        double commitMs = 0.0;
+        double invariantMs = 0.0;
+        double destroyMs = 0.0;
+#endif
+
+        // Helper: deactivate global, construct thread state, reactivate.
+        auto submitNode = [&](size_t nodeIdx) {
+            Node const& n = nodes[nodeIdx];
+            auto const& cluster =
+                stages[n.stageIdx].getCluster(n.clusterIdx);
+            globalParState.scopeDeactivate();
+            auto threadStatePtr =
+                std::make_unique<ThreadParallelApplyLedgerState>(
+                    app, globalParState, cluster, n.clusterIdx);
+            globalParState.scopeActivate();
+
+            std::packaged_task<void()> task(
+                [this, &app, &cluster, &config, ledgerInfo,
+                 sorobanBasePrngSeed, &threadStates, nodeIdx,
+                 &completionMu, &completionCv, &completedQueue,
+                 ts = std::move(threadStatePtr)]() mutable {
+                    try
+                    {
+                        threadStates[nodeIdx] = applyThread(
+                            app, std::move(ts), cluster, config,
+                            ledgerInfo, sorobanBasePrngSeed);
+                    }
+                    catch (std::exception const& e)
+                    {
+                        printErrorAndAbort(
+                            "Exception on apply thread: ", e.what());
+                    }
+                    catch (...)
+                    {
+                        printErrorAndAbort("Unknown exception on apply thread");
+                    }
+                    std::lock_guard<std::mutex> g(completionMu);
+                    completedQueue.push_back(nodeIdx);
+                    completionCv.notify_one();
+                });
+            mApplyWorkerPool->submit(std::move(task));
+            ++inFlight;
+        };
+
+        while (completedCount < nodes.size())
+        {
+            // Submit ready nodes up to the in-flight cap.
+            while (inFlight < maxInFlight && !readyQueue.empty())
+            {
+                size_t nodeIdx = readyQueue.front();
+                readyQueue.pop_front();
+                submitNode(nodeIdx);
+            }
+
+            // Wait for at least one completion.
+            size_t finishedIdx;
+            {
+                std::unique_lock<std::mutex> lk(completionMu);
+                completionCv.wait(
+                    lk, [&] { return !completedQueue.empty(); });
+                finishedIdx = completedQueue.front();
+                completedQueue.pop_front();
+            }
+            --inFlight;
+            ++completedCount;
+
+            Node const& fn = nodes[finishedIdx];
+            auto const& finishedCluster =
+                stages[fn.stageIdx].getCluster(fn.clusterIdx);
+
+            // Per-cluster invariant check (matches what the stage barrier
+            // would do at the end of the stage, just sliced finer).
+#ifdef BUILD_TESTS
+            auto t0 = std::chrono::steady_clock::now();
+#endif
+            for (auto const& tb : finishedCluster)
+            {
+                checkSingleTxBundleInvariants(app, tb, hasInvariants, header);
+            }
+#ifdef BUILD_TESTS
+            auto t1 = std::chrono::steady_clock::now();
+            invariantMs +=
+                std::chrono::duration<double, std::milli>(t1 - t0).count();
+#endif
+
+            // Commit this cluster's thread state to global, using its
+            // owning stage's pre-computed RW set so RO TTL bumps merge
+            // exactly as in the barrier path.
+#ifdef BUILD_TESTS
+            t0 = std::chrono::steady_clock::now();
+#endif
+            globalParState.commitChangesFromSingleThread(
+                app, *threadStates[finishedIdx],
+                stageRwSets[fn.stageIdx]);
+#ifdef BUILD_TESTS
+            t1 = std::chrono::steady_clock::now();
+            commitMs +=
+                std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+            t0 = std::chrono::steady_clock::now();
+#endif
+            threadStates[finishedIdx].reset();
+#ifdef BUILD_TESTS
+            t1 = std::chrono::steady_clock::now();
+            destroyMs +=
+                std::chrono::duration<double, std::milli>(t1 - t0).count();
+#endif
+
+            // Wake children whose last predecessor just finished.
+            for (size_t childIdx : fn.children)
+            {
+                if (--nodes[childIdx].pendingDeps == 0)
+                {
+                    readyQueue.push_back(childIdx);
+                }
+            }
+        }
+
+        releaseAssert(inFlight == 0);
+        releaseAssert(readyQueue.empty());
+
+#ifdef BUILD_TESTS
+        auto applyWallEnd = std::chrono::steady_clock::now();
+        mLastPhaseTimings.sorobanParallelApplyMs =
+            std::chrono::duration<double, std::milli>(applyWallEnd -
+                                                      applyWallStart)
+                .count() -
+            commitMs - invariantMs - destroyMs;
+        if (mLastPhaseTimings.sorobanParallelApplyMs < 0)
+        {
+            mLastPhaseTimings.sorobanParallelApplyMs = 0;
+        }
+        mLastPhaseTimings.sorobanCheckInvariantsMs = invariantMs;
+        mLastPhaseTimings.sorobanCommitFromThreadsMs = commitMs;
+        mLastPhaseTimings.sorobanDestroyThreadStatesMs = destroyMs;
+
         auto subStart = std::chrono::steady_clock::now();
 #endif
         globalParState.commitChangesToLedgerTxn(ltx);

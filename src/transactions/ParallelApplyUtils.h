@@ -267,6 +267,15 @@ class GlobalParallelApplyLedgerState
             threads,
         ApplyStage const& stage);
 
+    // Commit a single completed thread state into the global state, using a
+    // pre-computed read-write key set (typically the union of RW keys for the
+    // owning stage). Used by the DAG scheduler that commits clusters as soon
+    // as all their conflicting predecessors finish, rather than at a hard
+    // stage barrier.
+    void commitChangesFromSingleThread(
+        AppConnector& app, ThreadParallelApplyLedgerState& thread,
+        ParallelApplyLedgerKeySet const& readWriteSet);
+
     // Consumes the global entry map: moves entries into the LedgerTxn
     // instead of copying. Must only be called once, as the final operation
     // on this state (entries are left in a moved-from state afterwards).
@@ -388,4 +397,11 @@ class ParallelLedgerAccessHelper : virtual public LedgerAccessHelper
     uint32_t getLedgerVersion() override;
     uint32_t getLedgerSeq() override;
 };
+
+// Compute the union of read-write keys (and their associated TTL keys) across
+// every transaction in a stage. Exposed so the DAG scheduler in
+// LedgerManagerImpl can pre-compute and reuse the per-stage RW set when
+// committing individual cluster results out of stage order.
+ParallelApplyLedgerKeySet getReadWriteKeysForStage(ApplyStage const& stage);
+
 }
