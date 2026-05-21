@@ -226,3 +226,51 @@ Built with `./configure --enable-ccache --enable-sdfprefs --enable-tracy
 `753 passed; 0 failed; 2 ignored` (up from 751 — the two new accumulator
 equivalence/limit-boundary tests both pass), and the final make-check
 selftests reported `All 2 tests passed`.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-21
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The revised implementation still is not eligible for final confirmation because the handoff is not reproducible from the outer PoC branch. The outer repository commit `45b8e5999e6824ec7c69b3507e9cd374e3a9c58d` records `src/rust/soroban/p26` at baseline `fa1226b3068605c5376efe56c6cf809ca225a036`, while the checked-out p26 worktree is `89b4b8a95f2d9cb492c34cb3d5aa7afae32d573f`. Running the required `git submodule update --init --recursive src/rust/soroban/p26` on a clean checkout would therefore discard the accumulator code before build, test, or benchmark, so final review cannot promote or benchmark this handoff.
+
+The PoC file also still does not provide final-review-usable non-Tracy apply-load numbers. Per the objective workflow, final review must compare three optimized `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` runs against `ai-summary/CURRENT_STATE.md`; that step is blocked until the committed handoff records the optimized p26 SHA.
+
+During source audit, the successful-charge rounding issue from the prior review appears addressed by summing per-event rounded CPU/memory amounts before flush. However, add or confirm coverage for the failure path: when an accumulated batch crosses the CPU limit, `flush_mem_cpy_accumulator` updates the `MemCpy` tracker fields for the full batch before the CPU limit check. This does not currently look consensus-visible, but the intended next-protocol metering contract should explicitly test/report the expected resource and tracker state for budget-exceeded flushes.
+
+### Revision Instructions
+
+Record the optimized p26 commit in the outer `poc/002-protocol-gated-budget-charge-accumulator` gitlink so that `git ls-tree HEAD src/rust/soroban/p26` matches the p26 commit containing the revised accumulator (`89b4b8a95f2d9cb492c34cb3d5aa7afae32d573f` or its successor), and ensure that commit is available from the intended `SirTyson/rs-soroban-env` PoC branch. The outer worktree and p26 submodule must be clean after `git submodule update --init --recursive src/rust/soroban/p26`.
+
+After the handoff is reproducible, rerun the required full suite and provide the three authoritative non-Tracy apply-load runs. Add a focused budget-limit test (or extend the existing one) that verifies the observable CPU/memory totals and any relevant tracker state after an accumulated flush returns `ExceededLimit`, so the deferred-error semantics are documented rather than incidental.
+
+### Checks Passed So Far
+
+The source changes remain in scope for the Soroban apply path, and the successful accumulated `MemCpy` accounting now preserves per-charge scaled-term rounding for final CPU/memory totals and cost trackers. No existing test logic or assertions were weakened in the p26 diff reviewed here.
+
+---
+
+## PoC Attempt (Revision 2)
+
+**Result**: POC_PASS
+**Date**: 2026-05-21
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/budget.rs:409-465` — tightened `flush_mem_cpy_accumulator` so a CPU-limit failure leaves the CPU-side accumulated charge state visible, matching the ordinary `BudgetImpl::charge` ordering, while memory-side totals and tracker fields are not applied after that CPU-limit error.
+- `src/rust/soroban/p26/soroban-env-host/src/test/budget_metering.rs:630-681` — extended `accumulator_flush_enforces_cpu_limit` to assert the deterministic `ExceededLimit` flush boundary and the observable post-error CPU, memory, and `MemCpy` tracker state.
+
+### Demonstration
+
+The revised accumulator still avoids the per-charge `BudgetImpl` mutable borrow, tracker mutation, cost-model evaluation, and limit checks for opted-in hot map/vector `MemCpy` bookkeeping charges, flushing already-rounded CPU/memory deltas at deterministic boundaries. The failure-path semantics are now explicitly covered: a flush that exceeds the CPU limit reports `ExceededLimit`, records CPU-side state for the accumulated batch, and does not apply memory-side effects after the CPU failure, matching the ordinary charge path's ordering.
+
+The p26 submodule remains on branch `poc/002-protocol-gated-budget-charge-accumulator` at `89b4b8a95f2d9cb492c34cb3d5aa7afae32d573f` with this revision left dirty for the orchestrator to commit and then record as the outer gitlink, as required by the PoC handoff rules.
+
+### Test Results
+
+Built with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` and `make -j $(nproc)`. Full suite passed with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`; the p26 Rust host reported `753 passed; 0 failed; 2 ignored`, and the final make-check selftests reported `All 2 tests passed`.
