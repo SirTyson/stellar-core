@@ -388,3 +388,33 @@ make check`:
 The outer worktree leaves `src/rust/soroban/p26` dirty (gitlink
 pointing at baseline `fa1226b3`, working tree at optimized
 `0ca00ee4`), as required by the skill for orchestrator handoff.
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-05-21
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** YES — the p26 diff adds a next-protocol `BudgetChargeAccumulator`, routes audited hot map/vector `MemCpy` bookkeeping charges through it, and flushes before budget observers, shadow mode, Wasm fuel boundaries, and host invocation output extraction.
+2. **Are the preconditions realistic?** YES — the changed call sites are in Soroban host map/vector paths reached during apply-load close-ledger execution.
+3. **Is the original code inefficient or working as designed?** INEFFICIENCY PLAUSIBLE — repeated per-charge `BudgetImpl` borrows, model evaluation, tracker updates, and limit checks are real overhead, and the revised implementation preserves per-charge rounding for successful accumulated `MemCpy` totals.
+4. **Does the benchmark improvement match the claimed severity?** NO — the mandatory non-Tracy matrix showed a regression, not an improvement. Baseline soroswap medians from `CURRENT_STATE.md` were 272.249541 / 275.885919 / 270.551362 ms (average 272.895607 ms). Optimized soroswap medians were 274.467033 / 281.193809 / 287.307277 ms (average 280.989373 ms), a 2.97% regression. SAC also regressed from baseline average 306.542755 ms to optimized average 319.786048 ms, a 4.32% regression.
+5. **Is the optimization in scope?** YES — source changes are in p26 Soroban host metering used by `closeLedger` apply.
+6. **Is the benchmark methodology correct?** YES — built with the required Tracy/next-protocol configuration, full suite passed, then ran `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` three times without `--tracy` against the accepted `CURRENT_STATE.md` baseline.
+7. **Can the improvement be explained without the optimization?** NOT APPLICABLE — there was no measured improvement to explain; the top-line result regressed.
+8. **Is this optimization novel?** YES — this broad map/vector `MemCpy` accumulator is distinct from prior narrower metering coalescing findings.
+
+### Rejection Reason
+
+The optimization fails the required performance gate. Soroswap apply time did not improve consistently; it regressed in all three optimized runs relative to the accepted baseline average, with two runs also worse than the baseline's slowest run. Max-sac also regressed, so there is no acceptable soroswap-vs-max-sac tradeoff. Because the objective requires a reproducible apply-time reduction and explicitly rejects soroswap regressions, the finding cannot be confirmed.
+
+### Failed Checks
+
+- Step 5 benchmark improvement requirement — failed; optimized soroswap medians were 274.467033 / 281.193809 / 287.307277 ms vs baseline 272.249541 / 275.885919 / 270.551362 ms.
+- Step 7.4 benchmark improvement vs severity — failed; measured result is a regression, not Low/Medium improvement.
+- Verdict criterion "soroswap apply time improves consistently across all three non-Tracy runs" — failed.
