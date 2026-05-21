@@ -73,3 +73,25 @@ The impact is plausibly Medium for max-sac and worth a PoC under this objective.
 - **Change description**: Build stage RW/TTL key sets and per-thread dirty merge shards in bounded worker tasks, capped by `min(stage.numClusters(), ledgerMaxDependentTxClusters, LEDGER_CLOSE_WORKER_THREADS)` or the existing cluster count. Do not write `mGlobalEntryMap` concurrently. Reduce RO TTL bumps with exact `max`, preserve first-stage `mIsNew`, add restored entries with the existing disjointness assertions, and install final results in a deterministic order independent of worker completion.
 - **Correctness check**: Existing parallel Soroban apply tests and invariant checks should cover ledger/meta equivalence; add focused tests only if the implementation introduces new helper behavior for RO TTL merging or deterministic shard reduction. Preserve the current thread-state scope deactivation/adoption rules when moving entries between `ThreadParApply` and `GlobalParApply` scopes.
 - **Benchmark focus**: Measure `scripts/run_apply_load_matrix.py` non-Tracy apply time across repeated max-sac and soroswap runs, and use Tracy only to confirm that `commitChangesFromThreads`, `getReadWriteKeysForStage`, and per-thread fold self-time moved off the apply-thread serial region. The PoC should target at least a reproducible 3% max-sac apply-time reduction to remain Medium.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-21
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/transactions/ParallelApplyUtils.cpp:104-247` — split stage RW/TTL key-set construction by cluster range and added bounded worker helpers for collecting per-thread dirty global-scope entry shards plus restored entries.
+- `src/transactions/ParallelApplyUtils.cpp:971-1098` — factored global entry installation into `commitChange`, retained the existing serial path for single-worker stages, and added a multi-worker path that rescope-collects thread changes in parallel before reducing them in deterministic thread order without concurrent writes to `mGlobalEntryMap`.
+- `src/transactions/ParallelApplyUtils.h:239-246` — declared the new `commitChange` helper used by both the legacy serial fold and the new deterministic reduce path.
+
+### Demonstration
+
+The PoC moves the expensive stage read-write key scan and `ThreadParApply` to `GlobalParApply` dirty-entry rescoping off the apply thread when a stage has multiple clusters. The final global-map mutation, RO TTL `max` merge, first-stage `mIsNew` preservation, and restored-entry aggregation remain single-threaded and are applied in stable thread order, preserving observable ledger output while shrinking the post-worker critical path.
+
+### Test Results
+
+Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`, built with `make -j $(nproc)`, and ran `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`. The full existing suite completed successfully, ending with `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.
