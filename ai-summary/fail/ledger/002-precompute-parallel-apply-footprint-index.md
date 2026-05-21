@@ -221,3 +221,48 @@ STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots'
 make -j $(nproc) check ALL_SOROBAN_GIT_STATE_STAMPS=`; final output
 reported `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and
 `All 2 tests passed`.
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED  
+**Date**: 2026-05-20  
+**Final review by**: gpt-5.5, high  
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** PARTIAL — the source change does remove some repeated footprint walks and precomputes cluster key/TTL wrappers, but the revised implementation intentionally restores stage read-write recomputation and Soroban read-only preloading walks, so only a narrowed part of the original claimed inefficiency remains addressed.
+2. **Are the preconditions realistic?** YES — the changed path is the in-scope parallel Soroban apply path exercised by the apply-load soroswap and max-sac matrices.
+3. **Is the original code inefficient or working as designed?** INEFFICIENCY, BUT NOT PROFITABLE — duplicate key classification and TTL derivation are real, but the additional index construction/storage overhead does not translate into a top-line apply-time win.
+4. **Does the benchmark improvement match the claimed severity?** NO — the independent benchmark showed regressions, not improvement.
+5. **Is the optimization in scope?** YES — the modified code is within `closeLedger` parallel Soroban apply setup and thread-state initialization.
+6. **Is the benchmark methodology correct?** YES — built locally with the required Tracy-enabled, next-protocol configuration and ran `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` three times without `--tracy`; no diagnostic Tracy run was performed because the authoritative non-Tracy runs failed the verdict gate.
+7. **Can the improvement be explained without the optimization?** N/A — no improvement was measured. The regression is large enough that benchmark noise cannot support confirmation.
+8. **Is this optimization novel?** YES — no duplicate-confirmed optimization was identified, but novelty does not overcome the benchmark failure.
+
+### Benchmark Results
+
+Accepted baseline from `ai-summary/CURRENT_STATE.md`:
+
+| run | scenario | baseline median_ms | optimized median_ms |
+|-----|----------|--------------------|---------------------|
+| 1 | sac, TX=6000, T=8 | 306.357371 | 480.1974025 |
+| 1 | soroswap, TX=2000, T=8 | 272.249541 | 341.3324870 |
+| 2 | sac, TX=6000, T=8 | 300.543791 | 482.3871810 |
+| 2 | soroswap, TX=2000, T=8 | 275.885919 | 335.1882510 |
+| 3 | sac, TX=6000, T=8 | 312.727103 | 477.8221515 |
+| 3 | soroswap, TX=2000, T=8 | 270.551362 | 338.2418150 |
+
+Average soroswap median regressed from 272.895607 ms to 338.254184 ms, a 65.358577 ms / 23.95% slowdown. Average max-sac median regressed from 306.542755 ms to 480.135578 ms, a 173.592823 ms / 56.63% slowdown. This fails the objective's required consistent soroswap improvement and also fails the max-sac tradeoff envelope.
+
+### Rejection Reason
+
+The revised PoC is correct enough to build and pass the full regression suite, but it is a large top-line performance regression under the required project benchmark. Because soroswap apply time regressed in all three non-Tracy runs and max-sac regressed even more severely, the optimization cannot be confirmed or sent back as a marginal improvement.
+
+### Failed Checks
+
+- Check 4: benchmark improvement does not match the claimed severity; the measured result is a regression.
+- Check 6 / verdict gate: the three required non-Tracy benchmark runs do not show eligible improvement, so diagnostic Tracy capture is skipped.
+- Objective verdict criterion: soroswap regresses and max-sac degrades outside the tradeoff envelope.
