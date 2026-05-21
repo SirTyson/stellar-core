@@ -30,6 +30,7 @@
 #include "ledger/LedgerTypeUtils.h"
 #include "ledger/P23HotArchiveBug.h"
 #include "rust/RustBridge.h"
+#include "transactions/ApplyTimerBatch.h"
 #include "transactions/InvokeHostFunctionOpFrame.h"
 #include "transactions/MutableTransactionResult.h"
 #include "transactions/ParallelApplyUtils.h"
@@ -266,12 +267,15 @@ struct HostFunctionMetrics
         }
     }
 
-    std::optional<medida::TimerContext>
+    std::optional<ApplyTimerScope>
     getExecTimer()
     {
         if (!mDisableMetrics)
         {
-            return mMetrics.mHostFnOpExec.TimeScope();
+            auto* batch = currentApplyTimerBatch();
+            return std::make_optional<ApplyTimerScope>(
+                mMetrics.mHostFnOpExec,
+                batch ? &batch->mHostFnExec : nullptr);
         }
         return std::nullopt;
     }

@@ -11,6 +11,7 @@
 #include "ledger/P23HotArchiveBug.h"
 #include "medida/meter.h"
 #include "medida/timer.h"
+#include "transactions/ApplyTimerBatch.h"
 #include "transactions/MutableTransactionResult.h"
 #include "transactions/ParallelApplyUtils.h"
 #include "util/ProtocolVersion.h"
@@ -41,10 +42,12 @@ struct RestoreFootprintMetrics
         mMetrics.mRestoreFpOpReadLedgerByte.Mark(mLedgerReadByte);
         mMetrics.mRestoreFpOpWriteLedgerByte.Mark(mLedgerWriteByte);
     }
-    medida::TimerContext
+    ApplyTimerScope
     getExecTimer()
     {
-        return mMetrics.mRestoreFpOpExec.TimeScope();
+        auto* batch = currentApplyTimerBatch();
+        return ApplyTimerScope(mMetrics.mRestoreFpOpExec,
+                               batch ? &batch->mRestoreFpExec : nullptr);
     }
 };
 

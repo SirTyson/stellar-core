@@ -25,6 +25,7 @@
 #include "transactions/EventManager.h"
 #include "transactions/LumenEventReconciler.h"
 #include "transactions/MutableTransactionResult.h"
+#include "transactions/ApplyTimerBatch.h"
 #include "transactions/ParallelApplyUtils.h"
 #include "transactions/SignatureChecker.h"
 #include "transactions/SignatureUtils.h"
@@ -2411,12 +2412,13 @@ TransactionFrame::parallelApply(
             ledgerInfo.getLedgerVersion() >=
             config.LEDGER_PROTOCOL_MIN_VERSION_INTERNAL_ERROR_REPORT;
 
-        std::optional<medida::TimerContext> opTimer;
+        std::optional<ApplyTimerScope> opTimer;
         if (!config.DISABLE_SOROBAN_METRICS_FOR_TESTING)
         {
-            opTimer.emplace(app.getMetrics()
-                                .NewTimer({"ledger", "operation", "apply"})
-                                .TimeScope());
+            auto* batch = currentApplyTimerBatch();
+            opTimer.emplace(
+                app.getMetrics().NewTimer({"ledger", "operation", "apply"}),
+                batch ? &batch->mOpApply : nullptr);
         }
 
         releaseAssertOrThrow(mOperations.size() == 1);

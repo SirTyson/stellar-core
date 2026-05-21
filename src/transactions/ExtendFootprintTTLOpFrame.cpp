@@ -9,6 +9,7 @@
 #include "ledger/LedgerTypeUtils.h"
 #include "medida/meter.h"
 #include "medida/timer.h"
+#include "transactions/ApplyTimerBatch.h"
 #include "transactions/MutableTransactionResult.h"
 #include "transactions/ParallelApplyUtils.h"
 #include "util/GlobalChecks.h"
@@ -38,10 +39,12 @@ struct ExtendFootprintTTLMetrics
     {
         mMetrics.mExtFpTtlOpReadLedgerByte.Mark(mLedgerReadByte);
     }
-    medida::TimerContext
+    ApplyTimerScope
     getExecTimer()
     {
-        return mMetrics.mExtFpTtlOpExec.TimeScope();
+        auto* batch = currentApplyTimerBatch();
+        return ApplyTimerScope(mMetrics.mExtFpTtlOpExec,
+                               batch ? &batch->mExtFpTtlExec : nullptr);
     }
 };
 

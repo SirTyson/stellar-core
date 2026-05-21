@@ -35,6 +35,7 @@
 #include "rust/RustBridge.h"
 #include "transactions/MutableTransactionResult.h"
 #include "transactions/OperationFrame.h"
+#include "transactions/ApplyTimerBatch.h"
 #include "transactions/ParallelApplyUtils.h"
 #include "transactions/TransactionFrameBase.h"
 #include "transactions/TransactionMeta.h"
@@ -2487,14 +2488,31 @@ LedgerManagerImpl::applyThread(
     Cluster const& cluster, Config const& config, ParallelLedgerInfo ledgerInfo,
     Hash sorobanBasePrngSeed)
 {
+    bool const metricsEnabled =
+        !mApp.getConfig().DISABLE_SOROBAN_METRICS_FOR_TESTING;
+
+    // Per-worker batch of apply-path timer samples. Published in a
+    // thread_local for the duration of the worker so nested transaction /
+    // operation timer scopes (TransactionFrame::parallelApply,
+    // InvokeHostFunctionOpFrame::getExecTimer, etc.) append into it
+    // without touching shared medida histograms or meters. The
+    // accumulated samples are flushed in batches below after the loop
+    // completes, before this worker's future is joined.
+    ApplyTimerBatch batch;
+    std::optional<ScopedApplyTimerBatch> batchGuard;
+    if (metricsEnabled)
+    {
+        batchGuard.emplace(batch);
+    }
+
     for (auto const& txBundle : cluster)
     {
         // Apply timer
-        std::optional<medida::TimerContext> txTime;
-        if (!mApp.getConfig().DISABLE_SOROBAN_METRICS_FOR_TESTING)
+        std::optional<ApplyTimerScope> txTime;
+        if (metricsEnabled)
         {
-            txTime.emplace(
-                mApplyState.getMetrics().mTransactionApply.TimeScope());
+            txTime.emplace(mApplyState.getMetrics().mTransactionApply,
+                           &batch.mTxApply);
         }
 
         Hash txSubSeed = subSha256(sorobanBasePrngSeed, txBundle.getTxNum());
@@ -2516,6 +2534,27 @@ LedgerManagerImpl::applyThread(
     }
 
     threadState->flushRemainingRoTTLBumps();
+
+    if (metricsEnabled)
+    {
+        // Drop the thread_local publication before performing the batched
+        // flushes: the flush itself acquires per-timer locks and should
+        // not be re-entered as if we were still in the worker scope.
+        batchGuard.reset();
+
+        auto& metrics = mApplyState.getMetrics();
+        flushApplyTimerBatch(metrics.mTransactionApply, batch.mTxApply);
+        flushApplyTimerBatch(
+            app.getMetrics().NewTimer({"ledger", "operation", "apply"}),
+            batch.mOpApply);
+
+        auto& sorobanMetrics = getSorobanMetrics();
+        flushApplyTimerBatch(sorobanMetrics.mHostFnOpExec, batch.mHostFnExec);
+        flushApplyTimerBatch(sorobanMetrics.mExtFpTtlOpExec,
+                             batch.mExtFpTtlExec);
+        flushApplyTimerBatch(sorobanMetrics.mRestoreFpOpExec,
+                             batch.mRestoreFpExec);
+    }
 
     return threadState;
 }
