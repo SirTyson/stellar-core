@@ -76,3 +76,25 @@ The projected impact clears the review-stage Medium floor. The direct whole-zone
 - **Change description**: Add a new-protocol-gated contract-address balance helper that constructs the `DataKey::Balance` storage key once, performs one optional storage read, decodes one `BalanceValue`, and returns enough state for authorization plus mutation. Route `spend_balance` and `receive_balance` contract-address branches through it only when `ledger.protocol_version` is above the p26-compatible range; leave account-address paths and p26 behavior unchanged.
 - **Correctness check**: Preserve all existing SAC authorization, missing-balance, insufficient-funds, overflow, clawback, TTL-extension, and event behavior. Existing SAC tests under `stellar_asset_contract` should remain semantically unchanged; only protocol-gated budget constants/expectations may need mechanical updates for the new protocol.
 - **Benchmark focus**: Instrument duplicate `DataKey::Balance` reads inside `is_authorized`, `spend_balance_no_authorization_check`, and `receive_balance` to confirm the count reduction, then run `scripts/run_apply_load_matrix.py` repeatedly without Tracy. The target metric is soroswap median apply time; expected improvement must be at least 3% to satisfy this objective.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-21
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/balance.rs:169-268` adds a protocol-gated typed `ContractBalanceForUpdate` helper that constructs the SAC balance key once, performs one optional storage read, decodes `BalanceValue` once, and carries the original entry/live-until state for mutation.
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/balance.rs:381-475` routes next-protocol contract-address `receive_balance` through the fused helper while preserving the legacy p26/account-address path.
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/balance.rs:534-603` routes next-protocol contract-address `spend_balance` through the fused helper while preserving deauthorization, missing-balance, insufficient-funds, overflow, and zero-spend behavior.
+
+### Demonstration
+
+The optimization is gated by `Budget::coalesced_host_metering`, which is enabled only when the active ledger protocol is above p26, so p26 metering behavior remains on the legacy path. For next-protocol contract-address SAC transfers, sender and receiver balances are each read and decoded once for authorization plus mutation, avoiding the duplicate `is_authorized` read and the later mutation read while preserving the same final ledger entry and SAC event behavior.
+
+### Test Results
+
+`make -j $(nproc)` completed successfully. `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS="--ll fatal -r simple --abort --disable-dots" make check` completed successfully; the final reported suites included `751 passed; 0 failed; 2 ignored` for `soroban_env_host`, followed by all listed Rust integration/doc tests and `test/selftest-nopg` / `test/check-nondet` passing.
