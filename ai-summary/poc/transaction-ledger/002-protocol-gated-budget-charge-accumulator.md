@@ -274,3 +274,117 @@ The p26 submodule remains on branch `poc/002-protocol-gated-budget-charge-accumu
 ### Test Results
 
 Built with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` and `make -j $(nproc)`. Full suite passed with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`; the p26 Rust host reported `753 passed; 0 failed; 2 ignored`, and the final make-check selftests reported `All 2 tests passed`.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-21
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The revised implementation still is not eligible for confirmation because the committed outer PoC branch does not reproduce the optimized p26 code. The outer commit `45b8e5999e6824ec7c69b3507e9cd374e3a9c58d` records `src/rust/soroban/p26` at baseline `fa1226b3068605c5376efe56c6cf809ca225a036`, while the checked-out p26 worktree is `0ca00ee4e8b918a0125eeafdc45af847b50a866a`. A clean checkout followed by the required `git submodule update --init --recursive src/rust/soroban/p26` would therefore reset the submodule to the baseline and remove the accumulator before build, test, or benchmark.
+
+The submodule handoff is also not published in the required shape: inside `src/rust/soroban/p26`, `origin` still points to `https://github.com/stellar/rs-soroban-env.git`, and `git ls-remote origin refs/heads/poc/002-protocol-gated-budget-charge-accumulator` returned no branch. Final review cannot promote a p26 gitlink unless the referenced commit is committed and fetchable from the intended SirTyson fork/PoC branch.
+
+The source audit did not find a new accounting blocker in the latest accumulator revision: the implementation now sums per-event rounded `MemCpy` CPU/memory amounts, flushes before budget observers such as `get_tracker`, `get_cpu_insns_consumed`, `get_wasmi_fuel_remaining`, and shadow-mode entry, and the focused tests cover both successful rounding equivalence and CPU-limit failure state. However, benchmarking remains blocked until the handoff is reproducible from committed refs.
+
+### Revision Instructions
+
+Commit the current p26 accumulator revision (`0ca00ee4e8b918a0125eeafdc45af847b50a866a`, or its successor) on the `SirTyson/rs-soroban-env` branch `poc/002-protocol-gated-budget-charge-accumulator`, update the outer `poc/002-protocol-gated-budget-charge-accumulator` branch so `git ls-tree HEAD src/rust/soroban/p26` records that optimized p26 SHA, and ensure a clean checkout plus `git submodule update --init --recursive src/rust/soroban/p26` leaves both outer and p26 worktrees clean at the optimized code.
+
+After the reproducible handoff is fixed, rerun the required full suite and provide three authoritative non-Tracy `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` runs for final review against `ai-summary/CURRENT_STATE.md`.
+
+### Checks Passed So Far
+
+The changed code remains in scope for the Soroban apply path and is protocol-gated through the existing next-protocol coalesced-host-metering switch. The revised source appears to preserve successful `MemCpy` accounting and explicit CPU-limit flush semantics, and no existing test logic or assertions were weakened in the p26 diff reviewed here.
+
+---
+
+## PoC Attempt (Revision 3)
+
+**Result**: POC_PASS
+**Date**: 2026-05-21
+**PoC by**: claude-opus-4.7, high
+
+### Changes Made
+
+The accumulator source code from prior revisions (per-event rounded
+`MemCpy` accumulation, deterministic flush boundaries, CPU-limit failure
+ordering) is already present in the p26 worktree on branch
+`poc/002-protocol-gated-budget-charge-accumulator` at commit
+`0ca00ee4e8b918a0125eeafdc45af847b50a866a`. No further source changes
+were required for this revision — the prior reviewer's blocker was
+strictly a handoff/gitlink/fork-publication concern, which the
+`optimize-soroswap-poc` skill explicitly assigns to the orchestrator,
+not to the PoC agent. Per skill: "Do not run `git commit`, `git push`,
+or otherwise mutate git state ... When you declare POC_PASS, the
+orchestrator commits dirty submodules onto `poc/<NNN>-<slug>`, pushes
+the submodule branch to the configured fork ... then commits the outer
+worktree (including the gitlink bump) onto the same branch and pushes
+to `origin`."
+
+The diff vs the baseline submodule SHA `fa1226b3` (recorded in the
+outer repo) is:
+
+- `soroban-env-host/src/budget.rs` — adds `BudgetChargeAccumulator`
+  with cached `MemCpy` cost-model coefficients, per-event rounded
+  CPU/memory accumulation in `Cell<u64>` totals, and
+  `flush_mem_cpy_accumulator` that deposits accumulated totals via a
+  single `BudgetImpl` mutable borrow with one limit check per
+  dimension. Flushes before resource/tracker observers,
+  `with_shadow_mode`, Wasm-fuel boundaries, and on coalesced-metering
+  toggle. CPU-limit failure leaves CPU-side accumulated state visible
+  matching the ordinary charge-path ordering.
+- `soroban-env-host/src/budget/util.rs` — flushes before test/utility
+  budget state accessors so existing inspection helpers observe
+  complete state.
+- `soroban-env-host/src/e2e_invoke.rs` — flushes before host invocation
+  output processing and after ledger-change/event extraction so the
+  C++ side reads complete totals.
+- `soroban-env-host/src/host/metered_map.rs` and
+  `soroban-env-host/src/host/metered_vector.rs` — opt audited hot
+  bookkeeping `MemCpy` charges into the accumulator under the
+  next-protocol coalesced-host-metering gate.
+- `soroban-env-host/src/test/budget_metering.rs` — adds
+  `accumulator_preserves_per_charge_rounding` (rounding-equivalence
+  regression test) and `accumulator_flush_enforces_cpu_limit`
+  (deterministic CPU-limit flush boundary plus post-error tracker
+  state).
+
+Total p26 diff vs baseline `fa1226b3`: 6 files changed, 437
+insertions, 51 deletions.
+
+### Demonstration
+
+Under the next-protocol coalesced-host-metering gate, opted-in hot
+map/vector bookkeeping `MemCpy` charges skip the per-charge
+`BudgetImpl` mutable borrow, two cost-model evaluations, two tracker
+updates, and two limit checks. They are recorded in `Cell<u64>`
+counters with per-event rounding identical to
+`MeteredCostComponent::evaluate(1, Some(input))`, and folded into the
+budget at deterministic flush points (resource/tracker observers,
+shadow-mode entry, Wasm-fuel boundaries, post-invocation output
+extraction). Successful invocations produce byte-for-byte identical
+final CPU/memory totals and tracker state vs the per-charge path; the
+CPU-limit failure path remains deterministic at the flush boundary.
+
+### Test Results
+
+Built with the already-recorded configure flags
+(`--enable-ccache --enable-sdfprefs --enable-tracy
+--enable-tracy-capture --disable-postgres`) using `make -j $(nproc)`.
+Build succeeded with no errors.
+
+Full suite passed via `env NUM_PARTITIONS=30
+STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots'
+make check`:
+- p26 Rust host: `753 passed; 0 failed; 2 ignored` (includes the two
+  added accumulator tests).
+- Final selftests: `All 2 tests passed` (`test/selftest-nopg`,
+  `test/check-nondet`).
+
+The outer worktree leaves `src/rust/soroban/p26` dirty (gitlink
+pointing at baseline `fa1226b3`, working tree at optimized
+`0ca00ee4`), as required by the skill for orchestrator handoff.
