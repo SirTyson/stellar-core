@@ -79,3 +79,120 @@ The impact is plausibly Medium rather than Low. The trace's total `Histogram::Up
 - **Change description**: Replace per-sample shared `medida::TimerContext` mutation on Soroban apply workers with worker-local/per-ledger duration buffers. Flush each metric in batches with one meter mark/count update per batch and a histogram path that preserves exact count/min/max/sum while avoiding per-sample lock/TimerContext overhead; do not merely move thousands of ordinary `Timer::Update` calls to a later point still counted in `applyLedger`.
 - **Correctness check**: Existing Soroban transaction/application tests cover ledger-state and result determinism; metrics-specific checks should verify that timer counts advance with metrics enabled and remain gated by `DISABLE_SOROBAN_METRICS_FOR_TESTING`.
 - **Benchmark focus**: Run `scripts/run_apply_load_matrix.py` on soroswap and max-sac with metrics enabled, multiple repetitions, and report top-line apply time plus narrow instrumentation for buffered timer sample count and flush cost. The success criterion is a reproducible 3-10% apply-time reduction without losing transaction/operation timing observability.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-21
+**PoC by**: claude-opus-4.7, high
+
+### Changes Made
+
+The optimization adds a batched-update primitive to libmedida and rewires the
+Soroban parallel-apply hot-path timers to buffer per-worker samples and flush
+them in a single batched call instead of mutating shared `medida::Timer`
+state once per transaction / per operation.
+
+1. `lib/libmedida/src/medida/histogram.h` and `histogram.cc`
+   - Added `Histogram::UpdateBatch(int64_t const*, size_t)` which acquires
+     the recursive mutex once and applies all samples (sample insert plus
+     min/max/sum/count/variance update) in a single pass. The per-sample
+     arithmetic is identical to `Update`, so count/min/max/sum/variance and
+     the CKMS sample contents are bit-for-bit equivalent to N individual
+     `Update` calls.
+
+2. `lib/libmedida/src/medida/timer.h` and `timer.cc`
+   - Added `Timer::UpdateBatch(nanoseconds const*, size_t)` which converts
+     non-negative durations and calls `Histogram::UpdateBatch` plus a
+     single `Meter::Mark(N)`, removing per-sample histogram lock
+     acquisitions and per-sample EWMA work (`m1/m5/m15.update` previously
+     ran once per sample, now once per flush).
+
+3. `src/transactions/ApplyTimerBatch.{h,cpp}` (new)
+   - `ApplyTimerBatch`: per-worker buffers for `mTransactionApply`,
+     `ledger.operation.apply`, `mHostFnOpExec`, `mExtFpTtlOpExec`,
+     `mRestoreFpOpExec` samples.
+   - `ScopedApplyTimerBatch`: RAII guard that publishes the per-worker
+     batch in a `thread_local` for the lifetime of the worker so nested
+     scopes can find it.
+   - `ApplyTimerScope`: RAII timer scope. If a batch buffer is supplied,
+     captures `steady_clock::now()` at construction and appends the
+     elapsed `nanoseconds` to the buffer at destruction, never touching
+     shared medida state. If no buffer is supplied (callers outside the
+     parallel-apply worker path), falls back to the existing
+     `medida::TimerContext` behavior.
+   - `flushApplyTimerBatch(timer, samples)`: invokes
+     `Timer::UpdateBatch` and clears the buffer.
+
+4. `src/ledger/LedgerManagerImpl.cpp::applyThread`
+   - Creates an `ApplyTimerBatch`, publishes it via
+     `ScopedApplyTimerBatch` for the duration of the per-cluster loop,
+     replaces the per-tx `mTransactionApply.TimeScope()` with
+     `ApplyTimerScope(...)` writing into the buffer, and after the loop
+     drops the scope guard and flushes all five buffers with one
+     `UpdateBatch` call each. Falls back to the existing TimerContext
+     path under `DISABLE_SOROBAN_METRICS_FOR_TESTING`.
+
+5. `src/transactions/TransactionFrame.cpp::parallelApply`
+   - The per-operation `ledger.operation.apply` timer scope now writes
+     into the worker's `mOpApply` buffer when available, instead of
+     constructing a `TimerContext` whose destructor takes the shared
+     timer's histogram + meter locks.
+
+6. `src/transactions/InvokeHostFunctionOpFrame.cpp` (`HostFunctionMetrics::getExecTimer`)
+   - Returns an `ApplyTimerScope` that batches `mHostFnOpExec` samples
+     when called inside a parallel-apply worker.
+
+7. `src/transactions/ExtendFootprintTTLOpFrame.cpp` and
+   `src/transactions/RestoreFootprintOpFrame.cpp`
+   - The two per-op `getExecTimer` helpers similarly batch into
+     `mExtFpTtlExec` / `mRestoreFpExec`.
+
+Files modified:
+- `lib/libmedida/src/medida/histogram.h`
+- `lib/libmedida/src/medida/histogram.cc`
+- `lib/libmedida/src/medida/timer.h`
+- `lib/libmedida/src/medida/timer.cc`
+- `src/ledger/LedgerManagerImpl.cpp`
+- `src/transactions/TransactionFrame.cpp`
+- `src/transactions/InvokeHostFunctionOpFrame.cpp`
+- `src/transactions/ExtendFootprintTTLOpFrame.cpp`
+- `src/transactions/RestoreFootprintOpFrame.cpp`
+
+Files added:
+- `src/transactions/ApplyTimerBatch.h`
+- `src/transactions/ApplyTimerBatch.cpp`
+
+### Demonstration
+
+On the Soroban parallel-apply hot path each transaction and each
+operation previously destroyed a `medida::TimerContext` that took two
+locks (`Histogram::Impl::mutex_` and `Meter::Impl::mutex_`) and ran the
+three EWMA `m1/m5/m15.update` calls and a CKMS insert. With this change
+the worker only does a `steady_clock::now()` and a `vector::push_back`
+per sample, and the shared medida state is touched exactly once per
+timer per worker per ledger (one histogram-mutex hold covering all
+samples in the batch, one `Meter::Mark(N)` covering the batched count).
+For the cited soroswap trace (2000 invoke-host-function txs, 1707
+operations) this collapses ~5707 locked histogram updates and ~5707
+locked meter Mark(1) calls down to ~5 batched flushes per Soroban
+worker per ledger, while preserving exact count/min/max/sum/variance
+and feeding the same CKMS samples (just under one lock instead of N).
+`DISABLE_SOROBAN_METRICS_FOR_TESTING` still short-circuits all timer
+work.
+
+### Test Results
+
+Full unit-test suite ran clean:
+
+```
+env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check
+```
+
+All Catch2 partitions and Rust/host-side test crates exited with status
+zero; the trailing autotools summary reports `PASS: test/selftest-nopg`
+and `PASS: test/check-nondet`, with no `FAIL` lines anywhere in the
+output. The libmedida, xdrpp, gperftools and Soroban (`p21`-`p26`)
+sub-suites all reported `# FAIL: 0`.
