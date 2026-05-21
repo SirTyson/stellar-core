@@ -93,3 +93,27 @@ The projected impact meets the objective's Medium review bar but not High. The a
 - **Change description**: Under a next-protocol gate, accumulate eligible additive charges as `(iterations, input_sum)` per cost type, evaluate CPU and memory totals once per flush using the same linear model, update `meter_count` and per-cost trackers by the exact accumulated counts, then check CPU and memory limits. Do not globally defer all `MemCpy`/`MemAlloc`/`ValSer`/`VisitObject` charges by cost type alone; use explicit safe-site opt-in or a scoped host-internal API.
 - **Correctness check**: Existing coverage to run in the PoC stage includes Rust budget metering tests in `src/rust/soroban/p26/soroban-env-host/src/test/budget_metering.rs`, host/object/vector/map/XDR tests that assert budget trackers, and transaction-level Soroban resource-limit tests in `src/transactions/test/InvokeHostFunctionTests.cpp`. Add next-protocol tests for equivalent successful final CPU/memory totals, deterministic over-budget failure at a flush boundary, shadow-mode isolation, and immediate flush before `get_tracker`/resource getter observations.
 - **Benchmark focus**: Add temporary counters for accumulated-charge hits, immediate-charge fallbacks, and flush count by cost type, plus a non-Tracy before/after apply-load matrix for soroswap. The expected metric is a reproducible 3-10% reduction in top-line apply time; Tracy should be used only to confirm that `charge` call count and eligible map/vector/conversion charge sites are reduced or amortized, not as the production timing proof.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-21
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/budget.rs:47-84,328-388,1392-1720` — added a protocol-enabled `BudgetChargeAccumulator` beside the existing `BudgetImpl`, an accumulated `MemCpy` flush path that updates tracker and dimension totals once, and flushes before budget state/resource observation, shadow mode, Wasm fuel boundaries, and reset/default transitions.
+- `src/rust/soroban/p26/soroban-env-host/src/budget/util.rs:25-147` — flushed accumulated charges before test/utility budget state accessors and mutators so existing budget inspection helpers observe complete state.
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:561-580` — flushed before host invocation output processing and after ledger-change/event extraction so C++ output metrics see complete budget totals.
+- `src/rust/soroban/p26/soroban-env-host/src/host/metered_map.rs:63-80,447-486` — opted audited map scan, binary-search, and map-compare bookkeeping `MemCpy` charges into the accumulator.
+- `src/rust/soroban/p26/soroban-env-host/src/host/metered_vector.rs:38-51,339-370` — opted audited vector scan/access/search and vector-compare bookkeeping `MemCpy` charges into the accumulator.
+
+### Demonstration
+
+The implementation removes the `BudgetImpl` mutable borrow, per-cost tracker update, two cost-model evaluations, and two limit checks from each opted-in hot map/vector bookkeeping `MemCpy` charge while the next-protocol coalesced-host-metering gate is enabled. Those charges are recorded in cheap `Cell` counters and applied at deterministic flush points, so successful invocations still report complete final budget totals while over-budget detection moves to the protocol-defined flush boundary.
+
+### Test Results
+
+Built with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` and `make -j $(nproc)`. Full suite passed with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`; the p26 Rust host reported `751 passed; 0 failed; 2 ignored`, and the final make-check selftests reported `All 2 tests passed`.
