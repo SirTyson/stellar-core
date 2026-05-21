@@ -95,3 +95,33 @@ The PoC moves the expensive stage read-write key scan and `ThreadParApply` to `G
 ### Test Results
 
 Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`, built with `make -j $(nproc)`, and ran `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`. The full existing suite completed successfully, ending with `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-05-21
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** YES — the diff is confined to `GlobalParallelApplyLedgerState::commitChangesFromThreads` and related helpers. It parallelizes stage RW/TTL key-set construction and `ThreadParApply` to `GlobalParApply` dirty-entry collection while keeping final `mGlobalEntryMap` mutation single-threaded.
+2. **Are the preconditions realistic?** YES — the targeted code is reached from `applySorobanStage` after worker completion and before the next stage, so any real speedup would affect normal parallel Soroban apply. The measured workload did not show such a speedup.
+3. **Is the original code inefficient or working as designed?** INEFFICIENCY, but not successfully optimized — the serial merge is real apply-path work, but the proposed two-phase `std::async` collection adds enough overhead and still leaves the deterministic final install serial.
+4. **Does the benchmark improvement match the claimed severity?** NO — independent non-Tracy matrix runs showed no eligible improvement. Baseline soroswap medians were 272.249541 / 275.885919 / 270.551362 ms (avg 272.895607 ms). Optimized medians were 271.599889 / 275.972539 / 273.325672 ms (avg 273.632700 ms), a 0.27% regression. SAC also regressed from 306.542755 ms average to 308.541343 ms average, a 0.65% regression.
+5. **Is the optimization in scope?** YES — the source path is under `closeLedger` / `applyLedger` and not TX-set construction or background bucket merge work.
+6. **Is the benchmark methodology correct?** YES — the optimized build used the required Tracy-capable configuration plus the next-protocol flag required by the accepted baseline, the full test suite passed, and the authoritative command `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` was run three times without `--tracy`.
+7. **Can the improvement be explained without the optimization?** YES — the only favorable soroswap run was a small 0.24% single-run difference, well inside observed run-to-run noise, while the other runs and the average moved in the wrong direction.
+8. **Is this optimization novel?** NOVEL — no duplicate accepted optimization was found, but novelty does not overcome the failed benchmark result.
+
+### Rejection Reason
+
+The PoC fails the objective's headline metric. Soroswap apply time did not improve consistently across the three required non-Tracy benchmark runs and regressed on average; max-sac also regressed on average. Because the accepted baseline is already faster and the measured delta is below the 1% validity floor in the wrong direction, the performance claim is unsupported.
+
+### Failed Checks
+
+- Performance final-review Step 5: benchmark improvement was not measurable or positive.
+- Adversarial check 4: benchmark improvement does not match the claimed severity.
+- Adversarial check 7: any isolated favorable result is explainable by noise.

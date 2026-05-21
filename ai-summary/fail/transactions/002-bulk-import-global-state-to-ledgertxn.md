@@ -33,3 +33,34 @@ The current code already tracks `mIsNew` in parallel apply specifically to avoid
 ## Anti-Evidence
 
 The full 100 ms zone is an upper bound: a correct implementation still has to scan `mGlobalEntryMap`, move scoped entries safely, allocate or represent `LedgerEntryPtr` state, handle deletes exactly, mark restored entries, and commit the child `LedgerTxn`. Offer entries require order-book maintenance in `updateEntry`, so a bulk fast path should either be Soroban-entry-only or explicitly fall back to existing per-entry behavior for non-Soroban/offer keys.
+
+---
+
+## Review
+
+**Verdict**: NOT_VIABLE
+**Date**: 2026-05-21
+**Reviewed by**: gpt-5.5, high
+**Novelty**: PASS
+**Failed At**: reviewer
+
+### Trace Summary
+
+`LedgerManagerImpl::applySorobanStages` constructs `GlobalParallelApplyLedgerState`, applies each stage, and then synchronously calls `commitChangesToLedgerTxn` before the apply path can proceed. `commitChangesToLedgerTxn` creates a child `LedgerTxn`, scans `mGlobalEntryMap`, imports each dirty live entry via `createWithoutLoading` or `updateWithoutLoading`, handles deletes through `load`/`erase`, marks restored entries, and commits the child transaction. The inefficiency is real, but the cited 3.7% max-sac number is the whole zone, not the removable portion of the proposed bulk API.
+
+### Code Paths Examined
+
+- `src/ledger/LedgerManagerImpl.cpp:2672-2717` — `applySorobanStages` calls `globalParState.commitChangesToLedgerTxn(ltx)` after all Soroban stages and measures it as `sorobanCommitToLtxMs` in test builds.
+- `src/transactions/ParallelApplyUtils.cpp:721-800` — `commitChangesToLedgerTxn` performs the dirty scan, per-entry import, restored-entry marking, and final `ltxInner.commit()`.
+- `src/ledger/LedgerTxn.cpp:796-864` — moved-entry `createWithoutLoading` and `updateWithoutLoading` already avoid the deep copy but still perform thread/seal/child checks, `mActive` lookup, key extraction, `shared_ptr<InternalLedgerEntry>` allocation, and `updateEntry`.
+- `src/ledger/LedgerTxn.cpp:570-626` — committing the child `LedgerTxn` iterates the child entries and calls `updateEntry` on the parent, so a child-side bulk import alone does not remove the final per-entry parent merge.
+- `src/ledger/LedgerTxn.cpp:2487-2561` — `updateEntry`'s non-offer path is already essentially `mEntry.emplace` plus merge semantics; the order-book branch is bypassed for Soroban contract/TTL entries.
+- `src/ledger/LedgerTxn.cpp:2642-2661` and `src/ledger/LedgerTxn.h:527-528` — `prepareNewObjects` already exists to reserve `LedgerTxn::Impl::mEntry`, so the lowest-risk reserve-only portion does not require a new bulk import mechanism.
+
+### Why It Failed
+
+The proposed change cannot plausibly clear the objective's Medium threshold. The max-sac evidence gives only a 3.7% whole-zone upper bound, so reaching the required 3% apply-time reduction would require eliminating more than 80% of `commitChangesToLedgerTxn`. A correct implementation still must scan dirty global entries, move scoped ledger entries, allocate or otherwise represent `LedgerEntryPtr`s, insert them into a LedgerTxn map, preserve delete/restored-entry semantics, and then commit the child into the parent, which performs another per-entry `updateEntry` merge. The easy reserve optimization is already available through `prepareNewObjects`, and the soroswap-specific cited cost is only 27 ms before subtracting mandatory work.
+
+### Lesson Learned
+
+For final parallel-apply materialization, treat `commitChangesToLedgerTxn` as an upper bound that includes mandatory child commit and parent merge work. A viable Medium-tier hypothesis needs either a direct measurement of the removable child-import subset above 3% of apply time, or a broader LedgerTxn commit redesign that safely removes both child and parent per-entry overhead rather than only wrapping `createWithoutLoading` / `updateWithoutLoading` in a bulk API.
