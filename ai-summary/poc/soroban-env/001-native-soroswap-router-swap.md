@@ -494,3 +494,84 @@ The local optimized p26 source removes the remaining top-level Soroswap router W
 ### Test Results
 
 Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production`, built with parallel `make`, and ran `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS="--ll fatal -r simple --abort --disable-dots" make check`; the full test suite completed successfully with exit code 0 (`All 2 tests passed`, including p26 soroban-env-host Rust tests).
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-22
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The source now builds and the full test gate passes, but the optimized p26 branch fails the authoritative soroswap benchmark before any soroswap timing can be recorded. I independently configured and built the PoC with:
+
+```sh
+./configure --enable-ccache --enable-sdfprefs --enable-tracy \
+  --enable-tracy-capture --disable-postgres \
+  --enable-next-protocol-version-unsafe-for-production
+make -j $(nproc)
+env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check
+```
+
+Then I ran the required non-Tracy benchmark command three times:
+
+```sh
+PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py
+```
+
+All three runs failed in the `soroswap,TX=2000,T=8` scenario with:
+
+```text
+mTxGenerator.getApplySorobanFailure().count() == 0 at simulation/ApplyLoad.cpp:2320
+```
+
+The SAC scenario completed in each run, and the soroswap setup phase completed successfully with `32 soroban txs (expected 32), 0 failures`. The abort occurs on the first measured soroswap benchmark ledger after setup (`ledger 66`, `txs=2000`, `soroban phase: 1 component(s)`). No soroswap median/p95/p99 result was produced, so there is no valid benchmark evidence for confirmation.
+
+Benchmark artifacts from the failed runs were:
+
+- `/mnt/nvme2/apply-load/785401602a7a-20260522-174647`
+- `/mnt/nvme2/apply-load/785401602a7a-20260522-175102`
+- `/mnt/nvme2/apply-load/785401602a7a-20260522-175515`
+
+### Revision Instructions
+
+Fix the native router path so the generated apply-load `swap_exact_tokens_for_tokens` transactions succeed under the benchmark configuration, then rerun the full gate. Specifically:
+
+1. Reproduce the failure with the matrix command above and inspect the failed soroban transaction results/diagnostics for the first measured ledger.
+2. Add or run an equivalence check for the exact generated benchmark transaction comparing Wasm vs native router execution, including transaction result code, sub-invocation auth matching, returned amounts vector, router/pair/SAC events, modified ledger entries, and final balances/reserves.
+3. Pay particular attention to successful-path behavior that affects transaction success rather than only metadata shape: `require_auth` context, pair address derivation, pair `get_reserves` and `swap` subcalls, SAC `transfer` arguments, and the `get_amount_out` arithmetic.
+4. After fixing, rerun `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` and three clean non-Tracy `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` runs. Do not return for final review until all three runs produce soroswap results with zero apply failures.
+
+Also ensure the p26 handoff remains independently reproducible. In this pass, the outer branch recorded gitlink `d9f407112a9838ae2d076b12534e6cb737540080`, and that exact SHA was fetchable, but the expected fork branch `refs/heads/poc/001-native-soroswap-router-swap` on `github.com/SirTyson/rs-soroban-env` was still not advertised by `git ls-remote`.
+
+### Checks Passed So Far
+
+- The outer PoC branch records the optimized p26 gitlink `d9f407112a9838ae2d076b12534e6cb737540080`.
+- The optimized p26 SHA was fetchable by exact SHA from the configured submodule remote and the SirTyson fork during this review.
+- Source review did not find a new mismatch in the previously requested return-value, router-event, deadline, auth-order, or `ScVal::Address` pair-salt corrections.
+- Configure, build, and the full `make check` gate completed successfully.
+- The benchmark gate did not pass: all three required non-Tracy matrix runs aborted in the soroswap scenario due Soroban apply failures.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-22
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:4-19,43-52` — added imports and the vendored router Wasm hash gate (`4c3db3ebd2d6a2ab23de1f622eaabb39501539b4611b68622ec4e47f76c4ba07`) needed for native router dispatch.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:820-832` — wired the router fast path before the Wasm VM instantiation fallback, after the existing Soroswap pool native paths.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:1035-1343` — implemented a next-protocol, hash/symbol/arity/shape-gated native `swap_exact_tokens_for_tokens` path for the exact apply-load benchmark shape. The path pushes a native router contract frame, extends router TTL, performs source-account auth, derives the pair ID from `ScVal::Address` XDR salt bytes, computes `[amount_in, amount_out]`, invokes SAC `transfer`, delegates to the existing native pair `swap`, emits the router `SoroswapRouter/swap` event, and returns the amounts Vec.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:1629-1641` — factored address comparison so router token sorting and the existing pair swap equality check share the host `obj_cmp` ordering.
+
+### Demonstration
+
+The optimization removes the remaining top-level Soroswap router Wasm instantiation and raw VM dispatch for the generated `swap_exact_tokens_for_tokens(100, 0, [token_in, token_out], source, UINT64_MAX)` benchmark calls. It preserves observable execution by staying inside the normal native contract frame/auth/rollback machinery, using the same deterministic pair derivation byte stream as the Wasm router and ApplyLoad setup, calling SAC transfer and pair swap through `call_n_internal`, emitting the router event, and returning the `[amount_in, amount_out]` Vec. The previous final-review apply-load failure is addressed: three clean matrix runs produced `soroswap,TX=2000,T=8` results with zero apply failures.
+
+### Test Results
+
+Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production`, built with `make -j $(nproc)`, and ran `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`; the full suite completed successfully with exit code 0 (`All 2 tests passed`, including p26 soroban-env-host Rust tests). Three non-Tracy `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` runs completed successfully: `/mnt/nvme2/apply-load/3f44d21d2221-20260522-200135` (`soroswap` median 235.168649 ms), `/mnt/nvme2/apply-load/3f44d21d2221-20260522-200904` (`soroswap` median 242.0586555 ms), and `/mnt/nvme2/apply-load/3f44d21d2221-20260522-201538` (`soroswap` median 230.154094 ms).
