@@ -294,3 +294,129 @@ The local handoff now has the outer worktree pointing at the optimized p26 submo
 ### Test Results
 
 Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`, built with `make -j $(nproc)`, and ran `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`; the full suite completed successfully with exit code 0, including the p26 soroban-env-host Rust tests and the `selftest-nopg` / `check-nondet` aggregate tests.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-22
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The source-level router emulation now traces plausibly against the vendored
+router Wasm for the successful apply-load path, but the committed handoff is
+still not reproducible from a clean checkout. The outer PoC branch
+`poc/001-native-soroswap-router-swap` exists on the SirTyson `stellar-core`
+fork at `20d2f1ee5ff99d30264906a2540e05fce1bc3287`, and its gitlink records
+the optimized p26 commit `d9f407112a9838ae2d076b12534e6cb737540080`.
+However, the p26 submodule commit is not reachable from either the configured
+submodule remote (`https://github.com/stellar/rs-soroban-env.git`) or the
+expected SirTyson fork (`https://github.com/SirTyson/rs-soroban-env.git`), and
+the expected `poc/001-native-soroswap-router-swap` branch does not exist on the
+SirTyson p26 fork.
+
+A fresh checkout of the outer PoC branch followed by
+`git submodule update --init --recursive src/rust/soroban/p26` cannot fetch the
+gitlink target from the recorded submodule source. Because final review must
+validate and promote committed, reproducible branch state, this handoff is not
+eligible for the full test and benchmark gate yet. I stopped the local build
+after discovering the unreproducible p26 ref; local-only source state is not an
+acceptable basis for confirmation.
+
+### Revision Instructions
+
+Publish the p26 side of the handoff, then return for final review:
+
+1. Push `d9f407112a9838ae2d076b12534e6cb737540080` or a newer corrected p26
+   commit to `github.com/SirTyson/rs-soroban-env` on branch
+   `poc/001-native-soroswap-router-swap`.
+2. Ensure the outer branch `poc/001-native-soroswap-router-swap` records that
+   exact pushed p26 SHA in `src/rust/soroban/p26`.
+3. Verify from a clean checkout that `git submodule update --init --recursive
+   src/rust/soroban/p26` lands on the optimized p26 commit without relying on a
+   pre-existing local submodule object.
+4. Return with that reproducible paired branch state; final review can then run
+   the full test suite and the required three non-Tracy benchmark matrix runs.
+
+### Checks Passed So Far
+
+- The outer PoC branch exists on the SirTyson `stellar-core` fork and records
+  the optimized p26 gitlink.
+- The local p26 source diff is isolated to
+  `soroban-env-host/src/host/frame.rs`.
+- Disassembly of `src/rust/apply-load-wasm/soroswap_router.wasm` confirms the
+  revised success-path ordering matches the native implementation at a high
+  level: TTL extension, `require_auth`, deadline check, pair lookup, SAC
+  transfer, pair `swap`, router event, and returning the amounts vector.
+- No benchmark verdict was attempted because reproducibility failed before the
+  test/benchmark gate.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-22
+**PoC by**: claude-opus-4.7, high
+
+### Changes Made
+
+- `src/rust/soroban/p26` — outer gitlink remains at the optimized p26 submodule
+  commit `d9f407112a9838ae2d076b12534e6cb737540080` on local p26 branch
+  `poc/001-native-soroswap-router-swap`, which contains the hash-gated native
+  `swap_exact_tokens_for_tokens` router fast path.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs` — verified the
+  existing optimized p26 source contains (lines noted approximate):
+  - `SOROSWAP_ROUTER_WASM_HASH` constant at line 46 and the router/library
+    contract error code constants at lines 72-78.
+  - Dispatch wiring at lines 824-836 that invokes
+    `try_call_native_soroswap_router_swap_exact_tokens_for_tokens` ahead of
+    the Wasm VM instantiation fallback (after the existing pool getter/swap
+    native checks).
+  - Full implementation at lines 1042-1412 covering: protocol/hash/symbol/
+    arity/argument-shape gates, native `Frame::NativeContract` push for the
+    router, router TTL extension, `require_auth`, deadline check,
+    `ScVal::Address`-based pair salt derivation (matching the Wasm router's
+    `serialize_to_bytes` path and `ApplyLoad.cpp:3099-3108`), reserve/output
+    computation with `INSUFFICIENT_OUTPUT_AMOUNT` enforcement, SAC `transfer`
+    via `call_n_internal`, delegation to the native pair `swap`,
+    `SoroswapRouter/swap` event emission, and returning the
+    `[amount_in, amount_out]` Vec. Non-matching cases fall back to Wasm.
+
+No source code changes were required in this PoC iteration: the prior PoC
+already contained the correct optimization and corrected pair-salt derivation,
+and the prior final-review failure was an unreproducible-handoff issue rather
+than a source-correctness issue. The handoff state (publishing the p26 commit
+to the SirTyson `rs-soroban-env` fork on
+`poc/001-native-soroswap-router-swap`) is the orchestrator's responsibility
+per the `optimize-soroswap-poc` skill ("Do not run `git commit`, `git push`,
+or otherwise mutate git state... the orchestrator commits dirty submodules
+onto `poc/<NNN>-<slug>`, pushes the submodule branch to the configured fork
+(`fork` remote for p26 → `github.com/SirTyson/rs-soroban-env`)").
+
+### Demonstration
+
+The native router fast path removes the remaining top-level Soroswap router
+Wasm instantiation and raw VM dispatch for the exact apply-load
+`swap_exact_tokens_for_tokens` shape. It preserves observable execution by
+keeping the existing contract frame/auth/rollback machinery, deriving the pair
+contract ID from the same `ScVal::Address` XDR byte stream the Wasm router
+hashes via `serialize_to_bytes`, calling SAC `transfer` and the existing
+native pair `swap` through `call_n_internal`, emitting the `SoroswapRouter`
+swap event with `{amounts, path, to}`, and returning the
+`[amount_in, amount_out]` Vec. All non-matching protocol/hash/symbol/arity/
+argument-shape cases fall back to Wasm.
+
+### Test Results
+
+Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy
+--enable-tracy-capture --disable-postgres
+--enable-next-protocol-version-unsafe-for-production` (existing
+`config.status`), built with `make -j $(nproc)` (succeeded; only the
+top-level `stellar-core` Rust crate recompiled in 5m00s under ccache, then
+linked), and ran `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal
+-r simple --abort --disable-dots' make check`; the full command completed
+successfully with exit code 0, including the p26 `soroban-env-host` Rust
+test suite and the `selftest-nopg` / `check-nondet` aggregate tests
+("All 2 tests passed").
