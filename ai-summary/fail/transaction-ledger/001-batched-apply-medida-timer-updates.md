@@ -196,3 +196,65 @@ zero; the trailing autotools summary reports `PASS: test/selftest-nopg`
 and `PASS: test/check-nondet`, with no `FAIL` lines anywhere in the
 output. The libmedida, xdrpp, gperftools and Soroban (`p21`-`p26`)
 sub-suites all reported `# FAIL: 0`.
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-05-21
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** YES — the diff targets the claimed hot timers by replacing per-transaction / per-operation `medida::TimerContext` updates in Soroban parallel apply with worker-local duration buffers and libmedida `UpdateBatch`.
+2. **Are the preconditions realistic?** YES — the changed paths are exercised by the soroswap apply-load workload under `applyLedger`.
+3. **Is the original code inefficient or working as designed?** INEFFICIENCY — the per-sample shared histogram/meter updates are metrics-only work and not consensus state.
+4. **Does the benchmark improvement match the claimed severity?** NO — the independent authoritative non-Tracy benchmark runs show regressions, not improvement.
+5. **Is the optimization in scope?** YES — the modified timer scopes are descendants of `applyLedger` and do not target TX-set construction.
+6. **Is the benchmark methodology correct?** YES — the final review used the required local-build command, `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py`, run exactly three times without `--tracy`, and compared against `ai-summary/CURRENT_STATE.md`.
+7. **Can the improvement be explained without the optimization?** NOT APPLICABLE — there is no measured improvement to explain; the optimized runs are consistently slower.
+8. **Is this optimization novel?** NOVELTY NOT DISPUTED — duplicate handling is outside this final review.
+
+### Benchmark Results
+
+Baseline from `ai-summary/CURRENT_STATE.md`:
+
+| run | sac median_ms | soroswap median_ms |
+|-----|---------------|--------------------|
+| 1 | 306.357371 | 272.249541 |
+| 2 | 300.543791 | 275.885919 |
+| 3 | 312.727103 | 270.551362 |
+
+Independent optimized non-Tracy runs:
+
+| run | artifact directory | sac median_ms | soroswap median_ms |
+|-----|--------------------|---------------|--------------------|
+| 1 | `/mnt/nvme2/apply-load/8da1a64e5cf6-20260521-214915` | 330.059014 | 285.922630 |
+| 2 | `/mnt/nvme2/apply-load/8da1a64e5cf6-20260521-215602` | 340.390290 | 290.276738 |
+| 3 | `/mnt/nvme2/apply-load/8da1a64e5cf6-20260521-220248` | 363.784156 | 289.726871 |
+
+Average soroswap median regressed from 272.895607 ms to 288.642080 ms (+5.77%). Average max-sac median regressed from 306.542755 ms to 344.744487 ms (+12.46%). Because the required headline soroswap metric regressed in all three runs, no diagnostic `--tracy` run was collected.
+
+### Test Results
+
+The optimized branch built with:
+
+```sh
+./configure --enable-ccache --enable-sdfprefs --enable-tracy \
+            --enable-tracy-capture --disable-postgres \
+            --enable-next-protocol-version-unsafe-for-production
+make -j $(nproc)
+```
+
+The first full `make check` attempt hit a one-off third-party gperftools allocator test failure (`tcm_min_asserts_unittest`, `LargeAllocsRelease` allocation-failure threshold). A rerun with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make -j $(nproc) check` completed successfully, including `PASS: test/selftest-nopg` and `PASS: test/check-nondet`.
+
+### Rejection Reason
+
+The optimization does not meet the performance objective. It consistently regresses the headline soroswap apply-time metric versus the accepted baseline, and it also materially regresses max-sac. Under the objective's verdict criteria, soroswap regression blocks CONFIRMED and warrants rejection.
+
+### Failed Checks
+
+- Check 4: benchmark improvement does not match claimed severity; it is a reproducible regression.
+- Verdict criteria: soroswap regressed across all three authoritative non-Tracy benchmark runs.
