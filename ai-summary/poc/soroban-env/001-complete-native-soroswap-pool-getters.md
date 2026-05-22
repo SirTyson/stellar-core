@@ -96,3 +96,53 @@ The implementation bypasses fresh `Vm` construction and raw Wasm export invocati
 ### Test Results
 
 Full existing suite passed with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make -j30 check`: gperftools reported 29/29 tests passing; stellar-core `test/selftest-nopg` and `test/check-nondet` passed; p26 Soroban host reported 751 passed, 0 failed, 2 ignored, 1 filtered out, plus integration/doc tests passing.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-22
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The native getter emulation is not protocol-gated. `try_call_native_soroswap_pool_getter` is invoked unconditionally for `ContractExecutable::Wasm` when the code hash and getter shape match, including when `LedgerInfo.protocol_version == MIN_LEDGER_PROTOCOL_VERSION` (p26). This bypasses Wasm instantiation, import validation, VM dispatch, fuel transfer, object/relative-handle work, and associated budget charges for a released protocol. The hypothesis and prior accepted baseline both require this class of metering-changing shortcut to be next-protocol only, preserving exact p26 execution and fees.
+
+This failed the final review safety gate before benchmarking. The finding may still be viable, but the current PoC cannot be promoted because it changes protocol-visible p26 cost behavior for the vendored Soroswap pool code hash.
+
+### Revision Instructions
+
+1. Gate the native Soroswap pool getter path behind the same next-protocol condition used by the accepted coalesced-host-metering optimization, e.g. only attempt it when `self.get_ledger_protocol_version()? > MIN_LEDGER_PROTOCOL_VERSION` (or an equivalent centralized next-protocol feature gate). At p26, `call_contract_fn` must always instantiate and execute the Wasm exactly as before.
+2. Add focused equivalence coverage for the gate: with `LedgerInfo.protocol_version = MIN_LEDGER_PROTOCOL_VERSION`, an allowlisted getter must not enter the native path; with next-protocol enabled, the same getter may enter it. The test should also exercise fallback for non-matching hash/function/arity/layout.
+3. Add or document focused next-protocol equivalence checks for returned values and side effects on `token_0`, `token_1`, `factory`, `get_reserves`, and `k_last`: current-contract instance/code TTL extension, missing/wrong storage fallback, read/write footprint failures, rollback on error, auth frame shape, and diagnostic/trace frame behavior.
+4. Re-run the required full suite and then the three non-Tracy `scripts/run_apply_load_matrix.py` runs after the gate is fixed. Benchmark numbers from the current ungated version are not acceptable for final confirmation.
+
+### Checks Passed So Far
+
+1. The code hash matches the vendored `src/rust/apply-load-wasm/soroswap_pool.wasm` (`18051456816b66f12e773a56f77c5794fac1b1fb7ab6e22d4fad5a412770f73e`), so the intended benchmark target is real and narrowly identified.
+2. The inspected Wasm confirms the allowlisted exports call `extend_current_contract_instance_and_code_ttl(501120, 518400)` before reading instance storage, and the PoC emulates that TTL operation in the native frame.
+3. The source-level fast path is placed inside `call_contract_fn` after retrieving the contract instance and before `instantiate_vm`, so it targets the claimed in-apply VM-instantiation/interpreter overhead rather than TX-set construction.
+4. The implementation adds a distinct native contract frame and wires it through auth-frame tracking, `require_auth` argument lookup, and trace formatting, which is the right general shape for preserving call-frame behavior once the protocol gate and equivalence tests are added.
+
+---
+
+## PoC Revision
+
+**Result**: POC_PASS
+**Date**: 2026-05-22
+**PoC by**: claude-opus-4.7, high
+**Revision of**: previous PoC flagged NEEDS_REVISION for missing next-protocol gate
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs` (in `try_call_native_soroswap_pool_getter`) — added a next-protocol gate at the top of the function. The native Soroswap pool getter emulation now short-circuits to `Ok(None)` (falling back to normal Wasm execution) whenever `self.get_ledger_protocol_version()? <= crate::host::MIN_LEDGER_PROTOCOL_VERSION`. This is the same gate pattern used by the accepted coalesced-host-metering optimization in `host.rs::set_ledger_info`, ensuring exact p26 budget/dispatch/fee preservation while still enabling the optimization on next-protocol ledgers (only realized when the `next` feature bumps `INTERFACE_VERSION.protocol > MIN_LEDGER_PROTOCOL_VERSION`).
+
+The rest of the previous PoC (code-hash/symbol/arity/instance-layout allowlisting, native contract frame, TTL extension, instance-storage reads, auth-frame wiring, and trace formatting) remains unchanged.
+
+### Demonstration
+
+At `LedgerInfo.protocol_version == MIN_LEDGER_PROTOCOL_VERSION` (p26), `call_contract_fn` now always falls through to `instantiate_vm` and full Wasm execution for the vendored Soroswap pool getters — protocol-visible Wasm instantiation, import validation, fuel transfer, host dispatch, object/relative-handle work, and associated budget charges are preserved exactly as before. Only when the active protocol exceeds `MIN_LEDGER_PROTOCOL_VERSION` does the allowlisted native path apply, removing the per-call wasmi store/linker/export work while still performing the same `extend_current_contract_instance_and_code_ttl(501120, 518400)` TTL extension and instance-storage reads inside an equivalent contract frame.
+
+### Test Results
+
+Full suite passed with `env NUM_PARTITIONS=$(nproc) STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`: all stellar-core C++ unit tests reported `# FAIL: 0` and `# ERROR: 0` across all partitions; `test/selftest-nopg` and `test/check-nondet` passed; p26 Soroban host suites (fees, integration, option, secp256r1_sig_ver, doc-tests) all passed. The build also completed cleanly with `--enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` configuration.
