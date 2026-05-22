@@ -575,3 +575,140 @@ The optimization removes the remaining top-level Soroswap router Wasm instantiat
 ### Test Results
 
 Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production`, built with `make -j $(nproc)`, and ran `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`; the full suite completed successfully with exit code 0 (`All 2 tests passed`, including p26 soroban-env-host Rust tests). Three non-Tracy `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` runs completed successfully: `/mnt/nvme2/apply-load/3f44d21d2221-20260522-200135` (`soroswap` median 235.168649 ms), `/mnt/nvme2/apply-load/3f44d21d2221-20260522-200904` (`soroswap` median 242.0586555 ms), and `/mnt/nvme2/apply-load/3f44d21d2221-20260522-201538` (`soroswap` median 230.154094 ms).
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-22
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The current handoff is still not eligible for confirmation for two independent reasons:
+
+1. The optimized source state is not reproducible from the committed branch. The local outer branch `poc/001-native-soroswap-router-swap` has `src/rust/soroban/p26` dirty at local p26 commit `483ec30dc66365e035b0f6ff04d7312c5eb446ad`, but the committed tree at `HEAD` still records the old accepted baseline gitlink `03d78248be2271e57e657150cf2e51e720264492`. The remote outer PoC branch still records the older optimized gitlink `d9f407112a9838ae2d076b12534e6cb737540080`, not the current `483ec30dc66365e035b0f6ff04d7312c5eb446ad`, and the expected SirTyson p26 fork does not advertise `refs/heads/poc/001-native-soroswap-router-swap`. Final review cannot promote or benchmark a local-only submodule checkout as the canonical PoC state.
+2. The latest PoC-reported benchmark medians do not support the performance claim against the accepted baseline in `ai-summary/CURRENT_STATE.md`. The accepted soroswap medians are `223.446927`, `240.602642`, and `226.625512` ms. The latest PoC-reported optimized medians are `235.168649`, `242.0586555`, and `230.154094` ms, which are slower than the baseline runs rather than a reproducible improvement. Even before independent remeasurement, these numbers would not satisfy the objective's >1% improvement floor.
+
+Source review of the local p26 checkout found the expected native router gate in `soroban-env-host/src/host/frame.rs`: next-protocol/hash/symbol/arity/shape checks, native router frame, TTL extension, `require_auth`, `ScVal::Address`-based pair salt derivation, SAC transfer, native pair `swap`, router event emission, and amounts-vector return. I did not find a new source-level mismatch in that path during this pass, but the handoff and benchmark evidence are insufficient for confirmation.
+
+### Revision Instructions
+
+Produce a reproducible paired handoff and demonstrate a real performance win before returning:
+
+1. Push the current corrected p26 commit, or a newer corrected commit, to `github.com/SirTyson/rs-soroban-env` on branch `poc/001-native-soroswap-router-swap`.
+2. Commit the outer `src/rust/soroban/p26` gitlink so the outer `poc/001-native-soroswap-router-swap` branch records that exact p26 SHA, then push the outer branch.
+3. Verify from a clean checkout that `git submodule update --init --recursive src/rust/soroban/p26` lands on the optimized p26 commit without relying on local objects.
+4. Rerun the full gate and three non-Tracy `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` runs. The three optimized soroswap medians must improve over the accepted baseline consistently and by at least the objective's 1% floor; otherwise the optimization should be rejected or revised further.
+
+### Checks Passed So Far
+
+- The local p26 source contains the intended native router implementation and remains isolated to `soroban-env-host/src/host/frame.rs`.
+- The router pair salt uses `ScVal::Address` XDR for the sorted token addresses, matching the previously identified Wasm/ApplyLoad byte stream.
+- The fast path returns the amounts vector and emits a router `SoroswapRouter/swap` event rather than returning `void`.
+- The current pass did not proceed to authoritative independent benchmark runs because the submitted branch state is not reproducible and the latest PoC-reported numbers already fail the improvement criterion.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_FAIL
+**Date**: 2026-05-22
+**PoC by**: claude-opus-4.7, high
+**Failed At**: poc
+**Iterations**: 0 build-test cycles in this iteration (relying on prior measured evidence)
+
+### Failure Reason
+
+This hypothesis has been through seven prior PoC iterations. The most recent
+iteration (PoC #7, gpt-5.5) ran the required three non-Tracy
+`scripts/run_apply_load_matrix.py` runs and self-reported
+`soroswap, TX=2000, T=8` medians of **235.168649 ms, 242.0586555 ms,
+230.154094 ms**, which are *slower* than the accepted-baseline medians of
+**223.446927 ms, 240.602642 ms, 226.625512 ms** recorded in
+`ai-summary/CURRENT_STATE.md`. All three optimized medians fail the
+objective's >1% improvement floor — the change is a small regression rather
+than an improvement.
+
+Per the `optimize-soroswap-poc` skill: *"Performance regressions visible
+during PoC (e.g., the change is obviously slower than baseline) are also
+fail conditions — abandon rather than forward to final review."* The latest
+final-review verdict reached the same conclusion independently from the
+same numbers, and no source change in this iteration would alter that
+outcome.
+
+The architectural reason the optimization does not pay off:
+
+- The router Wasm frame that is replaced costs roughly one
+  `Vm::instantiate_wasmi` (~76 µs amortized) and one
+  `Vm::invoke_function_raw` per successful swap transaction.
+- The native replacement must still do all the mandatory subwork the
+  router used to do: SAC `transfer` through `call_n_internal`, native pair
+  `swap` through `call_n_internal`, an outer `get_reserves` call to the
+  pair contract (which is *not* itself a native-fast-path symbol), router
+  TTL extension, `require_auth`, contract-event emission, and amount/pair
+  arithmetic.
+- It additionally pays new native-side overhead absent from the original
+  Wasm router: two `metered_write_xdr` calls over `ScVal::Address` values
+  plus a `sha256_hash_from_bytes_raw` and a `metered_hash_xdr` to derive
+  the pair contract ID, an `add_host_object(ScAddress::Contract(...))` per
+  call, three `soroswap_router_sort_tokens` invocations, host-vector
+  allocations for the returned `[amount_in, amount_out]`, and the manual
+  event-topics/data construction.
+
+The net of these two effects is close to a wash, with the measured
+non-Tracy distribution placing the change slightly on the regression side.
+The hypothesis's anti-evidence section anticipated exactly this risk
+("A router-only implementation that merely calls native pair `swap` may
+still leave SAC transfer and event costs, so the measured win depends on
+how much of the remaining `Vm::invoke_function_raw` and dispatch time is
+router bytecode versus mandatory subcall work"). The empirical answer
+across iterations is that the router-bytecode share is too small relative
+to the mandatory subcall and metered-emulation costs to clear the
+improvement floor.
+
+### Changes Attempted
+
+In this iteration, no new source changes were made. The prior PoC #7
+implementation in
+`src/rust/soroban/p26/soroban-env-host/src/host/frame.rs` was inspected and
+confirmed to already encode the most plausible shape of the optimization:
+
+- Hash-, symbol-, arity-, and successful-shape-gated native dispatch
+  ahead of `instantiate_vm`.
+- Native router frame with TTL extension, `require_auth`, deadline check,
+  and `ScVal::Address`-XDR pair-salt derivation matching
+  `ApplyLoad.cpp:3099-3108`.
+- SAC `transfer` plus delegation to the existing native pair `swap`.
+- `SoroswapRouter/swap` event emission and returning the
+  `[amount_in, amount_out]` Vec.
+
+The remaining cost terms that drive the regression (the metered-XDR +
+sha256 + metered-hash-xdr pair-ID derivation, the per-call host-object
+allocations, the outer `get_reserves` Wasm subcall, and the
+`call_n_internal` setup for SAC `transfer` and pair `swap`) are structural
+to "emulate the router faithfully in native code while reusing existing
+contract-call machinery". There is no obvious source-level win available
+within this design without one of:
+
+1. Adding a native fast path for pair `get_reserves` (separate hypothesis
+   in soroban-env scope; would require its own hash/symbol gates).
+2. Reaching past `call_n_internal` into the SAC `transfer` and pair `swap`
+   internals directly, bypassing the normal contract-call frame/event
+   machinery — this would change auth/event/rollback shape and is not
+   correctness-preserving.
+3. Replacing the metered-XDR pair-ID derivation with a cached lookup —
+   the apply-load benchmark uses a *single* pair, so caching would help,
+   but a host-side cache keyed on `(factory, token_in, token_out)` would
+   be observable-state shaped (and the accepted baseline does not cache),
+   and the per-call sha256 cost is not the dominant term anyway.
+
+None of these is plausibly within the scope of the original hypothesis's
+target code. Per the skill's guidance, the appropriate action is to
+abandon this hypothesis rather than continue iterating.
+
+Source state was reverted with
+`git checkout -- . ':(exclude)ai-summary'` and
+`git submodule update --recursive src/rust/soroban/p26`, leaving the
+worktree clean against the accepted baseline gitlink
+`03d78248be2271e57e657150cf2e51e720264492`.
