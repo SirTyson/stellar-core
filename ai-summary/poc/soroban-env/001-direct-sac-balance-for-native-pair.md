@@ -74,3 +74,25 @@ Rollback semantics are preserved by the enclosing `Frame::NativeContract` around
 - **Change description**: Add a next-protocol direct SAC balance helper used only by the native Soroswap pair `swap` path. Gate on confirmed `ContractExecutable::StellarAsset` for the token contract; fall back to `call_n_internal(..., "balance", ...)` for every non-SAC or non-exact case. Reproduce SAC `balance` storage behavior directly: extend the SAC instance TTL, read the pair contract balance with an explicit token contract id, extend balance TTL on hit, parse `BalanceValue`, return `amount`, and return `0` on missing entry.
 - **Correctness check**: Existing Soroban host tests should remain unchanged. Add focused equivalence coverage for SAC token pair balances covering present balance, missing balance, malformed balance value, out-of-footprint balance key, out-of-footprint SAC instance, non-SAC token fallback, and rollback after a later pair-swap error.
 - **Benchmark focus**: Compare three non-Tracy `scripts/run_apply_load_matrix.py` runs against the current accepted baseline, with `soroswap, TX=2000, T=8` median apply time as the headline metric. The expected signal is fewer SAC balance subframes/internal calls and reduced storage/key/value scaffolding while preserving the mandatory balance storage lookup and TTL extension work.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-22
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract.rs:14-16` exports the direct contract-owner balance helper and SAC instance TTL constants for native host use.
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/balance.rs:15-22,180-200` adds `read_contract_balance_for_contract_owner`, which constructs a persistent SAC balance key for an explicit SAC contract id, reads/parses the existing typed `BalanceValue`, extends the balance TTL on hit, and returns `0` for missing balances.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:1-19,1354-1387` routes native Soroswap pair balance reads through the direct helper after confirming the token instance is `ContractExecutable::StellarAsset`; non-contract owners and non-SAC tokens fall back to the existing `call_n_internal(..., "balance", ...)` path.
+
+### Demonstration
+
+The native Soroswap pair `swap` path now avoids pushing two read-only `Frame::StellarAssetContract` SAC `balance` subframes when both pair tokens are SAC contracts. It preserves the required SAC storage side effects by extending the SAC instance TTL, reading the same persistent `Balance(pair)` entry under the token contract id, extending the balance TTL when present, and using the same missing-as-zero and typed-value parsing behavior.
+
+### Test Results
+
+Configured and built with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` and `make -j $(nproc)`. Full regression verification completed with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make -j $(nproc) check`: p26 Rust host tests passed (`751 passed; 0 failed` plus integration/doc tests), `test/selftest-nopg` and `test/check-nondet` passed, and the command exited successfully.
