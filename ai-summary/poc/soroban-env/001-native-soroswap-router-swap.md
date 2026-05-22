@@ -72,3 +72,25 @@ The proposed fix is correctness-plausible but should be assessed as **Medium**, 
 - **Change description**: add `SOROSWAP_ROUTER_WASM_HASH = 4c3db3ebd2d6a2ab23de1f622eaabb39501539b4611b68622ec4e47f76c4ba07` and a `try_call_native_soroswap_router_swap_exact_tokens_for_tokens` path gated by next protocol, exact hash, exact symbol, arity 5, and the benchmark successful shape. Push `Frame::NativeContract` for the router, extend router instance/code TTL with the same thresholds used by the Wasm helper, read the factory from router instance storage, compute the two-token output/pair using the same exported-router helper semantics, call input SAC `transfer` through `call_n_internal`, then call the already-native pair `swap` through `call_n_internal` with `(0, amount_out, to)` or `(amount_out, 0, to)` according to token order. Return `Val::VOID` and fall back to Wasm for every non-exact case.
 - **Correctness check**: keep all existing Soroban host and apply-load tests unchanged; focus equivalence testing on successful benchmark swaps plus fallback/error ordering for expired deadline, negative `amount_in`, negative `amount_out_min`, wrong path type, wrong path length, wrong element type, missing router factory instance value, missing factory pair mapping, and output below `amount_out_min`.
 - **Benchmark focus**: compare three non-Tracy `scripts/run_apply_load_matrix.py` runs against the current accepted baseline, with `soroswap, TX=2000, T=8` median apply time as the headline metric. Expect reduction from fewer `Vm::instantiate_wasmi`, `Vm::invoke_function_raw`, and generated VM host `call` dispatch events; validate with one diagnostic Tracy run only after non-Tracy wins are observed.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-22
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:5-18` — added imports needed for native router emulation, including HostVec access, metered XDR hashing, contract-address preimages, and VecObject handling.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:45-48` — added the vendored Soroswap router Wasm hash gate (`4c3db3ebd2d6a2ab23de1f622eaabb39501539b4611b68622ec4e47f76c4ba07`).
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:798-1165` — added a next-protocol native `swap_exact_tokens_for_tokens` router fast path for the exact apply-load shape: hash/symbol/arity and argument-shape checks, native router frame push, router TTL extension, auth, factory lookup, deterministic pair address derivation, reserve/output calculation, SAC transfer, and delegation to the existing native pair `swap` path. Non-exact calls fall back to Wasm.
+
+### Demonstration
+
+The change removes the remaining top-level Soroswap router Wasm instantiation and raw VM dispatch for the fixed apply-load swap transaction shape. It preserves observable execution by keeping the existing contract frame/auth/rollback machinery, using the same deterministic pair-address and constant-product output formula, and delegating state-changing work to the existing SAC transfer and native pair swap paths.
+
+### Test Results
+
+Configured with `--enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`, built with `make -j $(nproc)`, and ran `env NUM_PARTITIONS=30 make check`; the full suite completed successfully.
