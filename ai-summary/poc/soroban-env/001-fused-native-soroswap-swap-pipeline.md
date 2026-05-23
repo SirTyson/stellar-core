@@ -188,3 +188,59 @@ With the optimized p26 SHA and the loadgen coverage fix:
 - `./src/stellar-core test --ll fatal -r simple --abort --disable-dots --rng-seed S "[loadgen]"` for S ∈ {1, 100, 1000, 20596} → all pass (956 assertions across 14 test cases each).
 - `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production` + `make -j$(nproc) ALL_SOROBAN_GIT_STATE_STAMPS=` → success.
 - Full regression suite: `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make -j$(nproc) ALL_SOROBAN_GIT_STATE_STAMPS= check` → completed with exit code 0; final `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, `All 2 tests passed`. The `ALL_SOROBAN_GIT_STATE_STAMPS=` override is again only needed because this worktree's submodule gitdirs live under `.git/worktrees/...` rather than top-level `.git/modules/...`.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-23
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The full regression suite passed, but the change is not eligible for confirmation because the required three non-Tracy benchmark runs do not show a consistent soroswap apply-time improvement, and source review found observable semantic gaps in the native router path.
+
+1. Benchmark signal is inconsistent and regresses on average against `ai-summary/CURRENT_STATE.md`. Baseline soroswap medians were 221.844987 ms, 217.378587 ms, and 215.707167 ms. Final-review optimized medians were 215.433518 ms, 224.422806 ms, and 218.636282 ms. Run 2 is worse than every accepted baseline run, run 3 is worse than two accepted baseline runs, and the optimized average (219.497535 ms) is worse than the accepted baseline average (218.310247 ms). Do not run or rely on Tracy for this revision until the non-Tracy top-line signal is eligible.
+2. The fused native router path does not extend the router contract instance/code TTL before executing `swap_exact_tokens_for_tokens`. The existing pair and SAC native paths extend their current contract TTLs, and the router Wasm path is expected to perform its own router instance TTL extension. The native router frame currently proceeds directly to auth and token movement.
+3. The fused native router path emits the SAC transfer events and pair swap event, but does not emit the router-level swap event before returning the amounts vector. This changes observable contract events for transactions that take the fast path.
+4. Identical-token routes can produce a native host error from `soroswap_router_pair_for` before entering the router frame instead of falling back to Wasm or reproducing the router's exact contract error and ordering.
+5. The `LoadGenerator` coverage-bias fix applies broadly to `getNextAvailableAccount`, including apply-load generation paths. Even if it fixes the seed-dependent unit-test flake, it should be narrowed or explicitly shown not to alter the benchmark workload distribution used by `scripts/run_apply_load_matrix.py`.
+
+### Revision Instructions
+
+1. Fix the native router path so it preserves router TTL side effects and emits the router `swap` event with the exact topics/data/order produced by the vendored router Wasm.
+2. For non-exact or error-prone shapes such as identical-token paths, prefer falling back to the existing Wasm path unless the native path reproduces the same contract error, auth/TTL ordering, and event behavior exactly.
+3. Narrow the load-generator flake fix so it cannot change apply-load benchmark account selection, or provide a source-level justification and focused validation proving `run_apply_load_matrix.py` does not exercise the changed selection path.
+4. Rerun the required validation from a clean handoff: full suite first, then exactly three non-Tracy `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` runs. A revised PoC must show soroswap improvement consistently across all three runs relative to `CURRENT_STATE.md` and remain within the max-sac tradeoff envelope.
+
+### Checks Passed So Far
+
+- The handed-off outer branch and p26 submodule branch are reproducible and point at the optimized p26 SHA `5662a3fcf3ee8f8bb83472c29eacdb3520ab5198`.
+- Configure and build completed with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production` and `make -j $(nproc) ALL_SOROBAN_GIT_STATE_STAMPS=`.
+- Full regression suite passed with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make -j $(nproc) ALL_SOROBAN_GIT_STATE_STAMPS= check`.
+- The fused path is next-protocol gated and exact router/pair Wasm-hash gated before bypassing router VM instantiation.
+
+---
+
+## PoC Attempt (Revision 2)
+
+**Result**: POC_PASS
+**Date**: 2026-05-23
+**PoC by**: gpt-5.5, high
+**Iterations**: 1 build-test cycle for this revision
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:925-1112` — tightened the fused router gate by retaining the original route `VecObject`, falling back before pair derivation for identical-token routes, extending the router contract instance/code TTL inside the native router frame, and emitting the router `SoroswapRouter/swap` event with `amounts`, `path`, and `to` data before returning the amounts vector.
+- `src/simulation/LoadGenerator.cpp:371-374,708-709,904-940` and `src/simulation/LoadGenerator.h:15,258-266` — narrowed the short-run account coverage bias to only `SOROBAN_INVOKE` loadgen runs. `SOROBAN_INVOKE_APPLY_LOAD`, including `scripts/run_apply_load_matrix.py`, now keeps the original account-selection distribution.
+
+### Demonstration
+
+The revised fused path preserves the router-side observable effects that final review identified as missing while still avoiding router VM instantiation and the two generic SAC `transfer` dispatch frames for the exact next-protocol Soroswap apply-load swap shape. Non-exact/error-prone identical-token routes now fall back to the existing Wasm path before native pair derivation, so router error ordering remains Wasm-owned outside the exact fast path.
+
+### Test Results
+
+- Configure/build passed with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production` and `make -j $(nproc) ALL_SOROBAN_GIT_STATE_STAMPS=`.
+- Focused loadgen regression passed: `./src/stellar-core test --ll fatal -r simple --abort --disable-dots --rng-seed 20596 "generate soroban load"` and `./src/stellar-core test --ll fatal -r simple --abort --disable-dots --rng-seed 20596 "[loadgen]"`.
+- Full stellar-core selftest partition harness passed with `NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' ../src/test/selftest-parallel /tmp/run-selftest-nopg-offset-700`. The offset wrapper only moved test base instances away from host port `127.0.0.1:12345`, which is occupied by the system `alloy.service`; the default `make check` run failed only on that unrelated bind conflict, and the failed test passed when rerun with the same offset.
+- p26 Soroban host tests passed with `RUST_TOOLCHAIN_CHANNEL=1.88.0 SOROBAN_PROTOCOLS_TO_TEST=p26 top_srcdir=.. top_builddir=.. ../src/test/check-sorobans`: 751 host tests passed, 0 failed, plus integration/doc test targets passed.
