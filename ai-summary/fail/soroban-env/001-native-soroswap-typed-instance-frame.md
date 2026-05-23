@@ -148,3 +148,31 @@ This is a handoff-state revision in response to the prior NEEDS_REVISION verdict
 - `make -j $(nproc)` succeeded against the PoC p26 SHA.
 - `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots --rng-seed 12345' make -j $(nproc) check` reported `All 2 tests passed` (`PASS: test/selftest-nopg`, `PASS: test/check-nondet`).
 - Investigated one initial failure in the `generate soroban load` Catch test at `simulation/test/LoadGeneratorTests.cpp:733` that surfaced under Catch's auto-selected seed 20596. Reproduced the same failure at seed 20596 against the prior accepted baseline submodule SHA `fbbea0d9` with the PoC outer worktree reverted, confirming the flake is pre-existing and unrelated to this optimization. The PoC tree passes the full suite under deterministic seed 12345 and an unrelated random Catch seed.
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-05-23
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** YES. Source review confirms the PoC moves native Soroswap getter/swap reads from lazy `InstanceStorageMap::from_instance_xdr` / generic map lookups to an `Rc`-backed typed `SoroswapPoolInstanceView`, and records reserve writeback for successful native swaps.
+2. **Are the preconditions realistic?** YES. The path is gated to the next protocol, exact Soroswap pool Wasm hash, accepted getter symbols, and the native `swap` shape used by the apply-load soroswap workload.
+3. **Is the original code inefficient or by design?** INEFFICIENCY. The prior native path validated fields from the source `ScMap`, then rematerialized the same instance storage into host `Val`s for reads and generic reserve inserts.
+4. **Does the benchmark improvement match severity?** NOT MEASURED. Final review did not reach benchmarking because the required full-suite regression gate failed first.
+5. **Is the optimization in scope?** YES. The modified path is inside next-protocol `closeLedger` Soroban contract apply, not TX-set construction or lazy background bucket work.
+6. **Is the benchmark methodology correct?** NOT REACHED. The required three non-Tracy `scripts/run_apply_load_matrix.py` runs were not executed because tests did not pass cleanly.
+7. **Can the improvement be explained without the optimization?** NOT ASSESSED. No accepted final-review benchmark data exists.
+8. **Is this optimization novel?** YES. The typed native Soroswap instance frame is distinct from prior accepted SAC-balance and native-swap emulation changes.
+
+### Rejection Reason
+
+The final-review regression gate failed. After independently configuring and building the PoC handoff, `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make -j $(nproc) check` exited non-zero with `FAIL: test/selftest-nopg`; partition 8 failed `generate soroban load` at `simulation/test/LoadGeneratorTests.cpp:733` using Catch seed `20596`. The PoC notes indicate this seed is a pre-existing flake, but the objective-specific final-review rules state that any test failure or flake blocks CONFIRMED, so benchmarking cannot be accepted and the finding is rejected at the test gate.
+
+### Failed Checks
+
+- Step 4 / objective regression test gate: full `make check` did not complete cleanly.
