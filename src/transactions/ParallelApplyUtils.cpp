@@ -149,8 +149,30 @@ readOnlyPreParallelApplyRange(AppConnector& app,
 }
 
 bool
-isModifiedClassicKey(LedgerSnapshot const& current,
-                     LedgerSnapshot const& previous, LedgerKey const& key)
+isExpectedFeeProcessingDelta(LedgerKey const& key,
+                             LedgerEntry const& currentEntry,
+                             LedgerEntry const& previousEntry,
+                             AccountID const& feeSourceID,
+                             int64_t feeCharged)
+{
+    if (feeCharged <= 0 || key.type() != ACCOUNT ||
+        !(key.account().accountID == feeSourceID) ||
+        currentEntry.data.type() != ACCOUNT ||
+        previousEntry.data.type() != ACCOUNT ||
+        feeCharged > previousEntry.data.account().balance)
+    {
+        return false;
+    }
+
+    auto expectedEntry = previousEntry;
+    stellar::addBalance(expectedEntry.data.account().balance, -feeCharged);
+    return currentEntry == expectedEntry;
+}
+
+bool
+isModifiedClassicKeyBeyondExpectedFeeProcessing(
+    LedgerSnapshot const& current, LedgerSnapshot const& previous,
+    LedgerKey const& key, AccountID const& feeSourceID, int64_t feeCharged)
 {
     if (isSorobanEntry(key))
     {
@@ -164,25 +186,38 @@ isModifiedClassicKey(LedgerSnapshot const& current,
         return true;
     }
 
-    return currentEntry && currentEntry.current() != previousEntry.current();
+    if (!currentEntry || currentEntry.current() == previousEntry.current())
+    {
+        return false;
+    }
+
+    return !isExpectedFeeProcessingDelta(key, currentEntry.current(),
+                                        previousEntry.current(), feeSourceID,
+                                        feeCharged);
 }
 
 bool
 requiresSequentialPreParallelApply(LedgerSnapshot const& current,
                                    LedgerSnapshot const& previous,
-                                   TransactionFrameBase const& tx)
+                                   TxBundle const& txBundle)
 {
-    if (isModifiedClassicKey(current, previous, accountKey(tx.getSourceID())) ||
-        isModifiedClassicKey(current, previous,
-                             accountKey(tx.getFeeSourceID())))
+    auto const& tx = *txBundle.getTx();
+    auto const& feeSourceID = tx.getFeeSourceID();
+    auto const feeCharged = txBundle.getResPayload().getFeeCharged();
+    auto isModifiedBeyondFeeProcessing = [&](LedgerKey const& key) {
+        return isModifiedClassicKeyBeyondExpectedFeeProcessing(
+            current, previous, key, feeSourceID, feeCharged);
+    };
+
+    if (isModifiedBeyondFeeProcessing(accountKey(tx.getSourceID())) ||
+        isModifiedBeyondFeeProcessing(accountKey(feeSourceID)))
     {
         return true;
     }
 
     for (auto const& op : tx.getOperationFrames())
     {
-        if (isModifiedClassicKey(current, previous,
-                                 accountKey(op->getSourceID())))
+        if (isModifiedBeyondFeeProcessing(accountKey(op->getSourceID())))
         {
             return true;
         }
@@ -191,14 +226,14 @@ requiresSequentialPreParallelApply(LedgerSnapshot const& current,
     auto const& footprint = tx.sorobanResources().footprint;
     for (auto const& key : footprint.readOnly)
     {
-        if (isModifiedClassicKey(current, previous, key))
+        if (isModifiedBeyondFeeProcessing(key))
         {
             return true;
         }
     }
     for (auto const& key : footprint.readWrite)
     {
-        if (isModifiedClassicKey(current, previous, key))
+        if (isModifiedBeyondFeeProcessing(key))
         {
             return true;
         }
@@ -448,7 +483,7 @@ GlobalParallelApplyLedgerState::
             for (auto const& txBundle : stage)
             {
                 if (requiresSequentialPreParallelApply(current, previous,
-                                                       *txBundle.getTx()))
+                                                       txBundle))
                 {
                     txBundle.getTx()->preParallelApply(
                         app, ltx, txBundle.getEffects().getMeta(),
