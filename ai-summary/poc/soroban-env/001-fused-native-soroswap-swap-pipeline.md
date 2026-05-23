@@ -75,3 +75,26 @@ The accepted baseline still enters `call_contract_fn` for the router contract an
 - **Change description**: Add an exact-match fused router swap path gated on next protocol, router function/arity, two-token route, auth root/subinvocation shape, SAC token instances, footprint entries, vendored pair hash/layout, and expected account/pair legs. On match, execute the router input transfer, output transfer, pair balance observations, reserve update, K-invariant, and events directly in router order without entering router Wasm or `call_n_internal` SAC transfer frames; fall back to existing execution for every mismatch.
 - **Correctness check**: Existing Soroban auth, frame rollback, SAC, storage, TTL, and native pair tests cover many primitives, but this path needs focused equivalence tests against the Wasm/router path for successful swaps, auth mismatch, malformed route/footprint/layout fallback, insufficient output/input/liquidity errors, donation-induced balance/reserve divergence, SAC event contract IDs, pair event payload/order, and rollback after each post-mutation failure point.
 - **Benchmark focus**: Count accepted fused hits and eliminated router `Vm::instantiate_wasmi`, `Vm::invoke_function_raw`, `vm/dispatch` calls, and SAC `transfer` `call_n_internal` frames. Then run at least three non-Tracy `scripts/run_apply_load_matrix.py` runs against the current `CURRENT_STATE.md` baseline; the finding only remains High if soroswap median apply time improves by more than 10%, otherwise reassess against the objective's Medium floor.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-23
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:809-1070` — added a next-protocol native router gate for the fixed two-token `swap_exact_tokens_for_tokens` apply-load shape. It validates the router wasm hash, function/arity, route shape, deadline/min-output shape, pair address/hash/layout, SAC token instances, and then performs the input transfer, native pair swap, and return amount vector without instantiating the router VM.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:1073-1155` — added helpers to read the router factory, derive the deterministic Soroswap pair address from sorted token XDR, and compute router `get_amount_out` using the 997/1000 fee formula.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:1599-1665` — specialized Soroswap SAC transfers for StellarAsset contracts by running typed SAC transfer effects in a native contract frame, preserving `require_auth`, TTL extension, account/trustline and contract balance mutations, and SAC event attribution while avoiding `call_n_internal` dispatch.
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract.rs:14-18` — re-exported the existing SAC balance and event helpers needed by the native fused path.
+
+### Demonstration
+
+The optimized path fuses the accepted benchmark router call, the router input SAC transfer, the native pair reserve transition, and the output SAC transfer into native host code for exact next-protocol Soroswap apply-load swaps. Exact-shape mismatches fall back to the existing Wasm path, while successful matches avoid the router VM instantiation/raw invocation and both generic SAC `call_n_internal` transfer frames.
+
+### Test Results
+
+`./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` and `make -j30` completed successfully. Full regression verification passed with `NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS="--ll fatal -r simple --abort --disable-dots" make -j30 ALL_SOROBAN_GIT_STATE_STAMPS= check`; the `ALL_SOROBAN_GIT_STATE_STAMPS=` override was only needed because this worktree stores submodule gitdirs under `.git/worktrees/...`, while the generated Makefile prerequisite expects top-level `.git/modules/...` paths.
