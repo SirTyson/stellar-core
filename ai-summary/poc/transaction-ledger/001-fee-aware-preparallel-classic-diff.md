@@ -74,3 +74,24 @@ The expected impact clears the objective's review threshold. The cited setup pha
 - **Change description**: replace the unconditional current-vs-LCL source/fee-account byte comparison with a fee-aware check that accepts only expected fee-processing account deltas for the tx's own fee source/source account. All op-source accounts and all classic footprint keys should still force sequential pre-apply unless their current entry is byte-identical to LCL or the delta is explicitly proven to be the same tx's own fee-processing delta.
 - **Correctness check**: preserve deterministic write replay through `commitBufferedPreParallelApplyWrites`; add focused tests for regular Soroban source=fee, fee-bump outer fee source, source account touched by a classic-phase operation, operation-source override, footprint classic key touched before Soroban apply, and one-time signer removal. Do not allow a tx with an unrelated balance/signers/seq change to enter the read-only batch.
 - **Benchmark focus**: run `scripts/run_apply_load_matrix.py` on the soroswap `TX=2000, T=8` case repeatedly and track top-line apply time plus `soroban_setup_glbl`, `readOnlyPreParallelApply`, and serial pre-apply/fallback counts. The expected signal is a lower `soroban_setup_glbl` critical-path time with `readOnlyPreParallelApply` carrying most txs and total apply time improving by at least 3%.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-23
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/transactions/ParallelApplyUtils.cpp:151-247` — replaced the plain current-vs-LCL classic-key comparison with a fee-aware classifier. The classifier accepts only an account-entry delta on the transaction fee source that exactly matches the already-charged fee deduction, and continues to reject existence changes, Soroban-irrelevant classic mutations, operation-source changes, footprint classic-key changes, or any account mutation beyond the exact fee-processing balance delta.
+- `src/transactions/ParallelApplyUtils.cpp:484-490` — passed the full `TxBundle` into `requiresSequentialPreParallelApply` so the classifier can use the already-computed `MutableTransactionResultBase::getFeeCharged()` value from fee processing.
+
+### Demonstration
+
+The optimization lets ordinary Soroban transactions whose only current-vs-LCL classic delta is their own fee-source debit enter the existing `readOnlyPreParallelApply` batch instead of falling back to fully sequential `preParallelApply`. Deterministic writes are still replayed through `commitBufferedPreParallelApplyWrites`, while unrelated classic mutations still force sequential handling, preserving observable ledger order.
+
+### Test Results
+
+Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`, built with `make -j30`, and ran `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`. The full test suite completed successfully, ending with `All 2 tests passed` for the top-level check target and passing Rust/Soroban tests including `751 passed; 0 failed; 2 ignored; 0 measured; 1 filtered out` for the main p26 host unit suite.
