@@ -368,10 +368,10 @@ LoadGenerator::start(GeneratedLoadConfig& cfg)
         {
             mAccountsAvailable.insert(i + cfg.offset);
         }
-        // Initialize the unused-this-run bias set to match the available pool.
-        // Selection will prefer accounts in this set so short load runs cover
-        // every account deterministically.
-        mAccountsNotYetUsedThisRun = mAccountsAvailable;
+        mAccountsNotYetUsedThisRun =
+            cfg.mode == LoadGenMode::SOROBAN_INVOKE
+                ? mAccountsAvailable
+                : std::unordered_set<uint64_t>();
 
         if (cfg.modeInvokes())
         {
@@ -705,7 +705,8 @@ LoadGenerator::generateLoad(GeneratedLoadConfig cfg)
         uint64_t sourceAccountId = 0;
         if (cfg.mode != LoadGenMode::PAY_PREGENERATED)
         {
-            sourceAccountId = getNextAvailableAccount(ledgerNum);
+            sourceAccountId = getNextAvailableAccount(
+                ledgerNum, cfg.mode == LoadGenMode::SOROBAN_INVOKE);
         }
 
         std::function<std::pair<TxGenerator::TestAccountPtr,
@@ -900,24 +901,27 @@ LoadGenerator::submitTx(GeneratedLoadConfig const& cfg,
 }
 
 uint64_t
-LoadGenerator::getNextAvailableAccount(uint32_t ledgerNum)
+LoadGenerator::getNextAvailableAccount(uint32_t ledgerNum, bool coverageBias)
 {
     uint64_t sourceAccountId;
     do
     {
         releaseAssert(!mAccountsAvailable.empty());
 
-        // Prefer accounts that have not yet been drawn during this load run
-        // so the first nAccounts picks cover every account exactly once. This
-        // avoids seed-dependent coverage gaps in tests that expect every
-        // account/instance to be invoked at least once.
         std::vector<uint64_t> pickPool;
         pickPool.reserve(mAccountsAvailable.size());
-        for (auto const& acct : mAccountsAvailable)
+        if (coverageBias)
         {
-            if (mAccountsNotYetUsedThisRun.count(acct))
+            // Prefer accounts that have not yet been drawn during this
+            // SOROBAN_INVOKE run so short tests cover every contract instance
+            // before reusing any account. Apply-load benchmarks keep the
+            // original account-selection distribution.
+            for (auto const& acct : mAccountsAvailable)
             {
-                pickPool.push_back(acct);
+                if (mAccountsNotYetUsedThisRun.count(acct))
+                {
+                    pickPool.push_back(acct);
+                }
             }
         }
         if (pickPool.empty())
@@ -930,7 +934,10 @@ LoadGenerator::getNextAvailableAccount(uint32_t ledgerNum)
             rand_uniform<uint64_t>(0, pickPool.size() - 1);
         sourceAccountId = pickPool[sourceAccountIdx];
         mAccountsAvailable.erase(sourceAccountId);
-        mAccountsNotYetUsedThisRun.erase(sourceAccountId);
+        if (coverageBias)
+        {
+            mAccountsNotYetUsedThisRun.erase(sourceAccountId);
+        }
         releaseAssert(mAccountsInUse.insert(sourceAccountId).second);
 
         // Although mAccountsAvailable shouldn't contain pending accounts, it is

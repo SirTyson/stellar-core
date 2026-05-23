@@ -12,6 +12,7 @@
 #include "test/TxTests.h"
 #include "util/NonCopyable.h"
 #include "xdr/Stellar-types.h"
+#include <unordered_set>
 #include <vector>
 
 namespace medida
@@ -255,16 +256,15 @@ class LoadGenerator
     // queue (to avoid source account collisions during tx submission)
     std::unordered_set<uint64_t> mAccountsInUse;
     std::unordered_set<uint64_t> mAccountsAvailable;
-    // Accounts that have not yet been drawn from `mAccountsAvailable` during
-    // the current load run. Used to bias selection toward unused accounts so
-    // that short load runs achieve deterministic coverage of every account.
+    // Accounts that have not yet been drawn from `mAccountsAvailable` during a
+    // coverage-sensitive load run.
     std::unordered_set<uint64_t> mAccountsNotYetUsedThisRun;
 
     std::optional<XDRInputFileStream> mPreloadedTransactionsFile;
     uint32_t mCurrPreloadedTransaction = 0;
 
     // Get an account ID not currently in use.
-    uint64_t getNextAvailableAccount(uint32_t ledgerNum);
+    uint64_t getNextAvailableAccount(uint32_t ledgerNum, bool coverageBias);
 
     // Number of times `createContractTransaction` has been called. Used to
     // ensure unique preimages for all `SOROBAN_UPGRADE_SETUP` runs.
