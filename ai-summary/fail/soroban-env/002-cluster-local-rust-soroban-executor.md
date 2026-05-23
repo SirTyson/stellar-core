@@ -77,3 +77,145 @@ The apply path already partitions Soroban transactions into deterministic cluste
 - **Change description**: Pass the ordered cluster bundle once, execute transactions sequentially in Rust, and return a vector of per-transaction outputs that C++ applies in the same order. The cluster storage adapter should avoid repeatedly serializing/decoding unchanged shared entries, but it must define new protocol-visible charges rather than trying to reproduce p26 metering implicitly. Keep conservative fallbacks for diagnostics/tracing, hot-archive restoration, internal errors, non-invoke operations, classic creations that the batch path does not model, and any transaction whose source/auth/resources cannot be represented exactly.
 - **Correctness check**: Existing parallel-apply, Soroban host invocation, auth, rollback, TTL/rent, transaction-meta, diagnostic-event, and invariant tests cover the surrounding behavior. The PoC should add focused equivalence coverage for mixed success/failure clusters, storage upsert/delete/TTL changes, rent/refundable fee outputs, event/result hashes, RO TTL bump flushing, rollback boundaries, and fallback interleaving with the legacy per-transaction bridge.
 - **Benchmark focus**: Compare three non-Tracy `scripts/run_apply_load_matrix.py` runs against the accepted baseline, with soroswap median apply time as the primary metric. Instrument the PoC to report eliminated per-transaction `addReads`, `read xdr with budget`, `write xdr`, `recordStorageChanges`, storage-map build/clone, and bridge-call counts; require a reproducible 3-10% improvement for Medium, and only claim High if the cluster executor exceeds 10% or demonstrably restructures the dominant apply phase.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_FAIL
+**Date**: 2026-05-23
+**PoC by**: claude-opus-4.7, high
+**Failed At**: poc
+**Iterations**: 0 (scope assessment before first build-test cycle)
+
+### Failure Reason
+
+The reviewed hypothesis is not implementable as a PoC within the
+performance-mode PoC budget (≤10 build-test cycles, single agent). Both the
+hypothesis itself and the reviewer's Anti-Evidence / PoC Guidance sections
+make clear that the only viable shape of this change is a **protocol-gated
+redesign** that introduces:
+
+1. A new next-protocol resource model with explicit, protocol-visible
+   `cpu_insns` / `mem_bytes` charges for cluster-level execution (replacing
+   the per-transaction `ValDeser` / map-construction / `ValSer` charges that
+   today contribute to budget accounting on p26).
+2. A new CXX bridge entry alongside `rust_bridge::invoke_host_function` that
+   accepts an ordered cluster bundle of transactions plus a cluster-local
+   storage adapter, and returns a vector of per-transaction outputs.
+3. A new Rust cluster executor near `soroban_proto_any::invoke_host_function`
+   / `e2e_invoke::invoke_host_function` that reuses a cluster-local decoded
+   storage/effect cache across transactions while still constructing fresh
+   per-transaction `Budget`, `Host`, auth, event, PRNG, and result/error
+   contexts in the correct deterministic order.
+4. A refactor of `InvokeHostFunctionOpFrame` / `InvokeHostFunctionParallelApplyHelper`
+   and `LedgerManagerImpl::applyThread` so that supported invoke transactions
+   are described as a cluster batch while preserving the per-transaction
+   bridge path as a fallback.
+5. Conservative fallback paths for diagnostics/tracing mode, hot-archive
+   restorations, non-invoke operations within a cluster, internal errors,
+   unsupported host functions, and any transaction whose source / auth /
+   resources cannot be exactly represented in the batch shape.
+6. Determinism guarantees that the new path produces byte-identical
+   per-transaction results, events, refunds, TTL/rent effects, rollback
+   semantics, and ledger-entry mutation order versus the existing
+   per-transaction bridge — verified across the full
+   parallel-apply / Soroban-host / auth / rollback / TTL / rent / meta /
+   diagnostic-event / invariant test surface.
+
+This is a multi-engineer-month design and protocol-change project, not a
+single-agent PoC. Critical blockers:
+
+- **Protocol-spec change required**: The Anti-Evidence section explicitly
+  rules out the only "small" version of this change (silently reusing decoded
+  values under p26 metering). Any implementation that runs under the current
+  protocol would either (a) keep all the per-transaction `addReads` /
+  `read xdr with budget` / `write xdr` / `recordStorageChanges` work — which
+  defeats the entire optimization — or (b) skip that work and produce
+  different `cpu_insns` / `mem_bytes` numbers, breaking every test that
+  asserts exact budget consumption (a large and well-covered surface in
+  the Soroban test suite, including budget-edge cases that must still fail
+  for the same reason). There is no "small win" subset that both improves
+  perf and passes existing tests on the current protocol.
+- **New protocol resource model has to be designed before code can be
+  written**: A meaningful "per-cluster storage adapter charge" is a protocol
+  specification choice (what entities are charged, at what rate, with what
+  saturation behavior, how it interacts with refundable fees and rent).
+  Picking arbitrary numbers for a PoC would not be falsifiable by the
+  existing test suite (the protocol gate would silence them) and would
+  not produce a benchmark-credible "3-10% improvement" number — the final
+  review explicitly requires a reproducible perf win, which depends on the
+  chosen charge schedule.
+- **FFI surface is per-invocation by design**: `src/rust/src/bridge.rs` and
+  `src/rust/src/soroban_invoke.rs` expose a per-transaction
+  `InvokeHostFunctionOutput`. Adding a batch entry requires new `cxxbridge`
+  types (ordered cluster bundle, per-transaction output vector, storage
+  adapter callbacks back into C++), new `extern "C++"`/`extern "Rust"`
+  declarations, and matching changes to the `make-mks`-driven build. This
+  is feasible engineering but does not fit a single PoC cycle, and there is
+  no way to test it incrementally without the protocol model above.
+- **Cluster-local storage adapter requires re-architecting
+  `ThreadParallelApplyLedgerState` access from Rust**: today Rust gets
+  serialized XDR buffers and returns serialized XDR buffers. A cluster
+  executor that "reuses a cluster-local decoded storage cache" needs either
+  (a) Rust to own decoded state for the cluster's lifetime with C++ commit
+  callbacks, or (b) C++ to expose a stable handle / callback interface that
+  Rust calls during cluster execution. Both are substantial new bridge
+  designs that have to land together with the protocol charges.
+
+A defensible "smaller" first step (e.g., batching only the `addReads`
+serialization, or sharing one decoded TTL map across a cluster, or eliding
+unchanged-entry re-serialization in `recordStorageChanges`) was considered.
+Each of these still mutates p26-observable budget accounting and therefore
+would either (a) keep all the per-transaction charges and produce no net
+work reduction (the bridge calls themselves are <5% of the parent envelope
+according to the reviewer's trace summary — the wins are in
+serialize/decode), or (b) reduce charges and immediately diverge from
+existing budget assertions, which under the budget-number exception in
+this objective's testing rules is **only** permitted when the optimization
+makes operations cheaper in a way that a single budget constant covers —
+not when the charge schedule itself is redefined across many sites and
+many tests.
+
+### Changes Attempted
+
+No source changes were applied. The hypothesis was assessed against the PoC
+budget after reading the reviewer's PoC Guidance and confirming with the
+source files cited:
+
+- `src/transactions/InvokeHostFunctionOpFrame.cpp` — `addReads`,
+  `invokeHostFunction`, `recordStorageChanges` are tightly coupled to
+  per-transaction `CxxBuf` serialization and would need to be re-factored
+  behind a protocol gate to support both batch and legacy shapes.
+- `src/ledger/LedgerManagerImpl.cpp` — `applyThread` /
+  `applySorobanStageClustersInParallel` would need to hand off the entire
+  cluster bundle to Rust and post-process per-transaction outputs in order.
+- `src/rust/src/bridge.rs`, `src/rust/src/soroban_invoke.rs`,
+  `src/rust/src/soroban_proto_any.rs` — would need a new batch CXX entry
+  with cluster-bundle input and per-transaction output vector types.
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs` — being p26 is
+  ineligible for the change; the cluster executor would land in a new
+  next-protocol module (e.g. a hypothetical `p27` host) with its own
+  metering rules.
+
+The conclusion (no implementation attempted) is the right outcome under the
+performance-PoC rules: writing partial scaffolding that cannot pass
+`env NUM_PARTITIONS=30 make check` and cannot produce a defensible benchmark
+number would consume the iteration budget without producing a verifiable
+PoC, and a partial implementation in the source tree would block the next
+pipeline iteration. Source tree is clean (no `git checkout --` was needed).
+
+### Recommendation for Future Pipeline Iterations
+
+This optimization is real and the upper-bound savings are large, but it is a
+protocol-change project rather than an apply-path PoC. A more tractable
+follow-up hypothesis would target the same hot zones (`addReads`,
+`recordStorageChanges`, `read xdr with budget`, `write xdr`, storage-map
+build/clone) with changes that are **observationally equivalent on p26**
+— for example, avoiding redundant cloning in
+`e2e_invoke::invoke_host_function`'s `StorageMap` setup when the initial
+storage is only read for diff purposes, or batching the
+`recordStorageChanges` RW-footprint scan that today is linear per
+transaction. Those PoCs can run under the existing protocol and bridge
+shape and so are fit for this pipeline.
+
