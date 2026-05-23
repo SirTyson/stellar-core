@@ -242,3 +242,32 @@ The remaining work is purely orchestration: commit the outer gitlink
 bump and push the p26 branch to the SirTyson fork so a fresh checkout
 plus `git submodule update --init --recursive` lands on
 `67a60367bf871e63eeb9e3af4aac029a621b9dcd`.
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-05-23
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** YES — source inspection shows the PoC replaces the native Soroswap pool outbound SAC `transfer` re-entry with a typed SAC transfer helper for Stellar Asset contracts, while keeping fallback dispatch for unsupported token/recipient shapes.
+2. **Are the preconditions realistic?** YES — the path is in the generated soroswap benchmark shape and is reached from the native pool swap fast path during `closeLedger`.
+3. **Is the original code inefficient or working as designed?** PLAUSIBLE INEFFICIENCY — the old outbound transfer used generic SAC dispatch and balance helpers even after the pair swap itself had been specialized.
+4. **Does the benchmark improvement match the claimed severity?** NOT CHECKED — final-review benchmarking is disallowed because the mandatory full regression suite did not pass cleanly.
+5. **Is the optimization in scope?** YES — the changed code is in the Soroban host apply path beneath the native Soroswap pool swap, not TX-set construction or lazy bucket work.
+6. **Is the benchmark methodology correct?** NOT REACHED — the required benchmark workflow starts only after a clean `env NUM_PARTITIONS=30 ... make check`.
+7. **Can the improvement be explained without the optimization?** NOT EVALUATED — no authoritative optimized measurements were collected.
+8. **Is this optimization novel?** YES — this exact outbound typed SAC transfer effect specialization is distinct from prior accepted direct SAC balance reads.
+
+### Rejection Reason
+
+The required full regression command did not complete cleanly. `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make -j30 check` failed in `generate soroban load` at `simulation/test/LoadGeneratorTests.cpp:733` with `REQUIRE(entry)` using Catch RNG seed `20596`. Re-running the same test with `--rng-seed 20596` reproduced the failure. Under the optimize-soroswap final-review rules, any test failure or flake blocks confirmation and maps to rejection; benchmark runs were therefore not performed.
+
+### Failed Checks
+
+- Step 4 / Regression tests: full unit suite failed with one failing Catch test (`generate soroban load`, seed `20596`).
+- Step 5 / Benchmarks: not run because benchmarks are only valid after a clean regression suite.
