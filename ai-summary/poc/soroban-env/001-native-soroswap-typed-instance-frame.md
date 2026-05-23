@@ -76,3 +76,25 @@ The current accepted p26 native Soroswap path retrieves a `ScContractInstance`, 
 - **Change description**: Add a next-protocol-only typed native Soroswap frame/view that owns the validated token addresses, reserve values, factory, and optional `k_last` in XDR/typed form, and make native getter/swap reads use that view instead of `with_instance_storage`. For `swap`, update reserve keys 2 and 3 through a narrow success-only typed writeback that preserves rollback and reload behavior without constructing a full `InstanceStorageMap` unless a fallback/reentrant path genuinely needs it.
 - **Correctness check**: Existing generic frame rollback, auth, storage, TTL, and Soroban host tests cover the surrounding invariants, but this native path has limited direct equivalence coverage. The PoC should add focused native-vs-Wasm equivalence tests for getter returns, successful reserve updates, event output, rollback on post-mutation failure, reentry/parent reload behavior if applicable, and fallback for malformed layouts.
 - **Benchmark focus**: Instrument only accepted native Soroswap getter/swap frames to count avoided `InstanceStorageMap::from_instance_xdr`, `ScVal to Val`, `new map`, lookup, and insert rebuild work. Then run `scripts/run_apply_load_matrix.py` three non-Tracy times against the current `CURRENT_STATE.md` baseline and require a reproducible 3-10% soroswap median apply-time reduction.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-23
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:51-67,202-208,890-1450,2048-2072` - added an Rc-backed typed Soroswap pool instance view for next-protocol native frames; getters and swap now read validated token/reserve/factory/k_last fields directly instead of calling `with_instance_storage`, and successful swap records reserve updates for frame-pop persistence.
+- `src/rust/soroban/p26/soroban-env-host/src/host/declared_size.rs:11-14,122,670` - declared and checked the deterministic metered size for the new typed view.
+- `src/rust/soroban/p26/soroban-env-host/src/host.rs:3637` and `src/rust/soroban/p26/soroban-env-host/src/host/trace/fmt.rs:136` - adjusted existing `Frame::NativeContract` pattern matches for the new optional typed-view payload so auth and tracing preserve existing native-frame behavior.
+
+### Demonstration
+
+The native Soroswap getter/swap fast path now carries the validated fixed instance fields in a typed frame view and avoids lazy `InstanceStorageMap::from_instance_xdr` initialization for those reads. Successful swap reserve updates are written back by cloning the original `ScMap` and replacing only keys 2 and 3 during normal frame-pop persistence, preserving rollback and parent reload behavior while avoiding generic host-map construction/lookups on the hot path.
+
+### Test Results
+
+`./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` and `make -j $(nproc)` completed successfully. Full suite command `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make -j $(nproc) check` passed: `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, `All 2 tests passed`.
