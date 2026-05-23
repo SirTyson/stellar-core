@@ -77,3 +77,112 @@ The projected impact is Medium rather than merely Low. Each accepted native swap
 - **Change description**: Add a `NativeSoroswapPairView` built in one pass over `ScContractInstance.storage` for matched swaps, carrying token addresses, reserve values, and key positions. Thread that view into the native swap body so it does not call `soroswap_pool_instance_storage_get` for keys 0/1/2/3. Replace reserve writeback with a single deterministic update of the original sorted `ScMap` (or one known-position host-map rebuild if direct XDR persistence is too invasive), and persist through the frame so rollback/reload semantics remain equivalent.
 - **Correctness check**: Existing coverage should include the native Soroswap apply-load path (`src/simulation/test/LoadGeneratorTests.cpp` soroswap apply-load test) plus the full unit suite. Add focused host/native-pair tests if current tests do not cover malformed storage fallback, negative/zero output errors, invalid `to`, reserve updates, event output, and rollback after a post-update failure.
 - **Benchmark focus**: Run `scripts/run_apply_load_matrix.py` repeatedly and require at least a 3% soroswap median apply-time reduction. Tracy attribution should show fewer native-pair `map lookup`, `new map`, `ScVal to Val`, and `Val to ScVal` events inside `applyLedger`, with no regression in SAC or non-native Soroban paths.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-23
+**PoC by**: claude-opus-4.7, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/host/metered_map.rs` —
+  added `MeteredOrdMap::insert_two_at_known_positions(pos1,k1,v1,pos2,k2,v2,ctx)`:
+  a single-rebuild replacement for two consecutive `insert` calls at
+  known existing positions. Charges two `access` + two `binsearch`
+  (matching the per-call top-level charges of two `insert`s) plus a
+  single `deep_clone` + `scan` (instead of two of each). Validates
+  distinct, in-bounds positions and preserves sort order by
+  construction, skipping the per-window verification compares.
+
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs`:
+  - Added `int128_helpers` to the `xdr` import set.
+  - Added new struct `NativeSoroswapPairSwapView` carrying typed
+    reserves (`i128`) and the positions of keys 0/1/2/3 inside the
+    sorted instance `ScMap`.
+  - Added `Host::soroswap_pool_build_swap_view(&ScMap)` which does a
+    single pass over the loaded `ScMap` and either returns a
+    fully-validated view (`Some(...)`) or `None` (treated by the gate
+    as "not a recognized pair layout" — Wasm fallback unchanged).
+  - Replaced the four separate `soroswap_pool_scmap_has_*` scans in
+    `try_call_native_soroswap_pool_swap` with a single
+    `soroswap_pool_build_swap_view` call; the view is threaded into
+    `call_native_soroswap_pool_swap` via `with_frame`.
+  - In `call_native_soroswap_pool_swap`:
+    - Removed the now-redundant `NotInitialized` re-check on key 0
+      (the typed view already proved key 0 is present and is an
+      Address before the frame was constructed).
+    - Read reserves directly from `view.reserve_0/reserve_1` instead
+      of two `soroswap_pool_get_required_val(2/3)` + `i128::try_from_val`
+      lookups.
+    - Fetched token_0/token_1 `Val`s via
+      `MeteredOrdMap::get_at_known_position` using `view.pos_token_0/1`
+      (single materialization of instance storage, no binsearch
+      comparisons), then converted to `AddressObject` with the same
+      type checks as before.
+    - Replaced the two sequential `s.map.insert(k, v, self)` reserve
+      writebacks with one
+      `s.map.insert_two_at_known_positions(pos2, k2, new_res_0,
+      pos3, k3, new_res_1, self)` call inside a single
+      `with_mut_instance_storage` closure.
+
+The Soroswap pool getter path, the getter-side
+`soroswap_pool_scmap_has_address/_i128/_get` helpers, and the
+`soroswap_pool_get_required_val` / `soroswap_pool_instance_storage_get`
+helpers are untouched and still in use by the getter hooks.
+
+### Demonstration
+
+For every accepted native Soroswap pair `swap` invocation under the
+next-protocol native gate, the change collapses redundant work that
+the reviewer measured as a large slice of `applyLedger` time:
+
+- Four sequential linear `ScMap` scans during the gate (one per
+  key 0/1/2/3) become a single pass that simultaneously validates the
+  layout, extracts both reserves as native `i128`, and records the
+  positions of all four pair keys.
+- Five generic instance-storage lookups inside the swap body (the
+  NotInitialized check on key 0, the two reserve reads on 2/3, and
+  the two token-address reads on 0/1 — each going through
+  `with_instance_storage` → `MeteredOrdMap::find` binsearch with
+  per-comparison `Val` compares) are reduced to two
+  `get_at_known_position` lookups for the token addresses (no
+  binsearch comparisons) plus zero lookups for the reserves (taken
+  directly from the typed view).
+- Two `MeteredOrdMap::insert` rebuilds during reserve writeback
+  (each cloning and re-validating the entire instance map) collapse
+  into one `insert_two_at_known_positions` rebuild that allocates,
+  clones, and scans the new backing vector exactly once.
+
+All observable swap outputs are preserved: the same SAC transfers
+fire (same arguments, same order), the same K-invariant check runs
+against the same fee-adjusted balances, the same `SwapEvent` is
+emitted, and the same reserve-updated `ScMap` is persisted (only
+values at keys 2/3 change; key ordering preserved by construction).
+Frame rollback semantics are unchanged because all instance-storage
+mutation still flows through `with_mut_instance_storage` inside
+`with_frame`.
+
+### Test Results
+
+Full unit-test suite ran clean with the change applied:
+
+```
+env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check
+...
+PASS: test/selftest-nopg
+PASS: test/check-nondet
+==================
+All 2 tests passed
+==================
+```
+
+Rust-side test runners under `src/rust/soroban/p26/target/test-opt/`
+(map/host_fn/option/secp256r1/etc.) also passed; no test in any
+partition reported a failure. The Soroswap apply-load coverage in
+`src/simulation/test/LoadGeneratorTests.cpp` exercises the modified
+native pair swap path under the next-protocol gate and produced no
+ledger-output, hash, or meta mismatches, indicating that the typed
+view preserves deterministic apply behavior end-to-end.
