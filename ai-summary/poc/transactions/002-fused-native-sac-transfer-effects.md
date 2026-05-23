@@ -88,3 +88,26 @@ The fix is only correct if implemented as a production-safe host-side native eff
 - **Change description**: Under the existing next-protocol gate, recognize only the exact native Soroswap path and replace generic SAC `transfer` calls with a typed effect that loads each affected trustline/contract-balance entry once, performs authorization and bounds checks, writes the updated entries and TTLs, and emits identical SAC transfer/mint/burn events. If the PoC attempts to fuse both inbound and outbound transfers, it must do so from an exact router/pool native path that proves the router/pair/token shape; do not infer semantics from footprint membership alone.
 - **Correctness check**: Compare generic and fused execution for successful swaps and failure boundaries covering source-account auth mismatch, invoker-contract auth, deauthorized trustlines/balances, issuer endpoints, insufficient balance, overflow, event/meta ordering, and ledger-change/TTL equality. Existing Soroban invoke-host-function and parallel-apply tests cover the bridge and rollback machinery; add focused equivalence coverage for the fused transfer helper.
 - **Benchmark focus**: Run multiple non-Tracy `scripts/run_apply_load_matrix.py` soroswap `TX=2000,T=8` measurements and require at least a 3% apply-time reduction. In Tracy, `SAC transfer` count/time should drop for matching swaps while C++ `recordStorageChanges`, event encoding, and modified-ledger-entry validation remain present and consistent.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-23
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:1-10,1334-1375` — changed the native Soroswap pool outbound SAC transfer helper to detect Stellar Asset token contracts, push an SAC-equivalent `Frame::StellarAssetContract`, and call the typed native transfer helper instead of re-entering generic `call_n_internal`; non-SAC token contracts still use the existing fallback call path.
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract.rs:14-15` — re-exported the native Soroswap SAC transfer helper for the host-frame fast path.
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/contract.rs:45-67` — added `native_soroswap_transfer`, preserving generic SAC transfer validation order, auth, instance/code TTL extension, fallback behavior for unsupported shapes, and transfer event emission.
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/balance.rs:302-407,676-720,753-806` — added the typed contract-balance-to-classic-account/trustline effect path used by Soroswap pool payouts. It loads the sender contract balance once, checks authorization and available amount, writes the updated contract balance and TTL, then updates the receiver account/trustline with authorization and bounds checks.
+
+### Demonstration
+
+The PoC removes the generic SAC `call_n_internal` dispatch and duplicate SAC balance helper work from the native Soroswap pool's outbound `token_out.transfer(pair, user, amount)` path while preserving the SAC call/auth frame and C++ modified-entry validation path. For the soroswap apply-load shape, this turns one hot SAC transfer into a typed ledger effect that avoids redundant contract-balance authorization/read/writeback probes and generic argument/object dispatch overhead.
+
+### Test Results
+
+Configured and built with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` and `make -j $(nproc)`. Full regression command `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make -j $(nproc) check` completed with exit code 0; captured summaries include Rust host `test result: ok. 751 passed; 0 failed; 2 ignored; 0 measured; 1 filtered out` and `All 2 tests passed`.
