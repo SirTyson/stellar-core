@@ -573,3 +573,92 @@ exact-shape mismatch fall back to the Wasm path before native pair derivation.
   with the gitlink bump (`8e6fccbc...` → `e6f53451...`) and the narrowed
   `LoadGenerator` edits left dirty in the working tree for the orchestrator
   to commit and push to `origin`.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-23
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+Revision 5 still cannot be confirmed because the optimized p26 submodule state
+is only present locally and is not reproducible from the required SirTyson
+submodule handoff branch. The outer PoC branch is clean and its gitlink records
+`src/rust/soroban/p26` at `e6f5345176165e34fb86b253991e971c59a65e01`, matching
+the local p26 worktree, but `git ls-remote --exit-code
+https://github.com/SirTyson/rs-soroban-env.git
+refs/heads/poc/001-fused-native-soroswap-swap-pipeline` found no such branch,
+and the exact commit SHA is not advertised by the SirTyson fork either. The
+upstream `stellar/rs-soroban-env` remote also does not advertise that PoC
+branch.
+
+Because a fresh checkout cannot fetch the recorded optimized submodule commit
+from the expected permanent handoff location, final review cannot promote this
+state to `soroswap-perf` or record it as a new baseline. I did not run the full
+regression suite or the three authoritative non-Tracy benchmark runs; any
+measurement taken against a local-only submodule commit would not be a valid
+final-review measurement.
+
+### Revision Instructions
+
+1. Push p26 commit `e6f5345176165e34fb86b253991e971c59a65e01` to
+   `github.com/SirTyson/rs-soroban-env` on branch
+   `poc/001-fused-native-soroswap-swap-pipeline`.
+2. Re-verify from a fresh checkout of
+   `origin/poc/001-fused-native-soroswap-swap-pipeline` that
+   `git submodule update --init --recursive src/rust/soroban/p26` fetches the
+   recorded gitlink and leaves both the outer repo and p26 submodule clean.
+3. Re-run the exact final-review gate from that reproducible handoff:
+   `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make -j30 ALL_SOROBAN_GIT_STATE_STAMPS= check`,
+   followed by exactly three non-Tracy
+   `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` runs.
+
+### Checks Passed So Far
+
+- The local outer source handoff is clean excluding the repository's shared
+  `ai-summary` artifact symlink, and `HEAD` records the p26 gitlink at
+  `e6f5345176165e34fb86b253991e971c59a65e01`.
+- The local p26 submodule worktree itself is clean at
+  `e6f5345176165e34fb86b253991e971c59a65e01` on branch
+  `poc/001-fused-native-soroswap-swap-pipeline`.
+- Source inspection confirms Revision 5 carries the Revision 4
+  `with_soroswap_subframe` optimization and the narrowed `LoadGenerator`
+  coverage-bias fix described in the PoC notes.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_FAIL
+**Date**: 2026-05-23
+**PoC by**: gpt-5.5, high
+**Failed At**: poc
+**Iterations**: 0 build-test cycles for this revision
+
+### Failure Reason
+
+The remaining revision instruction is a reproducibility/handoff requirement, not
+a source-level optimization fix: p26 commit
+`e6f5345176165e34fb86b253991e971c59a65e01` must be fetchable from
+`github.com/SirTyson/rs-soroban-env` on branch
+`poc/001-fused-native-soroswap-swap-pipeline` before validation is meaningful.
+The current outer `HEAD` records that exact p26 gitlink and the local p26
+worktree is clean at that SHA, but `git ls-remote` against the SirTyson fork
+still advertises neither the required branch nor the commit SHA. The PoC
+procedure explicitly forbids `git commit` and `git push`, so I cannot make the
+submodule commit reproducible from the expected handoff remote.
+
+Because a fresh checkout cannot fetch the recorded p26 commit, running the full
+suite or apply-load measurements from this local-only submodule state would not
+demonstrate a valid handoff. The optimization therefore cannot be demonstrated
+in this PoC attempt.
+
+### Changes Attempted
+
+No source changes were made in this attempt. I inspected the current outer and
+p26 state, confirmed that the outer gitlink points at
+`e6f5345176165e34fb86b253991e971c59a65e01`, confirmed the p26 worktree is clean
+at the same SHA, and confirmed that the expected SirTyson fork branch/SHA is
+not reachable. Pre-existing source and submodule state was left untouched.
