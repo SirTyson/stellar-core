@@ -98,3 +98,53 @@ The native Soroswap getter/swap fast path now carries the validated fixed instan
 ### Test Results
 
 `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` and `make -j $(nproc)` completed successfully. Full suite command `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make -j $(nproc) check` passed: `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, `All 2 tests passed`.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-23
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The PoC source change could not be final-reviewed to CONFIRMED because the handoff is not reproducible from the outer PoC branch. On `poc/001-native-soroswap-typed-instance-frame`, running `git submodule update --init --recursive src/rust/soroban/p26` checks out the prior accepted baseline submodule SHA `fbbea0d9cb33e94fbab331d3d4bf8e69f088f9d4`, not the PoC submodule commit `86b614b3cafaeb1cfa1555a4eacc0386b6429a71`. The outer branch therefore does not record the required p26 gitlink bump, and a clean checkout would benchmark the old baseline rather than this optimization.
+
+The initial worktree also showed dirty pipeline artifacts and `src/rust/soroban/p26` modified relative to the outer index. Per the final-review handoff rules, benchmarking cannot proceed until the PoC branch is a clean, committed, reproducible state.
+
+### Revision Instructions
+
+Commit the outer-repo gitlink update on `poc/001-native-soroswap-typed-instance-frame` so `src/rust/soroban/p26` points at `86b614b3cafaeb1cfa1555a4eacc0386b6429a71` (or the next revised PoC commit), and ensure a fresh checkout followed by `git submodule update --init --recursive src/rust/soroban/p26` lands on that exact submodule SHA with clean status in both the outer worktree and p26. Then rerun the PoC handoff so final review can build, run `env NUM_PARTITIONS=30 make check`, and perform the three required non-Tracy `scripts/run_apply_load_matrix.py` benchmark runs against `ai-summary/CURRENT_STATE.md`.
+
+### Checks Passed So Far
+
+- Read the hypothesis, reviewer notes, PoC notes, and current accepted baseline in `ai-summary/CURRENT_STATE.md`.
+- Confirmed the p26 PoC branch commit exists locally at `86b614b3cafaeb1cfa1555a4eacc0386b6429a71`.
+- Audited the p26 diff before handoff validation reset the submodule: changes are limited to `soroban-env-host/src/host/frame.rs`, `host.rs`, `host/declared_size.rs`, and `host/trace/fmt.rs`; no test logic or assertions were modified.
+- Source-level mechanism is plausible and in scope, but no final-review test or benchmark result is accepted because the outer gitlink handoff failed.
+
+---
+
+## PoC Revision
+
+**Result**: POC_PASS
+**Date**: 2026-05-23
+**PoC by**: claude-opus-4.7, high
+**Iterations**: 1 build-test cycle (handoff fix only — source unchanged from prior PoC)
+
+### Revision Scope
+
+This is a handoff-state revision in response to the prior NEEDS_REVISION verdict. The prior PoC source changes (in `src/rust/soroban/p26`, commit `86b614b3cafaeb1cfa1555a4eacc0386b6429a71`) are unchanged and correct. The issue was purely that the outer worktree's gitlink had not been bumped to point at the new p26 SHA, so a fresh `git submodule update --init --recursive` would land on the prior baseline `fbbea0d9` and benchmark the wrong code.
+
+### Worktree State Prepared for Orchestrator
+
+- `src/rust/soroban/p26` submodule is checked out at `86b614b3cafaeb1cfa1555a4eacc0386b6429a71` (branch `poc/001-native-soroswap-typed-instance-frame`) with a clean working tree.
+- Outer worktree on branch `poc/001-native-soroswap-typed-instance-frame` shows exactly one tracked diff vs `HEAD`: the gitlink bump `src/rust/soroban/p26: fbbea0d9c → 86b614b3c`. No other source files are modified.
+- The orchestrator can now commit the outer gitlink bump onto the PoC branch so that a fresh checkout reproduces the optimized state.
+
+### Verification
+
+- `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production` already in place.
+- `make -j $(nproc)` succeeded against the PoC p26 SHA.
+- `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots --rng-seed 12345' make -j $(nproc) check` reported `All 2 tests passed` (`PASS: test/selftest-nopg`, `PASS: test/check-nondet`).
+- Investigated one initial failure in the `generate soroban load` Catch test at `simulation/test/LoadGeneratorTests.cpp:733` that surfaced under Catch's auto-selected seed 20596. Reproduced the same failure at seed 20596 against the prior accepted baseline submodule SHA `fbbea0d9` with the PoC outer worktree reverted, confirming the flake is pre-existing and unrelated to this optimization. The PoC tree passes the full suite under deterministic seed 12345 and an unrelated random Catch seed.
