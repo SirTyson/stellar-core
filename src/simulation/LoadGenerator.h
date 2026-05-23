@@ -255,6 +255,10 @@ class LoadGenerator
     // queue (to avoid source account collisions during tx submission)
     std::unordered_set<uint64_t> mAccountsInUse;
     std::unordered_set<uint64_t> mAccountsAvailable;
+    // Accounts that have not yet been drawn from `mAccountsAvailable` during
+    // the current load run. Used to bias selection toward unused accounts so
+    // that short load runs achieve deterministic coverage of every account.
+    std::unordered_set<uint64_t> mAccountsNotYetUsedThisRun;
 
     std::optional<XDRInputFileStream> mPreloadedTransactionsFile;
     uint32_t mCurrPreloadedTransaction = 0;
