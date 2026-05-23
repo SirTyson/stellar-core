@@ -239,3 +239,31 @@ exit 0. All 30 partitions plus the rust-side soroban-env-host unit
 tests (`selftest-nopg`, `check-nondet`) passed. The
 `apply load benchmark soroswap` acceptance test in particular passed,
 which validates router/swap equivalence end-to-end.
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-05-23
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** Not fully evaluated after the mandatory test gate failed. Source inspection shows the revision targets the intended `Host::call_contract_fn` Wasm dispatch path for the exact next-protocol Soroswap router `swap_exact_tokens_for_tokens` shape.
+2. **Are the preconditions realistic?** Not benchmarked. The apply-load generator does create this exact router call shape, but confirmation requires a clean full-suite gate first.
+3. **Is the original code inefficient or working as designed?** Not fully evaluated after the test failure. The original path does enter router Wasm for each matching swap, but the optimization cannot be accepted unless it preserves all existing tests.
+4. **Does the benchmark improvement match the claimed severity?** Not evaluated; benchmarks were not run because existing tests did not pass cleanly.
+5. **Is the optimization in scope?** The targeted code path is in the Soroban transaction apply path, but in-scope status is insufficient without a clean test gate.
+6. **Is the benchmark methodology correct?** Not reached. The required `scripts/run_apply_load_matrix.py` measurements are invalid to run for confirmation until `env NUM_PARTITIONS=30 make check` passes cleanly.
+7. **Can the improvement be explained without the optimization?** Not evaluated; no accepted benchmark numbers were produced.
+8. **Is this optimization novel?** No duplicate was identified during source review, but novelty does not override the failed regression gate.
+
+### Rejection Reason
+
+The required full unit-test suite did not complete cleanly. The independent final-review run of `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` failed in `simulation/test/LoadGeneratorTests.cpp:733` during `generate soroban load` with Catch seed `20596` (`REQUIRE(entry)`). The objective-specific final-review rules state that any test failure or flake blocks CONFIRMED and maps to REJECTED, regardless of whether the failure appears pre-existing. Because the test gate failed, no authoritative non-Tracy benchmark comparison was run.
+
+### Failed Checks
+
+- Step 4: Run Existing Tests — full suite failed (`test/selftest-nopg`, `generate soroban load`, seed `20596`).
