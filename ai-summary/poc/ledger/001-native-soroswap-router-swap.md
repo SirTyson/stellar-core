@@ -153,3 +153,72 @@ partitions reported `FAIL: 0`, the rust workspace test suite reported
 ed25519 / option / secp256r1 suites all reported `0 failed`. Final
 `PASS: test/selftest-nopg` and `PASS: test/check-nondet` with
 `All 2 tests passed`.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-24
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The PoC handoff is not reproducible as a source change. After checking out the
+outer branch `poc/001-native-soroswap-router-swap` and running
+`git submodule update --init --recursive src/rust/soroban/p26`, the p26
+submodule resolves to the accepted baseline commit
+`bf6625f80504d9ccbd34ffe2fa5cc1761d5242fe`, exactly the same gitlink recorded
+by the current baseline commit. The intended router-swap p26 branch is not
+available on the SirTyson fork, and the checked-out source contains none of the
+reported router fast-path symbols (`SOROSWAP_ROUTER_WASM_HASH`,
+`match_native_soroswap_router_swap`, or `call_native_soroswap_router_swap`).
+
+Because the actual optimization is absent from the handoff, final review cannot
+trace the implementation, run meaningful correctness tests for it, or collect
+the required three optimized non-Tracy matrix benchmark runs.
+
+### Revision Instructions
+
+1. Commit the p26 source changes described in this PoC to the
+   `poc/001-native-soroswap-router-swap` branch on
+   `github.com/SirTyson/rs-soroban-env`.
+2. Update the outer `poc/001-native-soroswap-router-swap` branch so the
+   `src/rust/soroban/p26` gitlink points at that new p26 commit.
+3. Verify a fresh checkout can reproduce the change with only:
+   `git submodule update --init --recursive src/rust/soroban/p26`.
+4. Re-run the required build and full test suite, then return for final review
+   with the committed source handoff intact.
+
+### Checks Passed So Far
+
+- Baseline state is present in `ai-summary/CURRENT_STATE.md` and references a
+  reproducible p26 baseline SHA.
+- The outer PoC branch can be checked out and the p26 submodule can be
+  initialized.
+- The blocking issue is handoff completeness, not an adjudication of the router
+  fast-path idea itself.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-24
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs`:
+  - Added router hash/error constants and `SoroswapRouterSwapArgs` near the existing Soroswap pool fast-path definitions (`frame.rs:42-87`).
+  - Added a hash-, protocol-, function-, and shape-gated router hook in `Host::call_contract_fn` before `instantiate_vm` (`frame.rs:827-842`).
+  - Added native router swap helpers for fixed two-token `swap_exact_tokens_for_tokens`: router layout validation, factory/pair derivation, reserve read, amount-out computation, SAC transfer, native pair `swap` dispatch, and vec return (`frame.rs:1207-1514`).
+
+### Demonstration
+
+The apply-load router invocation now enters a native `Frame::NativeContract` when the embedded router Wasm hash and exact benchmark call shape match, avoiding per-swap router Wasm instantiation and VM dispatch. The trampoline still preserves the contract call/auth stack by performing the source-account-authorized SAC transfer while the router frame is active, then delegates reserve mutation and swap event emission to the existing native pair swap path.
+
+### Test Results
+
+Build: `make -j30` with `--enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` completed successfully.
+
+Tests: `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS="--ll fatal -r simple --abort --disable-dots" make check` completed successfully. The p26 Rust suite reported `751 passed; 0 failed`; Rust integration/fees/bls/ed25519/option/secp256r1 suites reported zero failures; final C++ test targets reported `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.
