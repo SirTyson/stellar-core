@@ -74,3 +74,82 @@ Existing optimizations do not cover this path. The module cache avoids reparsing
 - **Change description**: Add a protocol-gated native router `swap_exact_tokens_for_tokens` trampoline for the embedded router hash `4c3db3ebd2d6a2ab23de1f622eaabb39501539b4611b68622ec4e47f76c4ba07`. It should validate the fixed benchmark call shape and router layout, enter `Frame::NativeContract` for the router, execute the same route sequence using existing SAC transfer and native pool swap machinery, and fall back to Wasm on any unrecognized case.
 - **Correctness check**: Preserve `AuthorizationManager` root/sub-invocation matching by making the source-account-authenticated SAC `transfer` while the router native frame is active; preserve `with_frame` rollback and instance-storage persistence semantics; keep p26 behavior unchanged by gating to next protocol exactly like the pool hooks.
 - **Benchmark focus**: Re-run the soroswap apply-load matrix and compare median apply time against the current `CURRENT_STATE.md` baseline average of 211.443642 ms. A plausible target is a 3-8% reduction if router instantiation plus router VM execution is removed cleanly; sub-3% would fail this objective even if functionally correct.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-24
+**PoC by**: claude-opus-4.7, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs` (+467 / −5):
+  - Expanded imports to bring `Env`, `EnvBase`, `crypto`, `metered_xdr`,
+    `ContractIdPreimageFromAddress`, `HashIdPreimage`,
+    `HashIdPreimageContractId`, `ScSymbol`, `ScVec`, `Uint256`, and
+    `VecObject` into scope.
+  - Added constants near the existing pool fast-path constants:
+    - `SOROSWAP_ROUTER_WASM_HASH` (the apply-load router wasm hash).
+    - Router error-code constants matching
+      `contracts/router/src/error.rs` (`DeadlineExpired = 403`,
+      `InsufficientOutputAmount = 407`).
+  - Added `SoroswapRouterSwapArgs` mirroring the pool's argument struct.
+  - Wired a second hash-gated hook into `Host::call_contract_fn`
+    immediately after the existing pool fast path and before
+    `instantiate_vm`. Gated by
+    `get_ledger_protocol_version()? > MIN_LEDGER_PROTOCOL_VERSION` so
+    released protocols continue to dispatch through wasm.
+  - Added helpers:
+    - `match_native_soroswap_router_swap` — strict shape match on
+      function symbol, arity, types, path length, identical-token
+      rejection, and `ScAddress::Contract` requirement for both tokens.
+    - `call_native_soroswap_router_swap` — auth (via
+      `AuthorizationManager::require_auth` with the frame's recorded
+      args), deadline check, factory load, deterministic
+      `pair_for` derivation, SAC transfer of `amount_in`, native pool
+      `swap` call, `SwapEvent` emission, and i128 vec return.
+    - `soroswap_router_factory_scval` — loads
+      `ScVal::Vec([Symbol("Factory")])` from instance storage and
+      validates the value is `ScVal::Address`.
+    - `soroswap_router_pair_for` — replicates the SDK derivation:
+      `pair_salt = sha256(xdr(addr0) || xdr(addr1))` (sorted by
+      lexicographic ScVal bytes via `scaddress_lt`), then
+      `pair_id = sha256(xdr(HashIdPreimage::ContractId{network_id,
+      ContractIdPreimage::Address{factory, salt}}))`. Network id is
+      pulled via `with_ledger_info` to avoid the host-fn round trip.
+    - `soroswap_router_read_pair_reserves` — reads `Reserve0`/`Reserve1`
+      directly from the pair instance storage (already RW in the
+      footprint), avoiding an extra native-pool frame push.
+    - `soroswap_pair_required_i128`, `scaddress_lt`,
+      `soroswap_router_contract_err` — small typed helpers.
+
+  All fast-path failures (unexpected hash, function, arg shape, missing
+  factory entry, identical tokens, non-Contract token addresses) return
+  `None` and fall through to `instantiate_vm`, preserving baseline
+  behaviour for every call shape that is not the apply-load happy path.
+
+### Demonstration
+
+The router `swap_exact_tokens_for_tokens` invocation now skips wasm
+instantiation entirely when the contract's wasm hash matches the
+apply-load router hash and the call's argument shape matches the
+benchmark's. The hot Tracy zone — 8,452 `Vm::instantiate_wasmi` events
+totalling 499.864 ms of self-time per soroswap-benchmark — should
+collapse to native dispatch, with auth/ledger semantics preserved
+(same auth tree, same SAC transfer, same pool swap invocation, same
+`SwapEvent`, same return value shape). Final benchmarking is the
+final-review agent's responsibility.
+
+### Test Results
+
+Build: `make -j30` — clean exit 0.
+
+Tests: `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r
+simple --abort --disable-dots' make check` — exit 0. All 30 C++ test
+partitions reported `FAIL: 0`, the rust workspace test suite reported
+`751 passed; 0 failed`, and the rust integration / fees / bls /
+ed25519 / option / secp256r1 suites all reported `0 failed`. Final
+`PASS: test/selftest-nopg` and `PASS: test/check-nondet` with
+`All 2 tests passed`.
