@@ -82,3 +82,87 @@ The performance case is Medium but tight. `commit_to_ltx` cannot disappear becau
 - **Change description**: Add dirty-global-key tracking for entries made dirty by non-final `commitChangeFromThread`, including the RO TTL merge branch that marks a clean preload dirty. For the final stage, skip the normal `commitChangesFromThreads`, collect dirty final-stage keys, merge prior-global/final-thread overlaps through the same `commitChangeFromThread`/`maybeMergeRoTTLBumps` semantics in a compact journal, add final-thread restored entries to `mGlobalRestoredEntries`, then write prior dirty globals not overwritten plus final collapsed journal entries once to a single inner `LedgerTxn`.
 - **Correctness check**: Existing parallel Soroban apply tests and full `make check` should cover normal apply, rollback, restore tracking, and meta behavior. Add targeted coverage only if needed for a multi-stage delete/recreate overlap and an RO TTL final-stage collision, without weakening existing tests.
 - **Benchmark focus**: Run `scripts/run_apply_load_matrix.py` at least three times without Tracy. The expected improvement must show in top-line soroswap median apply time, while diagnostic phase timings should show a substantial drop in `commit_from_thrds`; `commit_to_ltx` may only drop by the clean-scan portion because `LedgerTxn` writes remain mandatory.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-24
+**PoC by**: claude-opus-4.7, high
+
+### Changes Made
+
+- `src/transactions/ParallelApplyUtils.h`
+  - Added `mDirtyGlobalKeys` (`UnorderedSet<ParallelApplyLedgerKey>`) member
+    on `GlobalParallelApplyLedgerState`: compact journal of keys whose
+    `mGlobalEntryMap` entry is dirty (i.e. produced by
+    `commitChangeFromThread`, either as a fresh dirty insertion or via the
+    RO TTL max-merge path that marks a previously-clean preload dirty).
+  - Declared two new private helpers (`writeGlobalEntryToLtx`,
+    `writeRestoredMarkersToLtx`) factored from the old
+    `commitChangesToLedgerTxn` so both the existing and the new commit
+    paths can share them.
+  - Declared new public `commitFinalChangesFromThreadsToLedgerTxn(app,
+    threads, stage, ltx)` that fuses the final-stage thread→global commit
+    with the ltx writeback.
+
+- `src/transactions/ParallelApplyUtils.cpp`
+  - `commitChangeFromThread`: now inserts `key` into `mDirtyGlobalKeys`
+    in both branches that produce a dirty global entry (fresh insertion,
+    overwrite, and the RO TTL max-merge branch).
+  - `commitChangesToLedgerTxn`: now iterates `mDirtyGlobalKeys` and looks
+    up each entry in `mGlobalEntryMap`, instead of scanning every
+    preloaded (mostly clean) entry. Restored-entry marker emission
+    factored into `writeRestoredMarkersToLtx`.
+  - Added `commitFinalChangesFromThreadsToLedgerTxn`:
+    1. For each thread's dirty entry, if the key is already present in
+       `mGlobalEntryMap` (clean preload or prior-stage dirty), invoke
+       `commitChangeFromThread` so `mIsNew`, RO TTL max-merge, and
+       delete/recreate collapse semantics are preserved exactly.
+       Otherwise rescope and write the (collapsed) final state directly
+       to the inner ltx, skipping the global map entirely.
+    2. Fold each thread's restored entries into
+       `mGlobalRestoredEntries`.
+    3. Iterate `mDirtyGlobalKeys` to emit prior-stage dirty plus
+       final-stage overlap-merged entries via `writeGlobalEntryToLtx`.
+    4. Emit restored-entry markers and commit the inner ltx.
+
+- `src/ledger/LedgerManagerImpl.h`
+  - `applySorobanStage` signature gains `bool isFinalStage` and
+    `AbstractLedgerTxn& ltx` parameters.
+
+- `src/ledger/LedgerManagerImpl.cpp`
+  - `applySorobanStage`: on the final stage calls
+    `commitFinalChangesFromThreadsToLedgerTxn(app, threadStates, stage,
+    ltx)` instead of `commitChangesFromThreads`. The final-stage time
+    is attributed to `sorobanCommitToLtxMs` (since the bulk is now ltx
+    writes); non-final stages still update `sorobanCommitFromThreadsMs`.
+  - `applySorobanStages`: passes `isFinalStage = (stageIdx + 1 ==
+    stages.size())` to `applySorobanStage`. The trailing
+    `commitChangesToLedgerTxn(ltx)` call only runs in the (rare)
+    `stages.empty()` case, to keep restored-entry marker handling
+    correct. `sorobanCommitToLtxMs` is reset to 0 alongside the other
+    per-ledger phase counters and accumulated across calls.
+
+### Demonstration
+
+The optimization eliminates the redundant final-stage materialization of
+thread entries into `mGlobalEntryMap` followed by a scan of that map to
+filter out the clean preloads. For the final stage, non-overlapping
+dirty thread entries now go straight to the inner `LedgerTxn`, and the
+final commit walks only the `mDirtyGlobalKeys` set rather than every
+preloaded global entry. Correctness is preserved because overlap keys
+still flow through `commitChangeFromThread` / `maybeMergeRoTTLBumps`,
+which collapse delete-then-recreate sequences into a single LIVE state
+in memory before any `LedgerTxn` write — avoiding the `DELETED + LIVE`
+`LedgerEntryPtr::mergeFrom` failure that sank earlier direct-write
+sketches.
+
+### Test Results
+
+`env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple
+--abort --disable-dots' make check` ran the full suite to completion
+across all 30 partitions with zero failures (every partition reported
+"All tests passed"), and both `selftest-nopg` and `check-nondet`
+passed.
