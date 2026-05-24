@@ -248,6 +248,12 @@ class GlobalParallelApplyLedgerState
                               GlobalParallelApplyEntry& oldEntry,
                               ParallelApplyLedgerKeySet const& readWriteSet);
 
+    void mergeGlobalEntryIntoMap(GlobalParallelApplyEntryMap& entryMap,
+                                ParallelApplyLedgerKey const& key,
+                                GlobalParallelApplyEntry&& newEntry,
+                                ParallelApplyLedgerKeySet const& readWriteSet,
+                                ParallelApplyLedgerKeySet* dirtyKeys);
+
     void commitChangeFromThread(ThreadParallelApplyLedgerState const& thread,
                                 ParallelApplyLedgerKey const& key,
                                 ThreadParallelApplyEntry&& parEntry,
@@ -293,13 +299,14 @@ class GlobalParallelApplyLedgerState
     //    prior-stage dirty entry), invoke the existing
     //    commitChangeFromThread merge path so that mIsNew, the RO TTL
     //    max-merge, and delete-then-recreate collapse all behave exactly
-    //    as today. Otherwise emit the entry directly to the inner ltx
-    //    without materializing it into mGlobalEntryMap.
+    //    as today. Otherwise collect it in a compact final-stage journal
+    //    that applies the same merge semantics across same-stage duplicate
+    //    keys, without materializing it into mGlobalEntryMap.
     //
     //  - After draining threads, iterate mDirtyGlobalKeys to emit all
     //    prior-stage dirty entries plus the collapsed final-stage overlap
     //    entries. This avoids scanning every clean preloaded entry in
-    //    mGlobalEntryMap.
+    //    mGlobalEntryMap. Then emit the compact final-stage journal.
     //
     //  - Apply restored-entry markers exactly as commitChangesToLedgerTxn
     //    does today.

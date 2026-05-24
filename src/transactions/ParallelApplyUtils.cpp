@@ -827,13 +827,15 @@ GlobalParallelApplyLedgerState::commitFinalChangesFromThreadsToLedgerTxn(
     auto readWriteSet = getReadWriteKeysForStage(stage);
 
     LedgerTxn ltxInner(ltx);
+    GlobalParallelApplyEntryMap finalStageEntryMap;
 
     // First pass: drain each thread's dirty entries. For keys that overlap
     // a prior global entry (clean preload or prior-stage dirty), use the
     // existing commitChangeFromThread merge path so that mIsNew, RO TTL
     // max-merge, and delete/recreate collapse semantics are preserved
-    // exactly. For non-overlapping keys, emit the (collapsed) final state
-    // directly to ltxInner, skipping the global map. Also fold each
+    // exactly. For non-overlapping keys, collect collapsed final states in
+    // a compact final-stage journal so same-stage duplicates are still
+    // merged before any LedgerTxn writes. Also fold each
     // thread's restored entries into the global restored set.
     for (auto& thread : threads)
     {
@@ -856,11 +858,15 @@ GlobalParallelApplyLedgerState::commitFinalChangesFromThreadsToLedgerTxn(
             }
             else
             {
-                // No prior global entry. Emit the final state directly,
-                // skipping the global map materialization.
+                // No prior global entry. Keep the final state in a compact
+                // journal instead of writing immediately, so later
+                // same-stage duplicates (notably RO TTL bumps) merge through
+                // the same max-TTL / first-touch semantics before writeback.
                 GlobalParallelApplyEntry rescoped =
                     std::move(entry).rescope(*thread, *this);
-                writeGlobalEntryToLtx(ltxInner, key, std::move(rescoped));
+                mergeGlobalEntryIntoMap(finalStageEntryMap, key,
+                                        std::move(rescoped), readWriteSet,
+                                        nullptr);
             }
         }
         mGlobalRestoredEntries.addRestoresFrom(thread->getRestoredEntries());
@@ -874,6 +880,11 @@ GlobalParallelApplyLedgerState::commitFinalChangesFromThreadsToLedgerTxn(
         releaseAssert(it != mGlobalEntryMap.end());
         releaseAssert(it->second.mIsDirty);
         writeGlobalEntryToLtx(ltxInner, key, std::move(it->second));
+    }
+    for (auto& [key, entry] : finalStageEntryMap)
+    {
+        releaseAssert(entry.mIsDirty);
+        writeGlobalEntryToLtx(ltxInner, key, std::move(entry));
     }
 
     writeRestoredMarkersToLtx(ltxInner);
@@ -934,6 +945,43 @@ GlobalParallelApplyLedgerState::maybeMergeRoTTLBumps(
 }
 
 void
+GlobalParallelApplyLedgerState::mergeGlobalEntryIntoMap(
+    GlobalParallelApplyEntryMap& entryMap, ParallelApplyLedgerKey const& key,
+    GlobalParallelApplyEntry&& newEntry,
+    ParallelApplyLedgerKeySet const& readWriteSet,
+    ParallelApplyLedgerKeySet* dirtyKeys)
+{
+    auto it = entryMap.find(key);
+    if (it == entryMap.end())
+    {
+        entryMap.emplace(key, std::move(newEntry));
+    }
+    else
+    {
+        if (!maybeMergeRoTTLBumps(key, newEntry, it->second, readWriteSet))
+        {
+            // Preserve mIsNew from the first stage/thread that touched this
+            // entry, so delete/recreate sequences are emitted as one collapsed
+            // INIT/LIVE state.
+            bool oldIsNew = it->second.mIsNew;
+            it->second = std::move(newEntry);
+            it->second.mIsNew = oldIsNew;
+        }
+        else
+        {
+            // The merge modified the entry value in-place. Mark it dirty so
+            // the compact writeback path emits it even if the old entry was a
+            // clean preload.
+            it->second.mIsDirty = true;
+        }
+    }
+    if (dirtyKeys)
+    {
+        dirtyKeys->insert(key);
+    }
+}
+
+void
 GlobalParallelApplyLedgerState::commitChangeFromThread(
     ThreadParallelApplyLedgerState const& thread,
     ParallelApplyLedgerKey const& key, ThreadParallelApplyEntry&& parEntry,
@@ -944,32 +992,8 @@ GlobalParallelApplyLedgerState::commitChangeFromThread(
         return;
     }
     auto rescopedParEntry = std::move(parEntry).rescope(thread, *this);
-    auto it = mGlobalEntryMap.find(key);
-    if (it == mGlobalEntryMap.end())
-    {
-        mGlobalEntryMap.emplace(key, std::move(rescopedParEntry));
-        mDirtyGlobalKeys.insert(key);
-    }
-    else
-    {
-        if (!maybeMergeRoTTLBumps(key, rescopedParEntry, it->second,
-                                  readWriteSet))
-        {
-            // Preserve mIsNew from the first stage that touched this entry.
-            bool oldIsNew = it->second.mIsNew;
-            it->second = std::move(rescopedParEntry);
-            it->second.mIsNew = oldIsNew;
-        }
-        else
-        {
-            // The merge modified the entry value in-place. Mark it dirty
-            // so commitChangesToLedgerTxn writes it. This is necessary
-            // when the entry was pre-loaded (with mIsDirty=false) by the
-            // Soroban RO entry pre-loading in the constructor.
-            it->second.mIsDirty = true;
-        }
-        mDirtyGlobalKeys.insert(key);
-    }
+    mergeGlobalEntryIntoMap(mGlobalEntryMap, key, std::move(rescopedParEntry),
+                            readWriteSet, &mDirtyGlobalKeys);
 }
 
 void

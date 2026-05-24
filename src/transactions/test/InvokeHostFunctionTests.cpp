@@ -9323,7 +9323,8 @@ TEST_CASE("parallel restore and extend op", "[tx][soroban][parallelapply]")
     checkTx(1, r, txSUCCESS);
 }
 
-TEST_CASE("read-only bumps across threads", "[tx][soroban][parallelapply]")
+TEST_CASE("read-only bumps across final-stage threads use max TTL",
+          "[tx][soroban][parallelapply]")
 {
     auto cfg = getTestConfig();
 
@@ -9347,21 +9348,24 @@ TEST_CASE("read-only bumps across threads", "[tx][soroban][parallelapply]")
     auto keySpec = client.readKeySpec("key", ContractDataDurability::TEMPORARY);
 
     // Each tx is 4M instructions, so we can fit 5 txs in a single cluster.
-    // 10 txs will be split across 2 clusters.
+    // 10 txs will be split across 2 clusters. Use non-monotonic extension
+    // targets so the final TTL must be the maximum, not whichever cluster is
+    // committed last.
+    std::vector<uint32_t> extensions = {900, 150, 300, 750, 250,
+                                        450, 100, 600, 200, 350};
     std::vector<TestAccount> accounts;
-    for (size_t i = 0; i < 10; ++i)
+    for (size_t i = 0; i < extensions.size(); ++i)
     {
         accounts.emplace_back(
             root.create("a" + std::to_string(i), startingBalance));
     }
 
     uint32_t maxExtension = 0;
-    stellar::uniform_int_distribution<uint32_t> dist(100, 1000);
 
     std::vector<TransactionFrameBaseConstPtr> sorobanTxs;
-    for (auto& account : accounts)
+    for (size_t i = 0; i < accounts.size(); ++i)
     {
-        auto extendTo = dist(getGlobalRandomEngine());
+        auto extendTo = extensions.at(i);
         maxExtension = std::max(maxExtension, extendTo);
 
         auto inv = client.getContract().prepareInvocation(
@@ -9369,7 +9373,8 @@ TEST_CASE("read-only bumps across threads", "[tx][soroban][parallelapply]")
             {makeSymbolSCVal("key"), makeU32SCVal(extendTo),
              makeU32SCVal(extendTo)},
             keySpec);
-        auto tx = inv.withExactNonRefundableResourceFee().createTx(&account);
+        auto tx =
+            inv.withExactNonRefundableResourceFee().createTx(&accounts.at(i));
         sorobanTxs.emplace_back(tx);
     }
 
