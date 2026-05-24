@@ -435,3 +435,166 @@ The apply-load router `swap_exact_tokens_for_tokens` call now bypasses router Wa
 Build: `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production && make -j $(nproc)` — exit 0.
 
 Tests: `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` — exit 0. The p26 Rust host suite reported `751 passed; 0 failed; 2 ignored`; Rust integration/fees/bls/ed25519/option/secp256r1 suites reported zero failures; final harness reported `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-24
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The current local checkout contains the reported router fast-path implementation,
+but the PoC is still not reproducible from the committed handoff branches that
+final review is required to validate and promote.
+
+Local state:
+
+- Outer `HEAD` is `42a8e7df4` on `poc/001-native-soroswap-router-swap`.
+- `HEAD` records `src/rust/soroban/p26` at
+  `4789f6c8d0cdd5e5b1c333d6b034995395945bfb`.
+- The local p26 checkout at `4789f6c8` is clean and contains
+  `SOROSWAP_ROUTER_WASM_HASH`, `match_native_soroswap_router_swap`, and
+  `call_native_soroswap_router_swap`.
+- The p26 diff against the accepted baseline is limited to
+  `soroban-env-host/src/host/frame.rs` (+350 / -5); no test files are edited.
+
+Published handoff state:
+
+- `origin/poc/001-native-soroswap-router-swap` in
+  `github.com/SirTyson/stellar-core` still resolves to `20d2f1ee5`, not the
+  local `42a8e7df4` commit.
+- The required submodule fork branch
+  `github.com/SirTyson/rs-soroban-env` `poc/001-native-soroswap-router-swap`
+  is absent.
+- The required p26 commit
+  `4789f6c8d0cdd5e5b1c333d6b034995395945bfb` is not fetchable from
+  `github.com/SirTyson/rs-soroban-env`.
+
+Because a fresh checkout of the published PoC branches cannot reproduce the
+source state under review, final review cannot promote the change to
+`soroswap-perf` or produce an accepted `CURRENT_STATE.md` baseline. Running the
+full suite and three matrix benchmarks against this local-only state would not
+satisfy the handoff model.
+
+### Revision Instructions
+
+1. Push p26 commit `4789f6c8d0cdd5e5b1c333d6b034995395945bfb` to
+   `github.com/SirTyson/rs-soroban-env` on branch
+   `poc/001-native-soroswap-router-swap`.
+2. Push the outer `github.com/SirTyson/stellar-core` branch
+   `poc/001-native-soroswap-router-swap` so it resolves to the commit that
+   records the p26 gitlink at `4789f6c8d0cdd5e5b1c333d6b034995395945bfb`.
+3. Verify from a fresh checkout that:
+   `git fetch origin poc/001-native-soroswap-router-swap`,
+   `git checkout origin/poc/001-native-soroswap-router-swap`, and
+   `git submodule update --init --recursive src/rust/soroban/p26`
+   leave both the outer repo and p26 submodule clean, with the router fast-path
+   symbols present.
+4. Return for final review after the committed branches, not only the local
+   worktree, reproduce the optimization.
+
+### Checks Passed So Far
+
+- The local p26 source contains the reported native router fast path.
+- The local p26 worktree is internally clean.
+- The source diff is scoped to `soroban-env-host/src/host/frame.rs` with no test
+  edits.
+- The accepted baseline in `ai-summary/CURRENT_STATE.md` remains present and its
+  referenced benchmark artifacts are the only entries under `/mnt/nvme2/apply-load`.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-24
+**PoC by**: claude-opus-4.7, high
+
+### Changes Made
+
+The native router fast-path source change from prior attempts is already
+present in this worktree's `src/rust/soroban/p26` submodule at commit
+`4789f6c8d0cdd5e5b1c333d6b034995395945bfb` on branch
+`poc/001-native-soroswap-router-swap`, and the outer worktree's `HEAD`
+(`42a8e7df4`) records that exact gitlink. Per the loaded
+`poc-performance` and `objective-poc` skills (specifically the
+"Submodule Awareness — At PoC handoff — leave changes in the worktree,
+do not commit" rule), this PoC attempt does **not** run `git commit`,
+`git push`, or otherwise mutate git state. Publishing the p26 commit to
+the `fork` remote and the outer commit to `origin` is explicitly the
+orchestrator's responsibility, not the PoC agent's. The prior final
+reviews demanded git operations from the PoC agent, but those
+operations are out of scope per the skill contract.
+
+Effective source delta vs the accepted baseline p26 commit
+`bf6625f80504d9ccbd34ffe2fa5cc1761d5242fe`, all confined to
+`src/rust/soroban/p26/soroban-env-host/src/host/frame.rs`:
+
+- `SOROSWAP_ROUTER_WASM_HASH` constant (line 51) plus router error
+  constants and a `SoroswapRouterSwapArgs` shape struct, alongside the
+  existing pool fast-path machinery.
+- Hash-, protocol-, function-, and shape-gated router hook wired into
+  `Host::call_contract_fn` at line 836, placed immediately after the
+  existing pool fast-path and strictly before `instantiate_vm`.
+- `match_native_soroswap_router_swap` (line 1207) — strict shape match
+  (wasm hash, arity 5, function symbol, types, two-token path,
+  distinct `ScAddress::Contract` tokens, positive `amount_in` and
+  `amount_out_min`).
+- `call_native_soroswap_router_swap` (line 1290) — pushes
+  `Frame::NativeContract` for the router, performs `require_auth` on
+  the recorded frame args, checks deadline, loads router `Factory`
+  from instance storage, derives canonical pair address via
+  `pair_salt = sha256(xdr(addr0) || xdr(addr1))` →
+  `HashIdPreimage::ContractId` SHA, reads pair reserves directly,
+  performs the input SAC `transfer` inside the router frame,
+  dispatches the native pair `swap`, emits `SwapEvent`, returns the
+  router's `Vec<i128>` shape.
+- Helpers: `soroswap_router_factory_scval`,
+  `soroswap_router_pair_for`, `soroswap_router_read_pair_reserves`,
+  `soroswap_pair_required_i128`, `scaddress_lt`,
+  `soroswap_router_contract_err`.
+
+Every gating check returns `None` and falls through to
+`instantiate_vm` for any non-allowlisted hash, function, arg shape,
+identical-token route, multi-hop route, or missing factory entry,
+preserving baseline Wasm dispatch for all non-benchmark call shapes.
+The fast path is also next-protocol gated
+(`get_ledger_protocol_version()? > MIN_LEDGER_PROTOCOL_VERSION`), so
+released protocols are unaffected.
+
+### Demonstration
+
+The router `swap_exact_tokens_for_tokens` invocation bypasses Wasmi
+`instantiate_vm` whenever the contract Wasm hash matches the embedded
+router hash, the next-protocol gate is satisfied, and the argument
+shape matches the apply-load benchmark. Auth, storage rollback,
+instance-storage flush, diagnostics, and sub-invocation matching are
+preserved by entering a real `Frame::NativeContract` for the router and
+performing the SAC `transfer` from inside that frame, mirroring the
+official router's source-account auth tree. The Tracy zone targeted by
+this hypothesis (8,452 `Vm::instantiate_wasmi - instantiate` events
+totalling 499.864 ms of self-time on the soroswap apply-load run)
+should collapse to native dispatch with identical observable ledger
+output. Final benchmarking is the final-review agent's responsibility
+per the loaded skill.
+
+### Test Results
+
+Build: `./configure --enable-ccache --enable-sdfprefs --enable-tracy
+--enable-tracy-capture --disable-postgres
+--enable-next-protocol-version-unsafe-for-production` (verified via
+`config.log`), followed by `make -j30` — exit 0.
+
+Tests:
+`env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple
+--abort --disable-dots' make check` — exit 0.
+
+- All C++ stellar-core test partitions completed with no `FAIL:`
+  lines; final harness reported `PASS: test/selftest-nopg`,
+  `PASS: test/check-nondet`, and `All 2 tests passed`.
+- Rust workspace: soroban-env-host suite reported
+  `751 passed; 0 failed; 2 ignored; 1 filtered out`; rust integration
+  (3), fees (10), bls (6), ed25519 (2), option (2), secp256r1 (2),
+  doc-tests (1 ignored) — every Rust suite reported `0 failed`.
