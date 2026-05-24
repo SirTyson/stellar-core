@@ -268,3 +268,44 @@ The revised compact final-stage path keeps the optimization's intended win — a
 ### Test Results
 
 Configured with `--enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`, built with `make -j $(nproc)`, and ran `./src/stellar-core test --ll fatal -r simple --abort --disable-dots "read-only bumps across final-stage threads use max TTL"` successfully. The full regression suite `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` completed successfully, including `selftest-nopg` and `check-nondet`.
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-05-24
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** YES — source inspection confirms the final-stage path avoids materializing non-overlap thread entries into `mGlobalEntryMap` and avoids scanning clean preloaded globals during final `LedgerTxn` writeback.
+2. **Are the preconditions realistic?** YES — final-stage parallel Soroban writeback is on the measured `closeLedger` apply path exercised by the soroswap matrix.
+3. **Is the original code inefficient or working as designed?** MIXED — the original final-stage global-map pass performs real redundant work after the last stage, but the merge point is also correctness-critical for duplicate RO TTL bumps; the revised PoC restores this merge with a final-stage journal.
+4. **Does the benchmark improvement match the claimed severity?** NO — independent non-Tracy matrix runs regressed soroswap median apply time rather than improving it.
+5. **Is the optimization in scope?** YES — the affected code is in parallel Soroban apply/writeback under `closeLedger`, not TX-set construction or lazy background bucket work.
+6. **Is the benchmark methodology correct?** YES — benchmarks were run with the required local binary PATH prefix and without `--tracy`, three times, using `scripts/run_apply_load_matrix.py`.
+7. **Can the improvement be explained without the optimization?** NOT APPLICABLE — there was no measured top-line improvement to explain.
+8. **Is this optimization novel?** YES — this is a new compact-journal variant of prior rejected direct-write sketches.
+
+Independent benchmark comparison against `ai-summary/CURRENT_STATE.md` baseline:
+
+| Metric | Baseline runs | Optimized runs | Result |
+|--------|---------------|----------------|--------|
+| soroswap median_ms | 221.844987 / 217.378587 / 215.707167 | 225.039100 / 219.276633 / 216.288735 | 218.310247 avg -> 220.201489 avg (**0.87% regression**) |
+| sac median_ms | 316.314591 / 316.279749 / 311.369706 | 318.606422 / 319.190965 / 313.390423 | 314.654682 avg -> 317.062604 avg (**0.77% regression**) |
+
+The optimized soroswap distribution is slower at every rank than the accepted baseline distribution, so the headline metric fails the objective's improvement requirement. Because the non-Tracy runs do not show an eligible improvement, no diagnostic Tracy run was warranted.
+
+### Rejection Reason
+
+The optimization is source-plausible and passes correctness testing, but it does not measurably reduce apply time. The required independent benchmark runs show a soroswap median apply-time regression, which is a hard blocker for CONFIRMED under the optimize-soroswap final-review criteria.
+
+A secondary process concern is that the PoC modified an existing test case's logic (`read-only bumps across threads`) instead of adding a new targeted regression test. The change appears to make the test deterministic rather than weaker, but the objective's TESTING_RULES allow new tests and mechanical test edits only.
+
+### Failed Checks
+
+- Performance verdict criterion: soroswap apply time regressed across the three required non-Tracy matrix runs.
+- Adversarial check 4: benchmark improvement does not match the claimed severity; no improvement was observed.
+- Test audit rule: non-mechanical modification to an existing test case.

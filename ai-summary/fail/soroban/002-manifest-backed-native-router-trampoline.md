@@ -41,3 +41,39 @@ Run `scripts/run_apply_load_matrix.py` for the current soroswap scenario. `Apply
 - Prior native-router and native-pool proposals were rejected as under-specified. This hypothesis is only viable if the PoC includes a binary-derived manifest and tests proving storage schema, pair-address derivation, error/trap mapping, auth-tree shape, event order, and next-protocol metering equivalence for the exact vendored Wasm hash.
 - Broad VM and dispatch zones include mandatory SAC transfer, pair swap, storage, auth, event, and budget work that the router trampoline must preserve. The Medium claim depends on removing the root router VM/import layer plus related conversions, not the whole `parallelApply` body.
 - If instrumentation shows that most `call` dispatch self-time belongs to pair/SAC work that remains after bypassing the router, the realistic saving may fall below the 3% Medium threshold.
+
+---
+
+## Review
+
+**Verdict**: NOT_VIABLE
+**Date**: 2026-05-24
+**Reviewed by**: gpt-5.5, high
+**Novelty**: FAIL — duplicate of `ai-summary/fail/soroban/summary.md` retained item `001-protocol-gated-soroswap-native-router-pair.md + 001-protocol-gated-two-hop-soroswap-native-swap.md + 001-fused-applyload-soroswap-swap-precompile.md` and Meta-Pattern 15 ("All Native Soroswap Bypass Variants Share the Same Unresolved Specification Blockers")
+**Failed At**: reviewer
+
+### Trace Summary
+
+The generated soroswap workload does invoke the router exactly as claimed: `ApplyLoad::generateSoroswapSwaps` creates `InvokeContract(router, "swap_exact_tokens_for_tokens", [100, 0, [token_in, token_out], source, UINT64_MAX])` and a source-account auth tree rooted at that router call. The host path converts the top-level `HostFunction::InvokeContract` to `Val` arguments, calls `call_n_internal`, and then `call_contract_fn` loads the router instance; because the current native gates only recognize the pool Wasm hash, the router falls through to `instantiate_vm`, `Frame::ContractVM`, and `Vm::invoke_function_raw`. Router-emitted calls then enter `Host::call` / `call_n_internal`, where the existing next-protocol pool getter/swap native paths may intercept pair calls, but the root router VM frame remains.
+
+### Code Paths Examined
+
+- `src/simulation/ApplyLoad.cpp:3382-3505` — constructs the exact two-token router invocation, footprint, and source-account auth tree described in the hypothesis.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:1733-1756` — `HostFunction::InvokeContract` pushes a `HostFunction` frame, converts the contract address/function/args, and calls `call_n_internal`.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:1531-1729` — `call_n_internal` performs reentry checks and diagnostics, then dispatches to `call_contract_fn`.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:783-828` — `call_contract_fn` loads the contract instance, probes only native Soroswap pool getter/swap gates, and otherwise instantiates a Wasm VM and invokes the requested export in a `ContractVM` frame.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:42-48` and `840-1074` — the only production Soroswap native hash gate in this file is `SOROSWAP_POOL_WASM_HASH`; there is no router-hash gate, router manifest, or router trampoline in the current source.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:1013-1305` — the native pair `swap` path is next-protocol/hash/shape gated and preserves native frame, TTL, storage mutation, SAC transfer/balance, K-check, event, and rollback behavior for the pair contract only.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:437-631` and `1804-1886` — `with_frame` supplies rollback, auth-frame, event rollback, and instance-storage persistence semantics that any router-native frame would need to reproduce.
+- `src/rust/soroban/p26/soroban-env-host/src/auth.rs:1340-1370`, `src/rust/soroban/p26/soroban-env-host/src/host.rs:3629-3656`, and `src/rust/soroban/p26/soroban-env-host/src/events/mod.rs:250-263` — authorization and event identity derive from the current frame's contract/function/args and current contract id.
+- `src/rust/src/soroban_test_wasm.rs:135-137` — the router bytes are vendored as opaque `include_bytes!("../apply-load-wasm/soroswap_router.wasm")`; no generated manifest is present in the checked source.
+
+### Why It Failed
+
+This is not novel under the retained failure set. The fail summary already records a protocol-gated native Soroswap router/pair fast path, two-hop native swap, fused apply-load precompile, router-only trampoline, exact router plan, and two-token trampoline as rejected at reviewer stage because they require a complete native-contract protocol specification: approved hashes, exact ABI conversions, storage schema, event order, error/trap mapping, auth-tree semantics, and a next-protocol metering schedule. This hypothesis renames that blocker as a "manifest-backed" trampoline, but the checked source contains no router manifest or binary-derived proof; the proposal still delegates the hard work to the PoC rather than presenting the concrete semantic/metering equivalence needed to escape the prior rejection.
+
+The inefficiency itself is real and on the apply path, but the performance claim cannot be promoted under the optimize-soroswap rules while it remains a duplicate of the retained native-bypass family. A correct trampoline would have to preserve root auth-frame shape, router contract identity, fallback behavior, pair-address derivation, input SAC transfer semantics, pair native swap semantics, event ordering, rollback, and protocol-visible metering. Those exact blockers are the reason the prior native-router/native-Soroswap bypass variants were retained as failures.
+
+### Lesson Learned
+
+For native Soroswap bypass ideas, a manifest is only a solution if the manifest already exists as a binary-derived, reviewable protocol artifact with exact semantic and metering equivalence. A hypothesis that merely says such a manifest should be generated is still the same under-specified native-router trampoline family already rejected in `fail/soroban/summary.md`.
