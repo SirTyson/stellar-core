@@ -74,3 +74,78 @@ The proposed fix is correct only if it preserves current bridge semantics exactl
 - **Change description**: Add an enforcing/apply-output path that walks `Storage::map` once and directly builds `Vec<LedgerEntryRentChange>` plus `Vec<RustBuf>`/`Vec<Vec<u8>>` modified ledger effects, without materializing `Vec<LedgerEntryChange>` for the bridge path. Keep the existing dense `ledger_changes` path for recording/simulation/tests that require it, or refactor shared per-entry logic so dense and sparse outputs remain equivalent.
 - **Correctness check**: Preserve rent fee, `modified_ledger_entries`, resource counters, result/event bytes, deletion semantics, restored-key handling, and deterministic effect ordering. Any reduced metered `ValSer` work changes instruction/memory accounting, so either intentionally protocol-gate/update exact budget-number tests like `002-cache-old-entry-xdr-sizes`, or charge equivalent budget explicitly.
 - **Benchmark focus**: Re-run the soroswap apply-load matrix with at least three non-Tracy runs and require a reproducible 3%+ median apply-time reduction. A diagnostic Tracy run should show reduced post-invocation `write xdr`/ledger-change construction work, especially from key serialization and dense change filtering, without increasing C++ `recordStorageChanges` or rent computation time.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-24
+**PoC by**: claude-opus-4.7, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs`
+  - `get_ledger_changes` (lines ~224-360): added a `populate_encoded_key: bool`
+    parameter. When `false`, the per-entry `LedgerKey` XDR is no longer
+    written into `LedgerEntryChange.encoded_key`. The key-hash fallback for
+    entries lacking cached `ttl_entry` metadata uses a single shared scratch
+    `Vec<u8>` (cleared between entries), so a metered `metered_write_xdr` of
+    the key is still performed when (and only when) the hash is actually
+    needed. Cached-`ttl_entry` entries (i.e. all Soroban contract data /
+    code / instance / TTL footprint entries with initial metadata) now
+    completely skip key XDR serialization.
+  - Recording-mode caller `invoke_host_function_in_recording_mode` passes
+    `populate_encoded_key=true` (preserves the existing dense API consumed
+    by `soroban-simulation::simulation::extract_modified_entries` and the
+    host's own `e2e_tests`).
+  - Public `invoke_host_function` is unchanged in behaviour: it now
+    delegates to a new internal `invoke_host_function_internal` with
+    `populate_ledger_change_encoded_keys=true`.
+  - Added a new public `invoke_host_function_for_apply` wrapper that calls
+    the internal path with `populate_ledger_change_encoded_keys=false`.
+    Documented as the stellar-core apply path which never reads
+    `encoded_key` (only `read_only`, `encoded_new_value`, and `ttl_change`
+    are consumed downstream).
+
+- `src/rust/src/soroban_proto_all.rs`
+  - p26 module's `invoke_host_function_with_trace_hook_and_module_cache`
+    (lines ~95-130): switched to call
+    `e2e_invoke::invoke_host_function_for_apply` instead of
+    `invoke_host_function`. This routes every stellar-core enforcing-mode
+    invocation (the soroswap apply path) through the no-encoded-key
+    variant. p21-p25 modules left unchanged (older protocols, not on the
+    soroswap hot path; their submodules don't have the new helper).
+
+### Demonstration
+
+`get_ledger_changes` was unconditionally calling
+`metered_write_xdr(budget, key.as_ref(), &mut entry_change.encoded_key)`
+for every footprint entry, even though `encoded_key` is never read by
+the stellar-core apply path (the bridge only consumes `read_only`,
+`encoded_new_value`, and `ttl_change` via `extract_rent_changes` +
+`extract_ledger_effects`). For Soroban entries with cached TTL metadata
+(persistent / temporary contract data, contract code, contract instance —
+i.e. every TTL'd entry in a soroswap footprint), the metered XDR write is
+now skipped entirely. This removes one metered `ValSer` charge plus the
+allocated `encoded_key` buffer per footprint entry on every successful
+`InvokeHostFunction` swap, while keeping rent fee, modified-ledger-entry
+buffers, deletion semantics, and restored-key TTL handling identical.
+Recording mode and host self-tests continue to receive the dense
+`encoded_key` field as before.
+
+### Test Results
+
+`env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`
+runs to completion successfully:
+
+- p26 `soroban-env-host` lib tests: 751 passed; 0 failed; 2 ignored.
+- p26 integration / fees / option / secp256r1 / doc tests: all pass.
+- stellar-core C++ suite (`PASS: test/selftest-nopg`).
+- Non-determinism check (`PASS: test/check-nondet`).
+- Final result: `All 2 tests passed`.
+
+No test required updates; the public `invoke_host_function` API still
+populates `encoded_key`, so the host's own `e2e_tests::*` assertions
+(`LedgerKey::from_xdr(c.encoded_key.clone(), ...)`) continue to succeed.
+Only the stellar-core bridge wrapper opts into the sparse variant.
