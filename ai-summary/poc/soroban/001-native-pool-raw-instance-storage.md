@@ -182,3 +182,62 @@ Protocol behavior: the path remains gated to `protocol > MIN_LEDGER_PROTOCOL_VER
 - `bash src/test/check-nondet` passes (no nondeterministic constructs introduced).
 - Pre-existing environmental flake: `lib/gperftools/tcm_min_asserts_unittest` failed under the parallel `make check` harness but passes when invoked directly (`./tcm_min_asserts_unittest` → `[ PASSED ] 24 tests`). This is unrelated to the change and was present before this revision.
 
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-24
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The revised source change builds and the full test suite passes, but the independent non-Tracy benchmark signal still does not meet the objective gate. Against the accepted baseline soroswap medians of `221.844987`, `217.378587`, and `215.707167` ms (average `218.310247` ms), the revised optimized runs measured `218.5427345`, `223.7841585`, and `213.3274505` ms (average `218.551448` ms). That is a `0.11%` average soroswap regression, with one run substantially above the baseline range, so the change is not eligible for confirmation.
+
+Max-sac medians improved from baseline average `314.654682` ms to `308.899293` ms (`1.83%` improvement), but soroswap apply time is the headline metric for this objective and did not improve consistently.
+
+### Revision Instructions
+
+Do not rely on the current raw-storage/i128-direct revision as a confirmed optimization. Either strengthen the native Soroswap pool path so all three non-Tracy `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` runs show a reproducible soroswap median improvement of at least 1% against `ai-summary/CURRENT_STATE.md`, or reframe/drop the finding as subthreshold. Because the top-line non-Tracy result is ineligible, no diagnostic Tracy run was performed and no `CURRENT_STATE.md` update should be made.
+
+Independent final-review benchmark runs:
+
+| run | run id | scenario | median_ms | p95_ms | p99_ms |
+|-----|--------|----------|-----------|--------|--------|
+| 1 | `3c34c878fae3-20260524-103825` | sac, TX=6000, T=8 | 309.5678360 | 328.0830929 | 337.0334207 |
+| 1 | `3c34c878fae3-20260524-103825` | soroswap, TX=2000, T=8 | 218.5427345 | 223.6013228 | 234.9788233 |
+| 2 | `3c34c878fae3-20260524-104439` | sac, TX=6000, T=8 | 303.9227380 | 322.4589122 | 337.4206389 |
+| 2 | `3c34c878fae3-20260524-104439` | soroswap, TX=2000, T=8 | 223.7841585 | 227.5678016 | 230.8826526 |
+| 3 | `3c34c878fae3-20260524-105052` | sac, TX=6000, T=8 | 313.2073040 | 331.0408857 | 337.0630958 |
+| 3 | `3c34c878fae3-20260524-105052` | soroswap, TX=2000, T=8 | 213.3274505 | 217.8678650 | 219.2235011 |
+
+### Checks Passed So Far
+
+- Source diff remains scoped to `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs`.
+- No test-file edits are present in the optimization diff.
+- Build with `--enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production` completed successfully.
+- Full `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` completed cleanly.
+- The optimization targets an in-scope `closeLedger` native Soroswap pool path, but the required top-line soroswap apply-time improvement was not reproduced.
+
+---
+
+## PoC Attempt (Second Revision)
+
+**Result**: POC_PASS
+**Date**: 2026-05-24
+**PoC by**: gpt-5.5, high
+**Builds on**: prior raw-`ScMap` and direct-i128 revisions in the native Soroswap pool path.
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:794-857` — reworked native Soroswap pool dispatch so the accepted getter/swap path moves the already-loaded `ScContractInstance` into `Frame::NativeContract` instead of metered-cloning the full instance storage map a second time.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:982-1039` — added direct raw-`ScAddress` readers for fixed pool keys 0/1/4, allowing native getters and swap validation to avoid generic `ScVal -> Val` address conversion and host-object comparison where the raw schema was already validated.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:1178-1230` — tightened the native swap body to use direct raw token addresses for invalid-recipient checks and only materialize `AddressObject`s when invoking SAC transfer/balance calls.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:1379-1456` and `2001-2026` — preserved the prior raw reserve-update/persistence path that writes the updated raw `ScMap` through `store_contract_instance` without materializing `InstanceStorageMap`.
+
+### Demonstration
+
+This revision removes the remaining full-instance clone paid after `retrieve_contract_instance_from_storage` on every accepted native Soroswap pool getter/swap call. Combined with the existing raw-`ScMap` reads/writes and direct-i128 reserve path, the native pool path now avoids generic instance-storage materialization, fixed-key `MeteredOrdMap` lookups/inserts, intermediate i128 host objects for reserve reads, and the extra native-frame clone of the pool's instance storage.
+
+### Test Results
+
+Configured build artifacts were rebuilt with Tracy/next-protocol flags using `make -j $(nproc)`. The full regression suite completed successfully with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`: `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and the p26 Soroban host Rust suite reported `751 passed; 0 failed`.
