@@ -84,3 +84,56 @@ Impact is plausibly Medium under this objective. Unlike rejected Soroban map or 
 - **Change description**: While scanning the cluster footprint, first copy global entries exactly as today. For missing non-Soroban keys, collect a sorted `std::set<LedgerKey, LedgerEntryIdCmp>` of unique keys capped to the cluster footprint. Bulk-load those keys once, insert returned live entries into `mThreadEntryMap` as clean entries with `mIsNew=false`, and leave global entries untouched. Consider caching null misses only if their `mIsNew` handling is explicit and covered.
 - **Correctness check**: Existing parallel Soroban apply tests and ledger-delta tests should cover `mIsNew`, classic creation/update, deletion, and deterministic merge behavior. Pay particular attention to protocol 26 classic `ACCOUNT`/`TRUSTLINE` creations from Soroban output and to failed transactions, where clean preloaded entries must not commit.
 - **Benchmark focus**: Run the soroswap apply-load matrix and compare median apply time across multiple non-Tracy runs. The expected metric improvement is reduced `BucketListSnapshot::load` / `getBucketEntry` / index-scan time inside `applyLedger`, with no change in resource metering, modified ledger entries, or emitted events.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-24
+**PoC by**: claude-opus-4.7, high
+
+### Changes Made
+
+- `src/transactions/ParallelApplyUtils.cpp`,
+  `ThreadParallelApplyLedgerState::collectClusterFootprintEntriesFromGlobal`
+  (added block immediately after the existing global-fetch loop, ~70 lines):
+  after copying entries already present in the global map, gather every
+  non-Soroban footprint key that is still missing from `mThreadEntryMap`
+  into a `LedgerKeySet` (sorted by `LedgerEntryIdCmp`) and bulk-load them
+  with a single `mLCLSnapshot.loadLiveKeys(missingClassicKeys, ...)`
+  call. Returned live entries are inserted as clean
+  `ThreadParallelApplyEntry` values with `mIsNew=false` (matching the
+  semantics of the previous per-key `mLCLSnapshot.loadLiveEntry` path).
+  Global entries are left untouched. Soroban (CONTRACT_DATA /
+  CONTRACT_CODE / TTL) keys are skipped because they are already either
+  preloaded into the global map by `fetchSorobanReadOnlyEntries from
+  footprints` or served from `InMemorySorobanState` at lookup time.
+  Missing-entry caching is intentionally not done: only live hits are
+  inserted, so absent keys still take the existing fallback path with
+  unchanged `mIsNew` semantics.
+
+No other files were modified.
+
+### Demonstration
+
+This replaces O(footprint × txs) per-key `SearchableBucketListSnapshot::load`
+point lookups during `addReads` for classic ACCOUNT/TRUSTLINE footprint
+entries with a single per-cluster sorted bulk load that scans each bucket
+index once. In the soroswap workload every swap puts two classic
+trustline keys in its read-write footprint, so cluster-wide deduplication
+plus single-pass bucket traversal directly shrinks the apply-contained
+`load` / `getBucketEntry` / index-scan envelope identified in the
+hypothesis (859,746 `load` events totaling ~599 ms inside `applyLedger`).
+Returned entries are inserted as clean, non-new thread-map entries with
+the same shadowing semantics the per-key path produces, so deterministic
+merge behavior and INIT-vs-LIVE commit selection are preserved.
+
+### Test Results
+
+`env NUM_PARTITIONS=$(nproc) STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`
+completed with exit code 0. Both `test/selftest-nopg` and
+`test/check-nondet` reported PASS, all parallel C++ unit-test partitions
+finished without errors, and the Rust soroban-env-host crate tests (all
+protocol submodules, including p26) reported `0 failed` across every
+test binary.
