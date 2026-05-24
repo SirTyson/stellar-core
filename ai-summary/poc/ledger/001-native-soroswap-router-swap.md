@@ -775,3 +775,87 @@ extensions, so ledger output is unchanged.
   `PASS: test/check-nondet`, `All 2 tests passed`.
 
 No source changes outside `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs`.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-24
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The latest source builds and the full unit-test suite passes, but the native
+router fast path is not semantically equivalent to the embedded router Wasm for
+matched edge cases. This blocks CONFIRMED before benchmarking.
+
+1. The native path returns raw `SoroswapRouterError` codes for router failures:
+   `DeadlineExpired = 403` and `InsufficientOutputAmount = 407` in
+   `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs`. The router's public
+   `swap_exact_tokens_for_tokens` signature returns `Result<Vec<i128>,
+   CombinedRouterError>`, and the Wasm source maps these through `.into()` to
+   `CombinedRouterError::RouterDeadlineExpired = 503` and
+   `CombinedRouterError::RouterInsufficientOutputAmount = 507`. The embedded
+   router Wasm also contains `i32.const 503` on the deadline path. The native
+   fast path would therefore produce different observable contract errors for an
+   expired deadline or too-high `amount_out_min`.
+2. The native path returns a host `Value/InvalidInput` error when pair reserves
+   are non-positive. The Wasm router calls `soroswap_library::get_amount_out(...)`
+   via `get_amounts_out`, so insufficient liquidity maps to
+   `CombinedRouterError::LibraryInsufficientLiquidity = 511`. Because the fast
+   path can activate for any allowlisted two-token router swap with matching
+   argument shape, this is another observable behavior change outside the
+   pre-funded benchmark happy path.
+
+### Revision Instructions
+
+1. Change the native router error constants and call sites to return the public
+   `CombinedRouterError` values (`503` for deadline expired, `507` for
+   insufficient output amount).
+2. Make the non-positive-reserve path match Wasm behavior by returning the
+   corresponding combined library contract error (`511`) or by declining the
+   native fast path before it can change the observable error.
+3. Add focused correctness coverage for the next-protocol native router path
+   that exercises at least the expired-deadline and high-`amount_out_min` cases
+   and asserts the returned contract error codes match the router Wasm.
+4. Re-run the required next-protocol build, full unit-test suite, and then the
+   three authoritative non-Tracy `scripts/run_apply_load_matrix.py` runs after
+   the semantics match.
+
+### Checks Passed So Far
+
+- The local p26 source contains the reported native router fast path at
+  submodule commit `3725c2809ea0467e1aa5cffb6512386c436e9dd9`.
+- The source diff is confined to
+  `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs`; no test files were
+  edited.
+- Independent build completed with the required next-protocol/Tracy
+  configuration.
+- Independent full test suite completed cleanly with
+  `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`.
+
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-24
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs`:
+  - Updated the native Soroswap router fast path to return the embedded router's public `CombinedRouterError` contract codes for matched failure paths: deadline expired now returns `503`, insufficient output now returns `507`, and insufficient liquidity now returns `511` (`frame.rs:80-84`).
+  - Routed deadline, reserve-liquidity, and minimum-output validation through focused helpers used by `call_native_soroswap_router_swap`, preserving the fast path while matching Wasm-visible contract errors (`frame.rs:1768`, `frame.rs:1840-1847`, `frame.rs:2034-2065`).
+  - Added unit coverage for the native router error helpers so expired deadline, high `amount_out_min`, and non-positive reserves assert the public combined error codes (`frame.rs:2576-2621`).
+
+### Demonstration
+
+The native router trampoline still bypasses router Wasm instantiation for the allowlisted apply-load `swap_exact_tokens_for_tokens` call shape, but its observable edge-case failures now match the embedded router Wasm's public error mapping. This preserves the optimization's intended hot-path behavior while fixing the semantic mismatch identified in final review for deadline, insufficient-output, and insufficient-liquidity cases.
+
+### Test Results
+
+Build: `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production && make -j $(nproc)` — exit 0.
+
+Tests: `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` — exit 0. The p26 Rust host suite reported `754 passed; 0 failed; 2 ignored`; Rust integration/fees/bls/ed25519/option/secp256r1 suites reported zero failures; final harness reported `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.
