@@ -166,3 +166,105 @@ sketches.
 across all 30 partitions with zero failures (every partition reported
 "All tests passed"), and both `selftest-nopg` and `check-nondet`
 passed.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-24
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The compact final-stage commit path does not preserve the existing cross-cluster
+merge semantics for final-stage read-only TTL bumps when the bumped key was not
+already present in `mGlobalEntryMap`.
+
+`ParallelApplyUtils.cpp:42-58` documents that `RoTTLBump(LE)` actions can run in
+parallel across clusters and must be merged with `std::max()` when committing
+the stage back to global state. The existing non-final path does this through
+`GlobalParallelApplyLedgerState::maybeMergeRoTTLBumps`.
+
+The new `commitFinalChangesFromThreadsToLedgerTxn` path instead writes
+non-overlapping final-stage dirty entries directly to the inner `LedgerTxn`:
+
+- first dirty TTL bump for a key not in `mGlobalEntryMap` is written immediately;
+- a later dirty TTL bump for the same key from another final-stage thread is
+  also written directly, because the first one was not journaled in
+  `mGlobalEntryMap` or any equivalent final-stage map;
+- `LedgerTxn::updateWithoutLoading` then merges LIVE-over-LIVE by replacing the
+  previous entry, not by taking the max TTL.
+
+This can make the final TTL depend on thread/cluster emission order and can
+commit a lower `liveUntilLedgerSeq` after a higher one. The bug is easiest to
+trigger conceptually with two parallel `ExtendFootprintTTL` transactions in the
+same final stage that extend the same read-only footprint key to different
+`extendTo` values. The correct result is the larger extension; the current PoC
+can commit whichever direct write happens last.
+
+Because this is a subtle behavioral change in the ledger apply path, the PoC is
+not eligible for CONFIRMED even if the existing suite passes and even if the
+benchmark improves.
+
+### Revision Instructions
+
+Fix the final-stage compact path so every final-stage dirty key is collapsed
+exactly once before any `LedgerTxn` write. In particular:
+
+1. Do not immediately write first-seen non-overlapping final-stage dirty entries
+   to `ltxInner`.
+2. Keep those entries in a compact final-stage journal/map, or otherwise make
+   them visible to subsequent same-stage duplicate keys.
+3. When a later final-stage thread reports the same key, merge through the same
+   `maybeMergeRoTTLBumps` / `commitChangeFromThread` semantics used by the
+   existing path, including `std::max()` for RO TTL bumps and first-touch
+   `mIsNew` preservation.
+4. After all final-stage threads have been drained, write each collapsed final
+   state to `LedgerTxn` exactly once.
+5. Add targeted coverage with two parallel Soroban TTL-extension transactions
+   touching the same read-only key with different extension targets, verifying
+   that the final TTL is the maximum target and not dependent on cluster order.
+6. Re-run the full test suite and the required three non-Tracy matrix
+   benchmarks after the correctness fix.
+
+### Checks Passed So Far
+
+- The claimed inefficiency is in scope: final-stage parallel Soroban writeback is
+  inside `closeLedger`, not TX-set construction or lazy bucket work.
+- The source-level optimization target is real: the current final stage
+  materializes thread changes into `mGlobalEntryMap` and then performs a separate
+  final `LedgerTxn` writeback.
+- The PoC correctly identifies that delete/recreate sequences must be collapsed
+  before writing to `LedgerTxn`.
+- The PoC correctly preserves prior-global overlap keys by routing them through
+  `commitChangeFromThread`.
+
+### Failed Checks
+
+- Safety check: subtle behavioral change in read-only TTL bump merging.
+- Adversarial check 3: the apparent redundant merge is partly by design for
+  cross-cluster RO TTL bump determinism.
+- Adversarial check 6: existing test evidence is insufficient because it does
+  not cover same-final-stage duplicate RO TTL bumps with different targets.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-24
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/transactions/ParallelApplyUtils.h:251-255,294-318` — declared a shared merge helper and updated the compact final-stage commit contract to require a final-stage journal instead of direct first-seen writes.
+- `src/transactions/ParallelApplyUtils.cpp:827-891,947-997` — added `finalStageEntryMap` so non-overlapping final-stage dirty entries are collapsed in memory before any `LedgerTxn` write, and factored the prior global merge logic into `mergeGlobalEntryIntoMap` so prior-global and same-final-stage duplicates both preserve RO TTL max-merge and first-touch `mIsNew` semantics.
+- `src/transactions/test/InvokeHostFunctionTests.cpp:9326-9388` — made the parallel read-only TTL bump regression deterministic with non-monotonic extension targets across two clusters, verifying the final TTL is the maximum target rather than the last committed cluster's value.
+
+### Demonstration
+
+The revised compact final-stage path keeps the optimization's intended win — avoiding final-stage materialization of non-overlap entries into `mGlobalEntryMap` and avoiding a clean-entry scan — while restoring the important same-stage merge point. Every final-stage dirty key is now collapsed exactly once before writeback: prior-global overlaps still use `commitChangeFromThread`, and non-overlap final-stage entries merge in a compact journal through the same `maybeMergeRoTTLBumps` max-TTL and `mIsNew` preservation semantics.
+
+### Test Results
+
+Configured with `--enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`, built with `make -j $(nproc)`, and ran `./src/stellar-core test --ll fatal -r simple --abort --disable-dots "read-only bumps across final-stage threads use max TTL"` successfully. The full regression suite `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` completed successfully, including `selftest-nopg` and `check-nondet`.
