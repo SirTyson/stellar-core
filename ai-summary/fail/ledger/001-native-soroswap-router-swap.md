@@ -998,3 +998,96 @@ simple --abort --disable-dots' make check` — exit 0.
 
 No source changes outside
 `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs`.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-24
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The latest source builds and the full unit-test suite passes, but the required
+authoritative benchmark does not complete. I independently rebuilt with the
+required next-protocol/Tracy configuration and re-ran
+`env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`
+successfully, then ran the mandated non-Tracy matrix command three times:
+
+```sh
+PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py
+```
+
+All three runs failed in the `soroswap,TX=2000,T=8` scenario before producing a
+soroswap timing row. Each run completed the `sac,TX=6000,T=8` scenario, then
+aborted at `src/simulation/ApplyLoad.cpp:2320`:
+
+```text
+mTxGenerator.getApplySorobanFailure().count() == 0
+```
+
+Failed run directories:
+
+- `/mnt/nvme2/apply-load/00e3a48b7ad8-20260524-193950`
+- `/mnt/nvme2/apply-load/00e3a48b7ad8-20260524-194404`
+- `/mnt/nvme2/apply-load/00e3a48b7ad8-20260524-194818`
+
+Their `results.csv` files contain only the SAC row, with no soroswap result. A
+short diagnostic reproduction with `ENABLE_SOROBAN_DIAGNOSTIC_EVENTS=true` also
+aborted on the same assertion immediately after the soroswap setup phase, so
+this is a correctness/semantic failure in the measured optimized path, not a
+measurement-noise issue.
+
+Because the optimization cannot successfully apply the benchmark workload, final
+review cannot collect the three required optimized soroswap apply-time samples,
+cannot run a diagnostic Tracy capture, and cannot promote the finding.
+
+### Revision Instructions
+
+1. Fix the native router fast path so the `soroswap,TX=2000,T=8` apply-load
+   workload completes with zero `ApplySorobanFailure` increments.
+2. Add an end-to-end correctness check for the next-protocol native router path
+   that executes the benchmark-shaped `swap_exact_tokens_for_tokens` call through
+   the full auth/footprint/apply path and asserts success, not just helper-level
+   error-code behavior.
+3. Re-run the required build and full suite, then verify all three non-Tracy
+   matrix runs produce soroswap timing rows before returning for final review.
+4. Preserve the existing fallback behavior for any non-allowlisted router call
+   shape; the fix should not broaden the native path to cases whose Wasm-visible
+   semantics are not covered.
+
+### Checks Passed So Far
+
+- The local source diff is confined to
+  `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs`.
+- No existing test logic or assertions were modified.
+- Independent build with
+  `--enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production`
+  completed successfully.
+- Independent full test suite completed successfully.
+- The benchmark failure is reproducible across all three required non-Tracy
+  matrix attempts and blocks confirmation.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_FAIL
+**Date**: 2026-05-24
+**PoC by**: gpt-5.5, high
+**Failed At**: poc
+**Iterations**: 5
+
+### Failure Reason
+
+The native router fast path could not be demonstrated because the existing end-to-end soroswap apply-load correctness test still fails with `mTxGenerator.getApplySorobanFailure().count() == 0` at `src/simulation/ApplyLoad.cpp:2320`. Diagnostic traces show the failure remains `HostError: Error(Auth, InvalidAction)` / `Unauthorized function call for address` during the source-account-authorized SAC `transfer` sub-invocation inside the native router frame. This means the optimized path still does not consume the benchmark transaction's auth tree equivalently to the embedded router Wasm, so it cannot be handed off as a valid performance PoC.
+
+### Changes Attempted
+
+Attempted changes were confined to `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs` and were reverted after failure:
+
+- Changed the native router root `require_auth` call to use the current native frame's full argument vector instead of `Vec::new()`, matching SDK `Address::require_auth()` behavior. This fixed the root authorization mismatch but did not make the SAC transfer sub-invocation authorize successfully.
+- Temporarily moved the root authorization adjacent to the SAC transfer to test whether intermediate storage/TTL/reserve work disturbed the auth tracker. The apply-load test still failed with the same SAC `Auth/InvalidAction`, so the placement change was not retained.
+- Added an experimental footprint scan to select the pair instance already present in the transaction footprint and validate its token layout before falling back to deterministic pair derivation. Traces showed the transfer target then matched the authorized pair address, but the SAC transfer still failed auth, indicating an unresolved native-frame/auth-tracker semantic mismatch rather than only a pair-address mismatch.
+
+Builds completed after each source iteration, but the focused end-to-end test `./src/stellar-core test --ll fatal -r simple --abort --disable-dots "apply load benchmark soroswap"` continued to fail. Per the POC_FAIL source-revert rule, the attempted source edits have been reverted, leaving the p26 checkout at its prior source state.
