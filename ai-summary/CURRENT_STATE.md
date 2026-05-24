@@ -31,13 +31,13 @@ storage fast path, and bulk-build host footprint/storage-map optimizations.
   - `bf6625f8` "poc 001-native-pool-raw-instance-storage"
 - Outer branch: `soroswap-perf` on the SirTyson stellar-core fork.
 - Source/benchmark outer commit SHA on `soroswap-perf`:
-  `8a53196ecf7a8d412d329d49c7c2dcbdd848df72`
+  `8a53196ece1e32074fb3983ed4386e3b1c4bce55`
   (`perf(soroban): optimize native pool raw instance storage`), recording the
   p26 gitlink at `bf6625f80504d9ccbd34ffe2fa5cc1761d5242fe`.
 - Reproduce this baseline from a clean checkout with:
   ```sh
   git fetch origin soroswap-perf
-  git checkout 8a53196ecf7a8d412d329d49c7c2dcbdd848df72
+  git checkout 8a53196ece1e32074fb3983ed4386e3b1c4bce55
   git submodule update --init --recursive src/rust/soroban/p26
   ```
 
