@@ -983,6 +983,70 @@ ThreadParallelApplyLedgerState::collectClusterFootprintEntriesFromGlobal(
             }
         }
     }
+
+    // Bulk-preload classic (non-Soroban) footprint entries that are still
+    // missing from the thread map. Without this, each transaction's
+    // `addReads` would fall through `getLiveEntryOpt` to a separate
+    // `mLCLSnapshot.loadLiveEntry(key)` point lookup for every classic key
+    // not modified by an earlier sequential phase. `loadLiveKeys` scans
+    // each bucket index once in sorted order with the same shadowing
+    // semantics as the per-key path, so the returned entries are
+    // indistinguishable from those a per-key load would have produced.
+    //
+    // Only classic keys are bulk-loaded here: Soroban read-only entries
+    // and their TTLs are already preloaded into the global map (see
+    // `fetchSorobanReadOnlyEntries from footprints` above), and Soroban
+    // entry types use `mInMemorySorobanState` rather than the live
+    // BucketList at lookup time.
+    {
+        ZoneNamedN(bulkClassicZone,
+                   "bulkPreloadClassicFootprintEntries", true);
+        LedgerKeySet missingClassicKeys;
+        for (auto const& txBundle : cluster)
+        {
+            auto const& footprint =
+                txBundle.getTx()->sorobanResources().footprint;
+            for (auto const& keys :
+                 {footprint.readWrite, footprint.readOnly})
+            {
+                for (auto const& key : keys)
+                {
+                    if (isSorobanEntry(key))
+                    {
+                        continue;
+                    }
+                    ParallelApplyLedgerKey parallelKey(key);
+                    if (mThreadEntryMap.find(parallelKey) !=
+                        mThreadEntryMap.end())
+                    {
+                        continue;
+                    }
+                    missingClassicKeys.insert(key);
+                }
+            }
+        }
+
+        if (!missingClassicKeys.empty())
+        {
+            auto loadedEntries = mLCLSnapshot.loadLiveKeys(
+                missingClassicKeys, "bulkPreloadClassicFootprintEntries");
+            for (auto& le : loadedEntries)
+            {
+                auto lk = LedgerEntryKey(le);
+                ParallelApplyLedgerKey parallelKey(lk);
+                auto threadEntry = ThreadParallelApplyEntry::clean(
+                    scopeAdoptEntryOpt(std::make_optional(std::move(le))));
+                // Loaded from live snapshot: entry exists in persistent
+                // state, so mIsNew must be false. A later upsert in the
+                // same cluster will preserve this via try_emplace logic
+                // in upsertEntry, ensuring commitChangesToLedgerTxn uses
+                // updateWithoutLoading (LIVE) rather than
+                // createWithoutLoading (INIT).
+                mThreadEntryMap.emplace(std::move(parallelKey),
+                                        std::move(threadEntry));
+            }
+        }
+    }
 }
 
 ThreadParallelApplyLedgerState::ThreadParallelApplyLedgerState(
