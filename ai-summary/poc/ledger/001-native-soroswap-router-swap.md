@@ -351,3 +351,87 @@ simple --abort --disable-dots' make check` — exit 0.
   secp256r1 (2) all `0 failed`.
 - Final harness: `PASS: test/selftest-nopg`, `PASS: test/check-nondet`,
   `All 2 tests passed`.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-24
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The source implementation is present only in the local checkout, not in the
+reproducible committed handoff required by final review.
+
+The local outer branch `poc/001-native-soroswap-router-swap` is at
+`42a8e7df4` and records `src/rust/soroban/p26` at
+`4789f6c8d0cdd5e5b1c333d6b034995395945bfb`, where the router fast-path symbols
+are present. However the published outer branch on
+`github.com/SirTyson/stellar-core` is still
+`20d2f1ee5ff99d30264906a2540e05fce1bc3287`, which records the p26 gitlink
+`d9f407112a9838ae2d076b12534e6cb737540080`. The required p26 fork branch
+`github.com/SirTyson/rs-soroban-env` `poc/001-native-soroswap-router-swap` is
+still absent; `git ls-remote` only finds the prior
+`poc/001-native-pool-raw-instance-storage` baseline branch.
+
+Because a fresh checkout from the published PoC branches cannot reproduce the
+optimization, final review cannot promote it to `soroswap-perf` or update
+`CURRENT_STATE.md`. The current local binary also reports ledger protocol 26 and
+p26 git version `bf6625f8...-dirty`; the accepted baseline explicitly requires a
+next-protocol build so the protocol-gated native Soroswap paths are actually
+benchmarked.
+
+### Revision Instructions
+
+1. Push p26 commit `4789f6c8d0cdd5e5b1c333d6b034995395945bfb` to
+   `github.com/SirTyson/rs-soroban-env` on branch
+   `poc/001-native-soroswap-router-swap`.
+2. Push the outer PoC branch so `origin/poc/001-native-soroswap-router-swap`
+   records the p26 gitlink at that same pushed commit.
+3. Verify from a clean worktree that:
+   `git fetch origin poc/001-native-soroswap-router-swap`,
+   `git checkout origin/poc/001-native-soroswap-router-swap`, and
+   `git submodule update --init --recursive src/rust/soroban/p26`
+   leave both the outer repo and p26 submodule clean and at the router-swap
+   source state.
+4. Rebuild with the objective/baseline-required next-protocol configuration
+   before re-running tests and returning for final review, so the gated native
+   path is exercised by `scripts/run_apply_load_matrix.py`.
+
+### Checks Passed So Far
+
+- The local p26 commit `4789f6c8` contains the reported router fast-path
+  implementation in `soroban-env-host/src/host/frame.rs`.
+- The local p26 worktree is internally clean.
+- The accepted baseline in `ai-summary/CURRENT_STATE.md` remains reproducible
+  and still references the previous p26 baseline SHA
+  `bf6625f80504d9ccbd34ffe2fa5cc1761d5242fe`.
+
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-24
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs`:
+  - Added `SOROSWAP_ROUTER_WASM_HASH`, router error constants, and `SoroswapRouterSwapArgs` next to the existing Soroswap pool fast-path definitions (`frame.rs:46-88`).
+  - Wired a next-protocol-, hash-, function-, and shape-gated router hook into `Host::call_contract_fn` before `instantiate_vm`, entering `Frame::NativeContract` for matched router swaps (`frame.rs:816-842`).
+  - Added native router helpers for the fixed two-token `swap_exact_tokens_for_tokens` path: router factory validation, pair derivation, reserve reads, amount-out calculation, SAC transfer inside the router frame, native pair `swap` dispatch, and vector return (`frame.rs:1207-1520`).
+- `src/rust/soroban/p26` gitlink:
+  - The outer worktree records p26 at `4789f6c8d0cdd5e5b1c333d6b034995395945bfb`, matching the clean p26 checkout on local branch `poc/001-native-soroswap-router-swap`.
+
+### Demonstration
+
+The apply-load router `swap_exact_tokens_for_tokens` call now bypasses router Wasm instantiation when the embedded router Wasm hash and exact benchmark call shape match, dispatching through a native router frame before invoking the existing native pair swap. This preserves the contract/auth stack and rollback semantics by using `Frame::NativeContract` and performing the source-account-authorized SAC transfer inside that frame, while all non-allowlisted hashes, functions, path shapes, token types, or released-protocol executions fall back to Wasm unchanged.
+
+### Test Results
+
+Build: `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production && make -j $(nproc)` — exit 0.
+
+Tests: `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` — exit 0. The p26 Rust host suite reported `751 passed; 0 failed; 2 ignored`; Rust integration/fees/bls/ed25519/option/secp256r1 suites reported zero failures; final harness reported `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.
