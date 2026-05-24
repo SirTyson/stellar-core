@@ -719,52 +719,48 @@ GlobalParallelApplyLedgerState::collectModifiedClassicEntries(
 }
 
 void
-GlobalParallelApplyLedgerState::commitChangesToLedgerTxn(AbstractLedgerTxn& ltx)
+GlobalParallelApplyLedgerState::writeGlobalEntryToLtx(
+    AbstractLedgerTxn& ltxInner, ParallelApplyLedgerKey const& key,
+    GlobalParallelApplyEntry&& entry)
 {
-    ZoneScoped;
-    LedgerTxn ltxInner(ltx);
-    for (auto& [key, entry] : mGlobalEntryMap)
+    // Move the LedgerEntry out of the scoped wrapper. This is safe because
+    // this helper is called only from the final commit pass — the global
+    // state is destroyed immediately afterward.
+    auto movedLe = entry.mLedgerEntry.moveFromScope(*this);
+    if (movedLe)
     {
-        // Only update if dirty bit is set
-        if (!entry.mIsDirty)
+        // Use the mIsNew flag tracked during the parallel apply phase to
+        // decide between createWithoutLoading (INIT) and
+        // updateWithoutLoading (LIVE). This avoids the expensive per-entry
+        // existence check (mInMemorySorobanState.get() does SHA256 per
+        // CONTRACT_DATA key, and getNewestVersionBelowRoot does a hash map
+        // lookup for classic entries).
+        InternalLedgerEntry ile(std::move(*movedLe));
+        if (entry.mIsNew)
         {
-            continue;
-        }
-
-        // Move the LedgerEntry out of the scoped wrapper. This is safe
-        // because commitChangesToLedgerTxn is the final operation on the
-        // global state — it is destroyed immediately after this call.
-        auto movedLe = entry.mLedgerEntry.moveFromScope(*this);
-        if (movedLe)
-        {
-            // Use the mIsNew flag tracked during the parallel apply phase to
-            // decide between createWithoutLoading (INIT) and
-            // updateWithoutLoading (LIVE). This avoids the expensive per-entry
-            // existence check (mInMemorySorobanState.get() does SHA256 per
-            // CONTRACT_DATA key, and getNewestVersionBelowRoot does a hash map
-            // lookup for classic entries).
-            InternalLedgerEntry ile(std::move(*movedLe));
-            if (entry.mIsNew)
-            {
-                ltxInner.createWithoutLoading(std::move(ile));
-            }
-            else
-            {
-                ltxInner.updateWithoutLoading(std::move(ile));
-            }
+            ltxInner.createWithoutLoading(std::move(ile));
         }
         else
         {
-            // Delete case: use load() + erase() to maintain EXACT consistency.
-            // Deletes are rare in SAC transfers, so the cost is negligible.
-            auto ltxe = ltxInner.load(key.ledgerKey());
-            if (ltxe)
-            {
-                ltxInner.erase(key.ledgerKey());
-            }
+            ltxInner.updateWithoutLoading(std::move(ile));
         }
     }
+    else
+    {
+        // Delete case: use load() + erase() to maintain EXACT consistency.
+        // Deletes are rare in SAC transfers, so the cost is negligible.
+        auto ltxe = ltxInner.load(key.ledgerKey());
+        if (ltxe)
+        {
+            ltxInner.erase(key.ledgerKey());
+        }
+    }
+}
 
+void
+GlobalParallelApplyLedgerState::writeRestoredMarkersToLtx(
+    AbstractLedgerTxn& ltxInner)
+{
     // While the final state of a restored key that will be written to the
     // Live BucketList is already handled in mGlobalEntryMap, we need to
     // let the ltx know what keys were restored so that:
@@ -797,6 +793,90 @@ GlobalParallelApplyLedgerState::commitChangesToLedgerTxn(AbstractLedgerTxn& ltx)
             ltxInner.markRestoredFromLiveBucketList(kvp.second, it->second);
         }
     }
+}
+
+void
+GlobalParallelApplyLedgerState::commitChangesToLedgerTxn(AbstractLedgerTxn& ltx)
+{
+    ZoneScoped;
+    LedgerTxn ltxInner(ltx);
+    // Iterate the compact dirty-key journal instead of the full
+    // mGlobalEntryMap (which includes clean preloaded entries we'd just
+    // skip).
+    for (auto const& key : mDirtyGlobalKeys)
+    {
+        auto it = mGlobalEntryMap.find(key);
+        releaseAssert(it != mGlobalEntryMap.end());
+        releaseAssert(it->second.mIsDirty);
+        writeGlobalEntryToLtx(ltxInner, key, std::move(it->second));
+    }
+    writeRestoredMarkersToLtx(ltxInner);
+    ltxInner.commit();
+}
+
+void
+GlobalParallelApplyLedgerState::commitFinalChangesFromThreadsToLedgerTxn(
+    AppConnector& app,
+    std::vector<std::unique_ptr<ThreadParallelApplyLedgerState>> const& threads,
+    ApplyStage const& stage, AbstractLedgerTxn& ltx)
+{
+    ZoneScoped;
+    releaseAssert(threadIsMain() ||
+                  app.threadIsType(Application::ThreadType::APPLY));
+
+    auto readWriteSet = getReadWriteKeysForStage(stage);
+
+    LedgerTxn ltxInner(ltx);
+
+    // First pass: drain each thread's dirty entries. For keys that overlap
+    // a prior global entry (clean preload or prior-stage dirty), use the
+    // existing commitChangeFromThread merge path so that mIsNew, RO TTL
+    // max-merge, and delete/recreate collapse semantics are preserved
+    // exactly. For non-overlapping keys, emit the (collapsed) final state
+    // directly to ltxInner, skipping the global map. Also fold each
+    // thread's restored entries into the global restored set.
+    for (auto& thread : threads)
+    {
+        thread->scopeDeactivate();
+        for (auto& [key, entry] : thread->getEntryMap())
+        {
+            if (!entry.mIsDirty)
+            {
+                continue;
+            }
+            auto globalIt = mGlobalEntryMap.find(key);
+            if (globalIt != mGlobalEntryMap.end())
+            {
+                // Overlap with a prior global entry. Merge via the
+                // existing path; the merged entry stays in mGlobalEntryMap
+                // (with mDirtyGlobalKeys updated by commitChangeFromThread)
+                // and is emitted to ltxInner in the second pass below.
+                commitChangeFromThread(*thread, key, std::move(entry),
+                                       readWriteSet);
+            }
+            else
+            {
+                // No prior global entry. Emit the final state directly,
+                // skipping the global map materialization.
+                GlobalParallelApplyEntry rescoped =
+                    std::move(entry).rescope(*thread, *this);
+                writeGlobalEntryToLtx(ltxInner, key, std::move(rescoped));
+            }
+        }
+        mGlobalRestoredEntries.addRestoresFrom(thread->getRestoredEntries());
+    }
+
+    // Second pass: emit prior-stage dirty entries and any final-stage
+    // overlap-merged entries via the compact journal.
+    for (auto const& key : mDirtyGlobalKeys)
+    {
+        auto it = mGlobalEntryMap.find(key);
+        releaseAssert(it != mGlobalEntryMap.end());
+        releaseAssert(it->second.mIsDirty);
+        writeGlobalEntryToLtx(ltxInner, key, std::move(it->second));
+    }
+
+    writeRestoredMarkersToLtx(ltxInner);
     ltxInner.commit();
 }
 
@@ -868,6 +948,7 @@ GlobalParallelApplyLedgerState::commitChangeFromThread(
     if (it == mGlobalEntryMap.end())
     {
         mGlobalEntryMap.emplace(key, std::move(rescopedParEntry));
+        mDirtyGlobalKeys.insert(key);
     }
     else
     {
@@ -887,6 +968,7 @@ GlobalParallelApplyLedgerState::commitChangeFromThread(
             // Soroban RO entry pre-loading in the constructor.
             it->second.mIsDirty = true;
         }
+        mDirtyGlobalKeys.insert(key);
     }
 }
 

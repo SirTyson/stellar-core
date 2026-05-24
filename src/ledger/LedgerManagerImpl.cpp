@@ -2623,7 +2623,7 @@ void
 LedgerManagerImpl::applySorobanStage(
     AppConnector& app, LedgerHeader const& header,
     GlobalParallelApplyLedgerState& globalParState, ApplyStage const& stage,
-    Hash const& sorobanBasePrngSeed)
+    Hash const& sorobanBasePrngSeed, bool isFinalStage, AbstractLedgerTxn& ltx)
 {
     ZoneScoped;
     auto const& config = app.getConfig();
@@ -2653,11 +2653,35 @@ LedgerManagerImpl::applySorobanStage(
 #ifdef BUILD_TESTS
     subStart = std::chrono::steady_clock::now();
 #endif
-    globalParState.commitChangesFromThreads(app, threadStates, stage);
+    if (isFinalStage)
+    {
+        // Compact final-stage path: fuse thread-to-global commit with
+        // ledger-txn writeback. Skips materializing non-overlapping
+        // final-stage entries into mGlobalEntryMap and skips scanning
+        // clean preloaded entries in the writeback loop. The collapsed
+        // states are written exactly once to ltx, preserving mIsNew,
+        // RO TTL max-merge, and delete/recreate collapse semantics.
+        globalParState.commitFinalChangesFromThreadsToLedgerTxn(
+            app, threadStates, stage, ltx);
+    }
+    else
+    {
+        globalParState.commitChangesFromThreads(app, threadStates, stage);
+    }
 #ifdef BUILD_TESTS
     subEnd = std::chrono::steady_clock::now();
-    mLastPhaseTimings.sorobanCommitFromThreadsMs +=
-        std::chrono::duration<double, std::milli>(subEnd - subStart).count();
+    if (isFinalStage)
+    {
+        mLastPhaseTimings.sorobanCommitToLtxMs +=
+            std::chrono::duration<double, std::milli>(subEnd - subStart)
+                .count();
+    }
+    else
+    {
+        mLastPhaseTimings.sorobanCommitFromThreadsMs +=
+            std::chrono::duration<double, std::milli>(subEnd - subStart)
+                .count();
+    }
 
     subStart = std::chrono::steady_clock::now();
 #endif
@@ -2696,20 +2720,27 @@ LedgerManagerImpl::applySorobanStages(AppConnector& app, AbstractLedgerTxn& ltx,
         mLastPhaseTimings.sorobanParallelApplyMs = 0;
         mLastPhaseTimings.sorobanCheckInvariantsMs = 0;
         mLastPhaseTimings.sorobanCommitFromThreadsMs = 0;
+        mLastPhaseTimings.sorobanCommitToLtxMs = 0;
         mLastPhaseTimings.sorobanDestroyThreadStatesMs = 0;
 #endif
-        for (auto const& stage : stages)
+        for (size_t stageIdx = 0; stageIdx < stages.size(); ++stageIdx)
         {
-            applySorobanStage(app, header, globalParState, stage,
-                              sorobanBasePrngSeed);
+            bool const isFinalStage = (stageIdx + 1 == stages.size());
+            applySorobanStage(app, header, globalParState, stages[stageIdx],
+                              sorobanBasePrngSeed, isFinalStage, ltx);
         }
 #ifdef BUILD_TESTS
         auto subStart = std::chrono::steady_clock::now();
 #endif
-        globalParState.commitChangesToLedgerTxn(ltx);
+        if (stages.empty())
+        {
+            // No stages applied; still flush any restored-entry markers
+            // and clean-up via the standard ltx commit path.
+            globalParState.commitChangesToLedgerTxn(ltx);
+        }
 #ifdef BUILD_TESTS
         auto subEnd = std::chrono::steady_clock::now();
-        mLastPhaseTimings.sorobanCommitToLtxMs =
+        mLastPhaseTimings.sorobanCommitToLtxMs +=
             std::chrono::duration<double, std::milli>(subEnd - subStart)
                 .count();
         globalStart = std::chrono::steady_clock::now();

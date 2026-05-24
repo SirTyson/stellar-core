@@ -221,6 +221,13 @@ class GlobalParallelApplyLedgerState
     //    after -- as well as written back to the ltx at the phase's end.
     ParallelApplyEntryMap<staticScope> mGlobalEntryMap;
 
+    // Compact journal of keys in mGlobalEntryMap whose entry is dirty (i.e.
+    // produced by commitChangeFromThread, either as a fresh dirty insertion
+    // or via the RO TTL max-merge path that marks a previously-clean preload
+    // dirty). Lets the final commit pass iterate only the dirty entries
+    // rather than scanning every preloaded global entry.
+    UnorderedSet<ParallelApplyLedgerKey> mDirtyGlobalKeys;
+
     void preParallelApplyAndCollectModifiedClassicEntries(
         AppConnector& app, AbstractLedgerTxn& ltx,
         std::vector<ApplyStage> const& stages);
@@ -250,6 +257,17 @@ class GlobalParallelApplyLedgerState
                                  ThreadParallelApplyLedgerState& thread,
                                  ParallelApplyLedgerKeySet const& readWriteSet);
 
+    // Write a single dirty global entry to ltxInner, choosing
+    // create/update/erase based on mIsNew and the entry value.
+    void writeGlobalEntryToLtx(AbstractLedgerTxn& ltxInner,
+                               ParallelApplyLedgerKey const& key,
+                               GlobalParallelApplyEntry&& entry);
+
+    // Apply the restored-entry markers (hot archive + live bucket list) to
+    // ltxInner. Factored out so both commitChangesToLedgerTxn and the
+    // compact final-stage commit can share the same logic.
+    void writeRestoredMarkersToLtx(AbstractLedgerTxn& ltxInner);
+
   public:
     GlobalParallelApplyLedgerState(AppConnector& app,
                                    ApplyLedgerStateSnapshot snapshot,
@@ -266,6 +284,35 @@ class GlobalParallelApplyLedgerState
         std::vector<std::unique_ptr<ThreadParallelApplyLedgerState>> const&
             threads,
         ApplyStage const& stage);
+
+    // Compact final-stage commit. Fuses what commitChangesFromThreads +
+    // commitChangesToLedgerTxn would otherwise do for the last stage:
+    //
+    //  - For each dirty entry in each thread's map: if the same key is
+    //    already in mGlobalEntryMap (either as a clean preload or as a
+    //    prior-stage dirty entry), invoke the existing
+    //    commitChangeFromThread merge path so that mIsNew, the RO TTL
+    //    max-merge, and delete-then-recreate collapse all behave exactly
+    //    as today. Otherwise emit the entry directly to the inner ltx
+    //    without materializing it into mGlobalEntryMap.
+    //
+    //  - After draining threads, iterate mDirtyGlobalKeys to emit all
+    //    prior-stage dirty entries plus the collapsed final-stage overlap
+    //    entries. This avoids scanning every clean preloaded entry in
+    //    mGlobalEntryMap.
+    //
+    //  - Apply restored-entry markers exactly as commitChangesToLedgerTxn
+    //    does today.
+    //
+    // Must only be called once per global state, as the final operation
+    // (entries are moved out of their scopes during emission). After this
+    // call, mGlobalEntryMap entries are in a moved-from state and
+    // commitChangesToLedgerTxn must not be called.
+    void commitFinalChangesFromThreadsToLedgerTxn(
+        AppConnector& app,
+        std::vector<std::unique_ptr<ThreadParallelApplyLedgerState>> const&
+            threads,
+        ApplyStage const& stage, AbstractLedgerTxn& ltx);
 
     // Consumes the global entry map: moves entries into the LedgerTxn
     // instead of copying. Must only be called once, as the final operation

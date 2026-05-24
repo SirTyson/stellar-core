@@ -390,7 +390,8 @@ class LedgerManagerImpl : public LedgerManager
     void applySorobanStage(AppConnector& app, LedgerHeader const& header,
                            GlobalParallelApplyLedgerState& globalParState,
                            ApplyStage const& stage,
-                           Hash const& sorobanBasePrngSeed);
+                           Hash const& sorobanBasePrngSeed,
+                           bool isFinalStage, AbstractLedgerTxn& ltx);
 
     void applySorobanStages(AppConnector& app, AbstractLedgerTxn& ltx,
                             std::vector<ApplyStage> const& stages,
