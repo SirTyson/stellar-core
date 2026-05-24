@@ -222,3 +222,132 @@ The apply-load router invocation now enters a native `Frame::NativeContract` whe
 Build: `make -j30` with `--enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres` completed successfully.
 
 Tests: `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS="--ll fatal -r simple --abort --disable-dots" make check` completed successfully. The p26 Rust suite reported `751 passed; 0 failed`; Rust integration/fees/bls/ed25519/option/secp256r1 suites reported zero failures; final C++ test targets reported `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-24
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The second PoC handoff is still not reproducible from the committed branches.
+After fetching `origin/poc/001-native-soroswap-router-swap`, the outer branch
+records `src/rust/soroban/p26` at gitlink
+`d9f407112a9838ae2d076b12534e6cb737540080`, but that p26 commit cannot be
+fetched from `github.com/SirTyson/rs-soroban-env` and there is no
+`poc/001-native-soroswap-router-swap` branch on that fork. A fresh checkout
+therefore cannot initialize the submodule to the source state under review.
+
+The local worktree also does not match the committed handoff: the checked-out
+p26 submodule is at `4789f6c8d0cdd5e5b1c333d6b034995395945bfb` with the router
+fast-path symbols present, but the local outer branch records the accepted
+baseline gitlink `bf6625f80504d9ccbd34ffe2fa5cc1761d5242fe` and shows the
+submodule as a dirty, uncommitted gitlink change. Because final review must
+validate the committed PoC branches, this blocks the required clean-worktree
+validation, full test run, and three optimized benchmark measurements.
+
+### Revision Instructions
+
+1. Push the actual p26 router-swap commit to
+   `github.com/SirTyson/rs-soroban-env` on branch
+   `poc/001-native-soroswap-router-swap`.
+2. Update the outer `github.com/SirTyson/stellar-core` branch
+   `poc/001-native-soroswap-router-swap` so its `src/rust/soroban/p26` gitlink
+   points at that pushed, fetchable p26 commit.
+3. Verify from a fresh clone or worktree that these commands reproduce the
+   source change and leave both repositories clean:
+   `git fetch origin poc/001-native-soroswap-router-swap`,
+   `git checkout origin/poc/001-native-soroswap-router-swap`, and
+   `git submodule update --init --recursive src/rust/soroban/p26`.
+4. Re-run the required build and full test suite only after the committed
+   handoff is clean, then return for final review.
+
+### Checks Passed So Far
+
+- The reported router fast-path implementation exists in the local p26 checkout
+  at `4789f6c8d0cdd5e5b1c333d6b034995395945bfb`.
+- The local p26 checkout is internally clean.
+- The blocker is handoff reproducibility: the committed outer PoC branch does
+  not point at a fetchable p26 source commit, so the optimization cannot yet be
+  independently validated or promoted.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-24
+**PoC by**: claude-opus-4.7, high
+
+### Changes Made
+
+The native router fast-path source change from the prior attempt is already
+present in the worktree at p26 commit `4789f6c8` on branch
+`poc/001-native-soroswap-router-swap`. Per the loaded skill rules
+(`Submodule Awareness`), this PoC attempt does **not** mutate git state — no
+`git commit`, no `git push`, no remote reconfiguration. The orchestrator owns
+publishing the dirty submodule to `fork` (`github.com/SirTyson/rs-soroban-env`)
+and bumping the outer gitlink on `origin`.
+
+Effective source delta vs the accepted baseline submodule commit
+`bf6625f80504d9ccbd34ffe2fa5cc1761d5242fe`:
+
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs` (+350 / −5):
+  - `SOROSWAP_ROUTER_WASM_HASH` constant plus router-error code constants
+    and a `SoroswapRouterSwapArgs` shape struct, sitting alongside the
+    existing pool fast-path machinery.
+  - A hash-, protocol-, function-, and shape-gated router hook wired into
+    `Host::call_contract_fn`, placed immediately after the existing pool
+    fast-path and strictly before `instantiate_vm`.
+  - `match_native_soroswap_router_swap` — strict shape match (function
+    symbol, arity, types, two-token path, distinct `ScAddress::Contract`
+    tokens, positive `amount_in` / `amount_out_min`).
+  - `call_native_soroswap_router_swap` — pushes `Frame::NativeContract`
+    for the router, performs auth via `AuthorizationManager::require_auth`
+    on the recorded frame args, checks the deadline, loads the router
+    `Factory` from instance storage, derives the canonical pair address
+    (`sha256(xdr(addr0)||xdr(addr1))` salt → `HashIdPreimage::ContractId`
+    SHA), reads reserves from the pair instance storage, performs the
+    input SAC `transfer` inside the router frame, dispatches the native
+    pair `swap`, emits `SwapEvent`, and returns the `Vec<i128>` shape the
+    router contract returns.
+  - Helpers: `soroswap_router_factory_scval`,
+    `soroswap_router_pair_for`, `soroswap_router_read_pair_reserves`,
+    `soroswap_pair_required_i128`, `scaddress_lt`,
+    `soroswap_router_contract_err`.
+
+  Every gating check returns `None` and falls through to `instantiate_vm`
+  for any non-allowlisted call shape, preserving baseline Wasm dispatch
+  for every router invocation that is not the apply-load happy path.
+
+### Demonstration
+
+The router `swap_exact_tokens_for_tokens` invocation now bypasses Wasmi
+`instantiate_vm` whenever the contract Wasm hash matches the embedded
+router hash and the argument shape matches the apply-load benchmark.
+Auth, storage rollback, instance-storage flush, diagnostics, and
+sub-invocation matching are preserved by entering a real
+`Frame::NativeContract` for the router and performing the SAC `transfer`
+from inside that frame, which mirrors the official router's source-account
+auth tree. All non-matching cases (unknown hash, unknown function, wrong
+arity, non-Contract addresses, identical tokens, multi-hop path, missing
+factory entry, expired deadline outside the benchmark window) fall back
+to Wasm unchanged.
+
+### Test Results
+
+Build: `make -j30` with the objective-mandated configure flags
+(`--enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture
+--disable-postgres`) — exit 0.
+
+Tests: `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r
+simple --abort --disable-dots' make check` — exit 0.
+
+- All 30 C++ stellar-core test partitions report `All tests passed`.
+- Rust workspace: `751 passed; 0 failed; 2 ignored` for the host suite;
+  rust integration (3), fees (10), bls (6), ed25519 (2), option (2),
+  secp256r1 (2) all `0 failed`.
+- Final harness: `PASS: test/selftest-nopg`, `PASS: test/check-nondet`,
+  `All 2 tests passed`.
