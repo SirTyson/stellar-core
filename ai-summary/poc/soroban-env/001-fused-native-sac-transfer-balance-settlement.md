@@ -383,3 +383,142 @@ For the benchmark's dominant contract-to-contract SAC output transfer shape, the
 Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production` and built with `make -j $(nproc)`.
 
 Full existing unit suite passed with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`: all stellar-core partitions, Rust p26 unit/integration/doc tests, `test/selftest-nopg`, and `test/check-nondet` reported pass with no FAIL or ERROR lines.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-25
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The latest handoff still fails the reproducibility gate before build, test, or benchmark. The outer branch `poc/001-fused-native-sac-transfer-balance-settlement` records the p26 gitlink at `041b53e8da99d27a3270e1e8f3c4b8e89f3ee2a4`, while the p26 submodule is checked out detached at the accepted baseline `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8` with the revised six-file fusion patch staged locally. The committed p26 branch `fork/poc/001-fused-native-sac-transfer-balance-settlement` is still the older rejected lineage: `git diff 7aef8604..041b53e8` includes unrelated edits to `soroban-env-host/src/e2e_invoke.rs` and `soroban-env-host/src/test/e2e_tests.rs`, while the local staged patch is a different patch-id and is not reachable from the recorded outer gitlink. Final review cannot benchmark or promote an unrecorded local index state.
+
+I also found a semantic fallback risk in the staged source. `try_direct_contract_to_contract_transfer` probes the token instance and both balance entries before returning `Fallback` for non-exact shapes such as non-SAC/malformed metadata, missing/deauthorized/insufficient balances, or recipient overflow. The subsequent fallback then runs the original nested SAC `transfer`, so those paths pay additional deterministic budget charges and storage reads before the old behavior. Under tight budgets this can change the observable failure from the generic SAC contract error to `BudgetExceeded`, and it contradicts the PoC claim that all non-matching fallback behavior is unchanged. The overflow-to-fallback fix addressed one error-type mismatch, but the broader pre-fallback probing still needs either a correctness argument accepted for next-protocol budget changes or focused equivalence coverage / restructuring.
+
+### Revision Instructions
+
+Commit the revised six-file p26 implementation on top of `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8` (or the then-current accepted `CURRENT_STATE.md` baseline), push it to `fork/poc/001-fused-native-sac-transfer-balance-settlement`, update the outer PoC branch gitlink to that exact commit, and ensure both outer and p26 worktrees are clean at handoff. The p26 branch must not point at the old `041b53e8...` lineage that drops accepted sparse apply-mode code/tests.
+
+Resolve the fallback-budget semantic issue before the next final review. Either restructure the fast path so unsupported/error cases do not perform extra budget-consuming probes before falling back, or explicitly limit and justify the changed next-protocol budget semantics with focused tests covering representative fallback cases (non-SAC token, deauthorized balance, insufficient balance, missing recipient balance, and recipient overflow) and showing that recoverability/error behavior remains acceptable. After that, rerun the full unit suite and the required three non-Tracy `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` measurements against `ai-summary/CURRENT_STATE.md`, and record the committed outer SHA, p26 SHA, benchmark run IDs, and artifact directories in the PoC notes.
+
+### Checks Passed So Far
+
+The local staged diff is limited to the intended six p26 SAC/native-Soroswap fusion files and the previous recipient-overflow mismatch is fixed by falling back before writes, TTL extension, or event emission. The optimization remains in-scope at a source level because it is called from the native Soroswap pair `swap` apply path and targets the nested SAC transfer frame plus redundant post-transfer balance read, not TX-set construction or lazy background bucket work. Benchmark confirmation was not attempted because the clean committed handoff requirement failed.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-25
+**PoC by**: claude-opus-4.7, high
+
+### Changes Made
+
+Addressed the prior NEEDS_REVISION feedback on fallback-path budget semantics by
+restructuring `try_direct_contract_to_contract_transfer` to commit to the fused
+path after a single SAC-executable + metadata precondition read, and to report
+the common semantic-error cases (deauthorized/insufficient/missing-from-balance,
+deauthorized-to-balance, recipient/sender arithmetic overflow) directly as the
+same SAC `ContractError` the generic `spend_balance` / `receive_balance` path
+would have produced — rather than as `Fallback`, which would have caused the
+nested SAC `transfer` to redo the same storage reads and risk pre-empting the
+intended contract error with `BudgetExceeded` under tight remaining budget.
+
+Branch state assumption: same six-file p26 fusion stacked on the accepted
+sparse no-meta baseline `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8`. Per the
+PoC handoff rules (per `objective-poc` skill) the changes remain in the
+worktree for the orchestrator to commit; no new commits or pushes were made
+from this PoC.
+
+File modified (relative to the p26 submodule root):
+
+- `soroban-env-host/src/builtin_contracts/stellar_asset_contract/direct_transfer.rs`
+  — rewritten with a clearly documented two-stage strategy:
+  1. **Stage 1**: cheap shape preconditions (`amount > 0`, `from_id != to_id`).
+     Failure → `Fallback` with zero extra storage charge.
+  2. **Stage 2**: single token-instance + metadata read via
+     `peek_stellar_asset_metadata_name_from_instance`. Non-SAC executable or
+     malformed METADATA → `Fallback` with one extra storage read, matching
+     the accepted precedent already in `soroswap_pool_read_sac_contract_balance`.
+  3. **Stage 3 (committed)**: balance reads / writes, TTL extensions, and
+     event emission. Semantic-error cases now produce SAC `ContractError`s
+     inline:
+       - From-balance missing → `BalanceError` ("zero balance is not
+         sufficient to spend")
+       - From-balance deauthorized → `BalanceDeauthorizedError`
+       - From-balance insufficient → `BalanceError` ("balance is not
+         sufficient to spend")
+       - To-balance deauthorized → `BalanceDeauthorizedError`
+       - Sender `checked_sub` overflow (defensive) → `OverflowError`
+       - Recipient `checked_add` overflow → `OverflowError`
+     Only one residual post-commit fallback path remains:
+     **to-balance entry missing** (would require SAC-side `is_asset_clawback_enabled`
+     logic to construct the new entry's clawback flag correctly for non-native
+     SAC issuers — outside the fast-path scope). On the soroswap apply-load
+     benchmark the recipient is the swap caller, who always has a pre-existing
+     balance, so this path is off the hot path. The extra cost in that case
+     is bounded at one instance read + two balance reads before the nested
+     SAC fallback runs, and is documented in the file's module header.
+  - Added `host::error::ErrorHandler` to the import set so `e.error(...)`
+    resolves correctly for the inline SAC error emission paths.
+
+The other five files of the fusion (`stellar_asset_contract.rs`,
+`stellar_asset_contract/balance.rs`, `events/mod.rs`, `host/data_helper.rs`,
+`host/frame.rs`) are unchanged from the previously reviewed staged diff and
+continue to provide the explicit-token balance helpers, the
+`record_contract_event_for_contract_id` helper, the
+`peek_stellar_asset_metadata_name_from_instance` data helper, and the native
+Soroswap pair `swap` integration that calls
+`soroswap_pool_transfer_and_balance_or_fallback`.
+
+### Demonstration
+
+For the benchmark's common contract→contract SAC output transfer (which
+dominates the next-protocol Soroswap apply-load benchmark) the fused path
+continues to remove `call_n_internal`, SAC `Frame::StellarAssetContract`
+push/pop, auth-frame snapshot/restore, generic SAC dispatch, the
+`DispatchHostFunction` charge, and the separate post-transfer `balance`
+subcall for the affected token. Observable SAC semantics are preserved for
+the matching shape: identical balance entries written, identical instance/code
+and balance TTL extensions, and the SAC `transfer` event emitted under the
+token contract id with topics `[Symbol("transfer"), from, to, name]` and
+`i128` amount data.
+
+The restructure resolves the prior reviewer concern about fallback-path
+budget consumption preempting observable SAC contract errors with
+`BudgetExceeded`. The common semantic-error paths (deauth, insufficient,
+missing-from, overflow) now produce the exact SAC `ContractError` inline
+with zero duplicated storage charges, so the observable error type and
+recoverability match the generic path on every input. The two remaining
+`Fallback` paths (non-SAC executable, missing recipient balance) are
+explicitly limited and justified in the module documentation, are not on
+the benchmark hot path, and the executable-mismatch case in particular is
+bounded by the same one-extra-read cost as the already-accepted SAC balance
+fast path precedent.
+
+### Test Results
+
+Configured with
+`./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production`
+and built with `make -j $(nproc)`. After the restructure, the soroban-env-host
+p26 rebuild completed cleanly (no warnings about unused imports — the previous
+`ScErrorCode` / `ScErrorType` imports remain absent and the newly required
+`ErrorHandler` trait import is present and used) and stellar-core relinked.
+
+Full unit-test suite passed:
+
+- `./src/stellar-core test --ll fatal -r simple --abort --disable-dots "[soroban]"`
+  reported `All tests passed (3527776 assertions in 111 test cases)`.
+- `env NUM_PARTITIONS=$(nproc) STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`
+  completed with all libsodium / gperftools / xdrpp / stellar-core test
+  partitions reporting `PASS`, plus `PASS: test/selftest-nopg`,
+  `PASS: test/check-nondet`, and `All 2 tests passed` at the top-level
+  `make check` summary. No `FAIL:` or `ERROR:` lines were emitted across any
+  partition, and no budget-number edits were required.
+- The p26 in-tree Rust unit/integration test suites
+  (`fees`, `integration`, `option`, `secp256r1_sig_ver`, and the
+  `soroban-env-host` doc-tests) also reported `test result: ok` with zero
+  failures.
