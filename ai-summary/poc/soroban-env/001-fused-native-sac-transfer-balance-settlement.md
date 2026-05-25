@@ -3759,3 +3759,102 @@ the focused direct-transfer equivalence tests); p26 `fees` (10/10),
 `integration` (3/3), `option` (2/2), `secp256r1_sig_ver` (2/2), and the
 soroban-env-host doc-tests all returned `test result: ok`. No budget-number
 edits were required.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-25
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The handoff still fails the clean, reproducible branch validation gate. I
+independently checked the submitted refs and worktree state before attempting
+any build, test, benchmark, or promotion:
+
+1. Outer `HEAD` and `origin/poc/001-fused-native-sac-transfer-balance-settlement`
+   both resolve to `4a2e0a1ff4256eea20f9da06e452efda01994d80`.
+2. The outer `HEAD` tree and index both record `src/rust/soroban/p26` at
+   gitlink `041b53e8da99d27a3270e1e8f3c4b8e89f3ee2a4`.
+3. The p26 fork branch
+   `fork/poc/001-fused-native-sac-transfer-balance-settlement` also resolves to
+   `041b53e8da99d27a3270e1e8f3c4b8e89f3ee2a4`, and the accepted p26 baseline
+   `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8` is not an ancestor of that
+   branch.
+4. The checked-out p26 submodule is detached at
+   `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8` with the seven-file
+   implementation present only as local staged/unstaged changes:
+   `stellar_asset_contract.rs`, `balance.rs`, `direct_transfer.rs`,
+   `events/mod.rs`, `host/data_helper.rs`, `host/frame.rs`, and
+   `test/stellar_asset_contract.rs`.
+5. The outer worktree also shows tracked `ai-summary/` files as deleted through
+   the `ai-summary -> /mnt/nvme2/stellar-core/ai-summary` symlink, so this
+   checkout is not a clean final-review/promote candidate.
+
+A fresh checkout followed by
+`git submodule update --init --recursive src/rust/soroban/p26` would reproduce
+the old `041b53e8...` p26 branch tip, not the implementation described in the
+PoC notes. Measuring the current tree would therefore benchmark a local
+`7aef8604-dirty` submodule patch that cannot be promoted to `soroswap-perf` or
+recorded as the next `CURRENT_STATE.md` baseline.
+
+### Revision Instructions
+
+Create a clean committed handoff before resubmitting:
+
+1. Commit the current seven-file p26 implementation and focused SAC
+   equivalence tests on top of the accepted p26 baseline
+   `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8` or the then-current
+   `ai-summary/CURRENT_STATE.md` baseline.
+2. Push that p26 commit to
+   `github.com/SirTyson/rs-soroban-env` branch
+   `poc/001-fused-native-sac-transfer-balance-settlement`.
+3. Update the outer `poc/001-fused-native-sac-transfer-balance-settlement`
+   branch so `src/rust/soroban/p26` records the exact new p26 commit.
+4. Run final review from a checkout where both the outer repository and p26
+   submodule are clean after
+   `git submodule update --init --recursive src/rust/soroban/p26`, aside from
+   expected verdict artifacts.
+
+After that clean handoff exists, rerun final-review validation from the repo
+root: configure/build with the required Tracy/next-protocol flags, run
+`env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`,
+and run the three authoritative non-Tracy
+`PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` benchmark
+measurements against `ai-summary/CURRENT_STATE.md`.
+
+### Checks Passed So Far
+
+I verified the current outer branch, origin branch, recorded gitlink, p26 fork
+branch, local p26 HEAD, accepted baseline SHA, p26 dirty diff stat, and outer
+dirty status. I did not run an authoritative build, full-suite test,
+benchmark, Tracy diagnostic run, severity assignment, promotion, success
+document, or `CURRENT_STATE.md` update because the clean committed handoff gate
+failed before those steps were valid.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-25
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract.rs` (lines 6, 18): wires in the `direct_transfer` module and re-exports `try_direct_contract_to_contract_transfer` / `DirectTransferOutcome` for the native Soroswap frame path.
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/direct_transfer.rs` (lines 65-354): implements the exact-shape fused contract-to-contract SAC transfer helper. It validates the shape, confirms the explicit token is SAC, preserves generic SAC error semantics after committing to the fused path, updates token-owned balances, extends TTLs, emits the token-contract event, and returns the mutated pair balance.
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/balance.rs` (lines 192-334, 1276-1307): adds explicit-token balance read/write/create helpers plus issuer-auth/clawback helpers used by the fused path without relying on the current frame's contract id.
+- `src/rust/soroban/p26/soroban-env-host/src/events/mod.rs` (line 271): adds `record_contract_event_for_contract_id` so direct SAC transfer events are recorded under the explicit token contract id while executing in the pair frame.
+- `src/rust/soroban/p26/soroban-env-host/src/host/data_helper.rs` (lines 171-239): adds `peek_stellar_asset_metadata_name_from_instance` to confirm the token instance is `ContractExecutable::StellarAsset` and fetch the SAC metadata name without pushing a SAC frame.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs` (lines 1238-1255, 1521-1558): updates native Soroswap pair `swap` to try fused output transfer-and-balance settlement for positive outputs and fall back to the existing nested SAC `transfer` plus direct balance read when the exact shape is not met.
+- `src/rust/soroban/p26/soroban-env-host/src/test/stellar_asset_contract.rs` (lines 608-944): keeps focused direct-transfer equivalence coverage for missing sender/recipient balance cases, auth-required behavior, fallback, and applied fused-path outcomes.
+
+### Demonstration
+
+The fused path removes the hot nested SAC `call_n_internal` transfer frame, SAC frame push/pop, auth snapshot/restore, generic SAC dispatch, dispatch charge, and the separate post-transfer direct balance read for the affected output token on the native Soroswap pair path. It preserves observable SAC semantics for matching contract-to-contract transfers by mutating the same explicit-token balance entries, extending the same TTLs, and emitting the SAC transfer event under the token contract id; non-exact or uncertain shapes retain the existing fallback path.
+
+### Test Results
+
+Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production`, built with `make -j $(nproc)`, and ran the full suite with `env NUM_PARTITIONS=$(nproc) STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`. The validation completed successfully: p26 `soroban-env-host` reported `755 passed; 0 failed; 2 ignored`, related Rust tests passed (`fees` 10/10, `integration` 3/3, `option` 2/2, `secp256r1_sig_ver` 2/2), and core `selftest-nopg` / `check-nondet` reported all tests passed.
