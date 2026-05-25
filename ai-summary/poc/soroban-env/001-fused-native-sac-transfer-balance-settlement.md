@@ -107,3 +107,53 @@ Full unit-test suite passes:
 
 - `./src/stellar-core test "[soroban]"` — All tests passed (3,527,776 assertions in 111 test cases).
 - `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` — all 30 partitions PASS, `selftest-nopg` and `check-nondet` PASS, with no FAIL or ERROR results across any partition. No budget-number edits were required.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-25
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The handoff is not stacked on the accepted `CURRENT_STATE.md` baseline, so benchmark results from this branch would not be comparable to the current baseline. The p26 submodule at `041b53e8da99d27a3270e1e8f3c4b8e89f3ee2a4` diverges from the recorded baseline `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8` at `bf6625f80504d9ccbd34ffe2fa5cc1761d5242fe`, omitting the accepted sparse no-meta ledger-change commits.
+
+This also causes unrelated source and test changes outside the claimed SAC-transfer fusion: `soroban-env-host/src/e2e_invoke.rs` drops `invoke_host_function_for_apply` / sparse apply-mode behavior, `src/rust/src/soroban_proto_all.rs` switches p26 apply calls back to `invoke_host_function`, and `soroban-env-host/src/test/e2e_tests.rs` removes the accepted apply-mode helper and `test_apply_invoke_preserves_budget_while_omitting_encoded_keys`. Deleting or weakening existing accepted test coverage violates the objective testing rules and blocks CONFIRMED before benchmarking.
+
+### Revision Instructions
+
+Rebase or recreate the PoC p26 branch on the exact submodule SHA recorded in `ai-summary/CURRENT_STATE.md` (`7aef8604bced962d79aaf06cab2f9e2c2c4e95d8`, or the then-current accepted baseline if it changes). Preserve the sparse apply-mode implementation and its tests byte-for-byte unless a purely mechanical rebase conflict requires an equivalent edit. Remove the unrelated outer `src/rust/src/soroban_proto_all.rs` revert and ensure the final diff contains only the SAC transfer/balance fusion plus any focused new equivalence tests.
+
+After rebasing, rerun the full unit suite and the required three non-Tracy `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` runs against the current `CURRENT_STATE.md` baseline. Include the new p26 SHA and updated diff summary in the PoC notes so final review can audit only the intended optimization.
+
+### Checks Passed So Far
+
+The proposed optimization still appears in-scope at a source level: the new direct transfer helper is called from the native Soroswap pair `swap` apply path and targets the nested SAC transfer frame rather than TX-set construction or lazy background bucket work. The core idea may be valid, but the current handoff cannot be benchmark-confirmed because it is based on an older accepted state and removes existing tests.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-25
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+Recreated the SAC transfer/balance fusion on the accepted p26 baseline SHA `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8`, preserving the sparse no-meta ledger-change implementation and its tests. The final source diff is limited to the intended p26 SAC/native-Soroswap fusion files; `soroban-env-host/src/e2e_invoke.rs`, `soroban-env-host/src/test/e2e_tests.rs`, and outer `src/rust/src/soroban_proto_all.rs` are no longer changed.
+
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract.rs:6-19` — wires in the new direct-transfer module and re-exports the fused helper/outcome for the native Soroswap frame path.
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/direct_transfer.rs:1-203` — adds the exact-shape `try_direct_contract_to_contract_transfer` implementation. It verifies SAC/token metadata shape, requires contract-to-contract distinct addresses, reads both explicit-token balance entries, checks authorization/sufficiency, extends instance/code TTLs, mutates balances, extends touched balance TTLs, and emits the SAC `transfer` event under the token contract id. Any uncertain shape returns `Fallback`.
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/balance.rs:180-304` — adds explicit-token balance read/write helpers and a TTL wrapper so the fused path can operate on token-owned `Balance(contract)` entries without relying on the current frame contract id.
+- `src/rust/soroban/p26/soroban-env-host/src/host/data_helper.rs:162-229` — adds `peek_stellar_asset_metadata_name_from_instance`, preserving fallback behavior for malformed or non-SAC instances while avoiding full SAC frame setup when only the asset name event topic is needed.
+- `src/rust/soroban/p26/soroban-env-host/src/events/mod.rs:265-290` — adds `record_contract_event_for_contract_id` so the fused path records the SAC event against the token contract id while executing inside the pair contract frame.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:1235-1268,1500-1546` — changes native pair `swap` to attempt fused output transfer per positive output amount. On `Applied(balance)` it uses the returned post-transfer pair balance and skips the redundant balance subcall; on fallback it runs the existing nested `transfer` and direct-balance read unchanged.
+
+### Demonstration
+
+The revised PoC is stacked directly on the accepted sparse no-meta baseline (`7aef8604...`) and keeps the accepted apply-mode source/test coverage intact. For the benchmark's common contract-to-contract SAC output transfer, it removes `call_n_internal`, the nested `Frame::StellarAssetContract`, auth-frame snapshot/restore, generic SAC dispatch, and the separate post-transfer balance read for the affected token while preserving explicit token storage, TTL, event-contract-id, and fallback semantics.
+
+### Test Results
+
+Configured and built with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production` followed by `make -j $(nproc)`. Full unit suite passed with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`; the final output included all p26 Rust tests passing, `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.

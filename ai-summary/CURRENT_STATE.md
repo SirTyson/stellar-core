@@ -49,6 +49,8 @@ footprint/storage-map optimizations.
 
 - Non-Tracy benchmark runs: 2026-05-25T00:58:11Z through 2026-05-25T01:10:26Z
 - Diagnostic Tracy run: 2026-05-25T01:16:55Z
+- Artifact directories regenerated for the same accepted source state:
+  2026-05-25T14:15:21Z through 2026-05-25T14:33:57Z
 - Recorded: 2026-05-25
 
 ## Apply-time results (authoritative non-Tracy runs)
@@ -86,9 +88,9 @@ soroswap-vs-max-sac tradeoff to justify.
 
 - Run id: `f5502210f4e4-20260525-011655`
 - Soroswap trace:
-  `/mnt/nvme2/apply-load/f5502210f4e4-20260525-011655/logs/f5502210f4e4-20260525-011655-02-soroswap-tx-2000-t-8.tracy`
+  `/mnt/nvme2/apply-load/9e61f0301cf2-20260525-143357/logs/9e61f0301cf2-20260525-143357-02-soroswap-tx-2000-t-8.tracy`
 - SAC trace:
-  `/mnt/nvme2/apply-load/f5502210f4e4-20260525-011655/logs/f5502210f4e4-20260525-011655-01-sac-tx-6000-t-8.tracy`
+  `/mnt/nvme2/apply-load/9e61f0301cf2-20260525-143357/logs/9e61f0301cf2-20260525-143357-01-sac-tx-6000-t-8.tracy`
 - Tracy apply-time numbers from this run are **ignored for the verdict**; the
   headline metric is the three non-Tracy runs above.
 - Diagnostic attribution: the source-level change removes unconsumed
@@ -102,13 +104,18 @@ soroswap-vs-max-sac tradeoff to justify.
 ## Artifact Paths
 
 - Non-Tracy run 1 artifact directory:
-  `/mnt/nvme2/apply-load/f5502210f4e4-20260525-005811`
+  `/mnt/nvme2/apply-load/9e61f0301cf2-20260525-141521`
 - Non-Tracy run 2 artifact directory:
-  `/mnt/nvme2/apply-load/f5502210f4e4-20260525-010419`
+  `/mnt/nvme2/apply-load/9e61f0301cf2-20260525-142127`
 - Non-Tracy run 3 artifact directory:
-  `/mnt/nvme2/apply-load/f5502210f4e4-20260525-011026`
+  `/mnt/nvme2/apply-load/9e61f0301cf2-20260525-142741`
 - Tracy diagnostic run artifact directory:
-  `/mnt/nvme2/apply-load/f5502210f4e4-20260525-011655`
+  `/mnt/nvme2/apply-load/9e61f0301cf2-20260525-143357`
+
+The artifact directories above were regenerated from the same accepted source
+commit and p26 submodule SHA after stale artifact cleanup; the authoritative
+baseline apply-time numbers remain the accepted non-Tracy values recorded in
+the table above.
 
 ## Build configuration
 
