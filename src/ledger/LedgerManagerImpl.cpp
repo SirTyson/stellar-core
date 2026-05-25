@@ -78,9 +78,12 @@
 #include <memory>
 #include <optional>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 
 /*
 The ledger module:
@@ -2575,12 +2578,12 @@ LedgerManagerImpl::applySorobanStageClustersInParallel(
 }
 
 void
-LedgerManagerImpl::checkAllTxBundleInvariants(
-    AppConnector& app, ApplyStage const& stage, Config const& config,
+LedgerManagerImpl::checkClusterTxBundleInvariants(
+    AppConnector& app, Cluster const& cluster, Config const& config,
     ParallelLedgerInfo const& ledgerInfo, LedgerHeader const& header)
 {
     bool const hasInvariants = !config.INVARIANT_CHECKS.empty();
-    for (auto const& txBundle : stage)
+    for (auto const& txBundle : cluster)
     {
         // Only run invariant checks if any invariants are enabled.
         // The delta is not built when invariants are disabled (see
@@ -2616,6 +2619,18 @@ LedgerManagerImpl::checkAllTxBundleInvariants(
 
         txBundle.getEffects().getMeta().maybeSetRefundableFeeMeta(
             txBundle.getResPayload().getRefundableFeeTracker());
+    }
+}
+
+void
+LedgerManagerImpl::checkAllTxBundleInvariants(
+    AppConnector& app, ApplyStage const& stage, Config const& config,
+    ParallelLedgerInfo const& ledgerInfo, LedgerHeader const& header)
+{
+    for (size_t i = 0; i < stage.numClusters(); ++i)
+    {
+        checkClusterTxBundleInvariants(app, stage.getCluster(i), config,
+                                       ledgerInfo, header);
     }
 }
 
@@ -2698,10 +2713,218 @@ LedgerManagerImpl::applySorobanStages(AppConnector& app, AbstractLedgerTxn& ltx,
         mLastPhaseTimings.sorobanCommitFromThreadsMs = 0;
         mLastPhaseTimings.sorobanDestroyThreadStatesMs = 0;
 #endif
+        struct ReadyQueueCluster
+        {
+            Cluster const* mCluster;
+            size_t mNodeIdx;
+            size_t mNumPredecessors{0};
+            std::vector<size_t> mSuccessors;
+        };
+
+        std::vector<ReadyQueueCluster> clusters;
         for (auto const& stage : stages)
         {
-            applySorobanStage(app, header, globalParState, stage,
-                              sorobanBasePrngSeed);
+            for (size_t i = 0; i < stage.numClusters(); ++i)
+            {
+                clusters.push_back(
+                    {&stage.getCluster(i), clusters.size(), 0, {}});
+            }
+        }
+
+        struct ClusterFootprintHashes
+        {
+            std::unordered_set<size_t> mReadOnly;
+            std::unordered_set<size_t> mReadWrite;
+        };
+
+        auto getClusterFootprintHashes = [](Cluster const& cluster) {
+            std::hash<LedgerKey> keyHasher;
+            ClusterFootprintHashes res;
+            for (auto const& txBundle : cluster)
+            {
+                auto const& footprint =
+                    txBundle.getTx()->sorobanResources().footprint;
+                for (auto const& key : footprint.readWrite)
+                {
+                    res.mReadWrite.insert(keyHasher(key));
+                }
+                for (auto const& key : footprint.readOnly)
+                {
+                    res.mReadOnly.insert(keyHasher(key));
+                }
+            }
+            return res;
+        };
+
+        std::unordered_map<size_t, std::vector<size_t>> previousReaders;
+        std::unordered_map<size_t, std::vector<size_t>> previousWriters;
+        std::vector<std::unordered_set<size_t>> predecessors(clusters.size());
+        for (auto const& cluster : clusters)
+        {
+            auto footprintHashes = getClusterFootprintHashes(*cluster.mCluster);
+            auto addPredecessors = [&](auto const& keys, auto const& previous) {
+                for (auto const& keyHash : keys)
+                {
+                    auto it = previous.find(keyHash);
+                    if (it == previous.end())
+                    {
+                        continue;
+                    }
+                    predecessors[cluster.mNodeIdx].insert(it->second.begin(),
+                                                          it->second.end());
+                }
+            };
+
+            addPredecessors(footprintHashes.mReadWrite, previousReaders);
+            addPredecessors(footprintHashes.mReadWrite, previousWriters);
+            addPredecessors(footprintHashes.mReadOnly, previousWriters);
+
+            for (auto const predecessor : predecessors[cluster.mNodeIdx])
+            {
+                clusters[predecessor].mSuccessors.push_back(cluster.mNodeIdx);
+            }
+            clusters[cluster.mNodeIdx].mNumPredecessors =
+                predecessors[cluster.mNodeIdx].size();
+
+            for (auto const& keyHash : footprintHashes.mReadOnly)
+            {
+                previousReaders[keyHash].push_back(cluster.mNodeIdx);
+            }
+            for (auto const& keyHash : footprintHashes.mReadWrite)
+            {
+                previousWriters[keyHash].push_back(cluster.mNodeIdx);
+            }
+        }
+
+        struct ActiveCluster
+        {
+            size_t mNodeIdx;
+            std::future<std::unique_ptr<ThreadParallelApplyLedgerState>>
+                mFuture;
+        };
+
+        std::set<size_t> readyClusters;
+        for (auto const& cluster : clusters)
+        {
+            if (cluster.mNumPredecessors == 0)
+            {
+                readyClusters.insert(cluster.mNodeIdx);
+            }
+        }
+
+        DeactivateScopeGuard globalStateDeactivateGuard(globalParState);
+        std::vector<ActiveCluster> activeClusters;
+        auto const maxActiveClusters =
+            std::max<uint32_t>(1, sorobanConfig.ledgerMaxDependentTxClusters());
+        auto const& config = app.getConfig();
+        auto ledgerInfo = getParallelLedgerInfo(app, header);
+
+#ifdef BUILD_TESTS
+        auto phaseStart = std::chrono::steady_clock::now();
+        auto recordPhaseTiming = [&](double& phaseMs) {
+            auto phaseEnd = std::chrono::steady_clock::now();
+            phaseMs +=
+                std::chrono::duration<double, std::milli>(phaseEnd - phaseStart)
+                    .count();
+            phaseStart = phaseEnd;
+        };
+#endif
+        size_t numCompleted = 0;
+        while (numCompleted < clusters.size())
+        {
+            while (activeClusters.size() < maxActiveClusters &&
+                   !readyClusters.empty())
+            {
+                auto nodeIdx = *readyClusters.begin();
+                readyClusters.erase(readyClusters.begin());
+                auto const& cluster = *clusters[nodeIdx].mCluster;
+                auto threadStatePtr =
+                    std::make_unique<ThreadParallelApplyLedgerState>(
+                        app, globalParState, cluster, nodeIdx);
+                activeClusters.push_back(
+                    {nodeIdx,
+                     std::async(std::launch::async,
+                                &LedgerManagerImpl::applyThread, this,
+                                std::ref(app), std::move(threadStatePtr),
+                                std::cref(cluster), std::cref(config),
+                                ledgerInfo, sorobanBasePrngSeed)});
+            }
+
+            releaseAssert(!activeClusters.empty());
+
+            size_t completedActiveIdx = activeClusters.size();
+            while (completedActiveIdx == activeClusters.size())
+            {
+                for (size_t i = 0; i < activeClusters.size(); ++i)
+                {
+                    if (activeClusters[i].mFuture.wait_for(
+                            std::chrono::milliseconds(0)) ==
+                        std::future_status::ready)
+                    {
+                        completedActiveIdx = i;
+                        break;
+                    }
+                }
+                if (completedActiveIdx == activeClusters.size())
+                {
+                    activeClusters.front().mFuture.wait_for(
+                        std::chrono::milliseconds(1));
+                }
+            }
+
+            auto completed = std::move(activeClusters[completedActiveIdx]);
+            activeClusters.erase(activeClusters.begin() + completedActiveIdx);
+            auto const& cluster = *clusters[completed.mNodeIdx].mCluster;
+
+            std::unique_ptr<ThreadParallelApplyLedgerState> threadState;
+            releaseAssert(completed.mFuture.valid());
+            try
+            {
+                threadState = completed.mFuture.get();
+            }
+            catch (std::exception const& e)
+            {
+                printErrorAndAbort("Exception on apply thread: ", e.what());
+            }
+            catch (...)
+            {
+                printErrorAndAbort("Unknown exception on apply thread");
+            }
+
+#ifdef BUILD_TESTS
+            recordPhaseTiming(mLastPhaseTimings.sorobanParallelApplyMs);
+#endif
+
+            checkClusterTxBundleInvariants(app, cluster, config, ledgerInfo,
+                                           header);
+
+#ifdef BUILD_TESTS
+            recordPhaseTiming(mLastPhaseTimings.sorobanCheckInvariantsMs);
+#endif
+
+            globalParState.commitChangesFromThread(app, *threadState, cluster);
+
+#ifdef BUILD_TESTS
+            recordPhaseTiming(mLastPhaseTimings.sorobanCommitFromThreadsMs);
+#endif
+
+            threadState.reset();
+
+#ifdef BUILD_TESTS
+            recordPhaseTiming(mLastPhaseTimings.sorobanDestroyThreadStatesMs);
+#endif
+
+            ++numCompleted;
+            for (auto const successor : clusters[completed.mNodeIdx].mSuccessors)
+            {
+                auto& numPredecessors = clusters[successor].mNumPredecessors;
+                releaseAssert(numPredecessors > 0);
+                --numPredecessors;
+                if (numPredecessors == 0)
+                {
+                    readyClusters.insert(successor);
+                }
+            }
         }
 #ifdef BUILD_TESTS
         auto subStart = std::chrono::steady_clock::now();

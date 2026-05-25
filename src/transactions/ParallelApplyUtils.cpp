@@ -102,21 +102,21 @@ using namespace stellar;
 // and B in parallel in the future. CAP 0063 explicitly chose this tradeoff.
 
 ParallelApplyLedgerKeySet
-getReadWriteKeysForStage(ApplyStage const& stage)
+getReadWriteKeysForCluster(Cluster const& cluster)
 {
     ZoneScoped;
     ParallelApplyLedgerKeySet res;
 
     // Pre-reserve to avoid rehashing. Each RW key may also have a TTL key.
     size_t estimatedKeys = 0;
-    for (auto const& txBundle : stage)
+    for (auto const& txBundle : cluster)
     {
         estimatedKeys +=
             txBundle.getTx()->sorobanResources().footprint.readWrite.size() * 2;
     }
     res.reserve(estimatedKeys);
 
-    for (auto const& txBundle : stage)
+    for (auto const& txBundle : cluster)
     {
         for (auto const& lk :
              txBundle.getTx()->sorobanResources().footprint.readWrite)
@@ -127,6 +127,20 @@ getReadWriteKeysForStage(ApplyStage const& stage)
                 res.emplace(getTTLKey(lk));
             }
         }
+    }
+    return res;
+}
+
+ParallelApplyLedgerKeySet
+getReadWriteKeysForStage(ApplyStage const& stage)
+{
+    ZoneScoped;
+    ParallelApplyLedgerKeySet res;
+
+    for (size_t i = 0; i < stage.numClusters(); ++i)
+    {
+        auto clusterKeys = getReadWriteKeysForCluster(stage.getCluster(i));
+        res.insert(clusterKeys.begin(), clusterKeys.end());
     }
     return res;
 }
@@ -919,6 +933,19 @@ GlobalParallelApplyLedgerState::commitChangesFromThreads(
     {
         commitChangesFromThread(app, *thread, readWriteSet);
     }
+}
+
+void
+GlobalParallelApplyLedgerState::commitChangesFromThread(
+    AppConnector& app, ThreadParallelApplyLedgerState& thread,
+    Cluster const& cluster)
+{
+    ZoneScoped;
+    releaseAssert(threadIsMain() ||
+                  app.threadIsType(Application::ThreadType::APPLY));
+
+    auto readWriteSet = getReadWriteKeysForCluster(cluster);
+    commitChangesFromThread(app, thread, readWriteSet);
 }
 
 void

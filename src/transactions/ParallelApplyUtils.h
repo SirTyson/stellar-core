@@ -266,6 +266,9 @@ class GlobalParallelApplyLedgerState
         std::vector<std::unique_ptr<ThreadParallelApplyLedgerState>> const&
             threads,
         ApplyStage const& stage);
+    void commitChangesFromThread(AppConnector& app,
+                                 ThreadParallelApplyLedgerState& thread,
+                                 Cluster const& cluster);
 
     // Consumes the global entry map: moves entries into the LedgerTxn
     // instead of copying. Must only be called once, as the final operation

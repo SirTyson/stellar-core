@@ -386,6 +386,11 @@ class LedgerManagerImpl : public LedgerManager
                                     Config const& config,
                                     ParallelLedgerInfo const& ledgerInfo,
                                     LedgerHeader const& header);
+    void checkClusterTxBundleInvariants(AppConnector& app,
+                                        Cluster const& cluster,
+                                        Config const& config,
+                                        ParallelLedgerInfo const& ledgerInfo,
+                                        LedgerHeader const& header);
 
     void applySorobanStage(AppConnector& app, LedgerHeader const& header,
                            GlobalParallelApplyLedgerState& globalParState,
