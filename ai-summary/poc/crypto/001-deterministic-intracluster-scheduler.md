@@ -107,3 +107,134 @@ The optimization removes artificial serialization caused by bin-packing independ
 ### Test Results
 
 Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`, built with `make -j $(nproc)`, then ran `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`. The full partitioned regression suite completed successfully with zero failing tests.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-25
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The PoC branch is not benchmark-comparable with the accepted baseline in
+`ai-summary/CURRENT_STATE.md`. The accepted baseline records p26 submodule SHA
+`7aef8604bced962d79aaf06cab2f9e2c2c4e95d8` on
+`github.com/SirTyson/rs-soroban-env` branch
+`poc/001-sparse-no-meta-ledger-changes`, and that SHA exists on the fork.
+However the handed-off PoC commit records `src/rust/soroban/p26` at
+`bf6625f80504d9ccbd34ffe2fa5cc1761d5242fe`, rolling back the accepted p26
+stack. The outer diff also changes `src/rust/src/soroban_proto_all.rs` from the
+accepted `e2e_invoke::invoke_host_function_for_apply` path back to
+`e2e_invoke::invoke_host_function`.
+
+Because this unintentionally removes the current accepted p26 optimization
+baseline, any apply-load numbers from this branch would mix the scheduler
+change with a regression of previously accepted work. That fails the final
+review benchmark-methodology requirement before running the three-run matrix.
+The PoC notes also do not include any `scripts/run_apply_load_matrix.py`
+results, so there is no preliminary benchmark evidence to evaluate.
+
+### Revision Instructions
+
+Rebase or recreate the PoC on top of the current accepted baseline
+`origin/soroswap-perf` / outer commit
+`1e61a61455cb1e69e0e68295b5180ca0bb7dd831` (plus the docs commit if desired),
+and make sure the p26 gitlink remains at
+`7aef8604bced962d79aaf06cab2f9e2c2c4e95d8` unless the scheduler genuinely
+requires a new p26 source change. Preserve the accepted p26 bridge call
+`invoke_host_function_for_apply`; do not revert it as part of the scheduler
+patch.
+
+After restacking, rerun the required validation from the restacked branch:
+
+1. `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production`
+2. `make -j $(nproc)`
+3. `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`
+4. `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` exactly three times without `--tracy`
+
+Append the three non-Tracy soroswap and max-sac apply-time results to this file.
+Only then can final review compare the scheduler against the accepted
+`CURRENT_STATE.md` baseline.
+
+### Checks Passed So Far
+
+- The optimization target is in scope: `applySorobanStageClustersInParallel`
+  and `applyThread` are descendants of `applyLedger`, not TX-set construction.
+- The code shape keeps worker count capped by the original number of final
+  stage clusters and does not introduce nested unbounded parallelism.
+- The source diff did not modify existing test files.
+- The accepted baseline submodule SHA is reproducible from the SirTyson
+  `rs-soroban-env` fork, so the baseline itself is not the blocker.
+
+---
+
+## PoC Attempt (Revision)
+
+**Result**: POC_PASS
+**Date**: 2026-05-25
+**PoC by**: claude-opus-4.7, high
+
+### Changes Made
+
+Restacked the previously implemented scheduler onto the current accepted
+baseline by restoring the two artifacts that the prior revision had
+inadvertently rolled back:
+
+- `src/rust/soroban/p26` — bumped submodule gitlink from
+  `bf6625f80504d9ccbd34ffe2fa5cc1761d5242fe` back to
+  `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8` (the accepted baseline SHA on
+  `github.com/SirTyson/rs-soroban-env` branch
+  `poc/001-sparse-no-meta-ledger-changes`).
+- `src/rust/src/soroban_proto_all.rs:114` — restored the
+  `e2e_invoke::invoke_host_function_for_apply(...)` call in the `p26`
+  module so the bridge again uses the apply-optimized entry point that
+  the sparse-no-meta-ledger-changes baseline introduced.
+
+The C++ scheduler edits from the prior PoC iteration
+(`src/ledger/LedgerManagerImpl.{cpp,h}`, `src/transactions/ParallelApplyStage.h`,
+`src/transactions/ParallelApplyUtils.{cpp,h}`) are unchanged and remain
+in the worktree; the only revisions in this iteration are the two
+baseline restorations above.
+
+### Demonstration
+
+The scheduler change still removes the artificial serialization caused
+by bin-packing independent dependency components into a single final
+XDR cluster, while running on top of the accepted
+sparse-no-meta-ledger-changes baseline. Final review can now compare
+the scheduler against `CURRENT_STATE.md` without confounding it with a
+regression of previously accepted p26 work.
+
+### Test Results
+
+Reconfigured with
+`./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production`,
+rebuilt with `make -j $(nproc)`, and ran
+`env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`.
+The full partitioned regression suite completed successfully with zero
+failing tests (`PASS: test/selftest-nopg`, `PASS: test/check-nondet`,
+"All 2 tests passed"). Soroban Rust unit and doc tests also passed.
+
+### Apply-Load Matrix Results
+
+Ran `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py`
+three times (without `--tracy`):
+
+Run 1 (`3f19183c883f-20260525-063445`):
+- `sac,TX=6000,T=8`: median=558.94 ms, p95=580.80 ms, p99=603.84 ms
+- `soroswap,TX=2000,T=8`: median=223.59 ms, p95=227.58 ms, p99=232.42 ms
+
+Run 2 (`3f19183c883f-20260525-064150`):
+- `sac,TX=6000,T=8`: median=563.99 ms, p95=588.23 ms, p99=651.83 ms
+- `soroswap,TX=2000,T=8`: median=224.84 ms, p95=228.85 ms, p99=244.94 ms
+
+Run 3 (`3f19183c883f-20260525-064859`):
+- `sac,TX=6000,T=8`: median=574.14 ms, p95=597.42 ms, p99=657.95 ms
+- `soroswap,TX=2000,T=8`: median=222.76 ms, p95=227.75 ms, p99=235.42 ms
+
+Run output directories live under `/mnt/nvme2/apply-load/` for the
+final-review agent to consume. These three non-Tracy runs satisfy the
+revision-instructions benchmark-methodology gate; final-review is
+responsible for comparing them against the accepted
+`CURRENT_STATE.md` baseline.
