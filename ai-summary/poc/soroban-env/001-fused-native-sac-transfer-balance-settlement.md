@@ -4741,3 +4741,63 @@ instance read — matching the precedent already accepted in
   `secp256r1_sig_ver` 2/2, and the `soroban-env-host` doc-tests all returned
   `test result: ok`.
 - No budget-number edits were required.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-25
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The PoC still fails the clean, reproducible final-review handoff gate. I independently fetched and checked the submitted refs before running any authoritative build, test, or benchmark:
+
+1. Outer `HEAD` and `origin/poc/001-fused-native-sac-transfer-balance-settlement` both resolve to `4a2e0a1ff4256eea20f9da06e452efda01994d80`.
+2. The outer tree records `src/rust/soroban/p26` at gitlink `041b53e8da99d27a3270e1e8f3c4b8e89f3ee2a4`.
+3. The p26 fork branch `fork/poc/001-fused-native-sac-transfer-balance-settlement` also resolves to `041b53e8da99d27a3270e1e8f3c4b8e89f3ee2a4`.
+4. The accepted `CURRENT_STATE.md` p26 baseline `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8` is not an ancestor of that p26 PoC branch.
+5. The implementation described in the latest PoC notes is present only as dirty local edits in a detached p26 checkout at `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8`, with six modified files plus untracked `soroban-env-host/src/builtin_contracts/stellar_asset_contract/direct_transfer.rs`.
+
+Because a clean checkout plus `git submodule update --init --recursive src/rust/soroban/p26` would reproduce the stale `041b53e8...` p26 commit rather than the current seven-file implementation, any test or `scripts/run_apply_load_matrix.py` benchmark here would measure an uncommitted `7aef8604-dirty` state. That evidence cannot be promoted to `soroswap-perf`, recorded in `CURRENT_STATE.md`, or used for a `CONFIRMED` success document.
+
+### Revision Instructions
+
+Create a committed, reproducible handoff before resubmitting:
+
+1. Commit the current seven-file p26 implementation and focused SAC equivalence tests on top of accepted baseline `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8` or the then-current `ai-summary/CURRENT_STATE.md` p26 SHA.
+2. Push that p26 commit to `github.com/SirTyson/rs-soroban-env` branch `poc/001-fused-native-sac-transfer-balance-settlement`.
+3. Update the outer `poc/001-fused-native-sac-transfer-balance-settlement` branch so `src/rust/soroban/p26` records that exact new p26 commit.
+4. Verify from a clean outer checkout that `git submodule update --init --recursive src/rust/soroban/p26` reproduces the intended implementation and that `git -C src/rust/soroban/p26 status --short` is empty.
+
+Once those conditions hold, final review can run the mandatory Tracy/next-protocol build, `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`, and three authoritative non-Tracy `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` benchmark runs against `ai-summary/CURRENT_STATE.md`.
+
+### Checks Passed So Far
+
+I independently checked the PoC file, accepted baseline, outer branch/ref state, recorded gitlink, p26 fork branch target, baseline ancestry, and current dirty p26 status. The local source patch remains plausibly in scope at a source level, but no authoritative full-suite, benchmark, severity, Tracy diagnostic, promotion, `CURRENT_STATE.md`, or success-document step was performed because the reproducibility gate failed.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-25
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract.rs:1-20` wires the `direct_transfer` module into SAC and re-exports the direct-transfer helper/outcome.
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/direct_transfer.rs:1-357` adds the exact-shape contract-to-contract SAC transfer-and-balance helper that validates SAC metadata, mutates explicit-token balance entries, extends TTLs, emits the token-scoped transfer event, and returns the sender pair balance.
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/balance.rs:181-365` adds explicit-token balance read/write/create helpers and issuer-derived authorization/clawback plumbing used by the fused path.
+- `src/rust/soroban/p26/soroban-env-host/src/events/mod.rs:265-290` adds `record_contract_event_for_contract_id` so fused SAC events are recorded under the token contract id while running in the pair frame.
+- `src/rust/soroban/p26/soroban-env-host/src/host/data_helper.rs:162-229` adds a lightweight SAC-instance metadata-name peek used to decide whether the fast path can apply.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:1179-1265,1481-1568` routes positive native Soroswap pair output transfers through the fused helper and skips the redundant post-transfer balance read when the helper applies, while preserving fallback to the existing nested SAC transfer path.
+- `src/rust/soroban/p26/soroban-env-host/src/test/stellar_asset_contract.rs:667-930` adds focused equivalence tests for missing sender balance, missing recipient balance creation, auth-required recipient rejection, and matching generic SAC behavior.
+
+### Demonstration
+
+The optimization fuses the dominant next-protocol native Soroswap pair output settlement path: for contract-to-contract SAC transfers from the current pair contract, it avoids `call_n_internal`, nested `Frame::StellarAssetContract` push/pop, auth-frame snapshot/restore, generic SAC dispatch, and the redundant post-transfer balance subcall. It preserves observable SAC semantics by operating on explicit token-owned balance entries, extending the same instance/code and balance TTLs, returning the actual mutated pair balance, and emitting the SAC `transfer` event under the token contract id. Unsupported or uncertain shapes still fall back to the existing nested SAC transfer plus balance path.
+
+### Test Results
+
+Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production`; `make -j30` exited 0. Full suite command `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` exited 0, including top-level `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, `All 2 tests passed`, and p26 Rust `test result: ok. 755 passed; 0 failed; 2 ignored; 0 measured; 1 filtered out` plus all p26 integration/doc-test suites shown in the test tail.
