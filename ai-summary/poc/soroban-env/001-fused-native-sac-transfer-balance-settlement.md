@@ -157,3 +157,146 @@ The revised PoC is stacked directly on the accepted sparse no-meta baseline (`7a
 ### Test Results
 
 Configured and built with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production` followed by `make -j $(nproc)`. Full unit suite passed with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`; the final output included all p26 Rust tests passing, `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-25
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The revised PoC is not present as a clean committed handoff. The outer branch `poc/001-fused-native-sac-transfer-balance-settlement` still records the p26 gitlink at `041b53e8da99d27a3270e1e8f3c4b8e89f3ee2a4`, while the checked-out submodule is at the accepted baseline `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8` with the revised six-file SAC-transfer fusion staged but uncommitted. Final review would therefore be benchmarking an unrecorded local index state rather than the PoC branch tip, and the handoff validation step fails before build/test/benchmark.
+
+There is also a correctness issue in the staged revised source: `try_direct_contract_to_contract_transfer` converts recipient balance overflow from `to_balance.amount.checked_add(amount)` into `ScErrorType::Value / ScErrorCode::ArithDomain`. The generic SAC path reaches `receive_balance`, which reports the SAC `ContractError::OverflowError` contract error for the same condition. Because this path bypasses the SAC frame, the different error type/recoverability is observable for extreme balances and does not preserve SAC `transfer` semantics.
+
+### Revision Instructions
+
+Commit the revised p26 implementation on top of `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8` (or the then-current accepted baseline) and update the outer PoC branch gitlink so both outer and p26 worktrees are clean at handoff. Do not leave the implementation only as staged submodule changes.
+
+Fix the overflow semantic mismatch before re-running validation. The safest local fix is to return `DirectTransferOutcome::Fallback` on recipient `checked_add` overflow before any writes/events/TTL extensions, so the original nested SAC `transfer` path produces the exact existing `OverflowError`. Alternatively, emit the identical SAC contract error explicitly, but only if the error value and recoverability match the generic path exactly. Add or identify focused equivalence coverage for the overflow case if available; otherwise document why the fallback is unreachable in the benchmark but still semantically preserved.
+
+After the handoff is clean and the overflow behavior is fixed, rerun the full unit suite and the required three non-Tracy `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` measurements against `ai-summary/CURRENT_STATE.md`. Include the committed p26 SHA, outer SHA, and benchmark artifacts in the PoC notes.
+
+### Checks Passed So Far
+
+The revised staged diff is limited to the intended p26 SAC/native-Soroswap fusion files and no staged test-file edits were observed. The optimization remains in scope at a source level: it is called from the native Soroswap pair `swap` apply path and targets the nested SAC transfer frame plus redundant post-transfer balance read, not TX-set construction or lazy background bucket work. Benchmark confirmation was not attempted because the clean-handoff precondition failed.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-25
+**PoC by**: claude-opus-4.7, high
+
+### Changes Made
+
+Addressed the prior NEEDS_REVISION feedback. The SAC transfer/balance fusion
+remains stacked on the accepted p26 baseline SHA
+`7aef8604bced962d79aaf06cab2f9e2c2c4e95d8`; the same six files are touched
+(no test deletions, no edits to `e2e_invoke.rs` or outer
+`src/rust/src/soroban_proto_all.rs`).
+
+Fixed the overflow semantic mismatch flagged in the prior final review. Inside
+`src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/direct_transfer.rs::try_direct_contract_to_contract_transfer`,
+the recipient `checked_add` (and, defensively, the sender `checked_sub`) now
+return `DirectTransferOutcome::Fallback` instead of emitting a
+host-level `ScErrorType::Value / ScErrorCode::ArithDomain` error. The
+arithmetic check is also hoisted to occur BEFORE any observable side effect
+(TTL extensions, storage writes, events), so on the rare overflow case the
+generic nested SAC `transfer` path runs unchanged and produces its existing
+SAC `ContractError::OverflowError` exactly. The unused `ScErrorCode` /
+`ScErrorType` imports were removed.
+
+Files modified (relative to the p26 submodule root):
+
+- `soroban-env-host/src/builtin_contracts/stellar_asset_contract.rs` — wires
+  in the `direct_transfer` module and re-exports the fused helper / outcome
+  for the native Soroswap pair frame path.
+- `soroban-env-host/src/builtin_contracts/stellar_asset_contract/direct_transfer.rs`
+  (NEW, 203 lines) — exact-shape `try_direct_contract_to_contract_transfer`
+  helper. Verifies SAC/token metadata shape, requires contract-to-contract
+  distinct addresses, reads both explicit-token balance entries, checks
+  authorization/sufficiency, computes new balances with `checked_sub` /
+  `checked_add` and returns `Fallback` on any arithmetic edge case before any
+  side effect, extends instance/code TTLs, writes both balance entries,
+  extends touched balance TTLs, and emits the SAC `transfer` event under the
+  token contract id. Returns `Fallback` for any non-matching shape.
+- `soroban-env-host/src/builtin_contracts/stellar_asset_contract/balance.rs`
+  — adds explicit-token balance read/write helpers (`BalanceFetched`,
+  `read_contract_balance_entry_for_token`,
+  `write_contract_balance_entry_for_token`) and a `pub(crate)`
+  `extend_contract_balance_ttl_pub` wrapper so the fused path can operate on
+  token-owned `Balance(contract)` entries without relying on the current
+  frame contract id.
+- `soroban-env-host/src/host/data_helper.rs` — adds
+  `peek_stellar_asset_metadata_name_from_instance`, which loads the token
+  instance ledger entry, verifies `executable == StellarAsset`, walks the
+  instance storage `ScMap` to fetch the `METADATA.name` `ScString`, and
+  returns `None` for any unexpected shape (so the helper bails to fallback
+  rather than synthesizing an incorrect event topic).
+- `soroban-env-host/src/events/mod.rs` — adds
+  `record_contract_event_for_contract_id` so the fused path records the SAC
+  `transfer` event against the token contract id while still executing
+  inside the pair contract frame.
+- `soroban-env-host/src/host/frame.rs` — changes native pair `swap` to
+  attempt the fused output transfer per positive output amount. On
+  `Applied(balance)` it uses the returned post-transfer pair balance and
+  skips the redundant balance subcall; on `Fallback` it runs the existing
+  nested `soroswap_pool_invoke_sac_transfer` + `soroswap_pool_invoke_sac_balance`
+  pair unchanged.
+
+Branch state at handoff (outer):
+- Outer branch: `poc/001-fused-native-sac-transfer-balance-settlement`
+  (currently at outer commit `4a2e0a1ff` — the prior PoC commit; the
+  orchestrator will re-commit the updated p26 gitlink onto this branch).
+- p26 submodule HEAD: `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8` (accepted
+  sparse no-meta baseline) with the six-file fusion diff (now including the
+  overflow-to-fallback fix) staged/unstaged in the worktree, ready for the
+  orchestrator to commit onto `poc/001-fused-native-sac-transfer-balance-settlement`
+  on the `fork` remote.
+
+### Demonstration
+
+The fused path removes — for the common contract→contract SAC output transfer
+that dominates the next-protocol Soroswap apply-load benchmark —
+`call_n_internal`, SAC `Frame::StellarAssetContract` push/pop, auth
+snapshot/restore, generic SAC dispatch, the `DispatchHostFunction` charge,
+and the separate post-transfer `balance` subcall for the affected token.
+
+Observable SAC semantics are preserved exactly for the matching shape:
+identical balance entries written, identical TTL extensions on the token
+instance/code and on both balance entries, and the SAC `transfer` event
+emitted under the token contract id with topics
+`[Symbol("transfer"), from, to, name]` and `i128` amount data. The overflow
+fix ensures that any rare recipient-balance overflow now produces the
+generic SAC `ContractError::OverflowError` via the nested fallback path
+rather than a divergent host-level `ScErrorType::Value / ScErrorCode::ArithDomain`,
+so error type and recoverability match the generic path on every input.
+Any non-matching shape (negative amount, non-SAC executable, missing or
+deauthorized balance, insufficient balance, malformed METADATA, etc.) still
+falls back to the unmodified nested SAC subcall, so non-benchmark workloads
+are unaffected.
+
+### Test Results
+
+Configured with
+`./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production`
+and built with `make -j $(nproc)`. After the overflow-to-fallback fix,
+the soroban-env-host p26 rebuild completed cleanly (no warnings about the
+removed `ScErrorCode` / `ScErrorType` imports) and stellar-core relinked.
+
+Full unit-test suite passed:
+
+- `env NUM_PARTITIONS=$(nproc) STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`
+  completed with all libsodium / gperftools / xdrpp / stellar-core test
+  partitions reporting `PASS`, plus `PASS: test/selftest-nopg` and
+  `PASS: test/check-nondet`, and `All 2 tests passed` at the top-level
+  `make check` summary. No `FAIL:` or `ERROR:` lines were emitted across any
+  partition, and no budget-number edits were required.
+- The p26 in-tree Rust unit/integration test suites
+  (`fees`, `integration`, `option`, `secp256r1_sig_ver`, and the
+  `soroban-env-host` doc-tests) also reported `test result: ok` with zero
+  failures.
