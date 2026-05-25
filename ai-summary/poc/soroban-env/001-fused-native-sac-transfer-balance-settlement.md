@@ -522,3 +522,58 @@ Full unit-test suite passed:
   (`fees`, `integration`, `option`, `secp256r1_sig_ver`, and the
   `soroban-env-host` doc-tests) also reported `test result: ok` with zero
   failures.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-25
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The handoff still fails the reproducibility gate before tests or benchmarks can be accepted. The outer branch `poc/001-fused-native-sac-transfer-balance-settlement` is at `4a2e0a1ff4256eea20f9da06e452efda01994d80` and records the p26 gitlink at the older `041b53e8...` lineage, while the checked-out p26 submodule is detached at the accepted baseline `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8` with the six-file SAC-transfer fusion present only as local staged/unstaged changes. Final review would be measuring an unrecorded local index/worktree state rather than the branch tip that can be promoted or reproduced.
+
+There is also a remaining semantic mismatch in the local source. After `try_direct_contract_to_contract_transfer` confirms the token is a SAC, a missing `from` contract balance is always reported inline as `ContractError::BalanceError` ("zero balance is not sufficient to spend"). The generic SAC path first calls `is_authorized(from)`: for a missing contract balance on an auth-required asset this returns false and `spend_balance` reports `ContractError::BalanceDeauthorizedError` instead. The fused helper is not restricted to native assets, so this is an observable next-protocol behavior change for auth-required SAC pools with inconsistent/missing pair balance state.
+
+### Revision Instructions
+
+Commit the revised p26 implementation on top of the accepted `CURRENT_STATE.md` baseline SHA `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8`, push it to the PoC p26 branch, update the outer PoC branch gitlink to that exact commit, and ensure both outer and p26 worktrees are clean at handoff. The branch tip must not point at the older `041b53e8...` lineage.
+
+Fix the missing-from-balance auth-required mismatch. Either fall back before committing to the fused path when the `from` balance entry is missing, or explicitly reproduce `is_authorized` semantics for the missing-balance case by checking the token asset's auth-required flag and returning `BalanceDeauthorizedError` when appropriate. Add focused equivalence coverage for missing pair balance on both native/non-auth-required and auth-required SAC assets, then rerun the full unit suite and the required three non-Tracy `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` measurements against `ai-summary/CURRENT_STATE.md`.
+
+### Checks Passed So Far
+
+The local source diff remains limited to the intended six p26 SAC/native-Soroswap fusion files with no test-file edits observed. The optimization remains in scope at a source level because it is called from the native Soroswap pair `swap` apply path and targets the nested SAC transfer frame plus redundant post-transfer balance read, not TX-set construction or lazy background bucket work. Benchmark confirmation was not attempted because the clean committed handoff gate failed.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-25
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+Addressed the remaining semantic mismatch identified by final review while keeping the existing p26 SAC/native-Soroswap fusion in place. The fused helper now reproduces generic SAC `is_authorized` behavior when the sender contract balance entry is missing: non-auth-required assets still report `BalanceError`, while auth-required assets report `BalanceDeauthorizedError` before attempting spend semantics.
+
+Files modified in `src/rust/soroban/p26/soroban-env-host/src/`:
+
+- `builtin_contracts/stellar_asset_contract.rs:6-19` — continues to wire in the direct-transfer module and re-export the fused helper/outcome for the native Soroswap frame path.
+- `builtin_contracts/stellar_asset_contract/direct_transfer.rs:1-318` — updates the missing-from-balance branch to call the explicit-token authorization helper and emit the same SAC contract error as the generic path; documentation now reflects auth-required missing-balance semantics.
+- `builtin_contracts/stellar_asset_contract/balance.rs:180-304,1237-1282` — adds explicit-token asset-info/auth-required lookup helpers used only on the missing sender-balance error path, plus the existing explicit-token balance read/write helpers for the fused transfer.
+- `events/mod.rs:265-291` — keeps explicit contract-id event recording for token-contract SAC transfer events and removes an unused import warning.
+- `host/data_helper.rs:162-229` — keeps the SAC instance metadata-name peek used to confirm the token shape and build the transfer event topic without pushing a SAC frame.
+- `host/frame.rs:1238-1547` — keeps native pair `swap` integration that attempts fused output transfer, uses the returned post-transfer pair balance on success, and falls back to the original nested SAC transfer plus direct balance read otherwise.
+- `test/stellar_asset_contract.rs:42-90,668-742` — adds focused equivalence coverage for missing sender contract balances on both non-auth-required and auth-required SAC assets, comparing the fused helper error against the generic nested SAC `transfer` error.
+
+### Demonstration
+
+For the benchmark's dominant contract-to-contract SAC output transfer, the fused path still removes the nested `call_n_internal` SAC transfer frame, SAC frame push/pop, auth-frame snapshot/restore, generic SAC dispatch, dispatch charge, and the redundant post-transfer balance read for the affected token. The latest fix closes the auth-required missing-balance mismatch by reproducing the generic SAC authorization check for that error case, preserving observable contract error type and recoverability.
+
+### Test Results
+
+Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production` and built with `make -j $(nproc)`.
+
+Full existing unit suite passed with `env NUM_PARTITIONS=$(nproc) STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`: p26 `soroban-env-host` reported `753 passed; 0 failed; 2 ignored`, p26 integration/doc tests reported `ok`, `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and the top-level summary reported `All 2 tests passed`.
