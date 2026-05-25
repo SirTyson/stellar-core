@@ -1131,3 +1131,60 @@ side effect or balance read.
   `fees` 10/10, `integration` 3/3, `option` 2/2, `secp256r1_sig_ver`
   2/2, and the soroban-env-host doc-tests returned `test result: ok`.
   No budget-number edits were required.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-25
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The final-review handoff is still not a clean, reproducible committed branch state. The outer branch `poc/001-fused-native-sac-transfer-balance-settlement` is at `4a2e0a1ff4256eea20f9da06e452efda01994d80`, but its recorded p26 gitlink is still `041b53e8da99d27a3270e1e8f3c4b8e89f3ee2a4`. The p26 branch `fork/poc/001-fused-native-sac-transfer-balance-settlement` also resolves to that same old `041b53e8...` commit, which is the previously rejected lineage.
+
+The implementation described by the latest PoC notes is not reachable from that branch tip. The checked-out p26 submodule is detached at the accepted `CURRENT_STATE.md` baseline `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8` with the SAC/native-Soroswap fusion present only as staged/unstaged local changes. The outer repository also reports dirty `ai-summary/` symlink/artifact churn. Benchmarking this state would measure an unrecorded `7aef8604-dirty` local submodule rather than a branch that can be reproduced, promoted, or compared authoritatively against `CURRENT_STATE.md`.
+
+I spot-checked the local source diff again and did not identify a new semantic blocker in the fusion itself: the helper is reached from the native Soroswap pair `swap` path, targets the nested SAC `transfer` frame plus redundant post-transfer balance read, emits under the explicit token contract id, and includes focused missing-sender / missing-recipient SAC equivalence tests. This source-level status is not enough for `CONFIRMED` because the mandatory clean-handoff, full-suite, and three non-Tracy benchmark gates cannot be accepted from uncommitted local submodule edits.
+
+### Revision Instructions
+
+Commit the current seven-file p26 implementation, including the focused SAC tests, on top of the accepted p26 baseline `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8` (or the then-current `ai-summary/CURRENT_STATE.md` baseline if it changes). Push that commit to `fork/poc/001-fused-native-sac-transfer-balance-settlement`, update the outer PoC branch gitlink to the exact new p26 commit, and ensure both the outer repository and p26 submodule are clean at handoff.
+
+The committed p26 branch must not point at the old `041b53e8...` lineage and must not include unrelated sparse-apply reversions in `soroban-env-host/src/e2e_invoke.rs` or `soroban-env-host/src/test/e2e_tests.rs`. Restore the outer worktree's tracked `ai-summary/` state (or run final review from a clean worktree) so `git status` is clean except for expected verdict artifacts. After the clean committed handoff exists, rerun `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` and the required three non-Tracy `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` measurements against `ai-summary/CURRENT_STATE.md`, recording the committed outer SHA, p26 SHA, run IDs, and artifact directories in the PoC notes.
+
+If the intended workflow is for final review to validate uncommitted local submodule state, the final-review handoff procedure needs to be changed explicitly. Under the loaded final-review rules, final review validates reproducible committed branch tips and promotes those commits to `soroswap-perf`.
+
+### Checks Passed So Far
+
+The local source diff remains in scope at a source level: it is under the p26 Soroban env apply path and optimizes native Soroswap output settlement, not TX-set construction or lazy background bucket work. The added tests appear focused on the new helper, and I did not observe weakened existing test assertions in the reviewed diff. No benchmark confirmation was attempted because the clean committed handoff gate failed.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-25
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+Validated the current p26 fused native Soroswap SAC transfer-and-balance settlement implementation on top of accepted p26 baseline `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8`. The source changes remain confined to the intended p26 Soroban env files:
+
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract.rs:1-20` — wires in the `direct_transfer` module and re-exports the helper/outcome for the native pair frame path.
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/direct_transfer.rs:1-357` — adds the exact-shape contract-to-contract SAC transfer helper that validates SAC metadata, applies explicit-token balance mutations, extends TTLs, emits the token-contract transfer event, and returns the post-transfer pair balance.
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/balance.rs:181-344,1276-1339` — adds explicit-token balance read/write/create helpers and issuer-flag checks used by the fused helper.
+- `src/rust/soroban/p26/soroban-env-host/src/events/mod.rs:265-290` — adds explicit-contract-id event recording so the fused path emits SAC events under the token contract id while executing in the pair frame.
+- `src/rust/soroban/p26/soroban-env-host/src/host/data_helper.rs:136-229` — adds lightweight SAC executable / metadata-name peeking helpers.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:1235-1268,1500-1548` — attempts fused transfer-and-balance for positive native Soroswap swap output amounts and skips redundant balance reads when the helper applies; unsupported shapes fall back to the existing nested SAC transfer path.
+- `src/rust/soroban/p26/soroban-env-host/src/test/stellar_asset_contract.rs:668-933` — adds focused equivalence coverage for missing sender and missing recipient balance cases against generic SAC transfer behavior.
+
+### Demonstration
+
+For the dominant next-protocol Soroswap contract-to-contract SAC output settlement shape, the fused helper removes the nested `call_n_internal(..., "transfer", ...)` SAC frame and the redundant post-transfer output-token balance read. It preserves observable SAC behavior by writing/creating the same explicit-token balance entries, extending the same instance/code and balance TTLs, emitting the `transfer` event under the token contract id, and returning the actual mutated pair balance used by the K-invariant calculation. Unsupported or uncertain shapes fall back before side effects to the existing nested SAC path.
+
+### Test Results
+
+- Build configured with `--enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production`; after invalidating the p26/outer Rust git-state stamps, `make -j $(nproc)` rebuilt p26 Soroban env, relinked `stellar-core`, and completed successfully.
+- Full suite: `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` completed successfully with `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`.
+- p26 Rust suites included in `make check` reported `soroban-env-host` `755 passed; 0 failed; 2 ignored`, plus fees/integration/option/secp256r1/doc-tests all passed. No budget-number edits were required.
