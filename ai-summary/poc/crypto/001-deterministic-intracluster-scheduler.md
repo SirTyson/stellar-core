@@ -84,3 +84,26 @@ The measurable impact depends on workload structure. If soroswap final clusters 
 - **Change description**: First instrument each final apply cluster with exact counts for cluster size, conflict-edge count, ready-set width, critical-path length, and observed worker idle/straggler time. If those counters show exploitable width, replace the fixed one-future-per-cluster model with a deterministic stage-level work queue capped at `ledgerMaxDependentTxClusters`, scheduling ready txs by stable tx number while preserving dependency edges for RW/RW and RO/RW footprint conflicts. Do not add nested workers on top of the existing cluster futures.
 - **Correctness check**: Preserve per-tx `subSha256(sorobanBasePrngSeed, txBundle.getTxNum())`, transaction-result ordering in `processPostTxSetApply`, metadata/event ordering by `txNum`, RO TTL bump flush semantics before dependent writes, and deterministic global commit ordering. Existing parallel Soroban apply tests and invariant-enabled runs should cover ledger/result equivalence; add targeted tests only for new scheduler branches if the implementation introduces them.
 - **Benchmark focus**: Primary metric is `scripts/run_apply_load_matrix.py` soroswap apply time, with repeated runs. The PoC should report per-stage makespan before/after, ready-width histograms, number of final clusters with width >1, and whether wall-clock `applySorobanStageClustersInParallel` falls by at least 3% of end-to-end apply time without increasing total workers above `NUM_CLUSTERS`.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-25
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/ledger/LedgerManagerImpl.cpp:2488-2641` — added deterministic footprint-conflict component reconstruction for each final apply cluster, using the same conservative hashed LedgerKey RO/RW and RW/RW conflict rule as tx-set building.
+- `src/ledger/LedgerManagerImpl.cpp:2643-2764` and `src/ledger/LedgerManagerImpl.h:372-376` — changed `applyThread` to consume a `TxBundleList` work item and changed `applySorobanStageClustersInParallel` to feed conflict components through a bounded stage-level worker queue capped at the original number of final clusters.
+- `src/transactions/ParallelApplyStage.h:116-117` — introduced `TxBundleList` as a non-owning list of transaction bundles for split apply work items.
+- `src/transactions/ParallelApplyUtils.h:114-131` and `src/transactions/ParallelApplyUtils.cpp:924-1000` — updated `ThreadParallelApplyLedgerState` construction and footprint preloading to initialize from a `TxBundleList` rather than a full final cluster.
+
+### Demonstration
+
+The optimization removes artificial serialization caused by bin-packing independent dependency components into a single final XDR cluster. Conflicting transactions are still applied serially inside the same reconstructed component, while independent components are scheduled across the existing stage worker budget and committed in deterministic component order, preserving transaction result ordering, per-transaction PRNG seeds, metadata ownership, and RO TTL bump merge semantics.
+
+### Test Results
+
+Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres`, built with `make -j $(nproc)`, then ran `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`. The full partitioned regression suite completed successfully with zero failing tests.
