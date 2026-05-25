@@ -75,3 +75,35 @@ The projected impact clears the review threshold as a PoC candidate. The full `S
 - **Change description**: Add a next-protocol-only `try_soroswap_pool_direct_sac_transfer_and_balance` path for confirmed SAC token contracts where `from` is the current pair contract. It should mutate the explicit token's `Balance(pair)` and recipient balance, preserve nonnegative/authorization/TTL/event semantics, return the mutated pair balance for the output token, and fall back to `call_n_internal(..., "transfer", ...)` for non-SAC tokens, non-pair `from`, unsupported recipient/asset shapes, or any uncertain semantic case.
 - **Correctness check**: Existing native pair swap and SAC tests should continue to cover fallback and generic SAC behavior; add focused equivalence coverage in PoC for direct-vs-subcall output transfer with contract recipient, account recipient if supported, missing balance, insufficient balance, deauthorized balance, issuer mint/burn edge cases or explicit fallback, event contract id/topics/data, TTL extension, and rollback when the later K-invariant fails.
 - **Benchmark focus**: Run `scripts/run_apply_load_matrix.py` three times without Tracy against `CURRENT_STATE.md`. The target metric is soroswap `TX=2000,T=8` median apply time; Medium requires a reproducible 3-10% reduction, while max-sac regression should remain within the objective's accepted tradeoff envelope.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-25
+**PoC by**: claude-opus-4.7, high
+
+### Changes Made
+
+Implemented a fused-shape direct-SAC transfer-and-balance path in the p26 submodule. The change adds a narrowly scoped helper that, for the exact contract→contract SAC transfer shape used by the native Soroswap pair swap, performs the typed balance mutations, TTL extensions, and SAC `transfer` event emission directly under the explicit token contract id — avoiding `call_n_internal`, SAC `Frame::StellarAssetContract` push, auth snapshot, and generic SAC dispatch. Any precondition miss falls back to the existing nested SAC subcall.
+
+Files modified in `src/rust/soroban/p26/soroban-env-host/src/`:
+
+- `builtin_contracts/stellar_asset_contract.rs` — added `mod direct_transfer;` and re-export of `try_direct_contract_to_contract_transfer` / `DirectTransferOutcome`.
+- `builtin_contracts/stellar_asset_contract/direct_transfer.rs` (NEW) — `DirectTransferOutcome::{Applied(i128), Fallback}` and `try_direct_contract_to_contract_transfer(e, token_id, from_id, to_id, from_addr, to_addr, amount)` which: extends instance/code TTL under the explicit token id, reads both balance entries with the explicit-token helpers, checks authorization + sufficiency, writes the mutated entries back, extends touched balance TTLs, and emits the SAC `transfer` event under the token contract id. Returns `Fallback` for any non-matching shape (negative amount, missing/deauthorized/insufficient balance, missing METADATA, non-SAC executable, etc.).
+- `builtin_contracts/stellar_asset_contract/balance.rs` — added `pub(crate) extend_contract_balance_ttl_pub` wrapper, `pub(crate) BalanceFetched` struct, and `pub(crate) read_contract_balance_entry_for_token` / `write_contract_balance_entry_for_token` helpers that operate on the explicit-token storage key rather than the current frame id.
+- `host/data_helper.rs` — added `pub(crate) peek_stellar_asset_metadata_name_from_instance(&self, key)` that loads the token instance ledger entry, verifies `executable == StellarAsset`, walks the instance storage `ScMap` to fetch the `METADATA.name` `ScString`, and returns `None` for any unexpected shape.
+- `events/mod.rs` — added `pub(crate) record_contract_event_for_contract_id(&self, contract_id, topics, data)` so the fused path can emit the SAC `transfer` event under the explicit token contract id (rather than the current pair contract id).
+- `host/frame.rs` — updated `call_native_soroswap_pool_swap` to call a new `soroswap_pool_transfer_and_balance_or_fallback` helper per positive output amount: on `Applied(new_from_balance)` it short-circuits the subsequent direct-balance read, on `Fallback` it runs the existing `soroswap_pool_invoke_sac_transfer` + `soroswap_pool_invoke_sac_balance` pair unchanged. Added the `soroswap_pool_transfer_and_balance_or_fallback` helper next to `soroswap_pool_invoke_sac_transfer`.
+
+### Demonstration
+
+The fused path removes — for the common contract→contract SAC output transfer that dominates the next-protocol Soroswap apply-load benchmark — `call_n_internal`, SAC `Frame::StellarAssetContract` push/pop, auth snapshot/restore, generic SAC dispatch, the `DispatchHostFunction` charge, and the subsequent separate post-transfer balance read for the affected token. It preserves exact SAC observable semantics: identical balance entries written, identical TTL extensions on instance/code and on both balance entries, and the SAC `transfer` event emitted under the token contract id with topics `[Symbol("transfer"), from, to, name]` and `i128` data. Any non-matching shape falls back to the unmodified nested SAC subcall, so non-benchmark workloads are unaffected.
+
+### Test Results
+
+Full unit-test suite passes:
+
+- `./src/stellar-core test "[soroban]"` — All tests passed (3,527,776 assertions in 111 test cases).
+- `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` — all 30 partitions PASS, `selftest-nopg` and `check-nondet` PASS, with no FAIL or ERROR results across any partition. No budget-number edits were required.
