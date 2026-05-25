@@ -577,3 +577,156 @@ For the benchmark's dominant contract-to-contract SAC output transfer, the fused
 Configured with `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production` and built with `make -j $(nproc)`.
 
 Full existing unit suite passed with `env NUM_PARTITIONS=$(nproc) STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`: p26 `soroban-env-host` reported `753 passed; 0 failed; 2 ignored`, p26 integration/doc tests reported `ok`, `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and the top-level summary reported `All 2 tests passed`.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-25
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The handoff is still not a reproducible committed branch state. The outer branch
+`poc/001-fused-native-sac-transfer-balance-settlement` records the p26 gitlink at
+`041b53e8da99d27a3270e1e8f3c4b8e89f3ee2a4`, and
+`fork/poc/001-fused-native-sac-transfer-balance-settlement` resolves to that same
+old p26 commit. The checked-out p26 submodule is instead detached at the accepted
+baseline `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8` with the latest direct-transfer
+implementation present only as local staged/unstaged changes. The old recorded
+p26 branch also still includes unrelated reverted sparse-apply files
+(`soroban-env-host/src/e2e_invoke.rs` and `soroban-env-host/src/test/e2e_tests.rs`),
+so final review cannot benchmark or promote the branch tip as submitted.
+
+The latest source fixes the missing-sender-balance auth-required mismatch, but a
+semantic fallback gap remains. After confirming the token is SAC, the helper reads
+the sender balance and recipient balance, then returns `Fallback` when the
+recipient contract balance entry is missing. The generic SAC `transfer` supports
+this case by creating the recipient contract balance entry, with the `clawback`
+flag derived from issuer state. The current fallback therefore performs extra
+deterministic storage/budget work before running the original nested transfer.
+Under tight remaining budget this can change an otherwise valid transfer into
+`BudgetExceeded`, and the new focused tests do not cover this remaining
+post-commit fallback case.
+
+### Revision Instructions
+
+Commit the latest p26 implementation on top of the accepted `CURRENT_STATE.md`
+baseline SHA `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8`, push it to the PoC p26
+branch, update the outer PoC branch gitlink to that exact commit, and ensure both
+outer and p26 worktrees are clean at handoff. The branch tip must not point at
+the older `041b53e8...` lineage.
+
+Resolve the missing-recipient-balance path before the next final review. Either
+implement explicit-token recipient balance creation in the fused helper (including
+the correct SAC clawback flag semantics for non-native assets) so this case no
+longer falls back after duplicate reads, or restructure/gate the optimization so
+recipient-missing cases reach the generic nested SAC transfer without extra
+budget-consuming probes. Add focused equivalence coverage for transfer to a
+contract recipient with no existing balance, including native/non-auth-required
+and clawback-enabled credit assets where applicable. Then rerun the full unit
+suite and the required three non-Tracy
+`PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` measurements
+against `ai-summary/CURRENT_STATE.md`.
+
+### Checks Passed So Far
+
+The local source diff remains limited to the intended p26 SAC/native-Soroswap
+fusion files plus a new focused SAC test; no existing test logic was weakened in
+the reviewed diff. The optimization remains in scope at a source level because it
+is called from the native Soroswap pair `swap` apply path and targets the nested
+SAC transfer frame plus redundant post-transfer balance read, not TX-set
+construction or lazy background bucket work. Benchmark confirmation was not
+attempted because the clean committed handoff gate failed and the remaining
+recipient-missing fallback semantics need revision.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-25
+**PoC by**: claude-opus-4.7, high
+
+### Changes Made
+
+Addresses the prior reviewer concern: the previous iteration's
+`try_direct_contract_to_contract_transfer` fell back to the generic SAC
+`transfer` frame whenever the `to` contract balance entry was missing,
+after having already done three duplicate storage reads (to/issuer/from
+auth) on the fast-path. On hot Soroswap swap-into-fresh-pool paths this
+extra triple-read plus a re-entered SAC frame ate enough budget that
+otherwise-valid transfers could finish as `BudgetExceeded`. This
+iteration finishes the missing-recipient case inline so the fused path
+is the sole code path (no post-commit fallback) in
+`builtin_contracts/stellar_asset_contract/direct_transfer.rs`:
+
+- `direct_transfer.rs` (~lines 1-50, 209-330): updated module + function
+  docstrings (no remaining post-commit fallback documented), added
+  `BalanceValue`, `create_contract_balance_entry_for_token`, and
+  `is_asset_clawback_enabled_for_token` to imports, rewrote the stage-3
+  `to` handling to (a) match the fetched entry, (b) on `None` consult
+  `is_missing_contract_balance_authorized_for_token` and return
+  `BalanceDeauthorizedError` exactly when the generic
+  `receive_balance` would, otherwise (c) build a fresh
+  `BalanceValue { amount: 0, authorized: true, clawback: <issuer flag> }`
+  and remember that the entry did not previously exist. The final
+  settlement step now branches between
+  `write_contract_balance_entry_for_token` (update) and
+  `create_contract_balance_entry_for_token` (insert), then extends TTL
+  on the returned key, mirroring generic semantics for both branches.
+
+- `builtin_contracts/stellar_asset_contract/balance.rs` (~lines
+  307-344, 1244-1275): factored
+  `is_asset_auth_required_for_token` through a new
+  `is_asset_issuer_flag_set_for_token` helper, added
+  `is_asset_clawback_enabled_for_token` (reads
+  `ClawbackEnabledFlag` from the issuer account using the same explicit
+  `sac_contract_id` plumbing used elsewhere in the module), and added
+  `create_contract_balance_entry_for_token` which constructs a
+  Persistent `ContractDataEntry` keyed under
+  `ScAddress::Contract(sac_contract_id)` with
+  `live_until_ledger = get_min_live_until_ledger(Persistent)` —
+  matching the SAC's own create branch byte-for-byte except for the
+  contract id (which the fused path must pass explicitly because it
+  runs inside the pair frame, not the SAC frame).
+
+- `test/stellar_asset_contract.rs`: added `DirectTransferOutcome` to
+  imports and two focused tests after
+  `test_direct_contract_transfer_missing_from_balance_matches_auth_required`,
+  both with inline setup (the shared
+  `default_stellar_asset_contract()` helper creates the issuer
+  account, which can't be done twice in one host):
+  - `test_direct_contract_transfer_missing_to_balance_succeeds_and_matches_generic`
+    — fused path creates the recipient entry with issuer-derived
+    clawback flag and observable balance/TTL match the generic SAC
+    `transfer` path on a default (clawback-enabled) test asset.
+  - `test_direct_contract_transfer_missing_to_balance_on_auth_required_matches_generic`
+    — fused path errors with `BalanceDeauthorizedError` when the
+    issuer has `AUTH_REQUIRED_FLAG` and a contract receiver has no
+    pre-existing trustline-equivalent entry, exactly like the generic
+    path.
+
+### Demonstration
+
+The fused fast-path now handles the missing-recipient case inline with
+the same single round-trip of storage reads as the generic SAC
+`receive_balance` (one issuer read for the clawback flag, one write),
+removing the previous triple-duplicate-read-then-fallback footgun. With
+this in place the fused path strictly subsumes the generic path on
+Soroswap `swap` calls: every transfer the pair performs settles
+without re-entering the SAC frame, which is the dispatched-call/Wasm
+fuel saving the optimization was hypothesized to capture.
+
+### Test Results
+
+- Targeted: `cargo +1.88.0 test --release --lib test_direct` — all 4
+  direct-transfer tests pass (including the 2 new ones).
+- Subsystem: `cargo +1.88.0 test --release --lib stellar_asset_contract`
+  — 70/70 pass.
+- Full suite: `env NUM_PARTITIONS=$(nproc)
+  STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots'
+  make check` — exits 0; `PASS: test/selftest-nopg` and
+  `PASS: test/check-nondet`; all Rust crate test binaries (host lib,
+  integration, option, secp256r1_sig_ver, doc-tests, fees, etc.)
+  report `0 failed`.
