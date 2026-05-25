@@ -238,3 +238,34 @@ final-review agent to consume. These three non-Tracy runs satisfy the
 revision-instructions benchmark-methodology gate; final-review is
 responsible for comparing them against the accepted
 `CURRENT_STATE.md` baseline.
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-05-25
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** PARTIAL — the patch does split final apply clusters into reconstructed footprint-conflict components and feeds them through a bounded work queue, so it targets the intended `applySorobanStageClustersInParallel` / `applyThread` serialization surface. However, it only reconstructs connected components and then applies each component serially; it is not the full intra-cluster DAG scheduler described by the hypothesis.
+2. **Are the preconditions realistic?** NOT SUPPORTED — on the objective's actual apply-load matrix, the added scheduler work does not translate into a soroswap apply-time win. The final-review soroswap medians were 231.426 ms, 224.859 ms, and 227.947 ms, all slower than the accepted baseline medians of 207.046 ms, 209.272 ms, and 206.452 ms.
+3. **Is the original code inefficient or working as designed?** INCONCLUSIVE FOR THIS PATCH — final cluster bin-packing can serialize independent logical clusters, but the attempted apply-side reconstruction adds enough overhead and/or changes scheduling enough that the measured result is worse. The optimization is therefore not proven viable.
+4. **Does the benchmark improvement match the claimed severity?** NO — there is no improvement. The average soroswap median regressed from 207.590 ms to 228.077 ms, a 9.87% slowdown. Max-sac regressed from 308.898 ms to 562.520 ms, an 82.11% slowdown.
+5. **Is the optimization in scope?** YES — the modified code is in the `closeLedger` / Soroban apply path, not TX-set construction or lazy background bucket work.
+6. **Is the benchmark methodology correct?** YES FOR FINAL REVIEW — I configured and built the optimized branch, ran the full regression suite, then ran `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` exactly three times without `--tracy`. The accepted `ai-summary/CURRENT_STATE.md` baseline was used as the comparison point.
+7. **Can the result be explained without the optimization?** NO — the regression is large and consistent across all final-review runs, and it matches the PoC revision's own reported slower medians. This is not benchmark noise.
+8. **Is this optimization novel?** NOVEL BUT UNSUCCESSFUL — no duplicate issue was found, but novelty does not overcome the failed benchmark gate.
+
+### Rejection Reason
+
+The optimization fails the objective's required performance gate. All three independent non-Tracy final-review benchmark runs regress soroswap apply time relative to `ai-summary/CURRENT_STATE.md`, and max-sac regresses far outside the allowed tradeoff envelope. The branch also contains an unrelated `lib/asio` gitlink bump to a local commit that adds `asio/configure~`, which is not part of the scheduler optimization and would be unacceptable for promotion.
+
+### Failed Checks
+
+- Check 4: benchmark improvement / severity — no improvement; soroswap regressed by 9.87% on average.
+- Check 6: benchmark methodology support for PoC claim — final-review methodology was valid, but it disproved the claimed improvement.
+- Check 7: alternative explanations / noise — consistent large regression cannot be dismissed as noise.
+- Handoff hygiene: unrelated `lib/asio` submodule gitlink change to a backup-file commit.
