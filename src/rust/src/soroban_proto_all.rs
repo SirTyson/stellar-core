@@ -111,7 +111,7 @@ pub(crate) mod p26 {
         trace_hook: Option<TraceHook>,
         module_cache: &SorobanModuleCache,
     ) -> Result<InvokeHostFunctionResult, HostError> {
-        e2e_invoke::invoke_host_function(
+        e2e_invoke::invoke_host_function_for_apply(
             budget,
             enable_diagnostics,
             encoded_host_fn,
