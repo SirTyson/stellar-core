@@ -5092,3 +5092,170 @@ For matching Soroswap native-pair output transfers where both sender and recipie
 Build was forced to pick up the dirty p26 source state by removing `src/rust/soroban/p26/target/git-state.txt` and touching `direct_transfer.rs`, then `make -j $(nproc) 2>&1 | tail -200` completed successfully and relinked `stellar-core`.
 
 Full regression run completed successfully with `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check 2>&1 | tail -300`. The top-level summary reported `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and `All 2 tests passed`; the p26 Rust host suite reported `755 passed; 0 failed; 2 ignored; 0 measured; 1 filtered out`, including the direct-transfer equivalence tests.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-25
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The handoff still fails the mandatory reproducibility gate before final review can run the authoritative build, full-suite, benchmark, promotion, or success-document workflow.
+
+Independent checks in this pass found:
+
+1. Outer `HEAD` is `4a2e0a1ff4256eea20f9da06e452efda01994d80` on `poc/001-fused-native-sac-transfer-balance-settlement`.
+2. Both the outer `HEAD` tree and index record `src/rust/soroban/p26` at gitlink `041b53e8da99d27a3270e1e8f3c4b8e89f3ee2a4`.
+3. The local p26 remote branch `fork/poc/001-fused-native-sac-transfer-balance-settlement` also resolves to `041b53e8da99d27a3270e1e8f3c4b8e89f3ee2a4`, and the accepted baseline `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8` is not an ancestor of that branch.
+4. The implementation described by the latest PoC notes exists only as dirty local p26 worktree edits on detached `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8`: six modified files plus untracked `soroban-env-host/src/builtin_contracts/stellar_asset_contract/direct_transfer.rs`.
+5. The outer worktree also reports tracked `ai-summary/*` deletions plus an untracked `ai-summary` symlink, so a fresh checkout/submodule update would not reproduce the same tree state final review is seeing locally.
+
+Because there is no immutable p26 commit and matching outer gitlink for the seven-file SAC/native-Soroswap fusion, any `make check` or `scripts/run_apply_load_matrix.py` result from this worktree would be measuring an uncommitted `7aef8604-dirty` submodule state. Such measurements cannot be promoted to `soroswap-perf`, recorded in `CURRENT_STATE.md`, or used for a CONFIRMED success document.
+
+### Revision Instructions
+
+Create a clean committed handoff before the next final-review attempt:
+
+1. Commit the current p26 implementation on top of the accepted `CURRENT_STATE.md` p26 baseline `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8` or the then-current accepted baseline.
+2. Push that p26 commit to `github.com/SirTyson/rs-soroban-env` branch `poc/001-fused-native-sac-transfer-balance-settlement`.
+3. Update the outer `poc/001-fused-native-sac-transfer-balance-settlement` branch so `src/rust/soroban/p26` records that exact p26 commit, not the stale `041b53e8...` gitlink.
+4. Verify from a fresh checkout that `git submodule update --init --recursive src/rust/soroban/p26` leaves both the outer repository and p26 submodule clean, aside from expected verdict/pipeline artifacts.
+5. Preserve the accepted sparse apply-mode implementation and tests; the final source diff should remain limited to the claimed SAC/native-Soroswap fusion plus focused equivalence tests.
+
+After those conditions hold, final review can run the required Tracy/next-protocol build, `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`, and three authoritative non-Tracy `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` measurements against `ai-summary/CURRENT_STATE.md`.
+
+### Checks Passed So Far
+
+The PoC file and accepted `CURRENT_STATE.md` baseline were read. The current dirty p26 diff shape matches the claimed in-scope fused native SAC transfer-and-balance implementation and includes focused SAC tests, but the clean committed handoff check failed, so authoritative build/test/benchmark checks were not eligible to run.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-25
+**PoC by**: claude-opus-4.7, high
+
+### Changes Made
+
+The fused native SAC transfer-and-balance implementation is present in the
+p26 submodule worktree, stacked on the accepted sparse no-meta baseline
+`7aef8604bced962d79aaf06cab2f9e2c2c4e95d8`. Per the `objective-poc` skill
+("Do not run `git commit`, `git push`, or otherwise mutate git state. Leave
+your source edits in the worktree ... When you declare POC_PASS, the
+orchestrator commits dirty submodules onto `poc/<NNN>-<slug>` ..."), the
+seven-file fused implementation remains uncommitted for the orchestrator to
+commit and bump the outer gitlink. No additional source edits were required
+in this iteration — the implementation matches the prior accepted PoC shape
+with all reviewer-requested semantic fixes (missing-sender auth-required
+parity, recipient-overflow → SAC `OverflowError` inline, missing-recipient
+inline creation with issuer-derived clawback flag) already in place.
+
+Files modified (relative to the p26 submodule root):
+
+- `soroban-env-host/src/builtin_contracts/stellar_asset_contract.rs` — wires
+  in the `direct_transfer` module and re-exports
+  `try_direct_contract_to_contract_transfer` / `DirectTransferOutcome` for
+  the native Soroswap pair frame path.
+- `soroban-env-host/src/builtin_contracts/stellar_asset_contract/direct_transfer.rs`
+  (NEW, 356 lines) — exact-shape contract→contract SAC transfer-and-balance
+  helper. Two cheap shape preconditions (amount > 0, from_id != to_id), then
+  a single instance read confirms `ContractExecutable::StellarAsset` and
+  extracts the SAC metadata `name` for the event topic; after that the
+  helper commits to the fused path. Semantic-error cases (missing/deauth/
+  insufficient from-balance, deauth to-balance, sender/recipient overflow)
+  surface as the exact same SAC `ContractError` the generic
+  `spend_balance` / `receive_balance` would have produced. The missing
+  recipient balance case is handled inline by creating a fresh entry with
+  the issuer-derived `clawback` flag (no post-commit fallback).
+- `soroban-env-host/src/builtin_contracts/stellar_asset_contract/balance.rs`
+  — adds explicit-token balance read/write/create helpers
+  (`BalanceFetched`, `read_contract_balance_entry_for_token`,
+  `write_contract_balance_entry_for_token`,
+  `create_contract_balance_entry_for_token`), a `pub(crate)`
+  `extend_contract_balance_ttl_pub` wrapper, and explicit-token issuer-flag
+  helpers (`is_asset_clawback_enabled_for_token`,
+  `is_missing_contract_balance_authorized_for_token`) so the fused path can
+  operate on token-owned `Balance(contract)` entries and reproduce
+  auth-required semantics without relying on the current frame contract id.
+- `soroban-env-host/src/host/data_helper.rs` — adds
+  `peek_stellar_asset_metadata_name_from_instance`, which loads the token
+  instance ledger entry, verifies `executable == StellarAsset`, walks the
+  instance storage `ScMap` to fetch the `METADATA.name` `ScString`, and
+  returns `None` for any unexpected shape (so the helper falls back rather
+  than synthesizing an incorrect event topic).
+- `soroban-env-host/src/events/mod.rs` — adds
+  `record_contract_event_for_contract_id` so the fused path records the SAC
+  `transfer` event against the token contract id while executing in the
+  pair contract frame.
+- `soroban-env-host/src/host/frame.rs` — changes native pair `swap` to
+  attempt the fused output transfer per positive output amount via a new
+  `soroswap_pool_transfer_and_balance_or_fallback` helper next to
+  `soroswap_pool_invoke_sac_transfer`. On `Applied(balance)` it uses the
+  returned post-transfer pair balance and skips the redundant balance
+  subcall; on `Fallback` it runs the existing nested
+  `soroswap_pool_invoke_sac_transfer` + `soroswap_pool_invoke_sac_balance`
+  pair unchanged.
+- `soroban-env-host/src/test/stellar_asset_contract.rs` — adds focused
+  equivalence tests covering missing sender/recipient balance behavior on
+  both non-auth-required and auth-required SAC assets, comparing the fused
+  helper outcomes against the generic nested SAC `transfer` path.
+
+Branch state at handoff:
+
+- Outer worktree: `poc/001-fused-native-sac-transfer-balance-settlement`
+  branch at `4a2e0a1ff4256eea20f9da06e452efda01994d80` (with the recorded
+  p26 gitlink intentionally still `041b53e8...`; the orchestrator is
+  expected to bump it to the new p26 PoC commit when it commits the
+  submodule).
+- p26 submodule: detached at the accepted baseline
+  `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8` with the seven-file fusion
+  diff (six modified + one new `direct_transfer.rs`) staged/unstaged in the
+  worktree, ready for the orchestrator to commit onto
+  `poc/001-fused-native-sac-transfer-balance-settlement` on the `fork`
+  remote.
+
+### Demonstration
+
+For the benchmark's dominant contract→contract SAC output transfer (which
+dominates the next-protocol Soroswap apply-load benchmark) the fused path
+removes `call_n_internal`, SAC `Frame::StellarAssetContract` push/pop,
+auth-frame snapshot/restore, generic SAC dispatch, the `DispatchHostFunction`
+charge, and the separate post-transfer `balance` subcall for the affected
+token. Observable SAC semantics are preserved exactly for the matching shape:
+identical token-owned balance entries written (or created with the same
+issuer-derived `authorized` / `clawback` flags), identical TTL extensions on
+the token instance/code and on both balance entries, and the SAC `transfer`
+event emitted under the token contract id with topics
+`[Symbol("transfer"), from, to, name]` and `i128` amount data. All error
+cases (deauth, insufficient, missing-from, overflow) surface as the exact
+same SAC `ContractError` the generic path would have produced, with no
+duplicate storage reads that could pre-empt the contract error with
+`BudgetExceeded`. Non-matching shapes (negative amount, non-SAC executable,
+malformed metadata, etc.) fall back to the unmodified nested SAC subcall
+with at most one extra instance read, matching the accepted precedent set
+by the direct SAC-balance fast path.
+
+### Test Results
+
+Configured with
+`./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production`
+and built with `make -j $(nproc)`. The p26 submodule was rebuilt against
+the dirty worktree state and `stellar-core` relinked successfully.
+
+Full unit-test suite passed:
+
+- `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`
+  completed with all stellar-core test partitions reporting `PASS`, plus
+  `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, and
+  `All 2 tests passed` at the top-level `make check` summary. No `FAIL:`
+  or `ERROR:` lines were emitted across any partition, and no
+  budget-number edits were required.
+- The p26 in-tree Rust unit/integration/doc test suites (`bls`,
+  `ed25519_edge_cases`, `fees`, `integration`, `option`,
+  `secp256r1_sig_ver`, and `soroban-env-host` doc-tests) all reported
+  `test result: ok` with zero failures, including the focused
+  `direct_transfer` equivalence tests for missing sender/recipient balance
+  behavior on auth-required and non-auth-required SAC assets.
