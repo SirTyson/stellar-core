@@ -80,3 +80,25 @@ The impact is plausible at the objective's Medium floor but not proven High at r
 - **Change description**: Flatten `std::vector<ApplyStage>` into canonical cluster nodes, compute predecessor counts from read/write footprint conflicts against earlier canonical clusters, and run a deterministic ready queue capped at `sorobanConfig.ledgerMaxDependentTxClusters()`. When a cluster finishes, commit its thread state on the apply thread before releasing dependent successors. Preserve `TxBundle::getTxNum()` for PRNG seeds, post-apply, result, and metadata order.
 - **Correctness check**: Existing parallel Soroban apply tests should cover conflict validation, deterministic result ordering, PRNG/result replay, RoTTL bump behavior, and post-tx-set refund/meta processing. Add focused tests only if needed to show a later-stage non-conflicting cluster can run before an earlier-stage unrelated cluster while a conflicting later-stage cluster still waits.
 - **Benchmark focus**: Use `scripts/run_apply_load_matrix.py` on `soroswap, TX=2000, T=8`; the metric that must improve is median apply time across repeated non-Tracy runs. Also record stage/ready-queue critical-path stats: number of ready-queue nodes, dependency-edge count, maximum active workers, and current-barrier critical path vs scheduled critical path.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-25
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/ledger/LedgerManagerImpl.cpp:2580-2635` and `src/ledger/LedgerManagerImpl.h:385-393` — split invariant/refund-meta processing so it can run for a completed cluster while preserving the existing stage helper.
+- `src/ledger/LedgerManagerImpl.cpp:2716-2928` — replaced the full-stage loop in `applySorobanStages` with a flattened canonical cluster graph, read/write-footprint predecessor counts, and a deterministic ready queue capped by `ledgerMaxDependentTxClusters`.
+- `src/transactions/ParallelApplyUtils.cpp:104-144,938-948` and `src/transactions/ParallelApplyUtils.h:264-271` — factored read/write key collection to cluster granularity and added a single-cluster commit helper so completed ready-queue nodes can merge before releasing successors.
+
+### Demonstration
+
+The production apply path now starts any cluster whose earlier read/write conflicts have committed, instead of waiting for every cluster in the current `ApplyStage` to finish. Conflicting later clusters still wait on all canonical predecessors, while independent later clusters can occupy free workers immediately and retain existing `TxBundle::getTxNum()`-based PRNG/result/meta ordering.
+
+### Test Results
+
+`make -j30` completed successfully. `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make -j30 check` completed successfully with exit code 0, covering the full lib, C++, and Soroban Rust test suites.
