@@ -1,19 +1,20 @@
 # CURRENT_STATE — Soroswap Optimization Baseline
 
 This is the accepted current baseline for the soroswap-performance arc after
-confirming native Soroswap pool raw instance storage
-(`soroban/001-native-pool-raw-instance-storage`), stacked on top of direct SAC
-balance reads for the native Soroswap pair `swap` path, native Soroswap pair swap
-emulation, complete native Soroswap pool getter emulation, protocol-gated host
-metering coalescing, cached old-entry XDR size metadata, typed SAC balance
-storage fast path, and bulk-build host footprint/storage-map optimizations.
+confirming sparse no-meta Soroban ledger-change extraction
+(`ledger/001-sparse-no-meta-ledger-changes`), stacked on top of native Soroswap
+pool raw instance storage, direct SAC balance reads for the native Soroswap pair
+`swap` path, native Soroswap pair swap emulation, complete native Soroswap pool
+getter emulation, protocol-gated host metering coalescing, cached old-entry XDR
+size metadata, typed SAC balance storage fast path, and bulk-build host
+footprint/storage-map optimizations.
 
 ## Commit
 
-- p26 submodule SHA: `bf6625f80504d9ccbd34ffe2fa5cc1761d5242fe`
-  ("poc 001-native-pool-raw-instance-storage"), committed on the SirTyson fork
-  at branch
-  [`poc/001-native-pool-raw-instance-storage`](https://github.com/SirTyson/rs-soroban-env/tree/poc/001-native-pool-raw-instance-storage).
+- p26 submodule SHA: `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8`
+  ("poc 001-sparse-no-meta-ledger-changes"), committed on the SirTyson fork at
+  branch
+  [`poc/001-sparse-no-meta-ledger-changes`](https://github.com/SirTyson/rs-soroban-env/tree/poc/001-sparse-no-meta-ledger-changes).
   The accepted p26 stack is recorded as real submodule commits, in order:
   - upstream `b351f88a` ("Bump version to 26.0.0", v26.0.0)
   - `2b026eca` "viable success 001-bulk-build-host-storage-maps"
@@ -29,34 +30,37 @@ storage fast path, and bulk-build host footprint/storage-map optimizations.
   - `9f262829` "poc 001-native-pool-raw-instance-storage"
   - `53acea39` "poc 001-native-pool-raw-instance-storage"
   - `bf6625f8` "poc 001-native-pool-raw-instance-storage"
+  - `2ef5a839` "poc 001-sparse-no-meta-ledger-changes"
+  - `f8efa2a7` "poc 001-sparse-no-meta-ledger-changes"
+  - `7aef8604` "poc 001-sparse-no-meta-ledger-changes"
 - Outer branch: `soroswap-perf` on the SirTyson stellar-core fork.
 - Source/benchmark outer commit SHA on `soroswap-perf`:
-  `8a53196ece1e32074fb3983ed4386e3b1c4bce55`
-  (`perf(soroban): optimize native pool raw instance storage`), recording the
-  p26 gitlink at `bf6625f80504d9ccbd34ffe2fa5cc1761d5242fe`.
+  `1e61a61455cb1e69e0e68295b5180ca0bb7dd831`
+  (`perf(ledger): sparse no-meta ledger changes`), recording the p26 gitlink at
+  `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8`.
 - Reproduce this baseline from a clean checkout with:
   ```sh
   git fetch origin soroswap-perf
-  git checkout 8a53196ece1e32074fb3983ed4386e3b1c4bce55
+  git checkout 1e61a61455cb1e69e0e68295b5180ca0bb7dd831
   git submodule update --init --recursive src/rust/soroban/p26
   ```
 
 ## Timestamp
 
-- Non-Tracy benchmark runs: 2026-05-24T11:28:17Z through 2026-05-24T11:40:38Z
-- Diagnostic Tracy run: 2026-05-24T11:47:04Z
-- Recorded: 2026-05-24
+- Non-Tracy benchmark runs: 2026-05-25T00:58:11Z through 2026-05-25T01:10:26Z
+- Diagnostic Tracy run: 2026-05-25T01:16:55Z
+- Recorded: 2026-05-25
 
 ## Apply-time results (authoritative non-Tracy runs)
 
 | run | run id | scenario | median_ms | p95_ms | p99_ms |
 |-----|--------|----------|-----------|--------|--------|
-| 1 | `8dd3f525748f-20260524-112817` | sac, TX=6000, T=8 | 318.3988075 | 336.1706546 | 360.1546387 |
-| 1 | `8dd3f525748f-20260524-112817` | soroswap, TX=2000, T=8 | 210.6826550 | 214.8679175 | 217.6902260 |
-| 2 | `8dd3f525748f-20260524-113424` | sac, TX=6000, T=8 | 304.7521720 | 322.2278743 | 330.6001261 |
-| 2 | `8dd3f525748f-20260524-113424` | soroswap, TX=2000, T=8 | 210.6898800 | 214.4627854 | 223.1789672 |
-| 3 | `8dd3f525748f-20260524-114038` | sac, TX=6000, T=8 | 305.4485480 | 325.0758114 | 352.7727210 |
-| 3 | `8dd3f525748f-20260524-114038` | soroswap, TX=2000, T=8 | 212.9583905 | 216.8511416 | 219.6446553 |
+| 1 | `f5502210f4e4-20260525-005811` | sac, TX=6000, T=8 | 304.7717910 | 324.4614534 | 346.8156259 |
+| 1 | `f5502210f4e4-20260525-005811` | soroswap, TX=2000, T=8 | 207.0457240 | 210.7548173 | 218.1700961 |
+| 2 | `f5502210f4e4-20260525-010419` | sac, TX=6000, T=8 | 313.7902940 | 330.7629382 | 357.9009611 |
+| 2 | `f5502210f4e4-20260525-010419` | soroswap, TX=2000, T=8 | 209.2724275 | 214.0044290 | 215.7058769 |
+| 3 | `f5502210f4e4-20260525-011026` | sac, TX=6000, T=8 | 308.1304460 | 327.4401032 | 344.8353395 |
+| 3 | `f5502210f4e4-20260525-011026` | soroswap, TX=2000, T=8 | 206.4515575 | 211.0340098 | 217.7408400 |
 
 Use all three non-Tracy runs above as the reference baseline for future
 comparisons. Do not replace them with a single best run or an average-only
@@ -64,46 +68,47 @@ summary.
 
 ## Improvement vs Previous Baseline
 
-Previous accepted baseline (direct SAC balance reads for native pair swap):
-- soroswap median average: 218.310247 ms
-- sac median average: 314.654682 ms
+Previous accepted baseline (native pool raw instance storage):
+- soroswap median average: 211.443642 ms
+- sac median average: 309.533176 ms
 
-Current baseline (native pool raw instance storage):
-- soroswap median average: 211.443642 ms — **3.15% improvement**
-- sac median average: 309.533176 ms — **1.63% improvement**
+Current baseline (sparse no-meta ledger changes):
+- soroswap median average: 207.589903 ms — **1.82% improvement**
+- sac median average: 308.897510 ms — **0.21% improvement**
 
-All three optimized soroswap medians (210.683 / 210.690 / 212.958 ms) are below
-all three previous baseline medians (221.845 / 217.379 / 215.707 ms), so the
-headline improvement is supported across every run. Max-sac median also improved
-on average, so there is no soroswap-vs-max-sac tradeoff to justify.
+All three optimized soroswap medians (207.046 / 209.272 / 206.452 ms) are below
+all three previous baseline soroswap medians (210.683 / 210.690 / 212.958 ms),
+so the headline improvement is supported across every run. Max-sac median is
+roughly neutral and slightly improved on average, so there is no adverse
+soroswap-vs-max-sac tradeoff to justify.
 
 ## Diagnostic Tracy Run
 
-- Run id: `8dd3f525748f-20260524-114704`
+- Run id: `f5502210f4e4-20260525-011655`
 - Soroswap trace:
-  `/mnt/nvme2/apply-load/8dd3f525748f-20260524-114704/logs/8dd3f525748f-20260524-114704-02-soroswap-tx-2000-t-8.tracy`
+  `/mnt/nvme2/apply-load/f5502210f4e4-20260525-011655/logs/f5502210f4e4-20260525-011655-02-soroswap-tx-2000-t-8.tracy`
 - SAC trace:
-  `/mnt/nvme2/apply-load/8dd3f525748f-20260524-114704/logs/8dd3f525748f-20260524-114704-01-sac-tx-6000-t-8.tracy`
+  `/mnt/nvme2/apply-load/f5502210f4e4-20260525-011655/logs/f5502210f4e4-20260525-011655-01-sac-tx-6000-t-8.tracy`
 - Tracy apply-time numbers from this run are **ignored for the verdict**; the
   headline metric is the three non-Tracy runs above.
-- Diagnostic attribution: the source-level change removes redundant native pool
-  instance-storage representation work from the measured `closeLedger` apply
-  flow. The protocol-27 allowlisted pool path reads fixed raw `ScMap` fields,
-  keeps reserve values as `i128`, writes reserve updates by rebuilding the raw
-  storage map directly, and avoids the extra full-instance clone when entering
-  `Frame::NativeContract`. The change does not touch TX-set construction or lazy
+- Diagnostic attribution: the source-level change removes unconsumed
+  `LedgerEntryChange` output from the measured Soroban `InvokeHostFunction`
+  apply flow. The p26 stellar-core bridge still performs the same metered key
+  serialization for budget equivalence, but writes keys into a reused scratch
+  buffer and drops no-op read-only changes before the bridge's rent/effects
+  extractors iterate them. The change does not touch TX-set construction or lazy
   background bucket work.
 
 ## Artifact Paths
 
 - Non-Tracy run 1 artifact directory:
-  `/mnt/nvme2/apply-load/8dd3f525748f-20260524-112817`
+  `/mnt/nvme2/apply-load/f5502210f4e4-20260525-005811`
 - Non-Tracy run 2 artifact directory:
-  `/mnt/nvme2/apply-load/8dd3f525748f-20260524-113424`
+  `/mnt/nvme2/apply-load/f5502210f4e4-20260525-010419`
 - Non-Tracy run 3 artifact directory:
-  `/mnt/nvme2/apply-load/8dd3f525748f-20260524-114038`
+  `/mnt/nvme2/apply-load/f5502210f4e4-20260525-011026`
 - Tracy diagnostic run artifact directory:
-  `/mnt/nvme2/apply-load/8dd3f525748f-20260524-114704`
+  `/mnt/nvme2/apply-load/f5502210f4e4-20260525-011655`
 
 ## Build configuration
 
@@ -125,13 +130,11 @@ attribution; its apply-time numbers are not used for the verdict.
 
 The `--enable-next-protocol-version-unsafe-for-production` flag is required for
 this accepted state: the native Soroswap pool getter, pair swap, direct SAC
-balance-read, and raw pool instance-storage optimizations are intentionally gated
-behind a protocol number greater than released p26 so p26 ledgers retain their
-exact Wasm execution and metering. The flag bumps
-`Config::CURRENT_LEDGER_PROTOCOL_VERSION` from 26 to 27 and propagates the
-`next` cargo feature into the p26 Soroban host crate, raising the host's compiled
-`INTERFACE_VERSION.protocol` to 27 so the benchmark exercises the optimized path
-automatically.
+balance-read, and raw pool instance-storage optimizations are intentionally
+gated behind a protocol number greater than released p26 so p26 ledgers retain
+their exact Wasm execution and metering. The sparse no-meta ledger-change
+optimization itself preserves p26 budget accounting by retaining equivalent
+metered key serialization in the apply path.
 
 ## Worktree Build Note
 
