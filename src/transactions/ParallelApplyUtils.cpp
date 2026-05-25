@@ -924,7 +924,7 @@ GlobalParallelApplyLedgerState::commitChangesFromThreads(
 void
 ThreadParallelApplyLedgerState::collectClusterFootprintEntriesFromGlobal(
     AppConnector& app, GlobalParallelApplyLedgerState const& global,
-    Cluster const& cluster)
+    TxBundleList const& txBundles)
 {
     releaseAssert(threadIsMain() ||
                   app.threadIsType(Application::ThreadType::APPLY));
@@ -933,9 +933,9 @@ ThreadParallelApplyLedgerState::collectClusterFootprintEntriesFromGlobal(
     // execution. Each footprint key may have an associated TTL key.
     {
         size_t estimatedEntries = 0;
-        for (auto const& txBundle : cluster)
+        for (auto const* txBundle : txBundles)
         {
-            auto const& fp = txBundle.getTx()->sorobanResources().footprint;
+            auto const& fp = txBundle->getTx()->sorobanResources().footprint;
             estimatedEntries +=
                 fp.readWrite.size() * 2 + fp.readOnly.size() * 2;
         }
@@ -967,9 +967,9 @@ ThreadParallelApplyLedgerState::collectClusterFootprintEntriesFromGlobal(
         }
     };
 
-    for (auto const& txBundle : cluster)
+    for (auto const* txBundle : txBundles)
     {
-        auto const& footprint = txBundle.getTx()->sorobanResources().footprint;
+        auto const& footprint = txBundle->getTx()->sorobanResources().footprint;
         for (auto const& keys : {footprint.readWrite, footprint.readOnly})
         {
             for (auto const& key : keys)
@@ -987,7 +987,7 @@ ThreadParallelApplyLedgerState::collectClusterFootprintEntriesFromGlobal(
 
 ThreadParallelApplyLedgerState::ThreadParallelApplyLedgerState(
     AppConnector& app, GlobalParallelApplyLedgerState const& global,
-    Cluster const& cluster, size_t clusterIdx)
+    TxBundleList const& txBundles, size_t clusterIdx)
     : LedgerEntryScope(ScopeIdT(clusterIdx, global.mScopeID.mLedger))
     , mLCLSnapshot(global.mLCLSnapshot)
     , mInMemorySorobanState(global.mInMemorySorobanState)
@@ -997,7 +997,7 @@ ThreadParallelApplyLedgerState::ThreadParallelApplyLedgerState(
     releaseAssertOrThrow(global.getSnapshotLedgerSeq() ==
                          getSnapshotLedgerSeq());
     mPreviouslyRestoredEntries.addRestoresFrom(global.getRestoredEntries());
-    collectClusterFootprintEntriesFromGlobal(app, global, cluster);
+    collectClusterFootprintEntriesFromGlobal(app, global, txBundles);
 }
 
 void

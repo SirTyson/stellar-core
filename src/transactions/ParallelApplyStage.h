@@ -114,6 +114,7 @@ class TxBundle
 };
 
 typedef std::vector<TxBundle> Cluster;
+typedef std::vector<TxBundle const*> TxBundleList;
 
 class ApplyStage
 {

@@ -113,7 +113,7 @@ class ThreadParallelApplyLedgerState
 
     void collectClusterFootprintEntriesFromGlobal(
         AppConnector& app, GlobalParallelApplyLedgerState const& global,
-        Cluster const& cluster);
+        TxBundleList const& txBundles);
 
     void upsertEntry(LedgerKey const& key,
                      ThreadParApplyLedgerEntry const& entry, uint32_t ledgerSeq,
@@ -127,7 +127,8 @@ class ThreadParallelApplyLedgerState
   public:
     ThreadParallelApplyLedgerState(AppConnector& app,
                                    GlobalParallelApplyLedgerState const& global,
-                                   Cluster const& cluster, size_t clusterIdx);
+                                   TxBundleList const& txBundles,
+                                   size_t clusterIdx);
 
     // For every soroban LE in `txBundle`s RW footprint, ensure we've flushed
     // any buffered RO TTL bumps stored in `mRoTTLBumps` to the
@@ -279,7 +280,7 @@ class GlobalParallelApplyLedgerState
     // Constructor requires access to mInMemorySorobanState
     friend ThreadParallelApplyLedgerState::ThreadParallelApplyLedgerState(
         AppConnector& app, GlobalParallelApplyLedgerState const& global,
-        Cluster const& cluster, size_t clusterIdx);
+        TxBundleList const& txBundles, size_t clusterIdx);
 };
 
 class TxParallelApplyLedgerState

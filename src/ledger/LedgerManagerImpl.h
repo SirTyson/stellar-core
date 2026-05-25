@@ -372,7 +372,7 @@ class LedgerManagerImpl : public LedgerManager
     std::unique_ptr<ThreadParallelApplyLedgerState>
     applyThread(AppConnector& app,
                 std::unique_ptr<ThreadParallelApplyLedgerState> threadState,
-                Cluster const& cluster, Config const& config,
+                TxBundleList const& txBundles, Config const& config,
                 ParallelLedgerInfo ledgerInfo, Hash sorobanBasePrngSeed);
 
     std::vector<std::unique_ptr<ThreadParallelApplyLedgerState>>

@@ -22,6 +22,7 @@
 #include "invariant/InvariantManager.h"
 #include "ledger/FlushAndRotateMetaDebugWork.h"
 #include "ledger/LedgerEntryScope.h"
+#include "ledger/LedgerHashUtils.h"
 #include "ledger/LedgerHeaderUtils.h"
 #include "ledger/LedgerManager.h"
 #include "ledger/LedgerTxn.h"
@@ -73,8 +74,12 @@
 #include <Tracy.hpp>
 
 #include "LedgerManagerImpl.h"
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <future>
+#include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <regex>
@@ -2480,14 +2485,169 @@ LedgerManagerImpl::prefetchTransactionData(AbstractLedgerTxnParent& ltx,
     }
 }
 
+namespace
+{
+class DisjointTxSet
+{
+    std::vector<size_t> mParent;
+    std::vector<uint8_t> mRank;
+
+  public:
+    explicit DisjointTxSet(size_t size) : mParent(size), mRank(size, 0)
+    {
+        for (size_t i = 0; i < size; ++i)
+        {
+            mParent[i] = i;
+        }
+    }
+
+    size_t
+    find(size_t i)
+    {
+        if (mParent[i] != i)
+        {
+            mParent[i] = find(mParent[i]);
+        }
+        return mParent[i];
+    }
+
+    void
+    unite(size_t a, size_t b)
+    {
+        size_t rootA = find(a);
+        size_t rootB = find(b);
+        if (rootA == rootB)
+        {
+            return;
+        }
+
+        if (mRank[rootA] < mRank[rootB])
+        {
+            std::swap(rootA, rootB);
+        }
+        mParent[rootB] = rootA;
+        if (mRank[rootA] == mRank[rootB])
+        {
+            ++mRank[rootA];
+        }
+    }
+};
+
+struct ClusterFootprintEntry
+{
+    size_t mKeyHash;
+    size_t mTxIndex;
+    bool mIsRW;
+};
+
+std::vector<TxBundleList>
+splitClusterByFootprintConflicts(Cluster const& cluster)
+{
+    std::vector<TxBundleList> components;
+    if (cluster.empty())
+    {
+        return components;
+    }
+    if (cluster.size() == 1)
+    {
+        components.emplace_back(TxBundleList{&cluster.front()});
+        return components;
+    }
+
+    size_t totalFpEntries = 0;
+    for (auto const& txBundle : cluster)
+    {
+        auto const& fp = txBundle.getTx()->sorobanResources().footprint;
+        totalFpEntries += fp.readOnly.size() + fp.readWrite.size();
+    }
+
+    std::vector<ClusterFootprintEntry> fpEntries;
+    fpEntries.reserve(totalFpEntries);
+    std::hash<LedgerKey> keyHasher;
+    for (size_t i = 0; i < cluster.size(); ++i)
+    {
+        auto const& fp = cluster[i].getTx()->sorobanResources().footprint;
+        for (auto const& key : fp.readOnly)
+        {
+            fpEntries.push_back({keyHasher(key), i, false});
+        }
+        for (auto const& key : fp.readWrite)
+        {
+            fpEntries.push_back({keyHasher(key), i, true});
+        }
+    }
+
+    std::sort(fpEntries.begin(), fpEntries.end(),
+              [](ClusterFootprintEntry const& a,
+                 ClusterFootprintEntry const& b) {
+                  return a.mKeyHash < b.mKeyHash;
+              });
+
+    DisjointTxSet disjointSet(cluster.size());
+    for (size_t groupStart = 0; groupStart < fpEntries.size();)
+    {
+        size_t groupEnd = groupStart + 1;
+        while (groupEnd < fpEntries.size() &&
+               fpEntries[groupEnd].mKeyHash == fpEntries[groupStart].mKeyHash)
+        {
+            ++groupEnd;
+        }
+
+        for (size_t i = groupStart; i < groupEnd; ++i)
+        {
+            for (size_t j = i + 1; j < groupEnd; ++j)
+            {
+                if (fpEntries[i].mTxIndex != fpEntries[j].mTxIndex &&
+                    (fpEntries[i].mIsRW || fpEntries[j].mIsRW))
+                {
+                    disjointSet.unite(fpEntries[i].mTxIndex,
+                                      fpEntries[j].mTxIndex);
+                }
+            }
+        }
+
+        groupStart = groupEnd;
+    }
+
+    std::vector<size_t> componentForRoot(
+        cluster.size(), std::numeric_limits<size_t>::max());
+    for (size_t i = 0; i < cluster.size(); ++i)
+    {
+        size_t root = disjointSet.find(i);
+        size_t& componentIndex = componentForRoot[root];
+        if (componentIndex == std::numeric_limits<size_t>::max())
+        {
+            componentIndex = components.size();
+            components.emplace_back();
+        }
+        components[componentIndex].push_back(&cluster[i]);
+    }
+
+    return components;
+}
+
+std::vector<TxBundleList>
+buildApplyWorkItems(ApplyStage const& stage)
+{
+    std::vector<TxBundleList> workItems;
+    for (size_t i = 0; i < stage.numClusters(); ++i)
+    {
+        auto components = splitClusterByFootprintConflicts(stage.getCluster(i));
+        std::move(components.begin(), components.end(),
+                  std::back_inserter(workItems));
+    }
+    return workItems;
+}
+} // namespace
+
 std::unique_ptr<ThreadParallelApplyLedgerState>
 LedgerManagerImpl::applyThread(
     AppConnector& app,
     std::unique_ptr<ThreadParallelApplyLedgerState> threadState,
-    Cluster const& cluster, Config const& config, ParallelLedgerInfo ledgerInfo,
-    Hash sorobanBasePrngSeed)
+    TxBundleList const& txBundles, Config const& config,
+    ParallelLedgerInfo ledgerInfo, Hash sorobanBasePrngSeed)
 {
-    for (auto const& txBundle : cluster)
+    for (auto const* txBundle : txBundles)
     {
         // Apply timer
         std::optional<medida::TimerContext> txTime;
@@ -2497,21 +2657,21 @@ LedgerManagerImpl::applyThread(
                 mApplyState.getMetrics().mTransactionApply.TimeScope());
         }
 
-        Hash txSubSeed = subSha256(sorobanBasePrngSeed, txBundle.getTxNum());
+        Hash txSubSeed = subSha256(sorobanBasePrngSeed, txBundle->getTxNum());
 
-        threadState->flushRoTTLBumpsInTxWriteFootprint(txBundle);
+        threadState->flushRoTTLBumpsInTxWriteFootprint(*txBundle);
 
-        auto res = txBundle.getTx()->parallelApply(
-            app, *threadState, config, ledgerInfo, txBundle.getResPayload(),
-            getSorobanMetrics(), txSubSeed, txBundle.getEffects());
+        auto res = txBundle->getTx()->parallelApply(
+            app, *threadState, config, ledgerInfo, txBundle->getResPayload(),
+            getSorobanMetrics(), txSubSeed, txBundle->getEffects());
 
         if (res)
         {
-            threadState->commitChangesFromSuccessfulTx(*res, txBundle);
+            threadState->commitChangesFromSuccessfulTx(*res, *txBundle);
         }
         else
         {
-            releaseAssert(!txBundle.getResPayload().isSuccess());
+            releaseAssert(!txBundle->getResPayload().isSuccess());
         }
     }
 
@@ -2537,20 +2697,46 @@ LedgerManagerImpl::applySorobanStageClustersInParallel(
     ZoneScoped;
 
     std::vector<std::unique_ptr<ThreadParallelApplyLedgerState>> threadStates;
-    std::vector<std::future<std::unique_ptr<ThreadParallelApplyLedgerState>>>
-        threadFutures;
+    std::vector<std::future<void>> threadFutures;
 
     DeactivateScopeGuard globalStateDeactivateGuard(globalState);
 
-    for (size_t i = 0; i < stage.numClusters(); ++i)
+    auto workItems = buildApplyWorkItems(stage);
+    threadStates.resize(workItems.size());
+
+    std::vector<std::unique_ptr<ThreadParallelApplyLedgerState>>
+        initialThreadStates;
+    initialThreadStates.reserve(workItems.size());
+    for (size_t i = 0; i < workItems.size(); ++i)
     {
-        auto const& cluster = stage.getCluster(i);
-        auto threadStatePtr = std::make_unique<ThreadParallelApplyLedgerState>(
-            app, globalState, cluster, i);
+        initialThreadStates.emplace_back(
+            std::make_unique<ThreadParallelApplyLedgerState>(
+                app, globalState, workItems[i], i));
+    }
+
+    std::atomic<size_t> nextWorkItem{0};
+    size_t const workerCount = std::min(stage.numClusters(), workItems.size());
+    for (size_t i = 0; i < workerCount; ++i)
+    {
         threadFutures.emplace_back(std::async(
-            std::launch::async, &LedgerManagerImpl::applyThread, this,
-            std::ref(app), std::move(threadStatePtr), std::cref(cluster),
-            std::cref(config), ledgerInfo, sorobanBasePrngSeed));
+            std::launch::async,
+            [this, &app, &config, &initialThreadStates, &ledgerInfo,
+             &nextWorkItem, &sorobanBasePrngSeed, &threadStates,
+             &workItems]() {
+                while (true)
+                {
+                    size_t workItem = nextWorkItem.fetch_add(1);
+                    if (workItem >= workItems.size())
+                    {
+                        break;
+                    }
+
+                    threadStates[workItem] = applyThread(
+                        app, std::move(initialThreadStates[workItem]),
+                        workItems[workItem], config, ledgerInfo,
+                        sorobanBasePrngSeed);
+                }
+            }));
     }
 
     for (auto& threadFuture : threadFutures)
@@ -2558,8 +2744,7 @@ LedgerManagerImpl::applySorobanStageClustersInParallel(
         releaseAssert(threadFuture.valid());
         try
         {
-            auto futureResult = threadFuture.get();
-            threadStates.emplace_back(std::move(futureResult));
+            threadFuture.get();
         }
         catch (std::exception const& e)
         {
@@ -2571,6 +2756,10 @@ LedgerManagerImpl::applySorobanStageClustersInParallel(
         }
     }
     threadFutures.clear();
+    releaseAssert(std::all_of(threadStates.begin(), threadStates.end(),
+                              [](auto const& threadState) {
+                                  return threadState != nullptr;
+                              }));
     return threadStates;
 }
 
