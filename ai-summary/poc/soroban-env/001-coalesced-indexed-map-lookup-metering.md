@@ -71,3 +71,57 @@ Correctness hinges on the protocol gate. Released p26 must continue to use the c
 - **Change description**: add a next-protocol-only indexed lookup path behind `Budget::coalesced_host_metering()`. For deterministic loops such as `get_ledger_changes`, precompute the number of indexed initial-map and footprint hits and replace repeated identical MemCpy lookup/access charges with `bulk_charge` or an exact per-leaf batched helper before doing unchecked-by-metering direct `Vec::get` calls. For per-operation storage reads, either use the same next-protocol coalesced model to skip indexed-lookup bookkeeping entirely, or add an explicit accumulator that flushes at deterministic frame/invocation boundaries without changing released p26 behavior.
 - **Correctness check**: existing storage, map, protocol-gate, e2e invoke, and budget-metering tests should cover the core path; any budget-number updates must be limited to exact lower next-protocol metering expectations. Add focused tests that p26 leaves `get_at_known_position` charge totals unchanged and next protocol preserves storage/footprint decisions and ledger changes.
 - **Benchmark focus**: run `scripts/run_apply_load_matrix.py` three times and compare soroswap median apply time against the current `CURRENT_STATE.md` baseline. The expected signal is a 3-4% median improvement if the trace projection holds; the diagnostic Tracy run should show the `map lookup indexed` zone disappear or shrink sharply and fewer per-lookup `Budget::charge` events.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-26
+**PoC by**: claude-opus-4.7, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/host/metered_map.rs`
+  (`get_at_known_position`, lines ~317-348, and `charge_lookup`): gate the
+  per-call `charge_binsearch` + `charge_access(1)` metering on
+  `Budget::coalesced_host_metering()`. When the next-protocol coalesced
+  metering flag is enabled (established by `Host::set_ledger_info` for
+  ledger protocols above `MIN_LEDGER_PROTOCOL_VERSION`), both helpers
+  skip charging and the tracy span is suppressed, mirroring the same
+  pattern already used by `visit_obj_untyped` (host_object.rs) and
+  the batched ValSer fast path (metered_xdr.rs). Released p26 keeps
+  exact charge totals because the flag stays `false` at
+  `MIN_LEDGER_PROTOCOL_VERSION`.
+
+- `src/transactions/ParallelApplyUtils.cpp` (line ~803): restored a
+  missing function header for
+  `GlobalParallelApplyLedgerState::getSnapshotLedgerSeq()` that was
+  pre-existing dirty worktree state and prevented compilation. Not part
+  of the optimization; required only to build.
+
+### Demonstration
+
+The change removes per-call `Budget::charge` work (refcell borrow,
+tracker update, dimension evaluation, limit check) from the hot
+indexed-lookup path used by enforcing-storage reads, footprint access
+checks, and `get_ledger_changes` post-execution diffing. Each
+`get_at_known_position` call already performs zero key comparisons —
+the side index has supplied a verified position — so the remaining
+work was metering bookkeeping. With the coalesced-metering gate the
+fast path is just a bounds-checked `Vec::get`, plus an internal-error
+guard for stale indices. Released p26 behavior is unchanged because
+the protocol gate flips on exactly when other already-shipped
+coalesced charges flip on.
+
+### Test Results
+
+`env NUM_PARTITIONS=$(nproc) STELLAR_CORE_TEST_PARAMS='--ll fatal -r
+simple --abort --disable-dots' make check` ran to completion. All
+TESTS report `FAIL: 0` and `ERROR: 0` across the full C++ suite, the
+Rust soroban-env-host workspace tests (including the
+`protocol_gate::ledger_protocol_controls_coalesced_host_metering`
+test that pins the next-protocol gating semantics this change rides
+on), the fees, integration, option, and secp256r1 integration tests,
+and the `selftest-nopg` / `check-nondet` top-level harnesses
+(`All 2 tests passed`). No budget-number test edits were required.
