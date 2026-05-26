@@ -441,3 +441,87 @@ selftest summary reported `All 2 tests passed`
 (`PASS: test/selftest-nopg`, `PASS: test/check-nondet`). All per-partition
 Catch2 summaries reported `All tests passed`; no "FAIL" or "failed"
 lines appear in the test output other than `0 failed` totals.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-26
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The source-level optimization may still be viable, but the current handoff is
+not a valid final-review target and cannot be benchmark-confirmed.
+
+1. The outer branch `poc/002-footprint-resolved-native-router-swap` is still not
+   descended from the accepted `soroswap-perf` baseline commit
+   `1e61a61455cb1e69e0e68295b5180ca0bb7dd831`
+   (`git merge-base --is-ancestor ... HEAD` fails). Measuring this branch would
+   not isolate the router optimization against the accepted
+   `ai-summary/CURRENT_STATE.md` baseline.
+2. The committed outer gitlink records p26 SHA
+   `cb59d2439ed9ad9662b11bd95e33e9fb1e0b1946`, whose history is the older
+   router PoC stack based on `bf6625f80504d9ccbd34ffe2fa5cc1761d5242fe`, not a
+   descendant of accepted p26 baseline
+   `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8`.
+3. The restacked source described by the latest PoC is only staged inside
+   `src/rust/soroban/p26` while that submodule is checked out at
+   `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8`. A clean checkout followed by
+   `git submodule update --init --recursive src/rust/soroban/p26` would not
+   reproduce the reviewed source state.
+4. The outer apply-entrypoint restore in `src/rust/src/soroban_proto_all.rs` is
+   also uncommitted in the working tree, so the branch tip does not contain the
+   full source state claimed by the PoC.
+
+Because the final-review workflow requires a clean, committed PoC branch stacked
+on `CURRENT_STATE.md`, running the required full test suite and three
+non-Tracy `scripts/run_apply_load_matrix.py` benchmark passes would produce
+invalid verdict data.
+
+### Revision Instructions
+
+Publish a self-contained handoff before re-requesting final review:
+
+1. Commit the staged p26 router fast-path diff on a p26 branch whose history
+   descends from `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8`.
+2. Rebase or cherry-pick the outer PoC branch onto
+   `1e61a61455cb1e69e0e68295b5180ca0bb7dd831` / `soroswap-perf`.
+3. Commit the `src/rust/src/soroban_proto_all.rs` apply-entrypoint restore and
+   the p26 gitlink bump to the new restacked p26 SHA on that outer branch.
+4. Verify from a clean checkout that both the outer repo and p26 submodule are
+   clean after `git submodule update --init --recursive src/rust/soroban/p26`,
+   and that the recorded p26 SHA is a descendant of the accepted p26 baseline.
+5. Rerun the build, full unit suite, and the required three non-Tracy
+   `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` benchmark
+   runs only after the committed handoff is reproducible.
+
+### Checks Passed So Far
+
+Source inspection of the staged restacked p26 diff confirms it still has the
+intended narrow gates: next-protocol only, exact router Wasm hash, exact
+five-argument shape, positive reserves, unique footprint-loaded pair resolution,
+and no pair-id XDR/SHA256 rebuild. The prior reserve-edge success divergence is
+not present in this staged diff. No success-document, promotion, benchmark, or
+clean-handoff checks passed in this final-review pass.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-26
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:47-55,68-90,847-854,1424-1738`: preserves the restacked native Soroswap router `swap_exact_tokens_for_tokens` fast path on accepted p26 baseline `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8`. The fast path is exact-gated by next protocol, router Wasm hash, function name, five-argument benchmark shape, two SAC route tokens, a unique footprint-loaded pair instance, and positive reserves; matching calls dispatch through existing native SAC transfer and native pair swap helpers and return `[amount_in, amount_out]`.
+- `src/rust/src/soroban_proto_all.rs:114`: keeps p26 apply routed through `e2e_invoke::invoke_host_function_for_apply`, preserving the accepted sparse no-meta apply entrypoint while layering the router PoC on top.
+
+### Demonstration
+
+The optimization removes the remaining top-level router Wasm instantiation/invocation for the exact next-protocol Soroswap apply-load route by resolving the pair from already-loaded enforcing storage, avoiding pair-id XDR/SHA256 recomputation. Non-positive reserves and every non-exact shape fall back to the Wasm router, while matched swaps reuse the existing native SAC transfer and native pair swap paths to preserve auth ordering, ledger effects, events, and router return values.
+
+### Test Results
+
+`./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production && make -j $(nproc)` completed successfully. `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` completed successfully; p26 Rust tests reported `752 passed; 0 failed; 2 ignored`, p26 integration/doc test targets passed, and the final stellar-core selftest summary reported `All 2 tests passed`.
