@@ -191,3 +191,158 @@ ran to completion. The full suite passed, including the C++ harness, p26
 `soroban-env-host` tests (`752 passed; 0 failed; 2 ignored`), Rust integration
 tests, doc tests, and top-level `selftest-nopg` / `check-nondet` (`All 2 tests
 passed`).
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-26
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The p26 submodule now contains the claimed `metered_map.rs` change, and the
+full suite passes, but the handoff is not eligible for confirmation because the
+authoritative non-Tracy soroswap benchmark regressed in all three final-review
+runs:
+
+| run | baseline soroswap median_ms | final-review median_ms |
+|-----|-----------------------------|------------------------|
+| 1 | 207.0457240 | 209.4123050 |
+| 2 | 209.2724275 | 212.2768720 |
+| 3 | 206.4515575 | 214.0836195 |
+
+The optimized average was 211.924266 ms versus the accepted baseline average
+207.589903 ms, a roughly 2.09% regression. Per the objective criteria, a
+soroswap regression blocks CONFIRMED and no diagnostic Tracy run was warranted.
+
+The benchmark result is also confounded by an unclaimed outer-repo source diff:
+relative to `ai-summary/CURRENT_STATE.md`'s accepted outer commit
+`1e61a61455cb1e69e0e68295b5180ca0bb7dd831`, the PoC branch changes
+`src/rust/src/soroban_proto_all.rs` so the p26 wrapper calls
+`e2e_invoke::invoke_host_function` instead of the accepted
+`e2e_invoke::invoke_host_function_for_apply`. That reverts the accepted
+sparse no-meta apply-path optimization and means this handoff is not stacked on
+the current `soroswap-perf` baseline in a way that isolates the indexed-map
+metering change.
+
+### Revision Instructions
+
+Rebase or recreate the outer PoC branch on the current `soroswap-perf` accepted
+baseline (`1e61a61455cb1e69e0e68295b5180ca0bb7dd831` or its successor), preserving
+the accepted p26 apply wrapper call to `invoke_host_function_for_apply`. The
+outer diff should be limited to the p26 gitlink bump from baseline
+`7aef8604bced962d79aaf06cab2f9e2c2c4e95d8` to the revised p26 commit, plus
+pipeline notes; do not include unrelated outer source changes unless they are
+explicitly part of the optimization and benchmarked as such.
+
+Then rerun:
+
+1. `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production`
+2. `make -j $(nproc)`
+3. `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`
+4. `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` exactly three times
+
+If the corrected, isolated branch still regresses soroswap across the three
+non-Tracy runs, the finding should be rejected rather than revised again.
+
+### Checks Passed So Far
+
+- The hypothesis, review notes, and revised PoC notes were read from the
+  requested `ai-summary/poc/soroban-env/001-coalesced-indexed-map-lookup-metering.md`.
+- The p26 source change was traced in
+  `soroban-env-host/src/host/metered_map.rs`; released p26 keeps the old
+  `charge_binsearch` / `charge_access(1)` behavior while next-protocol
+  coalesced host metering skips the indexed lookup bookkeeping.
+- The required configure/build completed successfully with Tracy and
+  next-protocol enabled.
+- The required full test suite completed successfully.
+- The required three non-Tracy benchmark runs completed and produced the
+  regression numbers above.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-26
+**PoC by**: claude-opus-4.7, high
+**Iterations**: 1 (rebase + rebuild + retest)
+
+### Changes Made
+
+- **Outer repo (`stellar-core`)** — rebased the PoC outer commit so it
+  sits directly on the accepted `soroswap-perf` baseline outer commit
+  `1e61a61455cb1e69e0e68295b5180ca0bb7dd831` ("perf(ledger): sparse
+  no-meta ledger changes"). The new outer commit's only diff vs the
+  baseline is the p26 gitlink bump from
+  `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8` to
+  `1d85c08a514419bcb3dd1ec9d10d396155af2fb1`. The prior, confounding
+  revert of `src/rust/src/soroban_proto_all.rs` (which had switched
+  `e2e_invoke::invoke_host_function_for_apply` back to
+  `e2e_invoke::invoke_host_function` and undid the accepted
+  sparse-no-meta apply-path optimization) has been removed; the file
+  now matches `1e61a614` byte-for-byte.
+
+- **p26 submodule** — no new edits; the optimization commit
+  `1d85c08a514419bcb3dd1ec9d10d396155af2fb1` ("poc 001-coalesced-
+  indexed-map-lookup-metering") is unchanged. It modifies
+  `soroban-env-host/src/host/metered_map.rs` only — gating the
+  per-call `charge_binsearch` + `charge_access(1)` work in
+  `get_at_known_position` (and the equivalent delegation in
+  `charge_lookup`) plus the `map lookup indexed` Tracy span on
+  `Budget::coalesced_host_metering()`. Released p26 keeps the
+  existing charge totals because the coalesced-metering flag is
+  `false` at `MIN_LEDGER_PROTOCOL_VERSION`; next-protocol coalesced
+  mode skips that physical bookkeeping while still bounds-checking
+  the side-index position via `Vec::get`.
+
+  No `ParallelApplyUtils.cpp` change is included.
+
+### Demonstration
+
+The intended optimization is preserved and the prior confound is
+gone. The outer diff vs the current accepted soroswap-perf baseline
+is now a single-line gitlink bump (verified with
+`git diff 1e61a614 HEAD -- ':(exclude)ai-summary'`), so the next
+non-Tracy benchmark run isolates the indexed-lookup metering change
+from the sparse-no-meta apply-path optimization. The fast path
+removes the per-call `Budget::charge` refcell borrow, tracker
+update, dimension evaluation, and limit check from every
+indexed-storage / footprint / `get_ledger_changes` hit when the
+coalesced-metering flag is on, while keeping the bounds-checked
+direct `Vec::get` plus its stale-index internal-error behavior.
+
+### Test Results
+
+Configured with
+`./configure --enable-ccache --enable-sdfprefs --enable-tracy
+--enable-tracy-capture --disable-postgres
+--enable-next-protocol-version-unsafe-for-production` (already
+present in `config.status`) and rebuilt with `make -j $(nproc)`.
+
+`env NUM_PARTITIONS=$(nproc) STELLAR_CORE_TEST_PARAMS='--ll fatal
+-r simple --abort --disable-dots' make check` ran to completion.
+All TESTS report `FAIL: 0` and `ERROR: 0`, including the full C++
+unit-test suite, the p26 `soroban-env-host` cargo test workspace
+(host tests, fees, integration, option, secp256r1, bls,
+ed25519_edge_cases, doc tests), and the top-level
+`selftest-nopg` / `check-nondet` harness (`All 2 tests passed`).
+No budget-number test edits were required.
+
+### Handoff Notes for Final Review
+
+- Outer PoC branch tip: `f19b95e5b` ("poc 001-coalesced-indexed-
+  map-lookup-metering") on
+  `poc/001-coalesced-indexed-map-lookup-metering`, parented on the
+  accepted baseline `1e61a61455cb1e69e0e68295b5180ca0bb7dd831`.
+  Outer worktree is otherwise clean; the orchestrator will push.
+- p26 submodule tip on `fork/poc/001-coalesced-indexed-map-lookup-
+  metering`: `1d85c08a514419bcb3dd1ec9d10d396155af2fb1`, parented
+  on the accepted baseline `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8`.
+- Benchmarking remains the final-review responsibility. Per the
+  previous review's instructions, run
+  `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py`
+  three times against this rebased branch; if soroswap still
+  regresses, the finding should be rejected rather than revised
+  again.
