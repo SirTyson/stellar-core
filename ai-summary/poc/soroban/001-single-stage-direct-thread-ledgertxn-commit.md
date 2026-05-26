@@ -79,3 +79,84 @@ The Medium projection is credible for review. The current measured serial tail i
 - **Change description**: Add a one-stage-only direct commit path after `applySorobanStage` returns thread states. When `stages.size() == 1`, write dirty entries from each `ThreadParallelApplyLedgerState` directly into one inner `LedgerTxn` in cluster order, preserving `mIsNew` for create/update selection and using the existing load+erase behavior for deletes. Preserve RO TTL max semantics with a small duplicate-TTL merge mechanism, and either correctly mark per-thread restored entries or disable the fast path when any restore map is non-empty.
 - **Correctness check**: Existing parallel Soroban apply tests and full `make check` should cover ledger effects, meta, restored-entry invariants, and deterministic apply. Add narrow unit coverage only if the new direct path has branches not exercised by existing one-stage apply tests, especially duplicate RO TTL max-merge and create/delete/recreate state transitions.
 - **Benchmark focus**: Use the current `ai-summary/CURRENT_STATE.md` non-Tracy soroswap baseline and run `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` three times. The expected metric is lower top-line soroswap median apply time, with diagnostic phase timing showing `commit_from_thrds` mostly eliminated or replaced by a smaller direct-commit phase while `commit_to_ltx` does not regress enough to erase the gain.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-26
+**PoC by**: claude-opus-4.7, high
+
+### Changes Made
+
+- `src/transactions/ParallelApplyUtils.h` (around the
+  `GlobalParallelApplyLedgerState` public API near
+  `commitChangesToLedgerTxn`) — declared a new public method
+  `commitChangesFromThreadsDirectlyToLedgerTxn(app, threads, stage, ltx)`
+  alongside the existing two-phase commit API. The header doc spells out
+  the single-stage preconditions and the RO TTL max-merge / restored-entry
+  bookkeeping it preserves.
+
+- `src/transactions/ParallelApplyUtils.cpp` (immediately after
+  `commitChangesToLedgerTxn`) — added the new method. It opens one inner
+  `LedgerTxn`, iterates each thread's `mThreadEntryMap` in cluster order,
+  rescopes dirty entries from `ThreadParApply` to `GlobalParApply`, moves
+  the `LedgerEntry` out, and writes via
+  `createWithoutLoading`/`updateWithoutLoading` (driven by `mIsNew`) or
+  `load()+erase()` for deletes. Cross-cluster RO TTL bumps (TTL key not in
+  the stage's RW set) are accumulated in a small `UnorderedMap<LedgerKey,
+  LedgerEntry>` with `std::max` semantics and then flushed via
+  `updateWithoutLoading`. Restored entries are merged across threads with
+  `RestoredEntries::addRestoresFrom` and marked on the inner `LedgerTxn`
+  using the same hot-archive / live-bucket-list code paths as the
+  existing `commitChangesToLedgerTxn`.
+
+- `src/ledger/LedgerManagerImpl.cpp` (`applySorobanStages`, around the
+  `for (auto const& stage : stages) { applySorobanStage(...) }` loop) —
+  gated the new fast path behind `stages.size() == 1`. In the single-stage
+  case, the method now runs `applySorobanStageClustersInParallel`,
+  `checkAllTxBundleInvariants`, and
+  `commitChangesFromThreadsDirectlyToLedgerTxn` inline and then clears
+  thread states; `mGlobalEntryMap` is not touched after construction.
+  Multi-stage ledgers continue to take the original
+  `applySorobanStage` -> `commitChangesFromThreads` ->
+  `commitChangesToLedgerTxn` flow unchanged. Phase timings are recorded
+  under the existing `BUILD_TESTS` fields (`sorobanCommitFromThreadsMs`
+  captures direct-commit cost; `sorobanCommitToLtxMs` is 0 on the fast
+  path) so the diagnostic phase log used by the benchmark stays usable.
+
+- `src/Makefile` (generated, worktree-local) — replaced the pattern rule
+  at `src/Makefile.am:267` with a `$(foreach ...)` over `p21..p26` that
+  resolves each submodule's gitdir via `git rev-parse --git-dir`, per
+  the worktree-build workaround documented in
+  `ai-summary/CURRENT_STATE.md`. This is a build-system-only change; the
+  underlying `src/Makefile.am` is not modified.
+
+### Demonstration
+
+The change eliminates the `mGlobalEntryMap` merge-and-rescan tail for
+single-stage Soroban ledgers (the shape of the soroswap `TX=2000, T=8`
+workload). Per-cluster dirty thread entries flow directly into one inner
+`LedgerTxn` instead of being copied first into `mGlobalEntryMap` and then
+iterated to write into the inner `LedgerTxn`. RO TTL bump max-merge
+semantics across clusters are preserved by a small key->TTL map and
+final `updateWithoutLoading` flush; restored-entry bookkeeping is
+preserved by accumulating each thread's `RestoredEntries` and replaying
+the same `markRestoredFromHotArchive` / `markRestoredFromLiveBucketList`
+calls used by the existing slow path. Multi-stage ledgers still use the
+original flow, so the prior multi-stage correctness blocker
+(`DELETED+LIVE` / `DELETED+INIT` cross-stage merges) is bypassed
+entirely.
+
+### Test Results
+
+`env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple
+--abort --disable-dots' make check` completes with PASS for all three
+top-level test groups (`# FAIL: 0`, `# ERROR: 0` reported three times,
+totaling 7+69+29 = 105 unit-test cases plus the rust soroban-env-host
+crate tests, all green). The soroban env crate self-tests
+(`InvokeHostFunction`, `Stellar asset contract transfer with CAP-67
+address types`, parallel-apply oriented tests, ledger-txn commit tests,
+hot-archive and live-bucket-list restore tests) all pass without
+modification. No tests were changed.
