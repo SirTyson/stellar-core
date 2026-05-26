@@ -104,3 +104,48 @@ The new fast path collapses the only remaining top-level Wasm frame on the bench
 ### Test Results
 
 `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` completes with all suites passing — every `Makefile` summary block reports `FAIL: 0 / ERROR: 0`, totals across the three reported summaries: TOTAL 69 / PASS 69, TOTAL 7 / PASS 7, TOTAL 29 / PASS 29. Build exits with status 0.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-26
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The PoC cannot be confirmed in its current form.
+
+1. The native router helper changes behavior for matched pools with non-positive reserves. In `call_native_soroswap_router_swap`, the branch `if m.reserve_in <= 0 || m.reserve_out <= 0 { return Ok(self.compute_router_return(m.amount_in, 0)?); }` returns success and skips both the input SAC transfer and pair `swap`. The Wasm router/pair path would not silently succeed here: it would either fail during amount calculation / liquidity checks or call `pair.swap(0, 0, to)`, which the existing native pair helper maps to `SwapInsufficientOutputAmount`. This is a protocol-visible semantic divergence for a state shape that still passes the current fast-path gates.
+2. The handoff is not self-contained. The outer `poc/002-footprint-resolved-native-router-swap` branch records p26 gitlink `bf6625f80504d9ccbd34ffe2fa5cc1761d5242fe`, while the checked-out optimized submodule is `a794dce999775b0055d50b7d1a2ee97cd86f5a17` and appears as a dirty `+` submodule in `git submodule status`. Final review promotion requires the outer PoC branch to record the exact optimized p26 SHA.
+
+### Revision Instructions
+
+Fix the reserve edge case by falling back to Wasm, refusing the fast-path match, or otherwise preserving the exact router/pair error behavior when `reserve_in <= 0` or `reserve_out <= 0`; do not return a successful zero-output router vector. Add focused coverage or an equivalence check for this fallback/error case if practical, since the current full-suite result did not catch it.
+
+After the source fix, commit the corrected p26 submodule branch and commit the superproject gitlink bump on the outer PoC branch so a clean checkout plus `git submodule update --init --recursive src/rust/soroban/p26` reproduces the optimized state without a dirty submodule. Then rerun the full unit suite and the required three non-Tracy apply-load benchmark runs.
+
+### Checks Passed So Far
+
+The optimization target is in scope for the soroswap apply path, the code is next-protocol gated, the router hash/function/argument gates are narrow, and the pair is resolved from loaded storage without rebuilding the pair-id hash. The diff also only touches `soroban-env-host/src/host/frame.rs` in the p26 submodule; no test logic was weakened. Benchmarking was intentionally not run because the semantic divergence and unrecorded gitlink block confirmation.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-26
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:1508-1518`: tightened the native router fast-path matcher so a loaded pair candidate with `reserve_in <= 0` or `reserve_out <= 0` falls back to the normal Wasm router path instead of entering the native helper.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:1668-1670`: removed the success-shaped zero-output shortcut from `call_native_soroswap_router_swap`, eliminating the reviewed semantic divergence for non-positive reserves.
+
+### Demonstration
+
+The optimization remains the footprint-resolved native router fast path for the exact next-protocol Soroswap benchmark route: matching positive-reserve swaps avoid the top-level router Wasm instantiation and reuse the existing native SAC transfer plus native pair swap path. The revision preserves fallback/error behavior for non-positive reserve states by refusing the native router match before any auth, transfer, swap, or router return value is produced, so the original Wasm router/pair semantics handle that edge case.
+
+### Test Results
+
+`./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres && make -j $(nproc)` completed successfully. `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` completed successfully; the observed p26 Rust summary included `751 passed; 0 failed; 2 ignored`, and the final src selftest summary reported `All 2 tests passed`.
