@@ -84,3 +84,23 @@ Correctness constraints are severe but bounded. The path must be next-protocol g
 - **Change description**: Implement a next-protocol-gated `tryApplyNativeSoroswapSwapCluster` that first validates every tx in the cluster is the exact official router swap shape for one supported pair and supported SAC tokens, preloads typed pool/SAC/TTL state from the thread state, then executes swaps in cluster order over a copy-on-write journal. For each successful tx, materialize the same modified ledger entries, return value, contract events, refundable-fee/rent outputs, and result hash that the current native-pool-backed path would expose; on any recognition failure, run the existing per-tx path unchanged.
 - **Correctness check**: Existing parallel Soroban apply tests and native Soroswap/p26 host tests should remain authoritative. Add focused tests for exact fallback conditions, per-tx failure rollback inside a recognized cluster, event/result-hash equivalence against the existing host path for a small swap sequence, auth-shape rejection, TTL/rent entry equivalence, and mixed-pair/mixed-contract rejection.
 - **Benchmark focus**: Run `scripts/run_apply_load_matrix.py` three non-Tracy times and require soroswap median apply time to improve by at least 3%, with no material SAC regression. A diagnostic Tracy pass should show reduced per-tx `parallelApply` / `Host::invoke_function` / `Vm::invoke_function_raw` / generated `call` / `SAC transfer` descendants inside `applyLedger`, while preserving the same number and order of successful transaction results.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_FAIL
+**Date**: 2026-05-26
+**PoC by**: gpt-5.5, high
+**Failed At**: poc
+**Iterations**: 0
+
+### Failure Reason
+
+The optimization could not be demonstrated safely as a bounded PoC. The required deliverable is not a local ledger-loop optimization; it needs a new consensus-sensitive cluster executor that can recognize canonical Soroswap router swaps, validate auth/footprint/code/layout invariants, execute the router/pool/SAC state machine over a copy-on-write typed journal, and materialize fully equivalent per-transaction result values, events, rent/refund accounting, restored entries, TTL changes, result hashes, and `ParallelTxSuccessVal` maps. The current production interfaces only expose per-transaction `TransactionFrame::parallelApply` and the Rust host bridge output, so there is no existing safe seam to synthesize equivalent per-tx effects outside the host without building and validating that whole executor.
+
+There is also a baseline mismatch in this worktree: `CURRENT_STATE.md` and `origin/soroswap-perf` record p26 at `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8` with the sparse no-meta bridge path, while this PoC worktree starts from p26 gitlink `bf6625f80504d9ccbd34ffe2fa5cc1761d5242fe` and lacks the accepted baseline source state. I fetched the p26 fork and confirmed the recorded `7aef8604` baseline commit exists, but implementing and validating the cluster-batch redesign on the older checked-out base would not produce a meaningful handoff for final review.
+
+### Changes Attempted
+
+No production source changes were left in the tree. I inspected the relevant apply loop (`src/ledger/LedgerManagerImpl.cpp`), per-transaction parallel apply dispatch (`src/transactions/TransactionFrame.cpp`), the invoke-host-function bridge call site (`src/transactions/InvokeHostFunctionOpFrame.cpp`), the parallel apply merge boundary (`src/transactions/ParallelApplyUtils.*` and `src/transactions/TransactionFrameBase.h`), and the Rust bridge declarations. I also initialized the p26 submodule and fetched the SirTyson p26 fork to compare the checked-out gitlink with the accepted baseline. Because no viable bounded implementation seam existed and no source change was attempted, no build-test cycle was run.

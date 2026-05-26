@@ -41,3 +41,40 @@ The source also shows a clean recognition boundary: `InvokeHostFunctionOpFrame` 
 ## Anti-Evidence
 
 This is effectively a specialized interpreter for one benchmark-critical contract path, so correctness risk is high. It must reproduce router-visible auth roots, event XDR, result hashing, budget/resource accounting, TTL extension, rent-size accounting, rollback/failure behavior, and every fallback case exactly or be protocol-gated with updated budget expectations. Prior native-router work failed at PoC complexity; this hypothesis is only viable if scoped to an apply-only direct-effects builder with exhaustive shape checks and conservative fallback, not if it attempts to skip semantics by assuming the benchmark always succeeds.
+
+---
+
+## Review
+
+**Verdict**: NOT_VIABLE
+**Date**: 2026-05-26
+**Reviewed by**: gpt-5.5, high
+**Novelty**: FAIL — duplicate of `ai-summary/fail/ledger/summary.md` entry `001-native-soroswap-router-swap.md`
+**Failed At**: reviewer
+
+### Trace Summary
+
+The traced apply path is `InvokeHostFunctionOpFrame::doApply`, which builds the footprint, calls the Rust bridge, records returned ledger effects, collects events/result bytes, charges refundable resources, and hashes the result preimage. On the Rust side, `soroban_proto_any::invoke_host_function_or_maybe_panic` constructs the budget, calls p26 `e2e_invoke::invoke_host_function`, and converts `LedgerEntryChange`s into C++-consumed modified-entry buffers and rent fees. The p26 host path decodes resources, builds a generic `StorageMap`, clones the initial snapshot, constructs `Host`, decodes auth and host function XDR, invokes the router contract through `Host::invoke_function`, finalizes events/storage, and diffs storage. Native pool swap hooks exist below the router call, but the optimization family of adding a protocol-gated native Soroswap router swap path has already been reviewed and then failed at PoC as `001-native-soroswap-router-swap.md`.
+
+### Code Paths Examined
+
+- `src/transactions/InvokeHostFunctionOpFrame.cpp:557-585` — C++ always calls `rust_bridge::invoke_host_function` with encoded host function, resources, auth, source account, ledger entries, TTL entries, rent config, and module cache.
+- `src/transactions/InvokeHostFunctionOpFrame.cpp:641-766` — C++ consumes returned modified entries and treats omitted RW entries as deletions, so any direct builder must exactly reproduce host ledger effects.
+- `src/transactions/InvokeHostFunctionOpFrame.cpp:770-928` — event limits, refundable rent fee consumption, result-value XDR decode, success hash, metadata, and metrics all depend on the Rust output shape.
+- `src/transactions/InvokeHostFunctionOpFrame.cpp:982-1017` — complete operation apply order confirms this is in the `closeLedger` apply path.
+- `src/rust/src/soroban_proto_any.rs:391-488` — protocol wrapper builds budget, calls the p26 host, computes rent, extracts ledger effects, and packages `InvokeHostFunctionOutput`.
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:490-579` — generic host execution builds footprint/storage map, clones initial storage, constructs `Host`, decodes auth/host function/source account, invokes `Host::invoke_function`, finishes host, computes ledger changes, and encodes contract events.
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:224-357` — `get_ledger_changes` diffs every footprint entry and computes TTL/rent metadata that a direct builder would need to recreate.
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:1039-1151` — generic storage-map construction validates footprint membership, decodes ledger and TTL entries, preserves initial entry metadata, and inserts absent footprint entries.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:781-825` — generic contract dispatch only recognizes native Soroswap pool calls after router Wasm has already crossed the host call boundary.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:1127-1528` — native pool swap validates the pool shape, performs SAC transfers/balance reads, updates reserves, extends TTLs, and emits the swap event; it is a semantic reference but not a router-level apply-effects builder.
+- `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/contract.rs:206-225` and `src/rust/soroban/p26/soroban-env-host/src/builtin_contracts/stellar_asset_contract/balance.rs:303-428` — SAC transfer performs auth, TTL extension, debit/credit, authorization checks, balance writes, and transfer event emission.
+- `src/simulation/ApplyLoad.cpp:3381-3515` — the soroswap benchmark generates the exact router `swap_exact_tokens_for_tokens` transactions, footprint shape, and source-account auth subtree targeted by the prior native-router hypothesis.
+
+### Why It Failed
+
+This is not novel under the review rules. The ledger fail summary already records `001-native-soroswap-router-swap.md`, a protocol-gated native Soroswap router swap path for the same apply-load swap shape, with the same required semantic coverage: SAC auth, events, TTL extension, budget/resource-limit reporting, rollback behavior, and result hashing. Moving the recognizer earlier than `Host::with_storage_and_budget` broadens that same native-router/direct-effects idea, but it does not establish a materially different hypothesis from the already-investigated native Soroswap router swap path that failed during PoC.
+
+### Lesson Learned
+
+Future Soroswap direct-apply proposals should not repackage the native router-swap path unless they introduce a materially new mechanism that addresses the recorded PoC blocker, such as a concrete verified decomposition of auth, events, TTL/rent, rollback, result hashing, and resource accounting rather than another specialization boundary for the same router swap semantics.
