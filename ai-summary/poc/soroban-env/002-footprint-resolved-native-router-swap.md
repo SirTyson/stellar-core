@@ -149,3 +149,102 @@ The optimization remains the footprint-resolved native router fast path for the 
 ### Test Results
 
 `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres && make -j $(nproc)` completed successfully. `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` completed successfully; the observed p26 Rust summary included `751 passed; 0 failed; 2 ignored`, and the final src selftest summary reported `All 2 tests passed`.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-26
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The revised p26 source addresses the prior reserve-edge semantic issue, but the handoff is still not self-contained and cannot be benchmark-confirmed.
+
+1. The superproject branch `poc/002-footprint-resolved-native-router-swap` still records p26 gitlink `bf6625f80504d9ccbd34ffe2fa5cc1761d5242fe`, while the checked-out optimized p26 branch is `cb59d2439ed9ad9662b11bd95e33e9fb1e0b1946`. `git status` therefore reports `src/rust/soroban/p26` as a dirty `+` submodule. A clean checkout followed by `git submodule update --init --recursive src/rust/soroban/p26` would reproduce the old baseline submodule, not this PoC.
+2. The local p26 repository has no SirTyson fork remote configured, and no remote-tracking branch contains `cb59d2439ed9ad9662b11bd95e33e9fb1e0b1946`. The final-review handoff requires a committed, fetchable submodule branch tip plus a superproject gitlink bump to that exact SHA.
+
+### Revision Instructions
+
+Push or otherwise publish the corrected p26 commit `cb59d2439ed9ad9662b11bd95e33e9fb1e0b1946` on the required `github.com/SirTyson/rs-soroban-env` branch `poc/002-footprint-resolved-native-router-swap`, then commit the superproject gitlink bump on `github.com/SirTyson/stellar-core` branch `poc/002-footprint-resolved-native-router-swap` so `git ls-tree HEAD src/rust/soroban/p26` records `cb59d2439ed9ad9662b11bd95e33e9fb1e0b1946`. After that, final review can run the required clean checkout, full suite, and three non-Tracy benchmark runs.
+
+### Checks Passed So Far
+
+Source inspection of the checked-out p26 branch confirms the earlier non-positive reserve issue was fixed: `match_native_soroswap_router_swap` now returns `Ok(None)` before the fast path when `reserve_in <= 0 || reserve_out <= 0`, and the native helper no longer returns a successful zero-output vector for that case. No test-file edits were present in the p26 diff. Full tests and benchmarks were not run because the handoff validation fails before measurement.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-26
+**PoC by**: claude-opus-4.7, high
+
+### Changes Made
+
+No new source edits in this revision iteration. The prior revision's source
+state (p26 submodule branch `poc/002-footprint-resolved-native-router-swap`
+at `cb59d2439ed9ad9662b11bd95e33e9fb1e0b1946`) is preserved and verified:
+
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:1513-1518` —
+  `match_native_soroswap_router_swap` returns `Ok(None)` (Wasm fallback) when
+  the resolved pair has `reserve_in <= 0 || reserve_out <= 0`, fixing the
+  reserve-edge semantic divergence flagged in the first final review.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:1660-1690` —
+  `call_native_soroswap_router_swap` no longer contains the previously
+  reviewed success-shaped zero-output shortcut; non-positive-reserve cases
+  cannot reach this helper because they are rejected by the matcher above.
+
+The full router fast-path scaffolding (router-wasm-hash gate, 5-argument
+exact-shape decoding, footprint-based pair resolution without rebuilding the
+pair-id hash, native pair frame dispatch, router return vector construction)
+is unchanged from the earlier PoC attempts documented above.
+
+The outer worktree shows `+cb59d24…` for `src/rust/soroban/p26` (gitlink
+points at the prior `bf6625f8…` from PoC 001's accepted baseline; the
+optimized p26 commit is checked out but not yet bumped). Per the
+poc-performance / objective-poc skills the PoC agent must not run
+`git commit` or `git push`; the orchestrator is responsible for publishing
+the p26 branch to the `SirTyson/rs-soroban-env` fork and committing the
+superproject gitlink bump on the matching outer PoC branch. The submodule
+working tree itself is clean, so the orchestrator can fast-forward and
+publish the existing `cb59d2439ed9ad9662b11bd95e33e9fb1e0b1946` commit
+without any further source work.
+
+### Demonstration
+
+The optimization removes the last top-level router `Vm::instantiate_wasmi`
++ `Vm::invoke_function_raw` pair from the next-protocol Soroswap apply
+benchmark by matching the exact router wasm hash and argument shape and
+dispatching directly into the already-native SAC transfer and native pair
+swap helpers via a single `Frame::NativeContract`. The pair id is resolved
+by scanning the loaded enforcing storage for the unique pool instance whose
+token-0/token-1 addresses match the route, so no XDR/SHA256 pair-id
+recomputation is reintroduced (the precise anti-pattern that sank attempt
+001). Non-positive-reserve states, non-matching hashes, non-exact arg
+shapes, ambiguous pair candidates, and non-SAC tokens all fall back to the
+Wasm router so externally observable apply behavior is preserved on every
+non-benchmark shape.
+
+### Test Results
+
+`make -j $(nproc)` rebuilt cleanly from the existing `--enable-tracy
+--enable-tracy-capture --enable-ccache --enable-sdfprefs --disable-postgres`
+configuration with exit status 0.
+
+`env NUM_PARTITIONS=$(nproc) STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple
+--abort --disable-dots' make check` ran to completion. All stellar-core
+suites passed: `PASS: test/selftest-nopg`, `PASS: test/check-nondet`,
+"All 2 tests passed". The full p26 Rust workspace tests also passed
+(soroban-env-host unit tests, doc tests, and integration tests under
+`src/rust/soroban/p26/target/test-opt/`).
+
+One unrelated pre-existing failure was observed in the vendored
+`lib/gperftools` test target `tcm_min_asserts_unittest`
+(`TCMallocTest.LargeAllocsRelease` under
+`Testing TCMALLOC_HEAP_LIMIT_MB=512`). This failure is in third-party
+tcmalloc internals about large-allocation release behavior on this host's
+memory layout; it is not exercised by, and does not exercise, any Rust
+soroban code or any code modified by this PoC. The stellar-core selftest
+and check-nondet targets — the binding correctness gates for this work —
+pass cleanly.
