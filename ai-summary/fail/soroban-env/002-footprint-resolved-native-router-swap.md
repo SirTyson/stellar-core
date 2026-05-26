@@ -709,3 +709,137 @@ The revised fast path still removes the top-level router Wasm frame for the exac
 `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production && make -j $(nproc)` completed successfully.
 
 `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS="--ll fatal -r simple --abort --disable-dots" make check` completed successfully. The p26 Rust host tests reported `752 passed; 0 failed; 2 ignored`, Rust integration suites passed, doc tests had the expected ignored example, and stellar-core reported `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, `All 2 tests passed`.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-26
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The PoC is not eligible for confirmation in the current state.
+
+1. The handoff is still not clean or reproducible. The outer branch `poc/002-footprint-resolved-native-router-swap` is at `e49ecff0fb2d193a0459d1ff15fbfbd8655794e9`, which is not descended from accepted baseline outer commit `1e61a61455cb1e69e0e68295b5180ca0bb7dd831` recorded in `ai-summary/CURRENT_STATE.md` (`git merge-base --is-ancestor` fails). The committed outer gitlink still records p26 SHA `cb59d2439ed9ad9662b11bd95e33e9fb1e0b1946`, which is not descended from accepted p26 baseline `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8`. The checked-out p26 submodule is detached at `7aef8604...` with `soroban-env-host/src/host/frame.rs` staged and additionally modified, while `src/rust/src/soroban_proto_all.rs` is also uncommitted in the outer repo. A clean checkout plus `git submodule update --init --recursive src/rust/soroban/p26` would not reproduce the source state described by the PoC.
+2. The latest pair-identity fix changes the core performance claim and must be remeasured. The hypothesis and earlier PoC framing relied on avoiding the rejected pair-ID XDR/SHA rebuild; the current implementation now derives the canonical pair ID with metered XDR writes, `sha256_hash_from_bytes_raw`, `get_full_contract_id_preimage`, and `metered_hash_xdr` before taking the native path. That may be the right correctness gate, but it is no longer the advertised "without pair-ID hash rebuild" optimization and may recreate the cost pattern that previously made native-router work regress.
+3. Because the clean-handoff check fails, running the full-suite rerun and the required three authoritative non-Tracy `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` benchmark passes would produce invalid, non-promotable verdict data. The PoC agent's reported build/test results cannot substitute for final review's clean checkout and benchmark workflow.
+
+### Revision Instructions
+
+Publish a self-contained handoff and update the performance framing before requesting final review again:
+
+1. Commit the complete p26 router diff, including the canonical pair-ID proof, on a p26 branch descended from `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8`, and make that branch fetchable from the required fork.
+2. Rebase or cherry-pick the outer PoC branch onto `1e61a61455cb1e69e0e68295b5180ca0bb7dd831` / `soroswap-perf`, then commit both the `src/rust/src/soroban_proto_all.rs` `invoke_host_function_for_apply` restore and the p26 gitlink bump to the new p26 commit.
+3. Verify from a fresh checkout that `git submodule update --init --recursive src/rust/soroban/p26` leaves the outer repo and p26 submodule clean, and that the recorded p26 SHA descends from the accepted p26 baseline.
+4. Re-run the required build, full unit suite, and exactly three non-Tracy `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` benchmark runs from that clean committed handoff. The writeup must explicitly compare the new measured result against `CURRENT_STATE.md` and account for the newly reintroduced pair-ID XDR/SHA work; if that work erases the Soroswap apply-time win, reject the optimization rather than preserving a correctness shortcut.
+
+### Checks Passed So Far
+
+The current source inspection indicates the previously reported non-canonical-pool semantic divergence has been addressed: the fast path now derives a router-canonical pair ID and requires the loaded pool instance to match that ID, factory, token layout, vendored pool hash, and positive reserves before native execution. The router path remains next-protocol gated and exact-shape gated. No clean-handoff, independent build/test, benchmark, promotion, or success-document checks passed in this final-review pass.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_FAIL
+**Date**: 2026-05-26
+**PoC by**: claude-opus-4.7, high
+**Failed At**: poc
+**Iterations**: 1 (this iteration; prior PoC iterations are recorded above)
+
+### Failure Reason
+
+This PoC iteration declares the hypothesis unviable. The repeated final-review
+cycle has surfaced a hard, structural conflict between the hypothesis premise
+and the only known correctness gate, and the latest reviewer note explicitly
+authorizes rejection:
+
+> "if that work erases the Soroswap apply-time win, reject the optimization
+> rather than preserving a correctness shortcut." — Final Review (line 735)
+
+Specifically:
+
+1. **The hypothesis premise is "without pair-id hash rebuild"** (title, line 1
+   of this file; mechanism, line 15; anti-evidence, line 36). The previous
+   attempt `001-native-soroswap-router-swap` was rejected for exactly that
+   pair-id XDR/SHA derivation work; the entire reason H002 was filed was to
+   avoid recreating that anti-pattern.
+
+2. **The "no pair-id rebuild" shortcut is not correct.** The fifth final-review
+   pass (lines 672-679) showed the storage-scan-only matcher can select a
+   non-canonical, footprint-loaded pool with the same tokens and pool Wasm
+   hash, while the Wasm router would derive a different pair address from its
+   factory. That is a protocol-visible semantic divergence inside the
+   supposedly-optimized shape, not merely a fallback-shape concern.
+
+3. **The canonical-derivation fix reintroduces the anti-pattern.** The most
+   recent source state derives the pair ID via `metered_write_xdr` x2 +
+   `sha256_hash_from_bytes_raw` + `get_full_contract_id_preimage` +
+   `metered_hash_xdr` (see prior-PoC diff at lines 239-274 of the recorded
+   fast-path diff). That is the same XDR/SHA pair-id rebuild the hypothesis
+   was constructed to avoid and that previously caused attempt 001 to regress.
+
+4. **No third option is available to the PoC agent.** The pair contract's own
+   stored `factory` field (storage key 4) can be checked against the router's
+   factory, and the pair's stored token0/token1 (keys 0/1) can be checked
+   against the route, but neither proves the pair was *deployed by* that
+   factory — those fields are attacker-controllable in a spoofed pool entry
+   placed in the transaction footprint. The contract-ID derivation step
+   exists precisely because contract identity is the hash of its deployment
+   preimage; there is no cheaper authoritative source for it in the
+   `Storage`/`Host` state available at fast-path time. Caching across calls
+   does not help: `Host` is per-transaction, and the router fast path runs at
+   most once per Soroswap transaction.
+
+5. **No remaining iteration is expected to change this.** The two paths the
+   PoC has tried (storage-scan-only; storage-scan + canonical derivation) are
+   the only two correctness regimes consistent with the hypothesis's exact
+   benchmark route. The first is semantically wrong; the second restores the
+   exact cost component the hypothesis exists to avoid. The reviewer's
+   explicit instruction in this state is to reject rather than continue
+   shortcut-chasing.
+
+The repeated handoff/git-plumbing rejections in prior final-review passes
+(outer branch not descended from `soroswap-perf` baseline; gitlink not bumped;
+p26 fork branch not published) are orthogonal to the technical issue above
+and, per the `poc-performance` / `objective-poc` skill contract, are not
+something the PoC agent is permitted to fix (the skill explicitly says
+"Do not run `git commit`, `git push`, or otherwise mutate git state. ... the
+orchestrator commits dirty submodules onto `poc/<NNN>-<slug>`...").  Even if
+those were resolved, the correctness/perf trade-off above would still block
+promotion.
+
+### Changes Attempted
+
+This iteration made no new source edits. The prior iteration's worktree
+diff (most recent recorded state described in lines 689-712 of this file)
+consisted of:
+
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs` (+~450 lines):
+  next-protocol + exact-router-wasm-hash + exact-5-argument matcher;
+  factory extraction from router instance storage; canonical pair-ID
+  derivation via metered XDR write + SHA-256 + contract-ID preimage hash;
+  footprint scan for the matching loaded pool; native pair `swap` dispatch
+  via `call_n_internal`; SAC `transfer` dispatch via `call_n_internal`;
+  router return-vector construction; `reserve_in/out <= 0` fallback to
+  Wasm.
+- `src/rust/src/soroban_proto_all.rs`: route p26 apply through
+  `e2e_invoke::invoke_host_function_for_apply` so the PoC stayed stacked on
+  the accepted sparse no-meta apply entrypoint.
+
+Both files have been reverted in this iteration so the worktree is clean
+for the orchestrator's next action; the p26 submodule head is at the
+accepted baseline `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8`.
+
+### Outcome
+
+POC_FAIL. The hypothesis "footprint-resolved native router swap *without*
+pair-ID hash rebuild" cannot be both correct and faithful to its
+premise: correctness demands the pair-ID derivation, and that derivation
+is the exact anti-pattern the hypothesis was filed to avoid. Recommend
+not re-attempting H002 in its current framing; any future router fast
+path would need a fundamentally different correctness gate (e.g.,
+authoritative pair-id source recorded by the host outside the
+attacker-controllable footprint, or factory-side cooperation) before
+the underlying optimization could be both correct and net-positive.
