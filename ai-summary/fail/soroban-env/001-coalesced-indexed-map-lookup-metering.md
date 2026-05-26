@@ -346,3 +346,36 @@ No budget-number test edits were required.
   three times against this rebased branch; if soroswap still
   regresses, the finding should be rejected rather than revised
   again.
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-05-26
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** PARTIAL / FAIL — the p26 submodule commit `1d85c08a514419bcb3dd1ec9d10d396155af2fb1` does contain the claimed `metered_map.rs` coalesced-metering gate, but the outer PoC branch also changes `src/rust/src/soroban_proto_all.rs` from the accepted `e2e_invoke::invoke_host_function_for_apply` apply wrapper back to `e2e_invoke::invoke_host_function`. That unrelated outer change reverts the accepted sparse-no-meta apply-path optimization and prevents isolating the indexed-map metering change.
+2. **Are the preconditions realistic?** NOT REACHED — the source handoff is confounded before benchmark eligibility.
+3. **Is the original code inefficient or working as designed?** NOT DECISIVE — the source-level indexed lookup bookkeeping may still be a real next-protocol optimization target, but this PoC branch is not a valid demonstration.
+4. **Does the benchmark improvement match the claimed severity?** FAIL — the branch is not eligible for authoritative benchmark confirmation. The previous final-review run against the same confounded outer change measured soroswap median regressions in all three non-Tracy runs, and the current remote PoC branch still contains that same confound.
+5. **Is the optimization in scope?** PARTIAL — the p26 `MeteredOrdMap` change is in the Soroban apply path, but the unclaimed wrapper revert changes the broader apply invocation path and invalidates attribution.
+6. **Is the benchmark methodology correct?** FAIL — benchmarking this branch would compare a two-change stack against `CURRENT_STATE.md`, not the single claimed indexed-map lookup metering optimization. The latest PoC notes state the outer diff is only a p26 gitlink bump, but the actual remote branch disproves that.
+7. **Can the improvement be explained without the optimization?** FAIL — any measured movement could be explained by the unrelated apply-wrapper change, and prior measurements showed a regression with that confound present.
+8. **Is this optimization novel?** NOT DECISIVE — novelty is not enough to overcome the invalid handoff.
+
+### Rejection Reason
+
+The revised PoC handoff is still not stacked cleanly on the accepted `soroswap-perf` baseline. The actual remote outer branch `origin/poc/001-coalesced-indexed-map-lookup-metering` at `e50fa7cf56a4c6af323346252cd667c1d5f00623` has two source changes relative to the accepted baseline `1e61a61455cb1e69e0e68295b5180ca0bb7dd831`: the expected p26 gitlink bump to `1d85c08a514419bcb3dd1ec9d10d396155af2fb1`, and an unclaimed `src/rust/src/soroban_proto_all.rs` change that replaces `invoke_host_function_for_apply` with `invoke_host_function`. This is the exact confounding revert called out in the prior Needs Revision review, despite the latest PoC notes claiming it was removed.
+
+Because the PoC already received explicit revision instructions to remove this confound and rerun from the isolated branch, the repeated invalid handoff is rejected rather than sent back for another revision cycle.
+
+### Failed Checks
+
+- Final-review source validation: the actual remote branch does not match the latest PoC notes and is not isolated to the claimed p26 metering optimization.
+- Adversarial check 1: the branch does not solely address the claimed inefficiency.
+- Adversarial check 4: no eligible benchmark improvement can be accepted; the previous final-review measurements on the same confounded branch regressed soroswap.
+- Adversarial check 6: benchmark methodology would be invalid because the source comparison includes an unrelated apply-wrapper revert.
