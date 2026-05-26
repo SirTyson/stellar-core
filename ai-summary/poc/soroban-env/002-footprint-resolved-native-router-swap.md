@@ -248,3 +248,84 @@ memory layout; it is not exercised by, and does not exercise, any Rust
 soroban code or any code modified by this PoC. The stellar-core selftest
 and check-nondet targets — the binding correctness gates for this work —
 pass cleanly.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-26
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The source-level router fast path may still be viable, but the current handoff
+is not comparable to the accepted baseline and cannot be benchmark-confirmed.
+
+1. The outer PoC branch `poc/002-footprint-resolved-native-router-swap` at
+   `e49ecff0fb2d193a0459d1ff15fbfbd8655794e9` is not descended from the
+   accepted `soroswap-perf` baseline commit
+   `1e61a61455cb1e69e0e68295b5180ca0bb7dd831` recorded in
+   `ai-summary/CURRENT_STATE.md`. Final review must measure an optimized tree
+   stacked on the latest accepted state, not a side branch that can omit or
+   reorder earlier accepted optimizations.
+2. The p26 submodule branch records the router PoC commit
+   `cb59d2439ed9ad9662b11bd95e33e9fb1e0b1946`, but the local p26 history does
+   not contain the accepted baseline commit
+   `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8` from `CURRENT_STATE.md`.
+   Instead, the visible ancestry stops at the older native-pool baseline
+   (`bf6625f8...`) and is missing the later accepted sparse no-meta ledger
+   changes (`2ef5a839`, `f8efa2a7`, `7aef8604`). This means the benchmark delta
+   would not isolate the router optimization against the current baseline.
+3. Because the baseline ancestry check fails, running the required three
+   non-Tracy `scripts/run_apply_load_matrix.py` runs would produce invalid
+   verdict data. The final-review procedure requires the accepted
+   `CURRENT_STATE.md` numbers to be the reference point.
+
+### Revision Instructions
+
+Restack and republish the PoC on the current accepted state:
+
+1. Rebase or cherry-pick the p26 router commits onto
+   `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8` (the p26 SHA recorded in
+   `CURRENT_STATE.md`) so the resulting p26 branch is a descendant of that
+   baseline and still includes the router fast-path fix for non-positive
+   reserves.
+2. Rebase or cherry-pick the outer PoC branch onto
+   `1e61a61455cb1e69e0e68295b5180ca0bb7dd831` / `soroswap-perf`, then commit
+   the gitlink bump to the restacked p26 SHA.
+3. Ensure a clean checkout plus
+   `git submodule update --init --recursive src/rust/soroban/p26` reproduces
+   that exact optimized p26 SHA, and that both outer and p26 branches are
+   fetchable from the required SirTyson forks.
+4. Rerun the full unit suite and then the required three non-Tracy
+   `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` benchmark
+   runs against the restacked optimized tree.
+
+### Checks Passed So Far
+
+The p26 source inspection from the prior final-review pass still applies to the
+checked-out code: the non-positive-reserve success divergence was removed, the
+router match remains narrowly gated, and pair resolution avoids rebuilding the
+pair-id hash. No benchmark or promotion checks passed in this pass because the
+handoff fails the accepted-baseline ancestry requirement before measurement.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-26
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:47-55,68-95,847-854,1424-1738`: reapplied the native Soroswap router `swap_exact_tokens_for_tokens` fast path on top of accepted p26 baseline `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8`. The path is exact-gated by next protocol, router Wasm hash, function name, five-argument benchmark shape, two SAC route tokens, a unique footprint-loaded pair instance, and positive reserves; matching calls dispatch through the existing native SAC transfer and native pair swap helpers and return `[amount_in, amount_out]`.
+- `src/rust/src/soroban_proto_all.rs:114`: restored the accepted baseline apply entrypoint `invoke_host_function_for_apply`, so the router PoC remains stacked with the sparse no-meta ledger-change extraction baseline rather than the older generic invocation path.
+
+### Demonstration
+
+The optimization removes the remaining top-level router Wasm frame for the exact next-protocol Soroswap apply-load swap by resolving the pair from already-loaded enforcing storage and routing directly into native SAC transfer plus native pair swap. It avoids the rejected prior router approach's pair-id XDR/SHA rebuild, and non-positive reserves or any non-exact shape fall back to Wasm rather than producing a success-shaped shortcut.
+
+### Test Results
+
+`./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production && make -j $(nproc)` completed successfully. `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` completed successfully; p26 Rust tests reported `752 passed; 0 failed; 2 ignored`, and the final stellar-core selftest summary reported `All 2 tests passed`.
