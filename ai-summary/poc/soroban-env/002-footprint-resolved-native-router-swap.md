@@ -657,3 +657,55 @@ in-tree host unit/doc tests (0 failed across all reported suites; the
 single doc test is the pre-existing ignored `host::error::err` example).
 No "FAIL" / "failed" lines appear in the test output other than
 `0 failed` totals.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-26
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The PoC is not eligible for confirmation in the current state.
+
+1. The fast path can select the wrong pair. `find_native_soroswap_pair_in_storage` scans the loaded `StorageMap` and accepts the unique `ContractInstance` whose executable is the vendored pool Wasm and whose `token_0`/`token_1` instance-storage entries match the two-token route. It does not prove that this pair is the canonical pair the router would derive from its configured factory. For an exact-shape router call whose footprint contains a spoofed or non-canonical pool with the same tokens and pool Wasm hash, the native path can transfer to and swap against that loaded pool, while the Wasm router would derive the factory pair address and either touch a different pair or fail on the missing footprint entry. This is a protocol-visible semantic divergence inside the supposedly optimized shape, not merely a fallback-shape issue.
+2. The handoff remains non-reproducible. The outer branch `poc/002-footprint-resolved-native-router-swap` is at `e49ecff0fb2d193a0459d1ff15fbfbd8655794e9`, which is not descended from accepted baseline outer commit `1e61a61455cb1e69e0e68295b5180ca0bb7dd831`. The committed outer gitlink records p26 SHA `cb59d2439ed9ad9662b11bd95e33e9fb1e0b1946`, while the checked-out p26 submodule is at `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8` with the router diff staged in `soroban-env-host/src/host/frame.rs`. The outer `src/rust/src/soroban_proto_all.rs` restore to `invoke_host_function_for_apply` is also uncommitted. A clean checkout plus `git submodule update --init --recursive src/rust/soroban/p26` would not reproduce the reviewed source state.
+
+Because both correctness and reproducibility fail before measurement, the required full-suite rerun and three non-Tracy `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` benchmark runs would not produce valid final-review data.
+
+### Revision Instructions
+
+Fix the pair-resolution gate so the native router only executes when it can prove the selected pool is exactly the pair the router Wasm would use for its configured factory and route. A loaded-pool token match is insufficient. If proving this requires deriving the factory pair contract ID or checking authoritative factory state, include that work and re-measure; if the added proof removes the performance win, the hypothesis should be rejected rather than kept as a benchmark-only semantic shortcut.
+
+Then publish a self-contained handoff: commit the corrected p26 diff on a p26 branch descended from `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8`, rebase/cherry-pick the outer PoC branch onto the accepted `soroswap-perf` baseline, commit the `invoke_host_function_for_apply` restore and p26 gitlink bump, and verify a clean checkout reproduces both repos with no dirty state before rerunning build, full tests, and the required benchmark matrix.
+
+### Checks Passed So Far
+
+The targeted router frame is in the measured Soroswap apply path, the p26 staged diff is next-protocol gated, non-positive reserves fall back to Wasm, and the implementation does avoid the prior pair-id XDR/SHA rebuild. No benchmark, promotion, or success-document checks passed because the pair-identity proof and clean handoff are missing.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-26
+**PoC by**: gpt-5.5, high
+
+### Changes Made
+
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:1-20`: added the crypto, metered XDR, `ContractIdPreimageFromAddress`, and `Uint256` imports needed to derive and verify the canonical Soroswap pair contract ID.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:847-854`: kept the native router dispatch ahead of Wasm instantiation, now passing the router instance into the matcher so the fast path can read the configured factory.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:1424-1686`: tightened the router fast-path gate to extract the router factory from instance storage, derive the canonical pair ID from `(factory, sorted token path)` using the same XDR salt and contract-ID preimage scheme as the router/factory path, and require the loaded pool instance to match that canonical contract ID, factory, token layout, vendored pool hash, and positive reserves before native execution.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:1698-1785`: retained the existing native execution sequence after the corrected match: router-root auth, checked amount-out arithmetic, SAC input transfer, native pair swap, and router return vector construction.
+- `src/rust/src/soroban_proto_all.rs:114`: preserved p26 apply routing through `e2e_invoke::invoke_host_function_for_apply`, keeping this PoC stacked on the accepted sparse no-meta apply entrypoint.
+
+### Demonstration
+
+The revised fast path still removes the top-level router Wasm frame for the exact next-protocol Soroswap apply-load swap, but it no longer trusts a footprint-loaded pool solely because its tokens match. It proves the pool is the router-canonical pair by deriving the pair ID from the router instance factory and sorted route tokens, then only executes natively when the loaded pool instance has that exact contract ID and matching stored factory/token/reserve layout; spoofed or non-canonical pools therefore fall back to Wasm.
+
+### Test Results
+
+`./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production && make -j $(nproc)` completed successfully.
+
+`env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS="--ll fatal -r simple --abort --disable-dots" make check` completed successfully. The p26 Rust host tests reported `752 passed; 0 failed; 2 ignored`, Rust integration suites passed, doc tests had the expected ignored example, and stellar-core reported `PASS: test/selftest-nopg`, `PASS: test/check-nondet`, `All 2 tests passed`.
