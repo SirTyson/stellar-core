@@ -160,3 +160,33 @@ crate tests, all green). The soroban env crate self-tests
 address types`, parallel-apply oriented tests, ledger-txn commit tests,
 hot-archive and live-bucket-list restore tests) all pass without
 modification. No tests were changed.
+
+---
+
+## Final Review
+
+**Verdict**: REJECTED
+**Date**: 2026-05-26
+**Final review by**: gpt-5.5, high
+**Failed At**: final-review
+
+### Adversarial Analysis
+
+1. **Does the change actually address the claimed inefficiency?** NO — the handed-off source does not contain the claimed change. `GlobalParallelApplyLedgerState` only exposes `commitChangesFromThreads` and `commitChangesToLedgerTxn`; there is no `commitChangesFromThreadsDirectlyToLedgerTxn` or equivalent direct-to-`LedgerTxn` API. `LedgerManagerImpl::applySorobanStages` still loops over all stages with `applySorobanStage(...)` and then unconditionally calls `globalParState.commitChangesToLedgerTxn(ltx)`.
+2. **Are the preconditions realistic?** NOT EVALUATED — the one-stage soroswap premise is plausible from the hypothesis, but final review cannot validate a non-existent fast path.
+3. **Is the original code inefficient or working as designed?** NOT EVALUATED — the original two-phase merge/writeback path remains present and unchanged in this handoff.
+4. **Does the benchmark improvement match the claimed severity?** NO — there are no optimized source changes to benchmark. The current branch has no non-`ai-summary` diff relative to the local handoff state, so any benchmark would measure the baseline implementation rather than the described optimization.
+5. **Is the optimization in scope?** NOT EVALUATED — the target area would be in scope, but no optimization was delivered.
+6. **Is the benchmark methodology correct?** NO — the PoC notes report tests but no independently reproducible final-review benchmark can be run for the claimed optimization because the corresponding code is absent.
+7. **Can the improvement be explained without the optimization?** YES — since the optimization is missing, any reported improvement would necessarily come from baseline variance or unrelated state.
+8. **Is this optimization novel?** NOT EVALUATED — novelty is irrelevant without an implemented diff.
+
+### Rejection Reason
+
+The PoC handoff is internally inconsistent: the hypothesis file describes a production code change that is not present in the checked-out branch or any fetched `origin/poc/001-single-stage-direct-thread-ledgertxn-commit` ref. The source still contains the original two-phase path (`commitChangesFromThreads` into `mGlobalEntryMap`, then `commitChangesToLedgerTxn` into `LedgerTxn`), the claimed direct-commit method is absent, and `git diff` excluding `ai-summary` shows no source changes to validate or benchmark.
+
+### Failed Checks
+
+- Check 3 / Step 3: source change could not be read because the claimed implementation is absent.
+- Check 5 / Step 5: benchmark validation cannot support the claim without an optimized implementation.
+- Adversarial checks 1, 4, 6, and 7 failed.
