@@ -525,3 +525,135 @@ The optimization removes the remaining top-level router Wasm instantiation/invoc
 ### Test Results
 
 `./configure --enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production && make -j $(nproc)` completed successfully. `env NUM_PARTITIONS=30 STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check` completed successfully; p26 Rust tests reported `752 passed; 0 failed; 2 ignored`, p26 integration/doc test targets passed, and the final stellar-core selftest summary reported `All 2 tests passed`.
+
+---
+
+## Final Review — Needs Revision
+
+**Date**: 2026-05-26
+**Final review by**: gpt-5.5, high
+
+### What Needs Fixing
+
+The code-level idea remains plausible, but this handoff is still not a valid final-review target. I independently checked the current branch and submodule state before benchmarking:
+
+1. The outer branch `poc/002-footprint-resolved-native-router-swap` at `e49ecff0fb2d193a0459d1ff15fbfbd8655794e9` is not descended from the accepted `soroswap-perf` baseline commit `1e61a61455cb1e69e0e68295b5180ca0bb7dd831` recorded in `ai-summary/CURRENT_STATE.md`.
+2. The committed outer gitlink records p26 SHA `cb59d2439ed9ad9662b11bd95e33e9fb1e0b1946`, while the checked-out p26 submodule is at accepted baseline `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8` with the router fast-path diff staged in `soroban-env-host/src/host/frame.rs`. A clean checkout plus `git submodule update --init --recursive src/rust/soroban/p26` would therefore reproduce `cb59d243...`, not the staged restacked source being described in the latest PoC notes.
+3. The outer `src/rust/src/soroban_proto_all.rs` change that restores `invoke_host_function_for_apply` is also uncommitted. The branch tip does not contain the full optimized source state, so any build/test/benchmark result from this dirty worktree would not be promotable or reproducible.
+
+Because final review must compare a clean, committed PoC branch against the accepted `CURRENT_STATE.md` baseline, the required full-suite rerun and three non-Tracy `scripts/run_apply_load_matrix.py` benchmark passes would produce invalid verdict data in this state.
+
+### Revision Instructions
+
+Publish a self-contained, reproducible handoff before re-requesting final review:
+
+1. Commit the restacked p26 router fast-path diff on a p26 branch whose history descends from `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8`, and ensure that branch is available from the required fork.
+2. Rebase or cherry-pick the outer PoC branch onto `1e61a61455cb1e69e0e68295b5180ca0bb7dd831` / `soroswap-perf`.
+3. Commit both the `src/rust/src/soroban_proto_all.rs` apply-entrypoint restore and the p26 gitlink bump to the new restacked p26 SHA on the outer PoC branch.
+4. Verify from a clean checkout that `git submodule update --init --recursive src/rust/soroban/p26` leaves both the outer repo and p26 submodule clean, and that the recorded p26 SHA is a descendant of the accepted p26 baseline.
+5. Only after that clean handoff exists, rerun the build, full unit suite, and three authoritative non-Tracy `PATH="$PWD/src:$PATH" python3 scripts/run_apply_load_matrix.py` benchmark runs.
+
+### Checks Passed So Far
+
+Source inspection of the staged restacked p26 diff confirms the intended narrow gates are still present: next-protocol only, exact router Wasm hash, exact five-argument benchmark shape, positive reserves, unique footprint-loaded pair resolution, and no pair-id XDR/SHA256 rebuild. The earlier non-positive-reserve success divergence is not present. No clean-handoff, benchmark, promotion, or success-document checks passed because reproducibility fails before measurement.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_PASS
+**Date**: 2026-05-26
+**PoC by**: claude-opus-4.7, high
+
+### Changes Made
+
+No new source edits in this iteration. The prior iteration's restacked
+source state is preserved exactly as required by prior final reviews and
+left in the worktree per the poc-performance / objective-poc skill
+contract: the PoC agent must not run `git commit` or `git push`. The
+orchestrator owns publication of the p26 submodule branch on
+`SirTyson/rs-soroban-env` and the outer gitlink bump / restack on
+`SirTyson/stellar-core`.
+
+Current worktree source state (verified before build):
+
+- `src/rust/soroban/p26` submodule: detached at accepted p26 baseline
+  `7aef8604bced962d79aaf06cab2f9e2c2c4e95d8`
+  (`poc/001-sparse-no-meta-ledger-changes` tip from
+  `ai-summary/CURRENT_STATE.md`) with the router fast-path changes staged
+  in `soroban-env-host/src/host/frame.rs` (+369 / -6 lines vs HEAD).
+  The diff re-implements, on top of this baseline:
+  - `SOROSWAP_ROUTER_WASM_HASH` constant plus `NativeSoroswapPairSide`,
+    `NativeSoroswapPairMatch`, `NativeSoroswapRouterSwap` helpers.
+  - Router match-and-dispatch block in `call_contract_fn` (Wasm arm)
+    placed after the existing pool-swap matcher, before `instantiate_vm`.
+  - `match_native_soroswap_router_swap` with next-protocol gate, router
+    wasm-hash gate, exact 5-argument shape (`amount_in: i128`,
+    `amount_out_min == 0`, `path: VecObject(2 addresses)`,
+    `to: AddressObject`, `deadline == u64::MAX`), and the
+    `reserve_in <= 0 || reserve_out <= 0` fallback-to-Wasm gate added
+    after the first final-review revision.
+  - `find_native_soroswap_pair_in_storage` that scans `storage.map` for
+    a unique `ContractData{Persistent, ContractInstance}` whose
+    executable is `SOROSWAP_POOL_WASM_HASH` and whose instance storage
+    map has `token0/token1` matching the route in either orientation.
+  - `call_native_soroswap_router_swap`: `to.require_auth(...)`
+    router-root auth, checked Uniswap-V2 `amount_out` from reserves,
+    SAC `transfer(user, pair, amount_in)` via `call_n_internal`, native
+    pair `swap(a0, a1, to)` via `call_n_internal`, and
+    `[amount_in, amount_out]` return-vector construction. No success-shaped
+    zero-output shortcut remains; non-positive reserve states are rejected
+    by the matcher before this helper runs.
+- `src/rust/src/soroban_proto_all.rs`: modified to route p26 apply
+  through `e2e_invoke::invoke_host_function_for_apply` (the accepted
+  sparse no-meta apply entrypoint) rather than the generic
+  `e2e_invoke::invoke_host_function`, keeping this PoC stacked on the
+  accepted baseline instead of regressing the prior accepted optimization.
+
+The repeated "Needs Revision" verdicts from prior final-review passes
+are exclusively about git plumbing — the outer branch tip not being a
+descendant of `soroswap-perf` baseline `1e61a61...`, the outer gitlink
+still recording the old `cb59d243...` p26 SHA, and the staged-but-not-
+committed nature of both diffs. Per the objective-poc skill
+("Do not run `git commit`, `git push`, or otherwise mutate git state.
+Leave your source edits in the worktree (outer repo and `p26` submodule
+both dirty if needed). When you declare POC_PASS, the orchestrator
+commits dirty submodules onto `poc/<NNN>-<slug>`, pushes the submodule
+branch to the configured fork (`fork` remote for p26 →
+`github.com/SirTyson/rs-soroban-env`), then commits the outer worktree
+(including the gitlink bump) onto the same branch and pushes to
+`origin`.") the PoC agent cannot resolve those handoff issues — the
+orchestrator must restack/publish. The source state on disk is the
+intended, reviewer-approved fast-path implementation.
+
+### Demonstration
+
+The optimization removes the remaining top-level router
+`Vm::instantiate_wasmi` + `Vm::invoke_function_raw` pair from each
+next-protocol Soroswap apply-load swap by matching the exact router
+wasm hash, decoding the fixed 5-argument shape, resolving the pair
+from already-loaded enforcing storage (no XDR/SHA256 pair-id rebuild —
+the documented anti-pattern of failed attempt 001), and dispatching
+directly to the existing native SAC transfer and native pair swap
+helpers via a single `Frame::NativeContract`. Auth-tree ordering,
+ledger effects (balances, reserves, events), and the router return
+vector match the Wasm router path. Non-positive reserves, non-router
+wasm hashes, non-exact argument shapes, ambiguous pair candidates,
+non-SAC tokens, and released p26 all fall back to the Wasm router.
+
+### Test Results
+
+`make -j $(nproc)` rebuilt cleanly from the existing
+`--enable-ccache --enable-sdfprefs --enable-tracy --enable-tracy-capture --disable-postgres --enable-next-protocol-version-unsafe-for-production`
+configuration with exit status 0.
+
+`env NUM_PARTITIONS=$(nproc) STELLAR_CORE_TEST_PARAMS='--ll fatal -r simple --abort --disable-dots' make check`
+ran to completion successfully. All stellar-core suites passed:
+`PASS: test/selftest-nopg`, `PASS: test/check-nondet`,
+"All 2 tests passed". The full p26 Rust workspace tests also passed:
+bls 6 passed, ed25519_edge_cases 2 passed, fees 10 passed,
+integration 3 passed, option 2 passed, secp256r1 2 passed, plus the
+in-tree host unit/doc tests (0 failed across all reported suites; the
+single doc test is the pre-existing ignored `host::error::err` example).
+No "FAIL" / "failed" lines appear in the test output other than
+`0 failed` totals.
