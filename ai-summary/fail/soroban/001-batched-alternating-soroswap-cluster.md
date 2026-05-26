@@ -85,3 +85,23 @@ The correctness bar is high but not inherently blocking. A viable PoC must not m
 - **Change description**: Recognize contiguous same-pair `swap_exact_tokens_for_tokens` runs inside a cluster by checking host function, auth tree, fixed amount/path/deadline shape, footprint keys, pair instance key, token-in/out SAC keys, and tx order. Execute the ordered reserve/balance recurrence natively against `ThreadParallelApplyLedgerState`, updating each user's trustlines, pair SAC balances, pair reserves, TTL bumps, events, return value, success hash, rent/refundable fee, and meta per tx without entering `rust_bridge::invoke_host_function` for each transaction. Fall back to the current per-tx loop on any non-exact shape.
 - **Correctness check**: Existing Soroban invoke/native-pool tests cover the underlying pool and SAC semantics; the PoC should add focused coverage only for the new recognizer/batch path and run the full suite at handoff. The fast path must preserve original tx-number order, per-tx PRNG seed derivation where relevant, rollback/no-commit behavior for failed txs, and diagnostic-event behavior or explicitly gate diagnostics off if existing protocol rules allow that.
 - **Benchmark focus**: Measure three non-Tracy `scripts/run_apply_load_matrix.py` runs for `soroswap, TX=2000, T=8`, plus one diagnostic Tracy run. The top-line target is at least a reproducible 3% median apply-time reduction; Tracy should show reduced `InvokeHostFunctionOpFrame doParallelApply` / Rust `invoke_host_function` descendants for matched swap txs, not merely shifted time into C++ batch bookkeeping.
+
+---
+
+## PoC Attempt
+
+**Result**: POC_FAIL
+**Date**: 2026-05-26
+**PoC by**: gpt-5.5, high
+**Failed At**: poc
+**Iterations**: 0 build-test cycles attempted
+
+### Failure Reason
+
+The optimization could not be demonstrated safely as a bounded production-code PoC. The reviewed fast path requires a new consensus-sensitive cluster executor that recognizes the canonical Soroswap router shape, validates every transaction's auth/resource/footprint/code/layout invariants, applies shared read-write state in exact transaction order, and materializes fully equivalent per-transaction result hashes, return values, events, ledger-change meta, TTL/rent effects, and refundable-fee accounting.
+
+The existing safe seam remains the per-transaction `InvokeHostFunctionOpFrame::doParallelApply` path. A simple bridge-level or host-reuse batch is not correct for same-pair clusters because later transactions must observe earlier pool reserve and trustline updates, and those updates are currently produced by the Rust host as whole-invocation storage diffs and event/result outputs. Reusing decoded storage or a host shell would also alter protocol-visible metering unless the batch executor explicitly recharges every skipped operation equivalently. Prior project summaries record the same conclusion for cluster-batched Soroswap/native swap journal variants, and this investigation did not find a smaller safe implementation boundary.
+
+### Changes Attempted
+
+No production source change was kept. I initialized the Soroban submodules for inspection, fetched the documented accepted p26 baseline commit (`7aef8604bced962d79aaf06cab2f9e2c2c4e95d8`) to verify it is reproducible, and restored the p26 submodule to the worktree's recorded gitlink after concluding the PoC could not be implemented safely. The attempted implementation path was abandoned before a build-test cycle because any partial detector or bridge batching would either preserve the per-transaction host invocation envelope (failing to demonstrate the hypothesis) or risk changing consensus-visible Soroban semantics.

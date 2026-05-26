@@ -46,3 +46,39 @@ Prior failures rejected `InstancePre`, store reset, and pristine snapshots becau
 ## Anti-Evidence
 
 This is a major protocol-risk change. A compiled backend must have deterministic behavior across platforms, a precise fuel/budget mapping, safe memory/table/global initialization, and byte-for-byte-equivalent traps and host-call ordering. If implementing a backend requires a general Wasm compiler integration rather than a narrow router artifact, the scope may exceed the optimization arc. The reviewer should reject any PoC that only speeds up native host calls or wasmi instantiation while leaving interpreter execution unchanged; those narrower surfaces are already failed as sub-threshold or impossible with the pinned wasmi API.
+
+---
+
+## Review
+
+**Verdict**: NOT_VIABLE
+**Date**: 2026-05-26
+**Reviewed by**: gpt-5.5, high
+**Novelty**: FAIL — duplicate of `ai-summary/fail/soroban/002-hash-gated-compiled-soroswap-backend.md`
+**Failed At**: reviewer
+
+### Trace Summary
+
+The traced apply path enters Rust Soroban execution through the protocol-specific bridge, builds a fresh `Host`, installs the per-protocol `ModuleCache`, and calls `Host::invoke_function`. `Host::call_contract_fn` now checks post-p26 native Soroswap pool and router fast paths before the generic Wasm path; when the router fast path does not match, the code still instantiates a fresh `Vm` from the cached `ParsedModule` and calls `Vm::invoke_function_raw`, which marshals values and enters wasmi. This is substantially the same mechanism as the prior hash/protocol-gated compiled-backend review, and the current hypothesis does not add a new deterministic backend design or isolated removable guest-interpreter measurement that would overcome that prior failure.
+
+### Code Paths Examined
+
+- `src/rust/src/soroban_proto_any.rs:391-448` — `invoke_host_function_or_maybe_panic` constructs the budget and passes the shared `SorobanModuleCache` into the protocol-specific host invocation.
+- `src/rust/src/soroban_proto_all.rs:95-129` — the p26 adaptor passes `module_cache.p26_cache.module_cache.clone()` into `e2e_invoke::invoke_host_function`.
+- `src/rust/soroban/p26/soroban-env-host/src/e2e_invoke.rs:472-552` — the host is created per invocation, ledger/auth/module-cache state is installed, and `Host::invoke_function` is timed on the apply path.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:813-865` — `call_contract_fn` routes matching Soroswap native pool/router cases before falling back to `instantiate_vm` plus `Vm::invoke_function_raw`.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:1570-1878` — an existing post-p26 hash/function/shape-gated native router `swap_exact_tokens_for_tokens` implementation already bypasses router Wasm for the fixed apply-load shape when it matches.
+- `src/rust/soroban/p26/soroban-env-host/src/host/frame.rs:1992-2106` — `instantiate_vm` reuses `ParsedModule` from the cache on hits but still creates a fresh `Vm`/wasmi store/instance; cache misses retrieve Wasm and parse through an isolated engine.
+- `src/rust/soroban/p26/soroban-env-host/src/vm.rs:154-218` — `Vm::instantiate_wasmi` creates the wasmi store, validates imports, instantiates the module, and records memory for the fresh VM.
+- `src/rust/soroban/p26/soroban-env-host/src/vm.rs:275-412` — `metered_func_call` resolves the export, transfers fuel, calls wasmi, maps traps/errors, and `invoke_function_raw` marshals absolute/relative values around that call.
+- `src/rust/soroban/p26/soroban-env-host/src/vm/dispatch.rs:250-304` — generated host-function wrappers perform value conversion, host ABI calls, error escalation, and fuel refill, so broad dispatch time is not purely removable interpreter overhead.
+- `src/rust/soroban/p26/soroban-env-host/src/vm/module_cache.rs:15-24,160-204` — `ModuleCache` stores a shared wasmi engine/linker and `Hash -> Arc<ParsedModule>` map; there is no compiled-backend artifact slot or execution trait in the current cache.
+- `src/simulation/ApplyLoad.cpp:2896-2902,3427-3439` — the benchmark uploads the router Wasm and generates the two-token `swap_exact_tokens_for_tokens` top-level router invocation described by the hypothesis.
+
+### Why It Failed
+
+This hypothesis is not novel. `ai-summary/fail/soroban/002-hash-gated-compiled-soroswap-backend.md` already reviewed and rejected the same compiled-backend family as a duplicate of prior protocol-gated/AOT/hash-gated Soroswap backend variants. Narrowing the compiled backend to the known router hash/export is also covered by the retained Soroban fail-summary guidance for router-native proposals: exact vendored hash plus exact two-token trigger is not a new viability argument without a concrete deterministic execution/fuel specification, proof of artifact equivalence, and measurements isolating removable guest-interpreter work after subtracting host-call and mandatory ABI costs.
+
+### Lesson Learned
+
+Do not resubmit router-hash or Soroswap-hash compiled-backend hypotheses unless they introduce genuinely new evidence: a concrete backend implementation path compatible with the pinned runtime, a protocol-level deterministic metering/fuel contract, and router-specific measurements that separate guest interpreter cost from host dispatch, SAC/pair subcalls, auth, storage, TTL, event, and result encoding work.
