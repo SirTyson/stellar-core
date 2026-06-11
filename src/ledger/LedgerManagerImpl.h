@@ -467,7 +467,8 @@ class LedgerManagerImpl : public LedgerManager
         AppConnector& app, ApplyStage const& stage,
         GlobalParallelApplyLedgerState const& globalState,
         Hash const& sorobanBasePrngSeed, Config const& config,
-        ParallelLedgerInfo const& ledgerInfo);
+        ParallelLedgerInfo const& ledgerInfo,
+        ParallelApplyLedgerKeySet& rwSetOut);
 
     void checkAllTxBundleInvariants(AppConnector& app, ApplyStage const& stage,
                                     Config const& config,
@@ -480,8 +481,7 @@ class LedgerManagerImpl : public LedgerManager
     void applySorobanStage(AppConnector& app, LedgerHeader const& header,
                            GlobalParallelApplyLedgerState& globalParState,
                            ApplyStage const& stage,
-                           Hash const& sorobanBasePrngSeed, bool isLastStage,
-                           std::future<ParallelApplyLedgerKeySet> rwSetFuture);
+                           Hash const& sorobanBasePrngSeed, bool isLastStage);
 
     void applySorobanStages(AppConnector& app, AbstractLedgerTxn& ltx,
                             std::vector<ApplyStage> const& stages,

@@ -2844,7 +2844,8 @@ LedgerManagerImpl::applySorobanStageClustersInParallel(
     AppConnector& app, ApplyStage const& stage,
     GlobalParallelApplyLedgerState const& globalState,
     Hash const& sorobanBasePrngSeed, Config const& config,
-    ParallelLedgerInfo const& ledgerInfo)
+    ParallelLedgerInfo const& ledgerInfo,
+    ParallelApplyLedgerKeySet& rwSetOut)
 {
     ZoneScoped;
 
@@ -2924,6 +2925,12 @@ LedgerManagerImpl::applySorobanStageClustersInParallel(
     mLastPhaseTimings.sorobanThreadSpawnMs +=
         std::chrono::duration<double, std::milli>(spawnEnd - spawnStart).count();
 #endif
+    // Compute the stage's read-write key set on this (otherwise idle,
+    // join-blocked) thread while the workers run the clusters: it is only
+    // needed by commitChangesFromThreads after the join, and computing it on
+    // the pool would either steal a worker from the pre-apply phases
+    // (eager) or delay the commit (queued behind balanced clusters).
+    rwSetOut = getReadWriteKeysForStage(stage);
 
     for (auto& threadFuture : threadFutures)
     {
@@ -3020,8 +3027,7 @@ void
 LedgerManagerImpl::applySorobanStage(
     AppConnector& app, LedgerHeader const& header,
     GlobalParallelApplyLedgerState& globalParState, ApplyStage const& stage,
-    Hash const& sorobanBasePrngSeed, bool isLastStage,
-    std::future<ParallelApplyLedgerKeySet> rwSetFuture)
+    Hash const& sorobanBasePrngSeed, bool isLastStage)
 {
     ZoneScoped;
     auto const& config = app.getConfig();
@@ -3030,8 +3036,10 @@ LedgerManagerImpl::applySorobanStage(
 #ifdef BUILD_TESTS
     auto subStart = std::chrono::steady_clock::now();
 #endif
+    ParallelApplyLedgerKeySet readWriteSet;
     auto threadStates = applySorobanStageClustersInParallel(
-        app, stage, globalParState, sorobanBasePrngSeed, config, ledgerInfo);
+        app, stage, globalParState, sorobanBasePrngSeed, config, ledgerInfo,
+        readWriteSet);
 #ifdef BUILD_TESTS
     auto subEnd = std::chrono::steady_clock::now();
     mLastPhaseTimings.sorobanParallelApplyMs +=
@@ -3058,8 +3066,6 @@ LedgerManagerImpl::applySorobanStage(
     // restored entries and classic entries are always merged.
     bool skipSorobanDataAndCode =
         isLastStage && bypassLtxForSorobanEntries(app.getConfig());
-    releaseAssert(rwSetFuture.valid());
-    auto readWriteSet = rwSetFuture.get();
     globalParState.commitChangesFromThreads(app, threadStates, readWriteSet,
                                             skipSorobanDataAndCode);
 #ifdef BUILD_TESTS
@@ -3101,16 +3107,6 @@ LedgerManagerImpl::applySorobanStages(AppConnector& app, AbstractLedgerTxn& ltx,
         // apply pool right away: they depend only on the (static) tx set
         // footprints and overlap the global setup below, so they are ready
         // by the time each stage's commitChangesFromThreads needs them.
-        auto& rwSetPool = mApp.getApplyThreadPool();
-        rwSetPool.ensureWorkerCount(1);
-        std::vector<std::future<ParallelApplyLedgerKeySet>> rwSetFutures;
-        rwSetFutures.reserve(stages.size());
-        for (auto const& stage : stages)
-        {
-            rwSetFutures.emplace_back(rwSetPool.submit(
-                [&stage]() { return getReadWriteKeysForStage(stage); }));
-        }
-
         auto globalParStatePtr = std::make_unique<GlobalParallelApplyLedgerState>(
             app, mApplyState.copyApplyLedgerView(), ltx, stages,
             mApplyState.getInMemorySorobanState(), sorobanConfig);
@@ -3181,8 +3177,7 @@ LedgerManagerImpl::applySorobanStages(AppConnector& app, AbstractLedgerTxn& ltx,
             for (size_t i = 0; i < stages.size(); ++i)
             {
                 applySorobanStage(app, header, globalParState, stages[i],
-                                  sorobanBasePrngSeed, i + 1 == stages.size(),
-                                  std::move(rwSetFutures[i]));
+                                  sorobanBasePrngSeed, i + 1 == stages.size());
             }
         }
 
