@@ -137,6 +137,11 @@ class LiveBucketIndex : public NonMovableOrCopyable
 
     IndexReturnT lookup(LedgerKey const& k) const;
 
+    // Lookup with a precomputed identity hash (hashLedgerIdentity(k)); lets
+    // multi-bucket walks hash the key once. Only the in-memory index uses
+    // the hash; disk-backed indexes fall back to the plain lookup.
+    IndexReturnT lookup(LedgerKey const& k, size_t identityHash) const;
+
     std::pair<IndexReturnT, IterT> scan(IterT start, LedgerKey const& k) const;
 
     std::vector<PoolID> const& getPoolIDsByAsset(Asset const& asset) const;

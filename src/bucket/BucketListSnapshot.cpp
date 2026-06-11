@@ -169,7 +169,8 @@ SearchableBucketListSnapshot<BucketT>::getEntryAtOffset(
 template <class BucketT>
 std::pair<std::shared_ptr<typename BucketT::EntryT const>, bool>
 SearchableBucketListSnapshot<BucketT>::getBucketEntry(
-    std::shared_ptr<BucketT const> const& bucket, LedgerKey const& k) const
+    std::shared_ptr<BucketT const> const& bucket, LedgerKey const& k,
+    size_t keyIdentityHash) const
 {
     ZoneScoped;
     if (bucket->isEmpty())
@@ -177,7 +178,17 @@ SearchableBucketListSnapshot<BucketT>::getBucketEntry(
         return {nullptr, false};
     }
 
-    auto indexRes = bucket->getIndex().lookup(k);
+    IndexReturnT indexRes;
+    if constexpr (std::is_same_v<BucketT, LiveBucket>)
+    {
+        // Hash the key identity once per multi-bucket lookup (the walk
+        // probes every level's index, including all level-0 shards).
+        indexRes = bucket->getIndex().lookup(k, keyIdentityHash);
+    }
+    else
+    {
+        indexRes = bucket->getIndex().lookup(k);
+    }
     switch (indexRes.getState())
     {
     // Index had entry in cache
@@ -343,8 +354,9 @@ SearchableBucketListSnapshot<BucketT>::load(LedgerKey const& k) const
     std::shared_ptr<typename BucketT::LoadT const> result{};
 
     // Search function called on each Bucket in BucketList until we find the key
+    size_t const keyIdentityHash = hashLedgerIdentity(k);
     auto loadKeyBucketLoop = [&](std::shared_ptr<BucketT const> const& bucket) {
-        auto [be, bloomMiss] = getBucketEntry(bucket, k);
+        auto [be, bloomMiss] = getBucketEntry(bucket, k, keyIdentityHash);
         if (bloomMiss)
         {
             // Reset timer on bloom miss to avoid outlier metrics, since we

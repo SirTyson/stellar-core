@@ -240,6 +240,18 @@ LiveBucketIndex::lookup(LedgerKey const& k) const
     }
 }
 
+IndexReturnT
+LiveBucketIndex::lookup(LedgerKey const& k, size_t identityHash) const
+{
+    if (mDiskIndex)
+    {
+        return lookup(k);
+    }
+    releaseAssertOrThrow(mInMemoryIndex);
+    return mInMemoryIndex->scan(mInMemoryIndex->begin(), k, identityHash)
+        .first;
+}
+
 std::pair<IndexReturnT, LiveBucketIndex::IterT>
 LiveBucketIndex::scan(IterT start, LedgerKey const& k) const
 {

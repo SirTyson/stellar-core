@@ -79,6 +79,20 @@ InMemoryBucketState::scan(IterT start, LedgerKey const& searchKey) const
     return {IndexReturnT(), mEntries.begin()};
 }
 
+std::pair<IndexReturnT, InMemoryBucketState::IterT>
+InMemoryBucketState::scan(IterT start, LedgerKey const& searchKey,
+                          size_t identityHash) const
+{
+    ZoneScoped;
+    auto it =
+        mEntries.find(InternalInMemoryBucketEntry(searchKey, identityHash));
+    if (it != mEntries.end())
+    {
+        return {IndexReturnT(it->get()), mEntries.begin()};
+    }
+    return {IndexReturnT(), mEntries.begin()};
+}
+
 InMemoryIndex::InMemoryIndex(
     BucketManager& bm,
     std::shared_ptr<std::vector<BucketEntry> const> const& inMemoryState,

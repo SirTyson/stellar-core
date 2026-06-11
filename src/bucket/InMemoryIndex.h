@@ -71,6 +71,14 @@ class InternalInMemoryBucketEntry
     {
     }
 
+    // Query object with a precomputed identity hash (must equal
+    // hashLedgerIdentity(ledgerKey)); lets a multi-bucket lookup hash the
+    // key once instead of once per bucket probed.
+    InternalInMemoryBucketEntry(LedgerKey const& ledgerKey, size_t hash)
+        : mQueryKey(&ledgerKey), mHash(hash)
+    {
+    }
+
     size_t
     hash() const
     {
@@ -133,6 +141,8 @@ class InMemoryBucketState : public NonMovableOrCopyable
     // DiskIndex::scan.
     std::pair<IndexReturnT, IterT> scan(IterT start,
                                         LedgerKey const& searchKey) const;
+    std::pair<IndexReturnT, IterT> scan(IterT start, LedgerKey const& searchKey,
+                                        size_t identityHash) const;
 
     IterT
     begin() const
@@ -204,6 +214,12 @@ class InMemoryIndex
     scan(IterT start, LedgerKey const& searchKey) const
     {
         return mInMemoryState.scan(start, searchKey);
+    }
+
+    std::pair<IndexReturnT, IterT>
+    scan(IterT start, LedgerKey const& searchKey, size_t identityHash) const
+    {
+        return mInMemoryState.scan(start, searchKey, identityHash);
     }
 
     std::optional<std::pair<std::streamoff, std::streamoff>>
