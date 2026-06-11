@@ -2751,6 +2751,20 @@ LedgerManagerImpl::prefetchTransactionData(AbstractLedgerTxnParent& ltx,
     }
 }
 
+#ifdef BUILD_TESTS
+// Cross-thread CPU sums for the parallel apply worker loop (reset per
+// ledger, reported via the phase-timing table; they sum CPU across all the
+// workers and so can exceed the soroban_parallel wall time).
+std::atomic<int64_t> gParApplyExecNs{0};
+std::atomic<int64_t> gParApplyHostNs{0};
+std::atomic<int64_t> gParApplyFootNs{0};
+std::atomic<int64_t> gParApplyInvokeNs{0};
+std::atomic<int64_t> gParApplyStoreNs{0};
+std::atomic<int64_t> gParApplyEvtNs{0};
+std::atomic<int64_t> gParApplyCommitNs{0};
+std::atomic<int64_t> gParApplyOtherNs{0};
+#endif
+
 std::unique_ptr<ThreadParallelApplyLedgerState>
 LedgerManagerImpl::applyThread(
     AppConnector& app,
@@ -2758,6 +2772,18 @@ LedgerManagerImpl::applyThread(
     Cluster const& cluster, Config const& config, ParallelLedgerInfo ledgerInfo,
     Hash sorobanBasePrngSeed)
 {
+#ifdef BUILD_TESTS
+    int64_t execNs = 0, commitNs = 0, otherNs = 0;
+    auto lap = std::chrono::steady_clock::now();
+    auto lapNs = [&lap]() {
+        auto now = std::chrono::steady_clock::now();
+        auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      now - lap)
+                      .count();
+        lap = now;
+        return ns;
+    };
+#endif
     for (auto const& txBundle : cluster)
     {
         // Apply timer
@@ -2772,9 +2798,15 @@ LedgerManagerImpl::applyThread(
 
         threadState->flushRoTTLBumpsInTxWriteFootprint(txBundle);
 
+#ifdef BUILD_TESTS
+        otherNs += lapNs();
+#endif
         auto res = txBundle.getTx()->parallelApply(
             app, *threadState, config, ledgerInfo, txBundle.getResPayload(),
             getSorobanMetrics(), txSubSeed, txBundle.getEffects());
+#ifdef BUILD_TESTS
+        execNs += lapNs();
+#endif
 
         if (res)
         {
@@ -2784,10 +2816,18 @@ LedgerManagerImpl::applyThread(
         {
             releaseAssert(!txBundle.getResPayload().isSuccess());
         }
+#ifdef BUILD_TESTS
+        commitNs += lapNs();
+#endif
     }
 
     threadState->flushRemainingRoTTLBumps();
 
+#ifdef BUILD_TESTS
+    gParApplyExecNs.fetch_add(execNs, std::memory_order_relaxed);
+    gParApplyCommitNs.fetch_add(commitNs, std::memory_order_relaxed);
+    gParApplyOtherNs.fetch_add(otherNs, std::memory_order_relaxed);
+#endif
     return threadState;
 }
 
@@ -2797,6 +2837,7 @@ getParallelLedgerInfo(AppConnector& app, LedgerHeader const& lh)
     return {lh.ledgerVersion, lh.ledgerSeq, lh.baseReserve,
             lh.scpValue.closeTime, app.getNetworkID()};
 }
+
 
 std::vector<std::unique_ptr<ThreadParallelApplyLedgerState>>
 LedgerManagerImpl::applySorobanStageClustersInParallel(
@@ -3106,6 +3147,14 @@ LedgerManagerImpl::applySorobanStages(AppConnector& app, AbstractLedgerTxn& ltx,
         mLastPhaseTimings.sorobanThreadMinMs = 0;
         mLastPhaseTimings.sorobanThreadMeanMs = 0;
         mLastPhaseTimings.sorobanThreadMaxMs = 0;
+        gParApplyExecNs = 0;
+        gParApplyHostNs = 0;
+        gParApplyFootNs = 0;
+        gParApplyInvokeNs = 0;
+        gParApplyStoreNs = 0;
+        gParApplyEvtNs = 0;
+        gParApplyCommitNs = 0;
+        gParApplyOtherNs = 0;
         mLastPhaseTimings.sorobanCheckInvariantsMs = 0;
         mLastPhaseTimings.sorobanCommitFromThreadsMs = 0;
         mLastPhaseTimings.sorobanDestroyThreadStatesMs = 0;
@@ -3137,6 +3186,16 @@ LedgerManagerImpl::applySorobanStages(AppConnector& app, AbstractLedgerTxn& ltx,
             }
         }
 
+#ifdef BUILD_TESTS
+        mLastPhaseTimings.parApplyExecCpuMs = gParApplyExecNs.load() / 1e6;
+        mLastPhaseTimings.parApplyHostCpuMs = gParApplyHostNs.load() / 1e6;
+        mLastPhaseTimings.parApplyFootCpuMs = gParApplyFootNs.load() / 1e6;
+        mLastPhaseTimings.parApplyInvokeCpuMs = gParApplyInvokeNs.load() / 1e6;
+        mLastPhaseTimings.parApplyStoreCpuMs = gParApplyStoreNs.load() / 1e6;
+        mLastPhaseTimings.parApplyEvtCpuMs = gParApplyEvtNs.load() / 1e6;
+        mLastPhaseTimings.parApplyCommitCpuMs = gParApplyCommitNs.load() / 1e6;
+        mLastPhaseTimings.parApplyOtherCpuMs = gParApplyOtherNs.load() / 1e6;
+#endif
         // All stages have committed their thread states into the global map,
         // so read-only TTL bumps are fully reconciled: write the TTL shard
         // optimistically (overlapping the ltx commit and post-apply work).

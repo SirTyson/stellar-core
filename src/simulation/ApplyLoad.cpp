@@ -265,6 +265,22 @@ logPhaseTimingsTable(
         &LedgerManagerImpl::LedgerClosePhaseTimings::sorobanThreadMeanMs);
     auto sorobanThreadMax = extract(
         &LedgerManagerImpl::LedgerClosePhaseTimings::sorobanThreadMaxMs);
+    auto parExecCpu = extract(
+        &LedgerManagerImpl::LedgerClosePhaseTimings::parApplyExecCpuMs);
+    auto parHostCpu = extract(
+        &LedgerManagerImpl::LedgerClosePhaseTimings::parApplyHostCpuMs);
+    auto parFootCpu = extract(
+        &LedgerManagerImpl::LedgerClosePhaseTimings::parApplyFootCpuMs);
+    auto parInvokeCpu = extract(
+        &LedgerManagerImpl::LedgerClosePhaseTimings::parApplyInvokeCpuMs);
+    auto parStoreCpu = extract(
+        &LedgerManagerImpl::LedgerClosePhaseTimings::parApplyStoreCpuMs);
+    auto parEvtCpu = extract(
+        &LedgerManagerImpl::LedgerClosePhaseTimings::parApplyEvtCpuMs);
+    auto parCommitCpu = extract(
+        &LedgerManagerImpl::LedgerClosePhaseTimings::parApplyCommitCpuMs);
+    auto parOtherCpu = extract(
+        &LedgerManagerImpl::LedgerClosePhaseTimings::parApplyOtherCpuMs);
     auto sorobanCheckInvariants = extract(
         &LedgerManagerImpl::LedgerClosePhaseTimings::sorobanCheckInvariantsMs);
     auto sorobanCommitThreads =
@@ -406,6 +422,14 @@ logPhaseTimingsTable(
         {"|     thread_min", computePhaseStats(sorobanThreadMin)},
         {"|     thread_mean", computePhaseStats(sorobanThreadMean)},
         {"|     thread_max", computePhaseStats(sorobanThreadMax)},
+        {"|     exec_cpu", computePhaseStats(parExecCpu)},
+        {"|       host_cpu", computePhaseStats(parHostCpu)},
+        {"|       foot_cpu", computePhaseStats(parFootCpu)},
+        {"|       invoke_cpu", computePhaseStats(parInvokeCpu)},
+        {"|       store_cpu", computePhaseStats(parStoreCpu)},
+        {"|       evt_cpu", computePhaseStats(parEvtCpu)},
+        {"|     commit_cpu", computePhaseStats(parCommitCpu)},
+        {"|     other_cpu", computePhaseStats(parOtherCpu)},
         {"|   soroban_invariants", computePhaseStats(sorobanCheckInvariants)},
         {"|   commit_from_thrds", computePhaseStats(sorobanCommitThreads)},
         {"|   ~thread_states", computePhaseStats(sorobanDestroyThreads)},

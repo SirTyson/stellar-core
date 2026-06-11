@@ -36,6 +36,16 @@
 #include <Tracy.hpp>
 #include <crypto/SHA.h>
 
+#ifdef BUILD_TESTS
+// Defined in LedgerManagerImpl.cpp; sums the rust host's self-reported
+// invocation time across all apply workers, for the phase-timing table.
+extern std::atomic<int64_t> gParApplyHostNs;
+extern std::atomic<int64_t> gParApplyFootNs;
+extern std::atomic<int64_t> gParApplyInvokeNs;
+extern std::atomic<int64_t> gParApplyStoreNs;
+extern std::atomic<int64_t> gParApplyEvtNs;
+#endif
+
 namespace stellar
 {
 namespace
@@ -383,6 +393,14 @@ class InvokeHostFunctionApplyHelper : virtual LedgerAccessHelper
     HostFunctionMetrics mMetrics;
     // Used for hot archive access only
     ApplyLedgerView mStateSnapshot;
+
+    // Optional memoization of serialized read-only soroban entries; the
+    // parallel helper supplies the per-cluster cache from its thread state.
+    virtual UnorderedMap<LedgerKey, std::vector<uint8_t>>*
+    roEntrySerCache()
+    {
+        return nullptr;
+    }
     rust::Box<rust_bridge::SorobanModuleCache> const& mModuleCache;
     DiagnosticEventManager& mDiagnosticEvents;
 
@@ -579,7 +597,30 @@ class InvokeHostFunctionApplyHelper : virtual LedgerAccessHelper
                         mRwKeyExisted.set(i);
                     }
 
-                    auto leBuf = toCxxBufPooled(*entryOpt);
+                    CxxBuf leBuf;
+                    UnorderedMap<LedgerKey, std::vector<uint8_t>>* serCache =
+                        isReadOnly && isSorobanEntry(lk) ? roEntrySerCache()
+                                                         : nullptr;
+                    if (serCache)
+                    {
+                        auto it = serCache->find(lk);
+                        if (it != serCache->end())
+                        {
+                            leBuf = CxxBuf{takePooledBuf()};
+                            leBuf.data->assign(it->second.begin(),
+                                               it->second.end());
+                        }
+                        else
+                        {
+                            leBuf = toCxxBufPooled(*entryOpt);
+                            (*serCache)[lk] = std::vector<uint8_t>(
+                                leBuf.data->begin(), leBuf.data->end());
+                        }
+                    }
+                    else
+                    {
+                        leBuf = toCxxBufPooled(*entryOpt);
+                    }
                     entrySize = static_cast<uint32_t>(leBuf.data->size());
 
                     // For entry types that don't have an ttlEntry (i.e.
@@ -682,6 +723,10 @@ class InvokeHostFunctionApplyHelper : virtual LedgerAccessHelper
                 mSorobanConfig.rustBridgeRentFeeConfiguration(), *mModuleCache);
             // The pooled scratch buffers are returned to the pool by the
             // destructor, covering all exit paths uniformly.
+#ifdef BUILD_TESTS
+            gParApplyHostNs.fetch_add(static_cast<int64_t>(out.time_nsecs),
+                                      std::memory_order_relaxed);
+#endif
             mMetrics.mCpuInsn = out.cpu_insns;
             mMetrics.mMemByte = out.mem_bytes;
             mMetrics.mInvokeTimeNsecs = out.time_nsecs;
@@ -1085,10 +1130,24 @@ class InvokeHostFunctionApplyHelper : virtual LedgerAccessHelper
         ZoneNamedN(applyZone, "InvokeHostFunctionOpFrame doApply", true);
         auto timeScope = mMetrics.getExecTimer();
 
+#ifdef BUILD_TESTS
+        auto _lap = std::chrono::steady_clock::now();
+        auto _lapNs = [&_lap]() {
+            auto now = std::chrono::steady_clock::now();
+            auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          now - _lap)
+                          .count();
+            _lap = now;
+            return ns;
+        };
+#endif
         if (!addFootprint())
         {
             return false;
         }
+#ifdef BUILD_TESTS
+        gParApplyFootNs.fetch_add(_lapNs(), std::memory_order_relaxed);
+#endif
 
         InvokeHostFunctionOutput out;
         // Return the output's pooled byte buffers to the Rust pool on every exit
@@ -1111,17 +1170,26 @@ class InvokeHostFunctionApplyHelper : virtual LedgerAccessHelper
         {
             return false;
         }
+#ifdef BUILD_TESTS
+        gParApplyInvokeNs.fetch_add(_lapNs(), std::memory_order_relaxed);
+#endif
 
         if (!recordStorageChanges(out))
         {
             return false;
         }
+#ifdef BUILD_TESTS
+        gParApplyStoreNs.fetch_add(_lapNs(), std::memory_order_relaxed);
+#endif
 
         InvokeHostFunctionSuccessPreImage success;
         if (!collectEvents(out, success))
         {
             return false;
         }
+#ifdef BUILD_TESTS
+        gParApplyEvtNs.fetch_add(_lapNs(), std::memory_order_relaxed);
+#endif
 
         if (!consumeRefundableResources(out))
         {
@@ -1223,6 +1291,12 @@ class InvokeHostFunctionParallelApplyHelper
     // true, the entry is marked for autorestore.
     // If no entries are marked for autorestore, the vector is empty.
     std::vector<bool> mAutorestoredEntries{};
+
+    UnorderedMap<LedgerKey, std::vector<uint8_t>>*
+    roEntrySerCache() override
+    {
+        return &mParThreadState->roEntrySerCache();
+    }
 
     // Helper called on all archived keys in the footprint. Returns false if
     // the operation should fail and populates result code and diagnostic

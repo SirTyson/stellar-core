@@ -375,7 +375,9 @@ PreV23LedgerAccessHelper::eraseLedgerEntryIfExists(LedgerKey const& key)
 ParallelLedgerAccessHelper::ParallelLedgerAccessHelper(
     ThreadParallelApplyLedgerState const& threadState,
     ParallelLedgerInfo const& ledgerInfo)
-    : mLedgerInfo(ledgerInfo), mTxState(threadState)
+    : mLedgerInfo(ledgerInfo)
+    , mParThreadState(&threadState)
+    , mTxState(threadState)
 {
     releaseAssertOrThrow(ledgerInfo.getLedgerSeq() ==
                          threadState.getSnapshotLedgerSeq() + 1);

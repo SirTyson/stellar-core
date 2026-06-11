@@ -654,6 +654,17 @@ class LedgerManagerImpl : public LedgerManager
         double sorobanThreadMinMs = 0;
         double sorobanThreadMeanMs = 0;
         double sorobanThreadMaxMs = 0;
+        // CPU sums across all apply workers for the worker loop's three
+        // parts (tx execution, thread-map commit, per-tx overhead); can
+        // exceed the soroban_parallel wall time.
+        double parApplyExecCpuMs = 0;
+        double parApplyHostCpuMs = 0;
+        double parApplyFootCpuMs = 0;
+        double parApplyInvokeCpuMs = 0;
+        double parApplyStoreCpuMs = 0;
+        double parApplyEvtCpuMs = 0;
+        double parApplyCommitCpuMs = 0;
+        double parApplyOtherCpuMs = 0;
         double sorobanCheckInvariantsMs = 0;
         double sorobanCommitFromThreadsMs = 0;
         double sorobanDestroyThreadStatesMs = 0;

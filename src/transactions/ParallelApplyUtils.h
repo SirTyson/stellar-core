@@ -124,6 +124,14 @@ class ThreadParallelApplyLedgerState
     // entry.
     ParallelApplyEntryMap<staticScope> mThreadEntryMap;
 
+    // Memoized XDR serializations of read-only soroban footprint entries.
+    // RO data/code entries are immutable for the lifetime of this
+    // (per-stage, per-cluster) state, and the hot ones (contract instance
+    // and code) appear in every tx's footprint, so the host-invocation
+    // bridge reuses their serialized bytes instead of re-serializing per
+    // tx. Filled lazily by the (single) cluster worker thread.
+    mutable UnorderedMap<LedgerKey, std::vector<uint8_t>> mRoEntrySerCache;
+
     // Contains a buffered set of RO TTL bumps that should only be observed
     // when/if the corresponding entry is modified, otherwise they are merged
     // (by taking maximums) into the global map at the end of the thread's life.
@@ -171,6 +179,12 @@ class ThreadParallelApplyLedgerState
     // Ensure that for each remaining RO TTL bump in `mRoTTLBumps`, the
     // TTL entry is present in the `mThreadEntryMap` and is >= the bump TTL.
     void flushRemainingRoTTLBumps();
+
+    UnorderedMap<LedgerKey, std::vector<uint8_t>>&
+    roEntrySerCache() const
+    {
+        return mRoEntrySerCache;
+    }
 
     ParallelApplyEntryMap<staticScope> const& getEntryMap() const;
     ParallelApplyEntryMap<staticScope>& getEntryMap();
@@ -487,6 +501,8 @@ class ParallelLedgerAccessHelper : virtual public LedgerAccessHelper
         ParallelLedgerInfo const& ledgerInfo);
 
     ParallelLedgerInfo const& mLedgerInfo;
+    // For the RO-entry serialization cache (see roEntrySerCache).
+    ThreadParallelApplyLedgerState const* mParThreadState;
     TxParallelApplyLedgerState mTxState;
 
     std::optional<LedgerEntry> getLedgerEntryOpt(LedgerKey const& key) override;
