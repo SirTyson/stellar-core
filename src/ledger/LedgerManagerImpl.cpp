@@ -2547,7 +2547,11 @@ LedgerManagerImpl::processFeesSeqNums(
             auto& threadPool = mApp.getApplyThreadPool();
             threadPool.ensureWorkerCount(1);
             size_t const numChunks =
-                std::max<size_t>(1, std::min<size_t>(16, allTxs.size()));
+                std::max<size_t>(
+                    1,
+                    std::min<size_t>(
+                        mApp.getConfig().LEDGER_CLOSE_WORKER_THREADS,
+                        allTxs.size()));
             size_t const chunkSize = (allTxs.size() + numChunks - 1) / numChunks;
             std::vector<std::future<void>> futures;
             futures.reserve(numChunks);
@@ -3725,7 +3729,11 @@ LedgerManagerImpl::processPostTxSetApply(
             auto& threadPool = mApp.getApplyThreadPool();
             threadPool.ensureWorkerCount(1);
             size_t const numChunks =
-                std::max<size_t>(1, std::min<size_t>(16, bundles.size()));
+                std::max<size_t>(
+                    1,
+                    std::min<size_t>(
+                        mApp.getConfig().LEDGER_CLOSE_WORKER_THREADS,
+                        bundles.size()));
             size_t const chunkSize =
                 (bundles.size() + numChunks - 1) / numChunks;
             std::vector<std::future<void>> futures;

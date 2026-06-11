@@ -266,17 +266,18 @@ class GlobalParallelApplyLedgerState
     // The map is split into shards by key hash so the post-stage merge of
     // the per-thread maps can run on parallel workers: each worker owns one
     // shard and scans all thread maps for that shard's keys, so the shards
-    // never need locking.
-    static constexpr size_t kGlobalEntryMapShards = 16;
-    std::array<ParallelApplyEntryMap<staticScope>, kGlobalEntryMapShards>
-        mGlobalEntryMapShards;
+    // never need locking. The shard count is sized at construction from the
+    // stages' cluster count (the available merge parallelism), with a floor
+    // so small cluster counts still spread the (serial-phase) emplaces.
+    size_t const mGlobalMapShardCount;
+    std::vector<ParallelApplyEntryMap<staticScope>> mGlobalEntryMapShards;
 
-    static size_t
-    globalMapShardOf(ParallelApplyLedgerKey const& key)
+    size_t
+    globalMapShardOf(ParallelApplyLedgerKey const& key) const
     {
-        // Mix the (cached) key hash and take the top bits so the shard index
-        // stays uncorrelated with the in-shard bucket index.
-        return (key.hash() * 0x9E3779B97F4A7C15ull) >> 60;
+        // Mix the (cached) key hash so the shard index stays uncorrelated
+        // with the in-shard bucket index.
+        return (key.hash() * 0x9E3779B97F4A7C15ull) % mGlobalMapShardCount;
     }
 
     ParallelApplyEntryMap<staticScope>&

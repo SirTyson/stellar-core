@@ -17,12 +17,17 @@ namespace stellar
 
 namespace
 {
-// One logical CPU per physical core: every CPU whose id is the smallest in
-// its thread-siblings set. Empty on failure or on non-Linux platforms.
+// All logical CPUs ordered for pinning: first one CPU per physical core
+// (every CPU whose id is the smallest in its thread-siblings set), then the
+// remaining hyperthread siblings. Pinning worker i to the i-th entry gives
+// each worker a distinct physical core while workers fit, then a distinct
+// logical CPU while they fit, and only then wraps. Empty on failure or on
+// non-Linux platforms.
 std::vector<int>
-physicalCoreRepresentatives()
+pinnableCpusInOrder()
 {
-    std::vector<int> res;
+    std::vector<int> firsts;
+    std::vector<int> rest;
 #ifdef __linux__
     unsigned n = std::thread::hardware_concurrency();
     for (unsigned cpu = 0; cpu < n; ++cpu)
@@ -38,11 +43,16 @@ physicalCoreRepresentatives()
         // entry is the leading integer either way.
         if (atoi(s.c_str()) == static_cast<int>(cpu))
         {
-            res.push_back(static_cast<int>(cpu));
+            firsts.push_back(static_cast<int>(cpu));
+        }
+        else
+        {
+            rest.push_back(static_cast<int>(cpu));
         }
     }
+    firsts.insert(firsts.end(), rest.begin(), rest.end());
 #endif
-    return res;
+    return firsts;
 }
 }
 
@@ -70,7 +80,7 @@ void
 ThreadPool::pinWorkersToDistinctPhysicalCores()
 {
     std::lock_guard<std::mutex> guard(mMutex);
-    mPinCpus = physicalCoreRepresentatives();
+    mPinCpus = pinnableCpusInOrder();
     if (mPinCpus.empty())
     {
         CLOG_DEBUG(Perf, "CPU topology unavailable, not pinning pool workers");

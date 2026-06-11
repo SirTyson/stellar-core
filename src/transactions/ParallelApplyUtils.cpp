@@ -166,7 +166,9 @@ buildPreApplyAccountOverlay(AppConnector& app, AbstractLedgerTxn& ltx,
     auto& threadPool = app.getApplyThreadPool();
     threadPool.ensureWorkerCount(1);
     size_t const numChunks =
-        std::max<size_t>(1, std::min<size_t>(16, txBundles.size()));
+        std::max<size_t>(
+            1, std::min<size_t>(app.getConfig().LEDGER_CLOSE_WORKER_THREADS,
+                                txBundles.size()));
     size_t const chunkSize = (txBundles.size() + numChunks - 1) / numChunks;
     std::vector<PreApplyAccountOverlay> partials(numChunks);
     std::vector<std::future<void>> futures;
@@ -438,6 +440,18 @@ GlobalParallelApplyLedgerState::GlobalParallelApplyLedgerState(
     InMemorySorobanState const& inMemoryState,
     SorobanNetworkConfig const& sorobanConfig)
     : LedgerEntryScope(ScopeIdT(0, ltx.getHeader().ledgerSeq))
+    , mGlobalMapShardCount(std::max<size_t>(
+          {size_t(1),
+           [&stages]() {
+               size_t c = 0;
+               for (auto const& stage : stages)
+               {
+                   c = std::max(c, stage.numClusters());
+               }
+               return c;
+           }(),
+           size_t(8)}))
+    , mGlobalEntryMapShards(mGlobalMapShardCount)
     , mLCLApplyView(std::move(snapshot))
     , mInMemorySorobanState(inMemoryState)
     , mSorobanConfig(sorobanConfig)
@@ -464,7 +478,7 @@ GlobalParallelApplyLedgerState::GlobalParallelApplyLedgerState(
         }
         for (auto& shard : mGlobalEntryMapShards)
         {
-            shard.reserve(estimatedEntries / kGlobalEntryMapShards + 1);
+            shard.reserve(estimatedEntries / mGlobalMapShardCount + 1);
         }
     }
 
@@ -703,7 +717,8 @@ GlobalParallelApplyLedgerState::commitBufferedPreParallelApplyWrites(
     auto& threadPool = app.getApplyThreadPool();
     threadPool.ensureWorkerCount(1);
     size_t const numChunks = std::max<size_t>(
-        1, std::min<size_t>(kGlobalEntryMapShards, txBundles.size()));
+        1, std::min<size_t>(
+               app.getConfig().LEDGER_CLOSE_WORKER_THREADS, txBundles.size()));
     size_t const chunkSize = (txBundles.size() + numChunks - 1) / numChunks;
     std::vector<std::future<void>> futures;
     futures.reserve(numChunks);
@@ -866,10 +881,11 @@ GlobalParallelApplyLedgerState::collectModifiedClassicEntries(
     auto& threadPool = app.getApplyThreadPool();
     threadPool.ensureWorkerCount(1);
     size_t const numChunks = std::max<size_t>(
-        1, std::min<size_t>(kGlobalEntryMapShards, bundles.size()));
-    std::vector<
-        std::array<std::vector<ParallelApplyLedgerKey>, kGlobalEntryMapShards>>
-        bins(numChunks);
+        1, std::min<size_t>(app.getConfig().LEDGER_CLOSE_WORKER_THREADS,
+                            bundles.size()));
+    std::vector<std::vector<std::vector<ParallelApplyLedgerKey>>> bins(
+        numChunks, std::vector<std::vector<ParallelApplyLedgerKey>>(
+                       mGlobalMapShardCount));
     {
         std::vector<std::future<void>> futures;
         futures.reserve(numChunks);
@@ -877,7 +893,7 @@ GlobalParallelApplyLedgerState::collectModifiedClassicEntries(
         for (size_t c = 0; c < numChunks; ++c)
         {
             futures.emplace_back(
-                threadPool.submit([c, chunkSize, &bundles, &bins]() {
+                threadPool.submit([this, c, chunkSize, &bundles, &bins]() {
                     size_t const begin = c * chunkSize;
                     size_t const end =
                         std::min(begin + chunkSize, bundles.size());
@@ -913,8 +929,8 @@ GlobalParallelApplyLedgerState::collectModifiedClassicEntries(
 
     {
         std::vector<std::future<void>> futures;
-        futures.reserve(kGlobalEntryMapShards);
-        for (size_t s = 0; s < kGlobalEntryMapShards; ++s)
+        futures.reserve(mGlobalMapShardCount);
+        for (size_t s = 0; s < mGlobalMapShardCount; ++s)
         {
             futures.emplace_back(threadPool.submit([this, s, &bins, &ltx]() {
                 auto& shard = mGlobalEntryMapShards[s];
@@ -1351,10 +1367,10 @@ GlobalParallelApplyLedgerState::extractDirtyTTLShardEntries(
     // point: all stages have joined), then concatenate.
     auto& threadPool = app.getApplyThreadPool();
     threadPool.ensureWorkerCount(1);
-    std::array<std::vector<BucketEntry>, kGlobalEntryMapShards> perShard;
+    std::vector<std::vector<BucketEntry>> perShard(mGlobalMapShardCount);
     std::vector<std::future<void>> futures;
-    futures.reserve(kGlobalEntryMapShards);
-    for (size_t i = 0; i < kGlobalEntryMapShards; ++i)
+    futures.reserve(mGlobalMapShardCount);
+    for (size_t i = 0; i < mGlobalMapShardCount; ++i)
     {
         futures.emplace_back(threadPool.submit([this, i, &perShard]() {
             perShard[i] = extractDirtyEntriesForShard(mGlobalEntryMapShards[i],
@@ -1362,7 +1378,7 @@ GlobalParallelApplyLedgerState::extractDirtyTTLShardEntries(
         }));
     }
     size_t total = 0;
-    for (size_t i = 0; i < kGlobalEntryMapShards; ++i)
+    for (size_t i = 0; i < mGlobalMapShardCount; ++i)
     {
         releaseAssert(futures[i].valid());
         futures[i].get();
@@ -1400,12 +1416,10 @@ GlobalParallelApplyLedgerState::commitChangesFromThreads(
     // submaps without synchronization. The apply workers are idle at this
     // point (all clusters have joined), so the pool is free.
     auto& threadPool = app.getApplyThreadPool();
-    threadPool.ensureWorkerCount(
-        std::min(kGlobalEntryMapShards, static_cast<size_t>(std::max<size_t>(
-                                            1, threads.size()))));
+    threadPool.ensureWorkerCount(1);
     std::vector<std::future<void>> futures;
-    futures.reserve(kGlobalEntryMapShards);
-    for (size_t shardIdx = 0; shardIdx < kGlobalEntryMapShards; ++shardIdx)
+    futures.reserve(mGlobalMapShardCount);
+    for (size_t shardIdx = 0; shardIdx < mGlobalMapShardCount; ++shardIdx)
     {
         futures.emplace_back(threadPool.submit(
             [this, shardIdx, &threads, &readWriteSet, skipSorobanDataAndCode]() {
