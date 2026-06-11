@@ -351,8 +351,6 @@ LedgerManagerImpl::ApplyState::startEarlyInMemorySorobanStateUpdate(
     releaseAssert(!mEarlyInMemStateUpdate.valid());
 
     mInMemStateSizeBeforeEarlyUpdate = mInMemorySorobanState.getSize();
-    mEarlyUpdateModifiedSorobanKeys.clear();
-    mEarlyUpdateNewContractCode.clear();
 
     // The TTL entries are shared (read-only) between the byproduct scan and
     // the state application.
@@ -364,6 +362,10 @@ LedgerManagerImpl::ApplyState::startEarlyInMemorySorobanStateUpdate(
     mEarlyUpdateByproducts = std::async(
         std::launch::async, [this, threadShards, sharedTtl]() {
             ZoneScopedN("early update byproduct scan");
+            // Clearing the previous ledger's (large) keyset is deferred to
+            // this worker; it is pure overhead on the apply thread.
+            mEarlyUpdateModifiedSorobanKeys.clear();
+            mEarlyUpdateNewContractCode.clear();
             auto scanOne = [&](std::vector<BucketEntry> const& entries) {
                 mEarlyUpdateModifiedSorobanKeys.reserve(
                     mEarlyUpdateModifiedSorobanKeys.size() + entries.size());
@@ -1799,8 +1801,9 @@ LedgerManagerImpl::applyLedger(LedgerCloseData const& ledgerData,
         auto totalTxApplyTime =
             mApplyState.getMetrics().mTotalTxApply.TimeScope();
 
-        // Subtle: after this call, `header` is invalidated, and is not safe
-        // to use
+        // Subtle: after this point, `header` is deactivated and is not safe
+        // to use (processFeesSeqNums loads the header itself).
+        header.deactivate();
 #ifdef BUILD_TESTS
         phaseStart = std::chrono::steady_clock::now();
 #endif
@@ -2457,7 +2460,11 @@ LedgerManagerImpl::processFeesSeqNums(
     int index = 0;
     try
     {
-        LedgerTxn ltx(ltxOuter);
+        // Write directly into the outer ltx: a child here would re-merge
+        // every charged account on commit for no atomicity benefit (a
+        // failure below is fatal for the apply). The caller deactivates its
+        // header handle before calling (the child's construction used to).
+        auto& ltx = ltxOuter;
         auto header = ltx.loadHeader().current();
         // Cache protocol version to avoid repeated loadHeader() calls
         // in the per-TX loop below.
@@ -2506,6 +2513,17 @@ LedgerManagerImpl::processFeesSeqNums(
         }
         std::vector<std::optional<StagedFee>> stagedFees(allTxs.size());
         int64_t stagedFeeTotal = 0;
+#ifdef BUILD_TESTS
+        auto feesLap = std::chrono::steady_clock::now();
+        auto feesLapMs = [&feesLap]() {
+            auto now = std::chrono::steady_clock::now();
+            double ms =
+                std::chrono::duration<double, std::milli>(now - feesLap)
+                    .count();
+            feesLap = now;
+            return ms;
+        };
+#endif
         if (!ledgerCloseMeta &&
             protocolVersionStartsFrom(cachedLedgerVersion, ProtocolVersion::V_10))
         {
@@ -2513,6 +2531,9 @@ LedgerManagerImpl::processFeesSeqNums(
             // so a staged (soroban) charge can only be order-dependent if a
             // classic tx or fee bump in the same set charges the same
             // account; collect those accounts as the exclusion set.
+#ifdef BUILD_TESTS
+            mLastPhaseTimings.feesPrepMs = feesLapMs();
+#endif
             UnorderedSet<AccountID> conflictSrcs;
             for (auto const& tx : allTxs)
             {
@@ -2580,6 +2601,9 @@ LedgerManagerImpl::processFeesSeqNums(
                 f.get();
             }
         }
+#ifdef BUILD_TESTS
+        mLastPhaseTimings.feesParMs = feesLapMs();
+#endif
 
         bool mergeSeen = false;
         for (auto const& phase : txSet.getPhasesInApplyOrder())
@@ -2668,6 +2692,9 @@ LedgerManagerImpl::processFeesSeqNums(
                 ++index;
             }
         }
+#ifdef BUILD_TESTS
+        mLastPhaseTimings.feesSerialMs = feesLapMs();
+#endif
         if (stagedFeeTotal > 0)
         {
             ltx.loadHeader().current().feePool += stagedFeeTotal;
@@ -2698,7 +2725,6 @@ LedgerManagerImpl::processFeesSeqNums(
             }
         }
 
-        ltx.commit();
     }
     catch (std::exception& e)
     {
@@ -3199,8 +3225,18 @@ LedgerManagerImpl::applySorobanStages(AppConnector& app, AbstractLedgerTxn& ltx,
         // writer (which makes its own sorted copy off the apply thread)
         // rather than waiting on the TTL shard's file write.
         auto threadShardFutures = mPendingLedgerShards;
+#ifdef BUILD_TESTS
+        auto ttlExtractStart = std::chrono::steady_clock::now();
+#endif
         auto ttlEntries = std::make_shared<std::vector<BucketEntry> const>(
             globalParState.extractDirtyTTLShardEntries(app));
+#ifdef BUILD_TESTS
+        auto ttlExtractEnd = std::chrono::steady_clock::now();
+        mLastPhaseTimings.ttlExtractMs =
+            std::chrono::duration<double, std::milli>(ttlExtractEnd -
+                                                      ttlExtractStart)
+                .count();
+#endif
         if (!ttlEntries->empty())
         {
             auto& bm = mApp.getBucketManager();
@@ -3241,6 +3277,12 @@ LedgerManagerImpl::applySorobanStages(AppConnector& app, AbstractLedgerTxn& ltx,
                 std::move(threadShardFutures), std::move(ttlEntries),
                 sorobanConfig, header.ledgerVersion);
         }
+#ifdef BUILD_TESTS
+        mLastPhaseTimings.shardLaunchMs =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - ttlExtractEnd)
+                .count();
+#endif
 
 #ifdef BUILD_TESTS
         auto subStart = std::chrono::steady_clock::now();

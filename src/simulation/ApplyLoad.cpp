@@ -277,6 +277,16 @@ logPhaseTimingsTable(
         &LedgerManagerImpl::LedgerClosePhaseTimings::parApplyStoreCpuMs);
     auto parEvtCpu = extract(
         &LedgerManagerImpl::LedgerClosePhaseTimings::parApplyEvtCpuMs);
+    auto feesPrep =
+        extract(&LedgerManagerImpl::LedgerClosePhaseTimings::feesPrepMs);
+    auto feesPar =
+        extract(&LedgerManagerImpl::LedgerClosePhaseTimings::feesParMs);
+    auto feesSerial =
+        extract(&LedgerManagerImpl::LedgerClosePhaseTimings::feesSerialMs);
+    auto ttlExtract =
+        extract(&LedgerManagerImpl::LedgerClosePhaseTimings::ttlExtractMs);
+    auto shardLaunch =
+        extract(&LedgerManagerImpl::LedgerClosePhaseTimings::shardLaunchMs);
     auto parCommitCpu = extract(
         &LedgerManagerImpl::LedgerClosePhaseTimings::parApplyCommitCpuMs);
     auto parOtherCpu = extract(
@@ -393,6 +403,9 @@ logPhaseTimingsTable(
         {"prepare_txset", computePhaseStats(prepareTxSet)},
         {"prefetch_src_accts", computePhaseStats(prefetchSrc)},
         {"process_fees_seqnums", computePhaseStats(feesSeqNums)},
+        {"| fees_prep", computePhaseStats(feesPrep)},
+        {"| fees_par", computePhaseStats(feesPar)},
+        {"| fees_serial", computePhaseStats(feesSerial)},
         {"apply_transactions", computePhaseStats(applyTxs)},
         {"| setup", computePhaseStats(applyTxSetup)},
         {"| prefetch_tx_data", computePhaseStats(prefetchTxData)},
@@ -436,6 +449,8 @@ logPhaseTimingsTable(
         {"|   commit_to_ltx", computePhaseStats(sorobanCommitLtx)},
         {"|   ~global_par_state", computePhaseStats(sorobanDestroyGlobal)},
         {"|   *** par gap ***", computePhaseStats(parGap)},
+        {"|     ttl_extract", computePhaseStats(ttlExtract)},
+        {"|     shard_launch", computePhaseStats(shardLaunch)},
         {"| apply_seq_classic", computePhaseStats(applySeqClassic)},
         {"| post_tx_set_apply", computePhaseStats(postTxSetApply)},
         {"|   post_tx_refunds", computePhaseStats(postTxRefunds)},

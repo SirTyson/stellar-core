@@ -663,6 +663,15 @@ class LedgerManagerImpl : public LedgerManager
         double parApplyInvokeCpuMs = 0;
         double parApplyStoreCpuMs = 0;
         double parApplyEvtCpuMs = 0;
+        // Sub-timings of processFeesSeqNums: prep (flatten + conflict set),
+        // the parallel staged fee compute, and the serial insert/result loop.
+        double feesPrepMs = 0;
+        double feesParMs = 0;
+        double feesSerialMs = 0;
+        // Unattributed par-gap components: TTL extraction and the shard
+        // writer/updater launches at the end of the stages.
+        double ttlExtractMs = 0;
+        double shardLaunchMs = 0;
         double parApplyCommitCpuMs = 0;
         double parApplyOtherCpuMs = 0;
         double sorobanCheckInvariantsMs = 0;
