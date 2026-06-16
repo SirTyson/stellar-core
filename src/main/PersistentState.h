@@ -36,6 +36,9 @@ class PersistentState
         kLedgerUpgrades,
         kLastSCPDataXDR,
         kTxSet,
+        // Persisted per-quorum-key peering dispositions (see
+        // overlay/QuorumPeering.h)
+        kQuorumPeerDispositions,
         kLastEntry,
     };
 

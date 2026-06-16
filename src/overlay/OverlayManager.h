@@ -50,6 +50,7 @@ namespace stellar
 class PeerAuth;
 class PeerBareAddress;
 class PeerManager;
+class QuorumPeering;
 class SurveyManager;
 struct StellarMessage;
 
@@ -189,6 +190,10 @@ class OverlayManager
 
     // Return the persistent peer manager
     virtual PeerManager& getPeerManager() = 0;
+
+    // Return the automatic quorum peering state (per-quorum-key
+    // dispositions; see overlay/QuorumPeering.h)
+    virtual QuorumPeering& getQuorumPeering() = 0;
 
     virtual SurveyManager& getSurveyManager() = 0;
 

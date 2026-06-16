@@ -161,7 +161,7 @@ Config::Config() : NODE_SEED(SecretKey::random())
     LEDGER_PROTOCOL_MIN_VERSION_INTERNAL_ERROR_REPORT = 18;
 
     OVERLAY_PROTOCOL_MIN_VERSION = 40;
-    OVERLAY_PROTOCOL_VERSION = 41;
+    OVERLAY_PROTOCOL_VERSION = 42;
 
     VERSION_STR = STELLAR_CORE_VERSION;
 
@@ -246,6 +246,8 @@ Config::Config() : NODE_SEED(SecretKey::random())
     TARGET_PEER_CONNECTIONS = 8;
     MAX_PENDING_CONNECTIONS = 500;
     MAX_ADDITIONAL_PEER_CONNECTIONS = -1;
+    AUTOMATIC_QUORUM_PEERING = true;
+    RESERVED_UNPRIVILEGED_INBOUND_SLOTS = 20;
     MAX_OUTBOUND_PENDING_CONNECTIONS = 0;
     MAX_INBOUND_PENDING_CONNECTIONS = 0;
     PEER_AUTHENTICATION_TIMEOUT = 2;
@@ -1378,6 +1380,15 @@ Config::processConfig(std::shared_ptr<cpptoml::table> t)
                      MAX_PENDING_CONNECTIONS = readInt<unsigned short>(
                          item, 1, std::numeric_limits<unsigned short>::max());
                  }},
+                {"AUTOMATIC_QUORUM_PEERING",
+                 [&]() { AUTOMATIC_QUORUM_PEERING = readBool(item); }},
+                {"RESERVED_UNPRIVILEGED_INBOUND_SLOTS",
+                 [&]() {
+                     RESERVED_UNPRIVILEGED_INBOUND_SLOTS =
+                         readInt<unsigned short>(
+                             item, 0,
+                             std::numeric_limits<unsigned short>::max());
+                 }},
                 {"PEER_AUTHENTICATION_TIMEOUT",
                  [&]() {
                      PEER_AUTHENTICATION_TIMEOUT = readInt<unsigned short>(
@@ -2177,6 +2188,34 @@ Config::adjust()
         {
             MAX_ADDITIONAL_PEER_CONNECTIONS =
                 std::numeric_limits<unsigned short>::max();
+        }
+    }
+
+    if (AUTOMATIC_QUORUM_PEERING && NODE_IS_VALIDATOR)
+    {
+        // With automatic quorum peering, mutually trusted quorum peers may
+        // occupy inbound slots; make sure that even with every quorum member
+        // connected there remain at least
+        // RESERVED_UNPRIVILEGED_INBOUND_SLOTS inbound slots that only
+        // unprivileged (non-quorum) peers can use.
+        std::set<NodeID> quorumKeys;
+        LocalNode::forAllNodes(QUORUM_SET, [&](NodeID const& n) {
+            quorumKeys.insert(n);
+            return true;
+        });
+        quorumKeys.erase(NODE_SEED.getPublicKey());
+        int required = static_cast<int>(quorumKeys.size()) +
+                       RESERVED_UNPRIVILEGED_INBOUND_SLOTS;
+        if (MAX_ADDITIONAL_PEER_CONNECTIONS < required &&
+            required <= std::numeric_limits<unsigned short>::max())
+        {
+            LOG_WARNING(DEFAULT_LOG,
+                        "Adjusted MAX_ADDITIONAL_PEER_CONNECTIONS to {} to "
+                        "fit {} quorum peers plus {} reserved unprivileged "
+                        "inbound slots (AUTOMATIC_QUORUM_PEERING)",
+                        required, quorumKeys.size(),
+                        RESERVED_UNPRIVILEGED_INBOUND_SLOTS);
+            MAX_ADDITIONAL_PEER_CONNECTIONS = required;
         }
     }
 

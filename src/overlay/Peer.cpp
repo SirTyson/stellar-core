@@ -23,6 +23,7 @@
 #include "overlay/OverlayMetrics.h"
 #include "overlay/PeerAuth.h"
 #include "overlay/PeerManager.h"
+#include "overlay/QuorumPeering.h"
 #include "overlay/SurveyDataManager.h"
 #include "overlay/SurveyManager.h"
 #include "overlay/TxAdverts.h"
@@ -544,7 +545,16 @@ Peer::sendAuth()
     ZoneScoped;
     StellarMessage msg;
     msg.type(AUTH);
-    msg.auth().flags = AUTH_MSG_FLAG_FLOW_CONTROL_BYTES_REQUESTED;
+    int flags = AUTH_MSG_FLAG_FLOW_CONTROL_BYTES_REQUESTED;
+    if (mWeTrustRemote &&
+        mRemoteOverlayVersion >= FIRST_VERSION_SUPPORTING_QUORUM_PEERING)
+    {
+        // Tell the peer its key is in our quorum set, so it can classify
+        // this connection as mutually trusted or one-sided and remember the
+        // verdict (see overlay/QuorumPeering.h).
+        flags |= AUTH_MSG_FLAG_PEER_IN_QUORUM;
+    }
+    msg.auth().flags = flags;
     auto msgPtr = std::make_shared<StellarMessage const>(msg);
     sendMessage(msgPtr);
 }
@@ -1190,6 +1200,19 @@ Peer::recvSendMore(StellarMessage const& msg)
 {
     releaseAssert(threadIsMain());
     releaseAssert(mFlowControl);
+
+    // The remote only starts flow control after it has admitted us, so its
+    // first SEND_MORE is the signal that this dial fully succeeded: reset
+    // the address's connection backoff now (and not earlier -- see
+    // updatePeerRecordAfterAuthentication).
+    if (mRole == WE_CALLED_REMOTE && !mPeerRecordResetDone &&
+        !getAddress().isEmpty())
+    {
+        mAppConnector.getOverlayManager().getPeerManager().update(
+            getAddress(), PeerManager::BackOffUpdate::RESET);
+        mPeerRecordResetDone = true;
+    }
+
     mFlowControl->maybeReleaseCapacity(msg);
     maybeExecuteInBackground(
         "Peer::recvSendMore maybeSendNextBatch",
@@ -1719,8 +1742,23 @@ Peer::recvError(StellarMessage const& msg)
     case ERR_LOAD:
         codeStr = "ERR_LOAD";
         break;
+    case ERR_PEER_UNPRIVILEGED:
+        codeStr = "ERR_PEER_UNPRIVILEGED";
+        break;
     default:
         break;
+    }
+
+    if (msg.error().code == ERR_PEER_UNPRIVILEGED &&
+        mRole == WE_CALLED_REMOTE && !getAddress().isEmpty())
+    {
+        // The peer is alive but has no room for us and will never prioritize
+        // us: back off harder than for an ordinary connection failure. (No
+        // RESET happened for this dial -- see recvSendMore -- so backoff
+        // keeps growing across polite rejections, and persists in the peers
+        // DB across restarts.)
+        mAppConnector.getOverlayManager().getPeerManager().update(
+            getAddress(), PeerManager::BackOffUpdate::INCREASE);
     }
 
     std::string msgStr;
@@ -1766,14 +1804,39 @@ Peer::updatePeerRecordAfterAuthentication()
     releaseAssert(threadIsMain());
     releaseAssert(!getAddress().isEmpty());
 
-    if (mRole == WE_CALLED_REMOTE)
-    {
-        mAppConnector.getOverlayManager().getPeerManager().update(
-            getAddress(), PeerManager::BackOffUpdate::RESET);
-    }
-
+    // NB: the connection backoff is NOT reset here. A completed handshake
+    // can still end in rejection (no slots), and rejected dials must keep
+    // accumulating backoff -- otherwise a dialer facing a full peer re-knocks
+    // every few seconds forever. The reset happens on the remote's first
+    // SEND_MORE_EXTENDED, which is only sent after admission (see
+    // recvSendMore).
     CLOG_DEBUG(Overlay, "successful handshake with {}@{}",
                mAppConnector.getConfig().toShortString(mPeerID), toString());
+}
+
+void
+Peer::updatePeerRecordType()
+{
+    releaseAssert(threadIsMain());
+    releaseAssert(!getAddress().isEmpty());
+
+    PeerType type;
+    if (mAppConnector.getOverlayManager().isPreferred(this) ||
+        isMutuallyTrustedPeer())
+    {
+        type = PeerType::PREFERRED;
+    }
+    else if (mRole == WE_CALLED_REMOTE)
+    {
+        type = PeerType::OUTBOUND;
+    }
+    else
+    {
+        type = PeerType::INBOUND;
+    }
+    mAppConnector.getOverlayManager().getPeerManager().update(
+        getAddress(), type,
+        /* preferredTypeKnown */ true);
 }
 
 void
@@ -1808,6 +1871,9 @@ Peer::recvHello(Hello const& elo)
     mRemoteOverlayVersion = elo.overlayVersion;
     mRemoteVersion = elo.versionStr;
     mPeerID = elo.peerID;
+    mWeTrustRemote = mAppConnector.getOverlayManager()
+                         .getQuorumPeering()
+                         .isTrustedKey(mPeerID);
     mFlowControl->setPeerID(mPeerID);
     mRecvNonce = elo.nonce;
     mHmac.setSendMackey(peerAuth.getSendingMacKey(elo.cert.pubkey, mSendNonce,
@@ -1943,16 +2009,41 @@ Peer::recvAuth(StellarMessage const& msg)
 
     setState(guard, GOT_AUTH);
 
+    // The PEER_IN_QUORUM bit tells us whether the peer has our key in its
+    // quorum set; parse it before any admission/classification decisions.
+    int const authFlags = msg.auth().flags;
+    mRemoteTrustsUs = (authFlags & AUTH_MSG_FLAG_PEER_IN_QUORUM) != 0;
+
     if (mRole == REMOTE_CALLED_US)
     {
         sendAuth();
         sendPeers();
     }
 
-    if (msg.auth().flags != AUTH_MSG_FLAG_FLOW_CONTROL_BYTES_REQUESTED)
+    if ((authFlags & ~AUTH_MSG_FLAG_PEER_IN_QUORUM) !=
+        AUTH_MSG_FLAG_FLOW_CONTROL_BYTES_REQUESTED)
     {
         sendErrorAndDrop(ERR_CONF, "flow control bytes disabled");
         return;
+    }
+
+    // If the peer is in our quorum set, record what it told us about our
+    // place in its quorum -- whether this handshake ends in admission or
+    // not. This is the node's one-time self-classification memory (see
+    // overlay/QuorumPeering.h).
+    if (mWeTrustRemote)
+    {
+        auto staleAddress =
+            mAppConnector.getOverlayManager().getQuorumPeering().resolve(
+                mPeerID, mRemoteTrustsUs, getAddress());
+        if (staleAddress)
+        {
+            // The key moved to a new address: stop aggressively redialing
+            // the old one.
+            mAppConnector.getOverlayManager().getPeerManager().update(
+                *staleAddress, PeerType::OUTBOUND,
+                /* preferredTypeKnown */ true);
+        }
     }
 
     updatePeerRecordAfterAuthentication();
@@ -1960,9 +2051,26 @@ Peer::recvAuth(StellarMessage const& msg)
     auto self = shared_from_this();
     if (!mAppConnector.getOverlayManager().acceptAuthenticatedPeer(self))
     {
-        sendErrorAndDrop(ERR_LOAD, "peer rejected");
+        if (!isMutuallyTrustedPeer() &&
+            mRemoteOverlayVersion >= FIRST_VERSION_SUPPORTING_QUORUM_PEERING)
+        {
+            // Tell the peer it is not prioritized here so it backs off hard
+            // instead of retrying like we were just transiently overloaded.
+            sendErrorAndDrop(ERR_PEER_UNPRIVILEGED,
+                             "no slots available for unprivileged peers");
+        }
+        else
+        {
+            sendErrorAndDrop(ERR_LOAD, "peer rejected");
+        }
         return;
     }
+
+    // Now that the connection is admitted and fully classified, finalize the
+    // peer record's type: mutually trusted quorum peers are pinned PREFERRED
+    // so we reconnect to them aggressively. This also demotes stale
+    // PREFERRED typing left behind by an address's previous occupant.
+    updatePeerRecordType();
 
     uint32_t fcBytes =
         mAppConnector.getOverlayManager().getFlowControlBytesTotal();

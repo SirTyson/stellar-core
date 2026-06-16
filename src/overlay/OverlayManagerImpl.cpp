@@ -77,6 +77,7 @@ OverlayManagerImpl::PeersList::PeersList(OverlayManagerImpl& overlayManager,
                                          std::string const& directionString,
                                          std::string const& cancelledName,
                                          int maxAuthenticatedCount,
+                                         bool inbound,
                                          std::shared_ptr<SurveyManager> sm)
     : mConnectionsAttempted(metricsRegistry.NewMeter(
           {"overlay", directionString, "attempt"}, "connection"))
@@ -89,8 +90,55 @@ OverlayManagerImpl::PeersList::PeersList(OverlayManagerImpl& overlayManager,
     , mOverlayManager(overlayManager)
     , mDirectionString(directionString)
     , mMaxAuthenticatedCount(maxAuthenticatedCount)
+    , mInbound(inbound)
     , mSurveyManager(sm)
 {
+}
+
+size_t
+OverlayManagerImpl::PeersList::countMutuallyTrusted() const
+{
+    return std::count_if(
+        std::begin(mAuthenticated), std::end(mAuthenticated),
+        [&](auto const& p) {
+            return mOverlayManager.isMutuallyTrusted(p.second.get());
+        });
+}
+
+size_t
+OverlayManagerImpl::PeersList::trustedCapacity() const
+{
+    auto numTrusted = mOverlayManager.mQuorumPeering.numTrustedKeys();
+    if (mInbound)
+    {
+        size_t reserve = mOverlayManager.mApp.getConfig()
+                             .RESERVED_UNPRIVILEGED_INBOUND_SLOTS;
+        size_t available = mMaxAuthenticatedCount > reserve
+                               ? mMaxAuthenticatedCount - reserve
+                               : 0;
+        return std::min(numTrusted, available);
+    }
+    return numTrusted;
+}
+
+bool
+OverlayManagerImpl::PeersList::evictNonPrioritized(Peer::pointer forPeer)
+{
+    for (auto victim : mAuthenticated)
+    {
+        if (!mOverlayManager.isPrioritized(victim.second.get()))
+        {
+            CLOG_INFO(Overlay,
+                      "Evicting non-prioritized {} peer {} for prioritized "
+                      "peer {}",
+                      mDirectionString, victim.second->toString(),
+                      forPeer->toString());
+            victim.second->sendErrorAndDrop(ERR_LOAD,
+                                            "preferred peer selected instead");
+            return true;
+        }
+    }
+    return false;
 }
 
 Peer::pointer
@@ -212,37 +260,57 @@ OverlayManagerImpl::PeersList::acceptAuthenticatedPeer(Peer::pointer peer)
 
     CLOG_TRACE(Overlay, "Trying to promote peer to authenticated {}",
                peer->toString());
-    if (mOverlayManager.isPreferred(peer.get()))
+
+    bool const configPreferred = mOverlayManager.isPreferred(peer.get());
+    bool const mutuallyTrusted = mOverlayManager.isMutuallyTrusted(peer.get());
+
+    // Inbound, trusted quorum peers fit within mMaxAuthenticatedCount (which
+    // Config::adjust guarantees is large enough to also leave
+    // RESERVED_UNPRIVILEGED_INBOUND_SLOTS for everyone else); outbound, they
+    // get their own budget on top of TARGET_PEER_CONNECTIONS so the quorum
+    // mesh never competes with regular outbound peers.
+    size_t const totalCapacity = mInbound
+                                     ? mMaxAuthenticatedCount
+                                     : mMaxAuthenticatedCount +
+                                           trustedCapacity();
+
+    if (configPreferred)
     {
-        if (mAuthenticated.size() < mMaxAuthenticatedCount)
+        // Operator-configured preferred peers keep their historical,
+        // unconditional rights: always admitted, evicting an arbitrary
+        // non-prioritized peer when at capacity.
+        if (mAuthenticated.size() < totalCapacity || evictNonPrioritized(peer))
         {
             return moveToAuthenticated(peer);
         }
-
-        for (auto victim : mAuthenticated)
+    }
+    else if (mutuallyTrusted)
+    {
+        // Mutually trusted quorum peers are admitted within their own
+        // budget; inbound, that budget is capped so the reserved
+        // unprivileged slots can never be filled (or evicted into) by them.
+        if (countMutuallyTrusted() < trustedCapacity() &&
+            (mAuthenticated.size() < totalCapacity ||
+             evictNonPrioritized(peer)))
         {
-            if (!mOverlayManager.isPreferred(victim.second.get()))
-            {
-                CLOG_INFO(
-                    Overlay,
-                    "Evicting non-preferred {} peer {} for preferred peer {}",
-                    mDirectionString, victim.second->toString(),
-                    peer->toString());
-                victim.second->sendErrorAndDrop(
-                    ERR_LOAD, "preferred peer selected instead");
-                return moveToAuthenticated(peer);
-            }
+            return moveToAuthenticated(peer);
+        }
+    }
+    else if (!mOverlayManager.mApp.getConfig().PREFERRED_PEERS_ONLY)
+    {
+        // Regular peers: inbound they may use any free slot; outbound they
+        // only compete for TARGET_PEER_CONNECTIONS slots (trusted peers do
+        // not count against that target).
+        size_t used = mInbound ? mAuthenticated.size()
+                               : mAuthenticated.size() - countMutuallyTrusted();
+        if (used < mMaxAuthenticatedCount)
+        {
+            return moveToAuthenticated(peer);
         }
     }
 
-    if (!mOverlayManager.mApp.getConfig().PREFERRED_PEERS_ONLY &&
-        mAuthenticated.size() < mMaxAuthenticatedCount)
-    {
-        return moveToAuthenticated(peer);
-    }
-
     CLOG_INFO(Overlay,
-              "Non preferred {} authenticated peer {} rejected because all "
+              "Non prioritized {} authenticated peer {} rejected because all "
               "available slots are taken.",
               mDirectionString, peer->toString());
     CLOG_INFO(
@@ -308,6 +376,7 @@ OverlayManagerImpl::OverlayManagerImpl(Application& app)
     , mPeerManager(app)
     , mDoor(mApp)
     , mAuth(mApp)
+    , mQuorumPeering(app)
     , mShuttingDown(false)
     , mOverlayMetrics(app)
     , mMessageCache(0xffff)
@@ -318,9 +387,10 @@ OverlayManagerImpl::OverlayManagerImpl(Application& app)
     , mSurveyManager(make_shared<SurveyManager>(app))
     , mInboundPeers(*this, mApp.getMetrics(), "inbound", "reject",
                     mApp.getConfig().MAX_ADDITIONAL_PEER_CONNECTIONS,
-                    mSurveyManager)
+                    /* inbound */ true, mSurveyManager)
     , mOutboundPeers(*this, mApp.getMetrics(), "outbound", "cancel",
-                     mApp.getConfig().TARGET_PEER_CONNECTIONS, mSurveyManager)
+                     mApp.getConfig().TARGET_PEER_CONNECTIONS,
+                     /* inbound */ false, mSurveyManager)
     , mResolvingPeersWithBackoff(true)
     , mResolvingPeersRetryCount(0)
     , mScheduledMessages(100000)
@@ -340,6 +410,15 @@ OverlayManagerImpl::~OverlayManagerImpl()
 void
 OverlayManagerImpl::start()
 {
+    mQuorumPeering.load();
+    // Re-seed peer records for pinned quorum addresses, in case the peers
+    // table was wiped independently of the disposition store.
+    for (auto const& entry : mQuorumPeering.getMutualEntries())
+    {
+        mPeerManager.update(entry.second, PeerType::PREFERRED,
+                            /* preferredTypeKnown */ true);
+    }
+
     mDoor.start();
     mTimer.expires_from_now(std::chrono::seconds(2));
 
@@ -620,8 +699,7 @@ OverlayManagerImpl::updateTimerAndMaybeDropRandomPeer(bool shouldDrop)
                 std::copy_if(std::begin(allPeers), std::end(allPeers),
                              std::back_inserter(nonPreferredPeers),
                              [&](auto const& peer) {
-                                 return !mApp.getOverlayManager().isPreferred(
-                                     peer.second.get());
+                                 return !isPrioritized(peer.second.get());
                              });
                 if (!nonPreferredPeers.empty())
                 {
@@ -732,6 +810,10 @@ OverlayManagerImpl::tick()
                                       getOutboundAuthenticatedPeers(),
                                       mApp.getConfig());
 
+    // Invalidate pinned quorum addresses that went stale, so the hunt
+    // resumes for the corresponding keys (e.g. a quorum member changed IP).
+    invalidateStaleQuorumPeers();
+
     auto availablePendingSlots = availableOutboundPendingSlots();
     if (availablePendingSlots == 0)
     {
@@ -741,12 +823,19 @@ OverlayManagerImpl::tick()
 
     auto availableAuthenticatedSlots = availableOutboundAuthenticatedSlots();
 
-    // First, connect to preferred peers
+    // First, connect to preferred peers (operator-configured preferred peers
+    // and pinned mutually-trusted quorum peers, both stored with type
+    // PREFERRED)
     {
         // in that context, an available slot is either a free slot or a non
-        // preferred one
-        int preferredToConnect =
-            availableAuthenticatedSlots + nonPreferredAuthenticatedCount();
+        // preferred one; missing quorum peers additionally get their own
+        // budget on top of the regular outbound target
+        int trustedDeficit = std::max(
+            0, static_cast<int>(mQuorumPeering.numTrustedKeys()) -
+                   static_cast<int>(countConnectedMutuallyTrusted()));
+        int preferredToConnect = availableAuthenticatedSlots +
+                                 nonPreferredAuthenticatedCount() +
+                                 trustedDeficit;
         preferredToConnect =
             std::min(availablePendingSlots, preferredToConnect);
 
@@ -790,7 +879,25 @@ OverlayManagerImpl::tick()
     // Finally, attempt to promote some inbound connections to outbound
     if (availablePendingSlots > 0)
     {
-        connectTo(availablePendingSlots, PeerType::INBOUND);
+        auto pendingUsedByPromotion =
+            connectTo(availablePendingSlots, PeerType::INBOUND);
+        availablePendingSlots -= pendingUsedByPromotion;
+    }
+
+    // Quorum hunting: while some quorum keys have UNKNOWN dispositions,
+    // probe a few extra candidates beyond the regular outbound target. Each
+    // completed handshake resolves the disposition of whatever key it
+    // reveals; non-quorum probes are dropped again by the slot accounting in
+    // acceptAuthenticatedPeer. The probe rate decays if the hunt stops
+    // making progress (see QuorumPeering::probesThisTick).
+    if (availablePendingSlots > 0)
+    {
+        auto probes = mQuorumPeering.probesThisTick();
+        if (probes > 0)
+        {
+            connectTo(std::min(availablePendingSlots, probes),
+                      PeerType::OUTBOUND);
+        }
     }
 }
 
@@ -820,10 +927,14 @@ OverlayManagerImpl::availableOutboundAuthenticatedSlots() const
             ? OverlayManager::MIN_INBOUND_FACTOR
             : mApp.getConfig().TARGET_PEER_CONNECTIONS;
 
-    if (mOutboundPeers.mAuthenticated.size() < adjustedTarget)
+    // Mutually trusted quorum peers have their own budget and do not count
+    // against the regular outbound target.
+    auto regularCount = mOutboundPeers.mAuthenticated.size() -
+                        mOutboundPeers.countMutuallyTrusted();
+
+    if (regularCount < adjustedTarget)
     {
-        return static_cast<int>(adjustedTarget -
-                                mOutboundPeers.mAuthenticated.size());
+        return static_cast<int>(adjustedTarget - regularCount);
     }
     else
     {
@@ -837,7 +948,7 @@ OverlayManagerImpl::nonPreferredAuthenticatedCount() const
     unsigned short nonPreferredCount{0};
     for (auto const& p : mOutboundPeers.mAuthenticated)
     {
-        if (!isPreferred(p.second.get()))
+        if (!isPrioritized(p.second.get()))
         {
             nonPreferredCount++;
         }
@@ -909,9 +1020,12 @@ bool
 OverlayManagerImpl::isPossiblyPreferred(std::string const& ip) const
 {
     return std::any_of(
-        std::begin(mConfigurationPreferredPeers),
-        std::end(mConfigurationPreferredPeers),
-        [&](PeerBareAddress const& address) { return address.getIP() == ip; });
+               std::begin(mConfigurationPreferredPeers),
+               std::end(mConfigurationPreferredPeers),
+               [&](PeerBareAddress const& address) {
+                   return address.getIP() == ip;
+               }) ||
+           mQuorumPeering.isMutualAddressIP(ip);
 }
 
 bool
@@ -1094,6 +1208,69 @@ OverlayManagerImpl::isPreferred(Peer* peer) const
 
     CLOG_TRACE(Overlay, "Peer {} is not preferred", pstr);
     return false;
+}
+
+bool
+OverlayManagerImpl::isMutuallyTrusted(Peer* peer) const
+{
+    bool trusted = false;
+    peer->doIfAuthenticated(
+        [&]() { trusted = peer->isMutuallyTrustedPeer(); });
+    return trusted;
+}
+
+bool
+OverlayManagerImpl::isPrioritized(Peer* peer) const
+{
+    return isPreferred(peer) || isMutuallyTrusted(peer);
+}
+
+size_t
+OverlayManagerImpl::countConnectedMutuallyTrusted() const
+{
+    return mInboundPeers.countMutuallyTrusted() +
+           mOutboundPeers.countMutuallyTrusted();
+}
+
+void
+OverlayManagerImpl::invalidateStaleQuorumPeers()
+{
+    ZoneScoped;
+    // A MUTUAL quorum peer that is disconnected and whose pinned address
+    // keeps failing has likely changed address (and lost its own state, or
+    // it would have redialed us). Drop it back to UNKNOWN so the hunt
+    // resumes, and stop aggressively redialing the stale address.
+    constexpr size_t QUORUM_PEER_STALE_FAILURE_CUTOFF = 12;
+
+    auto entries = mQuorumPeering.getMutualEntries();
+    if (entries.empty())
+    {
+        return;
+    }
+    auto connected = getAuthenticatedPeers();
+    for (auto const& entry : entries)
+    {
+        if (connected.find(entry.first) != connected.end())
+        {
+            continue;
+        }
+        auto record = mPeerManager.load(entry.second);
+        if (!record.second ||
+            record.first.mNumFailures >= QUORUM_PEER_STALE_FAILURE_CUTOFF)
+        {
+            CLOG_INFO(Overlay,
+                      "Quorum peer {} is unreachable at pinned address {}; "
+                      "resuming hunt for it",
+                      mApp.getConfig().toShortString(entry.first),
+                      entry.second.toString());
+            mQuorumPeering.invalidate(entry.first);
+            if (record.second)
+            {
+                mPeerManager.update(entry.second, PeerType::OUTBOUND,
+                                    /* preferredTypeKnown */ true);
+            }
+        }
+    }
 }
 
 static xdr::opaque_array<32> const TX_BATCH_HASH = [] {
@@ -1315,6 +1492,12 @@ PeerManager&
 OverlayManagerImpl::getPeerManager()
 {
     return mPeerManager;
+}
+
+QuorumPeering&
+OverlayManagerImpl::getQuorumPeering()
+{
+    return mQuorumPeering;
 }
 
 SurveyManager&

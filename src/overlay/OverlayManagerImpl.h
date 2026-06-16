@@ -14,6 +14,7 @@
 #include "overlay/Floodgate.h"
 #include "overlay/OverlayManager.h"
 #include "overlay/OverlayMetrics.h"
+#include "overlay/QuorumPeering.h"
 #include "overlay/SurveyManager.h"
 #include "overlay/TxDemandsManager.h"
 #include "util/Timer.h"
@@ -48,7 +49,7 @@ class OverlayManagerImpl : public OverlayManager
                            MetricsRegistry& metricsRegistry,
                            std::string const& directionString,
                            std::string const& cancelledName,
-                           int maxAuthenticatedCount,
+                           int maxAuthenticatedCount, bool inbound,
                            std::shared_ptr<SurveyManager> sm);
 
         medida::Meter& mConnectionsAttempted;
@@ -59,6 +60,7 @@ class OverlayManagerImpl : public OverlayManager
         OverlayManagerImpl& mOverlayManager;
         std::string mDirectionString;
         size_t mMaxAuthenticatedCount;
+        bool const mInbound;
         std::shared_ptr<SurveyManager> mSurveyManager;
 
         std::vector<Peer::pointer> mPending;
@@ -73,6 +75,19 @@ class OverlayManagerImpl : public OverlayManager
         bool moveToAuthenticated(Peer::pointer peer);
         bool acceptAuthenticatedPeer(Peer::pointer peer);
         void shutdown();
+
+        // Number of authenticated peers that are mutually trusted quorum
+        // peers.
+        size_t countMutuallyTrusted() const;
+        // Slots available to mutually trusted quorum peers. Inbound, this is
+        // capped so that RESERVED_UNPRIVILEGED_INBOUND_SLOTS slots remain
+        // that trusted peers can neither fill nor evict into; outbound,
+        // trusted peers get their own budget on top of
+        // TARGET_PEER_CONNECTIONS.
+        size_t trustedCapacity() const;
+        // Evict an authenticated peer that is neither preferred nor mutually
+        // trusted; returns false if there is no such victim.
+        bool evictNonPrioritized(Peer::pointer forPeer);
     };
 
     std::shared_ptr<int> mLiveInboundPeersCounter;
@@ -82,6 +97,7 @@ class OverlayManagerImpl : public OverlayManager
     PeerManager mPeerManager;
     PeerDoor mDoor;
     PeerAuth mAuth;
+    QuorumPeering mQuorumPeering;
     std::atomic<bool> mShuttingDown;
 
     OverlayMetrics mOverlayMetrics;
@@ -130,6 +146,12 @@ class OverlayManagerImpl : public OverlayManager
 
     bool acceptAuthenticatedPeer(Peer::pointer peer) override;
     bool isPreferred(Peer* peer) const override;
+    // True when the peer is a quorum member that confirmed mutual trust
+    // during the handshake (see QuorumPeering).
+    bool isMutuallyTrusted(Peer* peer) const;
+    // Preferred (operator config) or mutually trusted (automatic quorum
+    // peering): peers we always want to stay connected to.
+    bool isPrioritized(Peer* peer) const;
     std::vector<Peer::pointer> const& getInboundPendingPeers() const override;
     std::vector<Peer::pointer> const& getOutboundPendingPeers() const override;
     std::vector<Peer::pointer> getPendingPeers() const override;
@@ -157,6 +179,8 @@ class OverlayManagerImpl : public OverlayManager
     PeerAuth& getPeerAuth() override;
 
     PeerManager& getPeerManager() override;
+
+    QuorumPeering& getQuorumPeering() override;
 
     SurveyManager& getSurveyManager() override;
 
@@ -206,6 +230,13 @@ class OverlayManagerImpl : public OverlayManager
 
     int availableOutboundAuthenticatedSlots() const;
     int nonPreferredAuthenticatedCount() const;
+
+    // Number of connected (inbound or outbound) mutually trusted quorum
+    // peers.
+    size_t countConnectedMutuallyTrusted() const;
+    // Invalidate MUTUAL quorum dispositions whose pinned address keeps
+    // failing while the key is disconnected, so hunting resumes for them.
+    void invalidateStaleQuorumPeers();
 
     virtual bool isPossiblyPreferred(std::string const& ip) const override;
     virtual bool haveSpaceForConnection(std::string const& ip) const override;

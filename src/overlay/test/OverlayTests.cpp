@@ -97,6 +97,100 @@ TEST_CASE("loopback peer hello", "[overlay][connections]")
     testutil::shutdownWorkScheduler(*app1);
 }
 
+TEST_CASE("automatic quorum peering", "[overlay][connections][quorumpeering]")
+{
+    VirtualClock clock;
+    auto cfg1 = getTestConfig(0);
+    auto cfg2 = getTestConfig(1);
+    auto key1 = cfg1.NODE_SEED.getPublicKey();
+    auto key2 = cfg2.NODE_SEED.getPublicKey();
+
+    SECTION("mutual quorum members pin each other")
+    {
+        cfg1.QUORUM_SET.validators.push_back(key2);
+        cfg2.QUORUM_SET.validators.push_back(key1);
+
+        auto app1 = createTestApplication(clock, cfg1);
+        auto app2 = createTestApplication(clock, cfg2);
+
+        REQUIRE(app1->getOverlayManager().getQuorumPeering().hasUnknownKeys());
+
+        LoopbackPeerConnection conn(*app1, *app2);
+        testutil::crankSome(clock);
+
+        REQUIRE(conn.getInitiator()->isAuthenticatedForTesting());
+        REQUIRE(conn.getAcceptor()->isAuthenticatedForTesting());
+        REQUIRE(conn.getInitiator()->isMutuallyTrustedPeer());
+        REQUIRE(conn.getAcceptor()->isMutuallyTrustedPeer());
+
+        REQUIRE(app1->getOverlayManager().getQuorumPeering().getDisposition(
+                    key2) == QuorumPeering::Disposition::MUTUAL);
+        REQUIRE(app2->getOverlayManager().getQuorumPeering().getDisposition(
+                    key1) == QuorumPeering::Disposition::MUTUAL);
+        REQUIRE(
+            !app1->getOverlayManager().getQuorumPeering().hasUnknownKeys());
+        REQUIRE(
+            !app2->getOverlayManager().getQuorumPeering().hasUnknownKeys());
+
+        // Both sides pin the other's address as PREFERRED, handing the mesh
+        // edge to the existing priority reconnect machinery.
+        REQUIRE(knowsAs(*app1, *app2, PeerType::PREFERRED));
+        REQUIRE(knowsAs(*app2, *app1, PeerType::PREFERRED));
+
+        // Dispositions are persisted: a fresh QuorumPeering instance loads
+        // the MUTUAL verdict back, so a restart would not re-hunt.
+        QuorumPeering reloaded(*app1);
+        reloaded.load();
+        REQUIRE(reloaded.getDisposition(key2) ==
+                QuorumPeering::Disposition::MUTUAL);
+        REQUIRE(!reloaded.hasUnknownKeys());
+
+        testutil::shutdownWorkScheduler(*app2);
+        testutil::shutdownWorkScheduler(*app1);
+    }
+
+    SECTION("one-sided trust is remembered as non-mutual")
+    {
+        // app1 has app2 in its quorum set but not vice versa: app1 must
+        // learn that the relationship is one-sided even though the
+        // connection succeeds (a "polite acceptance"), and must not pin
+        // app2's address.
+        cfg1.QUORUM_SET.validators.push_back(key2);
+
+        auto app1 = createTestApplication(clock, cfg1);
+        auto app2 = createTestApplication(clock, cfg2);
+
+        REQUIRE(app1->getOverlayManager().getQuorumPeering().hasUnknownKeys());
+
+        LoopbackPeerConnection conn(*app1, *app2);
+        testutil::crankSome(clock);
+
+        REQUIRE(conn.getInitiator()->isAuthenticatedForTesting());
+        REQUIRE(conn.getAcceptor()->isAuthenticatedForTesting());
+        REQUIRE(!conn.getInitiator()->isMutuallyTrustedPeer());
+        REQUIRE(!conn.getAcceptor()->isMutuallyTrustedPeer());
+
+        REQUIRE(app1->getOverlayManager().getQuorumPeering().getDisposition(
+                    key2) == QuorumPeering::Disposition::NON_MUTUAL);
+        REQUIRE(
+            !app1->getOverlayManager().getQuorumPeering().hasUnknownKeys());
+
+        // Recorded as a regular outbound peer, not pinned.
+        REQUIRE(knowsAsOutbound(*app1, *app2));
+
+        // The non-mutual verdict survives a reload: no re-hunting on
+        // restart.
+        QuorumPeering reloaded(*app1);
+        reloaded.load();
+        REQUIRE(reloaded.getDisposition(key2) ==
+                QuorumPeering::Disposition::NON_MUTUAL);
+        REQUIRE(!reloaded.hasUnknownKeys());
+
+        testutil::shutdownWorkScheduler(*app2);
+        testutil::shutdownWorkScheduler(*app1);
+    }
+}
+
 TEST_CASE("loopback peer with 0 port", "[overlay][connections]")
 {
     VirtualClock clock;

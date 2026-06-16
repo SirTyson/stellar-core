@@ -83,6 +83,11 @@ class Peer : public std::enable_shared_from_this<Peer>,
 
     typedef std::shared_ptr<Peer> pointer;
 
+    // First overlay protocol version that understands
+    // AUTH_MSG_FLAG_PEER_IN_QUORUM and ERR_PEER_UNPRIVILEGED.
+    static constexpr uint32_t
+        FIRST_VERSION_SUPPORTING_QUORUM_PEERING = 42;
+
     enum PeerState
     {
         CONNECTING = 0,
@@ -277,6 +282,17 @@ class Peer : public std::enable_shared_from_this<Peer>,
     QueryInfo mSCPStateQueryInfo;
     bool mPeersReceived{false};
 
+    // Automatic quorum peering handshake state (see overlay/QuorumPeering.h):
+    // whether the remote's key is in our quorum set (known after HELLO), and
+    // whether the remote's AUTH flags claimed our key is in its quorum set.
+    bool mWeTrustRemote{false};
+    bool mRemoteTrustsUs{false};
+    // Whether we already reset this address's connection backoff; only done
+    // once the remote has *admitted* us (signalled by its first
+    // SEND_MORE_EXTENDED), so handshakes that end in rejection keep
+    // accumulating backoff.
+    bool mPeerRecordResetDone{false};
+
     static Hash pingIDfromTimePoint(VirtualClock::time_point const& tp);
     void pingPeer();
     void maybeProcessPingResponse(Hash const& id);
@@ -288,6 +304,7 @@ class Peer : public std::enable_shared_from_this<Peer>,
     virtual void recvError(StellarMessage const& msg);
     void updatePeerRecordAfterEcho();
     void updatePeerRecordAfterAuthentication();
+    void updatePeerRecordType();
     void recvAuth(StellarMessage const& msg);
     void recvDontHave(StellarMessage const& msg);
     void recvHello(Hello const& elo);
@@ -417,6 +434,16 @@ class Peer : public std::enable_shared_from_this<Peer>,
     {
         releaseAssert(threadIsMain());
         return mPeerID;
+    }
+
+    // True when this peer's key is in our quorum set AND the peer's AUTH
+    // flags confirmed that our key is in its quorum set (see
+    // overlay/QuorumPeering.h). Only meaningful once authenticated.
+    bool
+    isMutuallyTrustedPeer() const
+    {
+        releaseAssert(threadIsMain());
+        return mWeTrustRemote && mRemoteTrustsUs;
     }
 
     std::string const& toString();

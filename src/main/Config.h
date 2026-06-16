@@ -729,6 +729,20 @@ class Config : public std::enable_shared_from_this<Config>
     // Whether to exclude peers that are not preferred.
     bool PREFERRED_PEERS_ONLY;
 
+    // Automatically treat validators from the local QUORUM_SET as high
+    // priority peers when they confirm (during the connection handshake)
+    // that the relationship is mutual: pin their addresses, reconnect to
+    // them aggressively, and hunt for the ones whose addresses are unknown.
+    // Only active when NODE_IS_VALIDATOR is set. See overlay/QuorumPeering.h.
+    bool AUTOMATIC_QUORUM_PEERING;
+
+    // Minimum number of inbound connection slots that mutually trusted
+    // quorum peers can neither occupy nor evict into, guaranteeing room for
+    // watcher nodes. When AUTOMATIC_QUORUM_PEERING is active,
+    // MAX_ADDITIONAL_PEER_CONNECTIONS is raised (if needed) to the quorum
+    // size plus this reserve.
+    unsigned short RESERVED_UNPRIVILEGED_INBOUND_SLOTS;
+
     // thread-management config
     int WORKER_THREADS;
 
