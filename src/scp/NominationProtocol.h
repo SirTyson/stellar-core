@@ -11,6 +11,7 @@
 #include <set>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace stellar
 {
@@ -40,6 +41,13 @@ class NominationProtocol
     // the value from the previous slot
     Value mPreviousValue;
 
+    // The seed used for leader election this slot. Leader selection is
+    // pipelined so that slot N's leaders are seeded by hash(N-2) rather than
+    // the immediately preceding value, which makes the schedule knowable a
+    // full ledger ahead of time (see docs/direct-leader-flooding.md). This is
+    // constant across rounds for a given slot (only mRoundNumber varies).
+    Value mLeaderElectionSeed;
+
     bool isNewerStatement(NodeID const& nodeID, SCPNomination const& st);
 
     // returns true if 'p' is a subset of 'v'
@@ -67,14 +75,8 @@ class NominationProtocol
     // updates the set of nodes that have priority over the others
     void updateRoundLeaders();
 
-    // computes Gi(isPriority?P:N, prevValue, mRoundNumber, nodeID)
-    // from the paper
-    uint64 hashNode(bool isPriority, NodeID const& nodeID);
-
     // computes Gi(K, prevValue, mRoundNumber, value)
     uint64 hashValue(Value const& value);
-
-    uint64 getNodePriority(NodeID const& nodeID, SCPQuorumSet const& qset);
 
     // returns the highest value that we don't have yet, that we should
     // vote for, extracted from a nomination.
@@ -91,15 +93,41 @@ class NominationProtocol
 
     static std::vector<Value> getStatementValues(SCPStatement const& st);
 
-    // attempts to nominate a value for consensus
+    // attempts to nominate a value for consensus.
+    // `leaderElectionSeed` seeds leader election for this slot (see
+    // mLeaderElectionSeed); `previousValue` is still used for value selection.
     bool nominate(ValueWrapperPtr value, Value const& previousValue,
-                  bool timedout);
+                  Value const& leaderElectionSeed, bool timedout);
 
     // stops the nomination protocol
     void stopNomination();
 
     // return the current leaders
     std::set<NodeID> const& getLeaders() const;
+
+    // Computes the set of leaders elected for a single nomination round from
+    // explicit inputs, rather than from member state. This is the pure core of
+    // the leader-election algorithm shared by live nomination
+    // (updateRoundLeaders) and the ahead-of-time leader schedule
+    // (computeLeaderSchedule / HerderSCPDriver::computeLeaderSchedule). `qset`
+    // must already be normalized with `localID` excluded.
+    static std::set<NodeID>
+    computeRoundLeaders(SCPDriver& driver, Value const& seed, uint64 slotIndex,
+                        int32_t roundNumber, SCPQuorumSet const& qset,
+                        NodeID const& localID);
+
+    // Computes the ordered list of up to `count` upcoming leaders for
+    // `slotIndex` ahead of time, given the leader-election `seed`. Walks
+    // nomination rounds 1, 2, ... accumulating each round's leaders (skipping
+    // rounds that elect no one, exactly as the live fast-timeout does) until
+    // `count` distinct leaders are collected or no more can be elected. The
+    // resulting set matches the leaders SCP elects live for `slotIndex` when
+    // fed the same seed; the ordering (by round, then NodeID within a round)
+    // is deterministic across nodes that share the same qset and weights.
+    static std::vector<NodeID>
+    computeLeaderSchedule(SCPDriver& driver, Value const& seed,
+                          uint64 slotIndex, size_t count,
+                          SCPQuorumSet const& qset, NodeID const& localID);
 
     ValueWrapperPtr const&
     getLatestCompositeCandidate() const

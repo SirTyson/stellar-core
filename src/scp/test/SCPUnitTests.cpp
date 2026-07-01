@@ -1,4 +1,5 @@
 #include "scp/LocalNode.h"
+#include "scp/QuorumSetUtils.h"
 #include "scp/SCP.h"
 #include "scp/Slot.h"
 #include "simulation/Simulation.h"
@@ -204,9 +205,21 @@ class NominationTestHandler : public NominationProtocol
     }
 
     void
+    setLeaderElectionSeed(Value const& v)
+    {
+        mLeaderElectionSeed = v;
+    }
+
+    void
     setRoundNumber(int32 n)
     {
         mRoundNumber = n;
+    }
+
+    int32
+    getRoundNumber() const
+    {
+        return mRoundNumber;
     }
 
     void
@@ -215,16 +228,19 @@ class NominationTestHandler : public NominationProtocol
         NominationProtocol::updateRoundLeaders();
     }
 
+    // Drives one nomination step the way the live nominate() path does:
+    // increments the round number, then recomputes/accumulates leaders.
+    void
+    bumpRoundAndUpdateLeaders()
+    {
+        ++mRoundNumber;
+        NominationProtocol::updateRoundLeaders();
+    }
+
     std::set<NodeID>&
     getRoundLeaders()
     {
         return mRoundLeaders;
-    }
-
-    uint64
-    getNodePriority(NodeID const& nodeID, SCPQuorumSet const& qset)
-    {
-        return NominationProtocol::getNodePriority(nodeID, qset);
     }
 };
 
@@ -288,7 +304,7 @@ TEST_CASE("updateRoundLeaders handles zero weight nodes", "[scp]")
 
         Value v;
         v.emplace_back(uint8_t(42));
-        nom.setPreviousValue(v);
+        nom.setLeaderElectionSeed(v);
 
         // Ensure that even with many more rounds than validators,
         // `updateRoundLeaders` always terminates and never picks a zero-weight
@@ -321,6 +337,153 @@ TEST_CASE("updateRoundLeaders handles zero weight nodes", "[scp]")
         REQUIRE(leaders.count(v1NodeID) == 1);
         REQUIRE(leaders.count(v2NodeID) == 1);
         REQUIRE(leaders.size() == 2);
+    }
+}
+
+// A test driver whose weight function ignores `isLocalNode`, mimicking
+// HerderSCPDriver's application-specific weights. Under such weights every node
+// computes the same weight for every validator (including itself), so the
+// ahead-of-time leader schedule is identical across nodes.
+class UniformWeightNominationSCP : public TestNominationSCP
+{
+  public:
+    UniformWeightNominationSCP(NodeID const& nodeID,
+                               SCPQuorumSet const& qSetLocal)
+        : TestNominationSCP(nodeID, qSetLocal)
+    {
+    }
+
+    uint64
+    getNodeWeight(NodeID const&, SCPQuorumSet const&, bool) const override
+    {
+        // Same weight for every node, independent of isLocalNode.
+        return UINT64_MAX / 2;
+    }
+};
+
+// This is the linchpin for direct leader flooding: the leaders predicted ahead
+// of time by NominationProtocol::computeLeaderSchedule must equal the leaders
+// SCP actually elects during live nomination when fed the same seed. Steps 2/3
+// (overlay push + TX routing) rely on the prediction targeting the real
+// proposer.
+TEST_CASE("computeLeaderSchedule matches live leader election", "[scp]")
+{
+    SIMULATION_CREATE_NODE(0);
+    SIMULATION_CREATE_NODE(1);
+    SIMULATION_CREATE_NODE(2);
+    SIMULATION_CREATE_NODE(3);
+    SIMULATION_CREATE_NODE(4);
+
+    std::vector<NodeID> nodeIDs = {v0NodeID, v1NodeID, v2NodeID, v3NodeID,
+                                   v4NodeID};
+
+    SCPQuorumSet qSet;
+    qSet.threshold = 3;
+    for (auto const& id : nodeIDs)
+    {
+        qSet.validators.push_back(id);
+    }
+
+    // Arbitrary, but fixed, leader-election seed for the slot.
+    Value seed;
+    for (uint8_t b : std::vector<uint8_t>{1, 2, 3, 4, 5})
+    {
+        seed.emplace_back(b);
+    }
+
+    uint64 const slotIndex = 7;
+
+    auto normalizedQSet = [&](NodeID const& localID) {
+        SCPQuorumSet q = qSet;
+        normalizeQSet(q, &localID); // excludes self
+        return q;
+    };
+
+    SECTION("predicted full schedule equals live accumulated leaders")
+    {
+        TestNominationSCP nomSCP(v0NodeID, qSet);
+        Slot slot(slotIndex, nomSCP.mSCP);
+        NominationTestHandler nom(slot);
+        nom.setLeaderElectionSeed(seed);
+
+        // Drive the live path exactly as nominate() does (bump round, then
+        // recompute leaders) until the leader set saturates.
+        nom.setRoundNumber(0);
+        size_t lastSize = 0;
+        int guard = 0;
+        do
+        {
+            lastSize = nom.getRoundLeaders().size();
+            nom.bumpRoundAndUpdateLeaders();
+        } while (nom.getRoundLeaders().size() != lastSize && ++guard < 1000);
+
+        std::set<NodeID> const actual = nom.getRoundLeaders();
+        REQUIRE(!actual.empty());
+
+        // A count larger than the number of nodes saturates the schedule; it is
+        // capped internally by the number of weighted nodes.
+        auto schedule = NominationProtocol::computeLeaderSchedule(
+            nomSCP, seed, slotIndex, nodeIDs.size() + 1,
+            normalizedQSet(v0NodeID), v0NodeID);
+
+        std::set<NodeID> const predicted(schedule.begin(), schedule.end());
+        // The ordered schedule must contain no duplicates.
+        REQUIRE(schedule.size() == predicted.size());
+        REQUIRE(predicted == actual);
+    }
+
+    SECTION("top-K prefix equals the first leaders elected live")
+    {
+        TestNominationSCP nomSCP(v0NodeID, qSet);
+        Slot slot(slotIndex, nomSCP.mSCP);
+        NominationTestHandler nom(slot);
+        nom.setLeaderElectionSeed(seed);
+
+        // The first productive round's leaders are what a node uses with no
+        // nomination timeout -- the schedule prefix must match them exactly.
+        nom.setRoundNumber(0);
+        nom.bumpRoundAndUpdateLeaders();
+        std::set<NodeID> const firstRound = nom.getRoundLeaders();
+        REQUIRE(!firstRound.empty());
+
+        auto schedule = NominationProtocol::computeLeaderSchedule(
+            nomSCP, seed, slotIndex, firstRound.size(),
+            normalizedQSet(v0NodeID), v0NodeID);
+        REQUIRE(schedule.size() == firstRound.size());
+        std::set<NodeID> const prefix(schedule.begin(), schedule.end());
+        REQUIRE(prefix == firstRound);
+    }
+
+    SECTION("ordering is deterministic for repeated calls")
+    {
+        TestNominationSCP nomSCP(v0NodeID, qSet);
+        auto a = NominationProtocol::computeLeaderSchedule(
+            nomSCP, seed, slotIndex, nodeIDs.size(), normalizedQSet(v0NodeID),
+            v0NodeID);
+        auto b = NominationProtocol::computeLeaderSchedule(
+            nomSCP, seed, slotIndex, nodeIDs.size(), normalizedQSet(v0NodeID),
+            v0NodeID);
+        REQUIRE(a == b);
+        REQUIRE(!a.empty());
+    }
+
+    SECTION("schedule is identical across nodes under uniform weights")
+    {
+        // With weights independent of isLocalNode (as in production's
+        // application-specific weights), every node computes the same ordered
+        // schedule.
+        UniformWeightNominationSCP scp0(v0NodeID, qSet);
+        UniformWeightNominationSCP scp1(v1NodeID, qSet);
+
+        auto s0 = NominationProtocol::computeLeaderSchedule(
+            scp0, seed, slotIndex, nodeIDs.size(), normalizedQSet(v0NodeID),
+            v0NodeID);
+        auto s1 = NominationProtocol::computeLeaderSchedule(
+            scp1, seed, slotIndex, nodeIDs.size(), normalizedQSet(v1NodeID),
+            v1NodeID);
+
+        REQUIRE(!s0.empty());
+        REQUIRE(s0 == s1);
     }
 }
 
@@ -357,7 +520,7 @@ TEST_CASE("nomination weight stats", "[scp][!hide]")
             Value v;
             v.emplace_back(uint8_t(s)); // anything will do as a value
 
-            nom.setPreviousValue(v);
+            nom.setLeaderElectionSeed(v);
 
             for (int i = 0; i < maxRoundPerSlot; i++)
             {
@@ -456,8 +619,8 @@ TEST_CASE("nomination two nodes win stats", "[scp][!hide]")
 
             Value v;
             v.emplace_back(uint8_t(g));
-            nom0.setPreviousValue(v);
-            nom1.setPreviousValue(v);
+            nom0.setLeaderElectionSeed(v);
+            nom1.setLeaderElectionSeed(v);
 
             bool res = true;
 

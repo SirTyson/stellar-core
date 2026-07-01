@@ -53,8 +53,11 @@ class SCP
 
     // Submit a value to consider for slotIndex
     // previousValue is the value from slotIndex-1
+    // leaderElectionSeed seeds leader election for this slot (see
+    // NominationProtocol::mLeaderElectionSeed)
     bool nominate(uint64 slotIndex, ValueWrapperPtr value,
-                  Value const& previousValue);
+                  Value const& previousValue,
+                  Value const& leaderElectionSeed);
 
     // stops nomination for a slot
     void stopNomination(uint64 slotIndex);
