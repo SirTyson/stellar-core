@@ -709,6 +709,13 @@ class Config : public std::enable_shared_from_this<Config>
     std::chrono::milliseconds FLOOD_ADVERT_PERIOD_MS;
     std::chrono::milliseconds FLOOD_DEMAND_BACKOFF_DELAY_MS;
 
+    // Number of upcoming nomination leaders to flood transactions to directly
+    // (experimental; see docs/direct-leader-flooding.md). The leader schedule
+    // is computed ahead of time (HerderSCPDriver::computeLeaderSchedule) and
+    // the top FLOOD_LEADER_COUNT leaders are targeted, covering the early
+    // nomination rounds. Defaults to 2.
+    size_t FLOOD_LEADER_COUNT;
+
     // If true, the bootstrap quorum-connectivity check (experimental; see
     // docs/direct-leader-flooding.md, step 0) throws a fatal error when any
     // quorum member is not connected after the grace period. If false

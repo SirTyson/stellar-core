@@ -268,6 +268,7 @@ Config::Config() : NODE_SEED(SecretKey::random())
     FLOOD_DEMAND_PERIOD_MS = std::chrono::milliseconds(200);
     FLOOD_ADVERT_PERIOD_MS = std::chrono::milliseconds(100);
     FLOOD_DEMAND_BACKOFF_DELAY_MS = std::chrono::milliseconds(500);
+    FLOOD_LEADER_COUNT = 2;
     QUORUM_CONNECTIVITY_CHECK_FATAL = false;
     EXPERIMENTAL_TX_BATCH_MAX_SIZE = 0;
 
@@ -1444,6 +1445,8 @@ Config::processConfig(std::shared_ptr<cpptoml::table> t)
                  [&]() {
                      EXPERIMENTAL_TX_BATCH_MAX_SIZE = readInt<size_t>(item, 0);
                  }},
+                {"FLOOD_LEADER_COUNT",
+                 [&]() { FLOOD_LEADER_COUNT = readInt<size_t>(item, 0); }},
                 {"QUORUM_CONNECTIVITY_CHECK_FATAL",
                  [&]() { QUORUM_CONNECTIVITY_CHECK_FATAL = readBool(item); }},
                 {"FLOOD_ARB_TX_BASE_ALLOWANCE",

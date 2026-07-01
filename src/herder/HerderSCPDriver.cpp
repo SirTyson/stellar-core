@@ -13,6 +13,9 @@
 #include "ledger/LedgerManager.h"
 #include "main/Application.h"
 #include "main/ErrorMessages.h"
+#include "scp/LocalNode.h"
+#include "scp/NominationProtocol.h"
+#include "scp/QuorumSetUtils.h"
 #include "scp/SCP.h"
 #include "scp/Slot.h"
 #include "util/Logging.h"
@@ -1006,7 +1009,18 @@ HerderSCPDriver::nominate(uint64_t slotIndex, StellarValue const& value,
                hexAbbrev(valueHash), slotIndex);
 
     auto prevValue = xdr::xdr_to_opaque(previousValue);
-    mSCP.nominate(slotIndex, mCurrentValue, prevValue);
+
+    // Leader election for slot N is pipelined: it is seeded by hash(N-2) rather
+    // than the immediately preceding value, so the leader schedule is knowable
+    // a full ledger ahead of time (see docs/direct-leader-flooding.md). When
+    // nominating slot N we have lcl = N-1, so hash(N-2) is exactly
+    // lcl.header.previousLedgerHash -- already in hand, no extra lookup.
+    // (Value selection still uses prevValue, the N-1 value, above.)
+    auto const& lcl = mLedgerManager.getLastClosedLedgerHeader();
+    Hash const& seedHash = lcl.header.previousLedgerHash;
+    Value leaderElectionSeed(seedHash.begin(), seedHash.end());
+
+    mSCP.nominate(slotIndex, mCurrentValue, prevValue, leaderElectionSeed);
 }
 
 SCPQuorumSetPtr
@@ -1542,6 +1556,23 @@ HerderSCPDriver::getNodeWeight(NodeID const& nodeID, SCPQuorumSet const& qset,
     // its home domain
     releaseAssert(homeDomainSizeIt->second > 0);
     return qualityWeightIt->second / homeDomainSizeIt->second;
+}
+
+std::vector<NodeID>
+HerderSCPDriver::computeLeaderSchedule(Hash const& seed, uint64_t slotIndex,
+                                      size_t count)
+{
+    // Use the local node's quorum set, normalized with self excluded, exactly
+    // as the live nomination path does in
+    // NominationProtocol::updateRoundLeaders.
+    auto localNode = mSCP.getLocalNode();
+    SCPQuorumSet qSet = localNode->getQuorumSet();
+    NodeID localID = localNode->getNodeID();
+    normalizeQSet(qSet, &localID);
+
+    Value seedValue(seed.begin(), seed.end());
+    return NominationProtocol::computeLeaderSchedule(*this, seedValue, slotIndex,
+                                                     count, qSet, localID);
 }
 
 std::optional<int64_t>

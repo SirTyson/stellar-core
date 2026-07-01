@@ -230,6 +230,7 @@ TEST_CASE("Two Cores communicate via Rust overlays", "[overlay-ipc][.]")
 // Include simulation headers for the E2E test
 #include "crypto/SHA.h"
 #include "herder/Herder.h"
+#include "herder/HerderImpl.h"
 #include "ledger/LedgerTxn.h"
 #include "main/AppConnector.h"
 #include "simulation/LoadGenerator.h"
@@ -896,6 +897,118 @@ TEST_CASE("Rust overlay TX included in ledger", "[overlay-ipc][.]")
         DEFAULT_LOG,
         "TX included in ledger test passed - "
         "TX submitted to node0, included in consensus, applied on both nodes");
+}
+
+/**
+ * Verify the pipelined (N-2 seeded) leader schedule against live SCP on a
+ * real network (direct leader flooding, step 1; see
+ * docs/direct-leader-flooding.md).
+ *
+ * For every closed slot S, the leaders a node predicts ahead of time via
+ * HerderSCPDriver::computeLeaderSchedule(hash(S-2), S) must equal the leaders
+ * its SCP actually elected when nominating S. Unlike the pure-logic test in
+ * SCPUnitTests.cpp, this exercises the real seed threading
+ * (lcl.header.previousLedgerHash in HerderSCPDriver::nominate) and the
+ * production weight function on a running consensus network.
+ */
+TEST_CASE("leader schedule prediction matches live nomination",
+          "[overlay-ipc][herder][.]")
+{
+    std::string overlayBinary = requireOverlayBinary();
+    Hash networkID = sha256(getTestConfig().NETWORK_PASSPHRASE);
+    auto simulation = std::make_shared<Simulation>(networkID);
+
+    std::vector<SecretKey> keys;
+    for (int i = 0; i < 3; ++i)
+    {
+        keys.push_back(SecretKey::fromSeed(
+            sha256("LEADER_SCHEDULE_TEST_NODE_" + std::to_string(i))));
+    }
+
+    SCPQuorumSet qSet;
+    qSet.threshold = 2;
+    for (auto const& k : keys)
+    {
+        qSet.validators.push_back(k.getPublicKey());
+    }
+
+    uint16_t const basePort = 11655;
+    std::vector<Application::pointer> nodes;
+    for (int i = 0; i < 3; ++i)
+    {
+        auto cfg = simulation->newConfig();
+        cfg.PEER_PORT = basePort + i;
+        for (int j = 0; j < 3; ++j)
+        {
+            if (j != i)
+            {
+                cfg.KNOWN_PEERS.push_back("127.0.0.1:" +
+                                          std::to_string(basePort + j));
+            }
+        }
+        nodes.push_back(simulation->addNode(keys[i], qSet, &cfg));
+    }
+    simulation->startAllNodes();
+
+    // Record each closed ledger's hash as the network progresses; hash(S-2)
+    // is the leader-election seed for slot S.
+    std::map<uint32_t, Hash> ledgerHashes;
+    auto recordLcl = [&]() {
+        auto const& lcl =
+            nodes[0]->getLedgerManager().getLastClosedLedgerHeader();
+        ledgerHashes[lcl.header.ledgerSeq] = lcl.hash;
+    };
+    recordLcl();
+
+    uint32_t const targetLedger = 6;
+    simulation->crankUntil(
+        [&]() {
+            recordLcl();
+            if (!simulation->haveAllExternalized(targetLedger, 2))
+            {
+                return false;
+            }
+            // getNodeWeight (used below) asserts no ledger is being applied.
+            for (auto const& node : nodes)
+            {
+                if (node->getLedgerManager().isApplying())
+                {
+                    return false;
+                }
+            }
+            return true;
+        },
+        30 * targetLedger * simulation->getExpectedLedgerCloseTime(), false);
+    REQUIRE(simulation->haveAllExternalized(targetLedger, 2));
+
+    size_t checked = 0;
+    for (auto const& node : nodes)
+    {
+        auto& herder = static_cast<HerderImpl&>(node->getHerder());
+        for (uint32_t slot = 3; slot <= targetLedger; ++slot)
+        {
+            // Live leaders accumulated while this node nominated `slot`.
+            // Empty if the node externalized the slot from peers before
+            // nominating it itself; nothing to compare then.
+            auto live = herder.getSCP().getNominationLeaders(slot);
+            auto seedIt = ledgerHashes.find(slot - 2);
+            if (live.empty() || seedIt == ledgerHashes.end())
+            {
+                continue;
+            }
+            auto schedule = herder.getHerderSCPDriver().computeLeaderSchedule(
+                seedIt->second, slot, live.size());
+            REQUIRE(std::set<NodeID>(schedule.begin(), schedule.end()) ==
+                    live);
+            ++checked;
+        }
+    }
+    // The run must have produced real comparisons, or the test is vacuous.
+    REQUIRE(checked > 0);
+    LOG_INFO(DEFAULT_LOG,
+             "Leader schedule prediction test passed ({} slot/node "
+             "combinations checked)",
+             checked);
 }
 
 /**

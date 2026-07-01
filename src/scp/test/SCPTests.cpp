@@ -114,7 +114,11 @@ class TestSCP : public SCPDriver
     nominate(uint64 slotIndex, Value const& value, bool timedout)
     {
         auto wv = wrapValue(value);
-        return mSCP.getSlot(slotIndex, true)->nominate(wv, value, timedout);
+        // At the SCP level these tests exercise the leader-election algorithm
+        // directly, so they seed it with `value` (the same value historically
+        // used as previousValue). The N-2 seeding lives in HerderSCPDriver.
+        return mSCP.getSlot(slotIndex, true)
+            ->nominate(wv, value, value, timedout);
     }
 
     // only used by nomination protocol
