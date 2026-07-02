@@ -1179,20 +1179,18 @@ publish(Application::pointer app)
 
 // Returns the major release version extracted from a release-version string if
 // it matches one of the supported release formats, such as vNN.X.Y,
-// vNN.X.YrcZ, vNN.X.Y-external, or the packaged form
-// `stellar-core NN.X.Y (<commit-hash>)`. If its version has some other name
-// structure, return std::nullopt.
+// vNN.X.YrcZ, or vNN.X.Y-external. Any other version structure returns
+// std::nullopt. In particular the packaged form
+// `stellar-core NN.X.Y (<commit-hash>)` is NOT treated as a release: dev
+// packages embed a release-like version derived from the nearest tag even
+// when built from non-release commits.
 std::optional<uint32_t>
 getStellarCoreMajorReleaseVersion(std::string const& vstr)
 {
     std::regex releaseTagRe(
         "^v([0-9]+)\\.[0-9]+\\.[0-9]+(rc[0-9]+|-external)?$");
-    std::regex packagedReleaseRe(
-        "^stellar-core ([0-9]+)\\.[0-9]+\\.[0-9]+(rc[0-9]+|-external)? "
-        "\\([0-9a-fA-F]+\\)$");
     std::smatch match;
-    if (std::regex_match(vstr, match, releaseTagRe) ||
-        std::regex_match(vstr, match, packagedReleaseRe))
+    if (std::regex_match(vstr, match, releaseTagRe))
     {
         uint32_t vers = stoi(match.str(1));
         return std::make_optional<uint32_t>(vers);

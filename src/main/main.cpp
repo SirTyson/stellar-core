@@ -298,12 +298,12 @@ void
 checkStellarCoreMajorVersionProtocolIdentity()
 {
     // This extracts a major version number from the version string embedded in
-    // the binary if, and only if, it identifies a release build. Supported
-    // formats include source builds like vX.Y.Z, vX.Y.ZrcN,
-    // vX.Y.Z-external, and
-    // packaged builds like `stellar-core X.Y.Z (<commit-hash>)`. Other version
-    // strings return nullopt, for example git-describe versions that typically
-    // look more like `v21.0.0rc1-84-g08d89bb4a`.
+    // the binary if, and only if, it identifies a release source build like
+    // vX.Y.Z, vX.Y.ZrcN, or vX.Y.Z-external. Other version strings return
+    // nullopt, for example git-describe versions that typically look more
+    // like `v21.0.0rc1-84-g08d89bb4a`, or packaged builds like
+    // `stellar-core X.Y.Z (<commit-hash>)`, which carry a release-like
+    // version even when built from non-release commits.
     auto major_release_version =
         stellar::getStellarCoreMajorReleaseVersion(STELLAR_CORE_VERSION);
     if (major_release_version)
