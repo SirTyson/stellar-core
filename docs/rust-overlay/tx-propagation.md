@@ -1,5 +1,16 @@
 # TX Propagation: INV / GETDATA / TX
 
+> **Direct leader flooding (experimental).** On this branch the pull
+> protocol below is the *fallback* path. When Core has pushed a leader
+> schedule (`SET_LEADERS`, see
+> [`../direct-leader-flooding.md`](../direct-leader-flooding.md)) and at
+> least one leader is connected, `broadcast_tx` and the relay path send
+> the **full TX body directly** to the connected leaders (a plain `TX`
+> 0x01 message — receivers accept unsolicited TXs and dedup via
+> `tx_seen`) and skip INV/GETDATA entirely. The pull protocol still
+> runs when no schedule is known (non-validators, startup) or no leader
+> is connected, and `tx_buffer`/GETDATA serving is unchanged.
+
 Transactions are flooded with a **three-phase pull protocol** instead of
 SCP's push-everything strategy. A node announces "I have TX X"
 (INV_BATCH), peers that don't have it reply "send me X" (GETDATA), and

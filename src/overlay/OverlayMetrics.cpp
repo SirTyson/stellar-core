@@ -44,6 +44,12 @@ OverlayMetrics::OverlayMetrics(Application& app)
           {"overlay", "demand", "timeout"}, "timeout"))
     , mAbandonedDemandMeter(app.getMetrics().NewMeter(
           {"overlay", "flood", "abandoned-demands"}, "message"))
+    , mFloodLeaderPushMeter(app.getMetrics().NewMeter(
+          {"overlay", "flood", "leader-push"}, "message"))
+    , mFloodLeaderPushBytesMeter(app.getMetrics().NewMeter(
+          {"overlay", "flood", "leader-push-bytes"}, "byte"))
+    , mFloodLeaderFallbackMeter(app.getMetrics().NewMeter(
+          {"overlay", "flood", "leader-fallback"}, "message"))
     , mMessagesBroadcast(app.getMetrics().NewMeter(
           {"overlay", "message", "broadcast"}, "message"))
     , mUniqueFloodBytesRecv(app.getMetrics().NewMeter(

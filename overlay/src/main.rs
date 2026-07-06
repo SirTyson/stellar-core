@@ -443,6 +443,30 @@ fn expected_quorum_from_strkeys(
     Ok(expected)
 }
 
+/// Parse a SET_LEADERS payload: JSON `{ "slot": u64, "leaders": ["G...", ...] }`,
+/// ordered by election priority. Returns the slot and the (strkey, PeerId)
+/// pairs. Any invalid entry rejects the whole payload so a partially-mapped
+/// leader set can never be installed.
+fn parse_leaders_payload(payload: &[u8]) -> Result<(u64, Vec<(String, PeerId)>), String> {
+    let value: serde_json::Value =
+        serde_json::from_slice(payload).map_err(|e| format!("invalid JSON: {}", e))?;
+    let slot = value
+        .get("slot")
+        .and_then(|s| s.as_u64())
+        .ok_or("missing or invalid 'slot'")?;
+    let entries = value
+        .get("leaders")
+        .and_then(|l| l.as_array())
+        .ok_or("missing or invalid 'leaders'")?;
+
+    let mut leaders = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let strkey = entry.as_str().ok_or("non-string leader entry")?;
+        leaders.push((strkey.to_string(), quorum_member_peer_id(strkey)?));
+    }
+    Ok((slot, leaders))
+}
+
 fn missing_quorum_members(
     expected_quorum: &HashMap<PeerId, String>,
     connected_quorum: &HashSet<PeerId>,
@@ -486,6 +510,11 @@ struct App {
     /// PeerId → configured hostname, so targeted reconnect can re-resolve DNS
     /// after a pod restart changes the peer's IP address.
     peer_hostnames: Arc<RwLock<HashMap<PeerId, String>>>,
+    /// Upcoming nomination leaders to flood transactions to, ordered by
+    /// election priority, with the slot they were computed for. Replaced on
+    /// every SET_LEADERS push (each ledger close). See
+    /// docs/direct-leader-flooding.md.
+    leaders: Arc<RwLock<(u64, Vec<(String, PeerId)>)>>,
     /// Expected quorum validators, keyed by authenticated libp2p PeerId.
     expected_quorum: Arc<RwLock<HashMap<PeerId, String>>>,
     /// All currently connected authenticated libp2p peers.
@@ -576,6 +605,7 @@ impl App {
             })),
             known_peers: Arc::new(RwLock::new(HashMap::new())),
             peer_hostnames: Arc::new(RwLock::new(HashMap::new())),
+            leaders: Arc::new(RwLock::new((0, Vec::new()))),
             expected_quorum: Arc::new(RwLock::new(HashMap::new())),
             connected_peers: Arc::new(RwLock::new(HashSet::new())),
             connected_quorum: Arc::new(RwLock::new(HashSet::new())),
@@ -1531,14 +1561,75 @@ impl App {
                 }
             }
 
+            MessageType::SetLeaders => {
+                match parse_leaders_payload(&msg.payload) {
+                    Ok((slot, leaders)) => {
+                        {
+                            let connected = self.connected_peers.read().await;
+                            if leaders.is_empty() {
+                                info!("Flood leaders for slot {}: none elected", slot);
+                            }
+                            for (rank, (strkey, peer_id)) in leaders.iter().enumerate() {
+                                info!(
+                                    "Flood leader {} for slot {}: {} ({}) connected={}",
+                                    rank,
+                                    slot,
+                                    strkey,
+                                    peer_id,
+                                    connected.contains(peer_id)
+                                );
+                            }
+                        }
+
+                        // Hand the routing targets to the libp2p overlay,
+                        // which pushes TX bodies directly to them (step 3 of
+                        // docs/direct-leader-flooding.md). Awaited inline so
+                        // the new targets are enqueued before any SubmitTx
+                        // broadcast dispatched after this message.
+                        let peer_ids: Vec<PeerId> =
+                            leaders.iter().map(|(_, peer_id)| *peer_id).collect();
+                        self.libp2p_handle.set_leaders(peer_ids).await;
+
+                        *self.leaders.write().await = (slot, leaders);
+                    }
+                    Err(e) => {
+                        // Keep the previous leader set; a partially-valid push
+                        // must never be installed.
+                        error!("Invalid SET_LEADERS payload: {}", e);
+                    }
+                }
+            }
+
             MessageType::RequestOverlayMetrics => {
-                // Snapshot metrics and send back as JSON
+                // Snapshot metrics and send back as JSON, with the current
+                // flood-leader set attached for observability.
                 let snapshot = self.metrics.snapshot();
-                match serde_json::to_vec(&snapshot) {
-                    Ok(json_bytes) => {
-                        let resp = Message::new(MessageType::OverlayMetricsResponse, json_bytes);
-                        if let Err(e) = self.core_ipc.sender.send(resp) {
-                            error!("Failed to send metrics response: {}", e);
+                match serde_json::to_value(&snapshot) {
+                    Ok(mut value) => {
+                        {
+                            let (slot, leaders) = &*self.leaders.read().await;
+                            let connected = self.connected_peers.read().await;
+                            value["flood_leaders_slot"] = serde_json::json!(slot);
+                            value["flood_leaders"] = serde_json::json!(leaders
+                                .iter()
+                                .map(|(strkey, _)| strkey.clone())
+                                .collect::<Vec<_>>());
+                            value["flood_leaders_connected"] = serde_json::json!(leaders
+                                .iter()
+                                .map(|(_, peer_id)| connected.contains(peer_id))
+                                .collect::<Vec<_>>());
+                        }
+                        match serde_json::to_vec(&value) {
+                            Ok(json_bytes) => {
+                                let resp =
+                                    Message::new(MessageType::OverlayMetricsResponse, json_bytes);
+                                if let Err(e) = self.core_ipc.sender.send(resp) {
+                                    error!("Failed to send metrics response: {}", e);
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to serialize metrics snapshot: {}", e);
+                            }
                         }
                     }
                     Err(e) => {
@@ -1733,6 +1824,60 @@ mod tests {
 
         let expected = expected_quorum_from_strkeys(&[strkey.clone()]).unwrap();
         assert_eq!(expected.get(&expected_peer_id), Some(&strkey));
+    }
+
+    #[test]
+    fn test_parse_leaders_payload() {
+        // Build two distinct identities the way Core would (strkey of the
+        // validator public key).
+        let mut config_a = Config::default();
+        config_a.node_seed =
+            Some("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f".to_string());
+        let keypair_a = libp2p_keypair_from_config(&config_a).unwrap();
+        let peer_a = keypair_a.public().to_peer_id();
+        let strkey_a = stellar_strkey::ed25519::PublicKey(
+            keypair_a.public().try_into_ed25519().unwrap().to_bytes(),
+        )
+        .to_string();
+
+        let mut config_b = Config::default();
+        config_b.node_seed =
+            Some("a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf".to_string());
+        let keypair_b = libp2p_keypair_from_config(&config_b).unwrap();
+        let peer_b = keypair_b.public().to_peer_id();
+        let strkey_b = stellar_strkey::ed25519::PublicKey(
+            keypair_b.public().try_into_ed25519().unwrap().to_bytes(),
+        )
+        .to_string();
+
+        // Valid payload: order must be preserved.
+        let payload =
+            serde_json::to_vec(&serde_json::json!({"slot": 42, "leaders": [strkey_b, strkey_a]}))
+                .unwrap();
+        let (slot, leaders) = parse_leaders_payload(&payload).unwrap();
+        assert_eq!(slot, 42);
+        assert_eq!(
+            leaders,
+            vec![(strkey_b.clone(), peer_b), (strkey_a.clone(), peer_a)]
+        );
+
+        // Empty leader list is valid (no one elected).
+        let (slot, leaders) =
+            parse_leaders_payload(br#"{"slot": 7, "leaders": []}"#).unwrap();
+        assert_eq!(slot, 7);
+        assert!(leaders.is_empty());
+
+        // Any invalid entry rejects the whole payload.
+        let bad = serde_json::to_vec(
+            &serde_json::json!({"slot": 1, "leaders": [strkey_a, "GNOTAKEY"]}),
+        )
+        .unwrap();
+        assert!(parse_leaders_payload(&bad).is_err());
+
+        // Missing fields / malformed JSON are rejected.
+        assert!(parse_leaders_payload(br#"{"leaders": []}"#).is_err());
+        assert!(parse_leaders_payload(br#"{"slot": 1}"#).is_err());
+        assert!(parse_leaders_payload(b"not json").is_err());
     }
 
     #[test]

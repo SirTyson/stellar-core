@@ -1119,12 +1119,60 @@ HerderImpl::lastClosedLedgerIncreased(bool latest, TxSetXDRFrameConstPtr txSet,
 
         setupTriggerNextLedger();
 
+        // The just-closed ledger's hash seeds leader election for slot L+2
+        // (N-2 pipelining); push the newly-computable leaders to the overlay.
+        pushLeaderSchedule();
+
         // Now that the new ledger is closed, purge SCP slots outside of our
         // validity bracket and process any already-buffered SCP envelopes for
         // the next slot. Posted to the main thread so control returns to the
         // caller first, matching the previous post-externalize behavior.
         purgeOldSlotsAndProcessSCPQueue(false);
     }
+}
+
+void
+HerderImpl::pushLeaderSchedule()
+{
+    releaseAssert(threadIsMain());
+    if (!getSCP().isValidator())
+    {
+        return;
+    }
+
+    auto const& lcl = mLedgerManager.getLastClosedLedgerHeader();
+
+    // Cross-node agreement on the pushed schedule requires node weights that
+    // ignore isLocalNode (as the application-specific election's do). The
+    // old-style election boosts the local node, so under it every validator
+    // pushes a different, self-biased target set and "flood to the leader"
+    // degrades to "flood to a per-node guess" (INV fallback still covers
+    // liveness). Warn once so operators can tell which regime they are in.
+    if (!mWarnedOldStyleLeaderSchedule &&
+        (protocolVersionIsBefore(
+             lcl.header.ledgerVersion,
+             APPLICATION_SPECIFIC_NOMINATION_LEADER_ELECTION_PROTOCOL_VERSION) ||
+         !mApp.getConfig().VALIDATOR_WEIGHT_CONFIG.has_value() ||
+         mApp.getConfig().FORCE_OLD_STYLE_LEADER_ELECTION))
+    {
+        mWarnedOldStyleLeaderSchedule = true;
+        CLOG_WARNING(
+            Herder,
+            "Direct leader flooding: old-style (self-biased) leader election "
+            "weights are active, so the pushed leader schedule differs per "
+            "node; targeted flooding will be approximate");
+    }
+    uint64_t const slotIndex = lcl.header.ledgerSeq + 2;
+    auto leaders = mHerderSCPDriver.computeLeaderSchedule(
+        lcl.hash, slotIndex, mApp.getConfig().FLOOD_LEADER_COUNT);
+
+    std::vector<std::string> strkeys;
+    strkeys.reserve(leaders.size());
+    for (auto const& id : leaders)
+    {
+        strkeys.emplace_back(KeyUtils::toStrKey(id));
+    }
+    mApp.getOverlayManager().getOverlayIPC().updateLeaders(slotIndex, strkeys);
 }
 
 VirtualClock::time_point

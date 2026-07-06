@@ -719,9 +719,10 @@ class Config : public std::enable_shared_from_this<Config>
     // If true, the bootstrap quorum-connectivity check (experimental; see
     // docs/direct-leader-flooding.md, step 0) throws a fatal error when any
     // quorum member is not connected after the grace period. If false
-    // (default), an incomplete topology is logged as an error only.
-    // Deployments that want the experiment's fail-fast dense-mesh assert
-    // should set this to true.
+    // (default), an incomplete topology is logged as an error only — targeted
+    // flooding degrades to INV flooding via its fallback paths, so liveness
+    // does not depend on the assert. Experiment deployments that want the
+    // fail-fast dense-mesh assert should set this to true.
     bool QUORUM_CONNECTIVITY_CHECK_FATAL;
     static constexpr size_t const POSSIBLY_PREFERRED_EXTRA = 2;
     static constexpr size_t const REALLY_DEAD_NUM_FAILURES_CUTOFF = 120;

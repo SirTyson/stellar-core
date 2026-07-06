@@ -151,6 +151,11 @@ impl From<IdentifyEvent> for StellarBehaviourEvent {
 #[derive(Clone)]
 pub struct OverlayHandle {
     cmd_tx: mpsc::Sender<OverlayCommand>,
+    /// Shared with SharedState. Written directly (not via the bounded command
+    /// channel) so installing a new leader set can never block the caller's
+    /// dispatch loop behind slow overlay commands, while still being ordered:
+    /// the write completes before the caller processes its next message.
+    flood_leaders: Arc<RwLock<Vec<PeerId>>>,
 }
 
 impl OverlayHandle {
@@ -174,6 +179,13 @@ impl OverlayHandle {
                 e
             );
         }
+    }
+
+    /// Set the flood-target leaders (ordered by election priority). Replaces
+    /// the previous set; an empty set restores INV flooding to all peers.
+    pub async fn set_leaders(&self, leaders: Vec<PeerId>) {
+        debug!("Flood leaders updated: {} leaders", leaders.len());
+        *self.flood_leaders.write().await = leaders;
     }
 
     pub async fn fetch_txset(&self, hash: [u8; 32]) {
@@ -316,6 +328,11 @@ struct SharedState {
     pending_getdata: RwLock<PendingRequests>,
     /// TX buffer for responding to GETDATA requests
     tx_buffer: RwLock<TxBuffer>,
+    /// Upcoming nomination leaders to flood TXs to directly, ordered by
+    /// election priority (see docs/direct-leader-flooding.md). Empty means no
+    /// leader schedule is known and TXs are INV-flooded to all peers. Shared
+    /// with OverlayHandle, which writes it directly.
+    flood_leaders: Arc<RwLock<Vec<PeerId>>>,
     /// Overlay metrics (shared with App for IPC reporting)
     metrics: Arc<OverlayMetrics>,
 }
@@ -326,6 +343,7 @@ impl SharedState {
         tx_event_tx: mpsc::Sender<OverlayEvent>,
         control: Control,
         metrics: Arc<OverlayMetrics>,
+        flood_leaders: Arc<RwLock<Vec<PeerId>>>,
     ) -> Self {
         Self {
             peer_streams: RwLock::new(HashMap::new()),
@@ -351,6 +369,7 @@ impl SharedState {
             inv_tracker: RwLock::new(InvTracker::new()),
             pending_getdata: RwLock::new(PendingRequests::new()),
             tx_buffer: RwLock::new(TxBuffer::new()),
+            flood_leaders,
             metrics,
         }
     }
@@ -419,11 +438,13 @@ pub fn create_overlay(
     // Bounded channel for TX events - drops allowed under backpressure
     let (tx_event_tx, tx_event_rx) = mpsc::channel(TX_EVENT_CHANNEL_CAPACITY);
 
+    let flood_leaders = Arc::new(RwLock::new(Vec::new()));
     let state = Arc::new(SharedState::new(
         event_tx,
         tx_event_tx,
         control.clone(),
         metrics,
+        Arc::clone(&flood_leaders),
     ));
 
     let overlay = StellarOverlay {
@@ -433,7 +454,10 @@ pub fn create_overlay(
         cmd_rx,
     };
 
-    let handle = OverlayHandle { cmd_tx };
+    let handle = OverlayHandle {
+        cmd_tx,
+        flood_leaders,
+    };
 
     Ok((handle, event_rx, tx_event_rx, overlay))
 }
@@ -845,23 +869,75 @@ impl StellarOverlay {
         let fee_per_op = (parsed.fee / u64::from(parsed.num_ops.max(1))) as i64;
 
         // Dedup check
-        {
+        let already_seen = {
             let mut seen = self.state.tx_seen.write().await;
             if seen.contains(&hash) {
-                trace!("TX already seen, skipping broadcast");
-                return;
+                true
+            } else {
+                seen.put(hash, ());
+                self.state
+                    .metrics
+                    .memory_flood_known
+                    .store(seen.len() as i64, Ordering::Relaxed);
+                false
             }
-            seen.put(hash, ());
-            self.state
-                .metrics
-                .memory_flood_known
-                .store(seen.len() as i64, Ordering::Relaxed);
+        };
+        if already_seen {
+            // Core resubmitted a TX we already flooded. The original push may
+            // have targeted a previous slot's leaders (or failed outright), so
+            // re-push to the *current* connected leaders — receivers dedup via
+            // tx_seen — but skip the INV re-flood. This keeps "TXs simply
+            // resubmit" a real recovery path in leader-routing mode.
+            if let Some(connected_leaders) = connected_flood_leaders(&self.state).await {
+                if !connected_leaders.is_empty() {
+                    {
+                        let mut buffer = self.state.tx_buffer.write().await;
+                        buffer.insert(hash, tx.clone());
+                    }
+                    debug!(
+                        "TX_LEADER_REPUSH: Re-pushing resubmitted TX {:02x?}... to {} leaders",
+                        &hash[..4],
+                        connected_leaders.len()
+                    );
+                    push_tx_to_peers(&self.state, &connected_leaders, &tx, &hash, fee_per_op)
+                        .await;
+                    return;
+                }
+            }
+            trace!("TX already seen, skipping broadcast");
+            return;
         }
 
         // Store TX in buffer for GETDATA responses
         {
             let mut buffer = self.state.tx_buffer.write().await;
             buffer.insert(hash, tx.clone());
+        }
+
+        // Direct leader flooding: when the upcoming leaders are known and at
+        // least one is connected, push the full body straight to them and skip
+        // INV/GETDATA — the round-trip is pure overhead for a known recipient
+        // that needs the TX. With no connected leader, fall back to INV
+        // flooding for liveness.
+        if let Some(connected_leaders) = connected_flood_leaders(&self.state).await {
+            if !connected_leaders.is_empty() {
+                debug!(
+                    "TX_LEADER_PUSH: Pushing TX {:02x?}... ({} bytes) to {} leaders",
+                    &hash[..4],
+                    tx.len(),
+                    connected_leaders.len()
+                );
+                push_tx_to_peers(&self.state, &connected_leaders, &tx, &hash, fee_per_op).await;
+                return;
+            }
+            self.state
+                .metrics
+                .flood_leader_fallback
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(
+                "TX_LEADER_FALLBACK: No connected leader, INV flooding TX {:02x?}...",
+                &hash[..4]
+            );
         }
 
         let streams = self.state.peer_streams.read().await;
@@ -1785,6 +1861,117 @@ async fn handle_getdata(
 }
 
 /// Handle TX response (from GETDATA request)
+/// Direct leader flooding (see docs/direct-leader-flooding.md): the subset of
+/// the current flood-leader set with live streams, in priority order. Returns
+/// `None` when no leader schedule is known — the caller should INV-flood to
+/// all peers as before. `Some(empty)` means leaders are known but none is
+/// connected (callers fall back to INV flooding for liveness).
+async fn connected_flood_leaders(state: &Arc<SharedState>) -> Option<Vec<PeerId>> {
+    let leaders = state.flood_leaders.read().await;
+    if leaders.is_empty() {
+        return None;
+    }
+    let streams = state.peer_streams.read().await;
+    Some(
+        leaders
+            .iter()
+            .filter(|p| streams.contains_key(p))
+            .cloned()
+            .collect(),
+    )
+}
+
+/// INV-announce a TX to every connected peer (the legacy flood primitive,
+/// also used to rescue a TX whose direct leader push failed so it remains
+/// pullable). Assumes the TX is already in `tx_buffer`.
+async fn announce_tx_inv_to_all(state: &Arc<SharedState>, hash: &[u8; 32], fee_per_op: i64) {
+    let peers: Vec<PeerId> = {
+        let streams = state.peer_streams.read().await;
+        streams.keys().cloned().collect()
+    };
+    if peers.is_empty() {
+        return;
+    }
+    state
+        .metrics
+        .flood_advertised
+        .fetch_add(peers.len() as u64, Ordering::Relaxed);
+    let inv_entry = InvEntry {
+        hash: *hash,
+        fee_per_op,
+    };
+    for peer in &peers {
+        let batch_to_send = {
+            let mut batcher = state.inv_batcher.write().await;
+            batcher.add(*peer, inv_entry.clone())
+        };
+        if let Some(batch) = batch_to_send {
+            send_inv_batch(state, *peer, batch).await;
+        }
+    }
+}
+
+/// Push a full TX body directly to `peers` on the TX stream, skipping the
+/// INV/GETDATA round-trip. Used for leader-targeted flooding; receivers
+/// dedup via `tx_seen` exactly as for pulled TXs.
+///
+/// A direct push is often this TX's *only* delivery attempt (there is no
+/// GETDATA retry machinery behind it), so a failed send falls back to
+/// INV-announcing the TX to all peers, restoring pull-mode recoverability.
+/// The flood_leader_push metrics count *successful* sends only.
+async fn push_tx_to_peers(
+    state: &Arc<SharedState>,
+    peers: &[PeerId],
+    tx: &[u8],
+    hash: &[u8; 32],
+    fee_per_op: i64,
+) {
+    let encoded = match TxStreamMessage::Tx(tx.to_vec()).encode() {
+        Ok(encoded) => encoded,
+        Err(e) => {
+            warn!(
+                "TX_LEADER_PUSH: Failed to encode TX {:02x?}...: {}",
+                &hash[..4],
+                e
+            );
+            return;
+        }
+    };
+    let tx_len = tx.len() as u64;
+
+    for peer in peers {
+        let state_clone = Arc::clone(state);
+        let peer = *peer;
+        let encoded = encoded.clone();
+        let hash = *hash;
+        tokio::spawn(async move {
+            match send_to_peer_stream(&state_clone, peer, StreamType::Tx, &encoded).await {
+                Ok(()) => {
+                    let m = &state_clone.metrics;
+                    m.flood_leader_push.fetch_add(1, Ordering::Relaxed);
+                    m.flood_leader_push_bytes.fetch_add(tx_len, Ordering::Relaxed);
+                    m.message_write.fetch_add(1, Ordering::Relaxed);
+                    m.byte_write
+                        .fetch_add(encoded.len() as u64, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    state_clone
+                        .metrics
+                        .error_write
+                        .fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        "TX_LEADER_PUSH_FAIL: TX {:02x?}... to {}: {} — rescuing via INV flood",
+                        &hash[..4],
+                        peer,
+                        e
+                    );
+                    announce_tx_inv_to_all(&state_clone, &hash, fee_per_op).await;
+                }
+            }
+        });
+    }
+}
+
 async fn handle_tx_response(state: &Arc<SharedState>, peer_id: &PeerId, tx: Vec<u8>) {
     let parsed = match crate::xdr::parse_supported_transaction(&tx) {
         Ok(parsed) => parsed,
@@ -1866,17 +2053,48 @@ async fn handle_tx_response(state: &Arc<SharedState>, peer_id: &PeerId, tx: Vec<
         }
     }
 
-    // RELAY: Announce to other peers via INV
-    let peers_to_announce: Vec<PeerId> = {
-        let streams = state.peer_streams.read().await;
+    // Peers who already know about this TX (INV'd us or sent it to us)
+    let known_sources: HashSet<PeerId> = {
         let tracker = state.inv_tracker.read().await;
-
-        // Get peers who already know about this TX (INV'd us)
-        let known_sources: HashSet<PeerId> = tracker
+        tracker
             .peek_sources(&hash)
             .map(|v| v.iter().cloned().collect())
-            .unwrap_or_default();
+            .unwrap_or_default()
+    };
 
+    // RELAY. With a known leader schedule, forward the full body directly to
+    // the connected leaders that don't already have it — this closes coverage
+    // holes when the origin couldn't reach every leader. Without a schedule
+    // (or with all leaders disconnected, for liveness), INV-announce to all
+    // peers as before.
+    let connected_leaders = connected_flood_leaders(state).await;
+    if let Some(leaders) = &connected_leaders {
+        if !leaders.is_empty() {
+            let targets: Vec<PeerId> = leaders
+                .iter()
+                .filter(|p| **p != *peer_id && !known_sources.contains(p))
+                .cloned()
+                .collect();
+            if !targets.is_empty() {
+                debug!(
+                    "TX_LEADER_RELAY: Pushing TX {:02x?}... to {} leaders",
+                    &hash[..4],
+                    targets.len()
+                );
+                push_tx_to_peers(state, &targets, &tx, &hash, fee_per_op).await;
+            }
+            record_recv_transaction_timing(state, recv_start);
+            return;
+        }
+        // Leaders known but none connected: INV relay below.
+        state
+            .metrics
+            .flood_leader_fallback
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    let peers_to_announce: Vec<PeerId> = {
+        let streams = state.peer_streams.read().await;
         streams
             .keys()
             .filter(|p| **p != *peer_id && !known_sources.contains(p))
@@ -1905,7 +2123,11 @@ async fn handle_tx_response(state: &Arc<SharedState>, peer_id: &PeerId, tx: Vec<
         }
     }
 
-    // Record recv-transaction timing
+    record_recv_transaction_timing(state, recv_start);
+}
+
+/// Record recv-transaction timing metrics for handle_tx_response.
+fn record_recv_transaction_timing(state: &Arc<SharedState>, recv_start: std::time::Instant) {
     let elapsed_us = recv_start.elapsed().as_micros() as u64;
     state
         .metrics
@@ -2292,6 +2514,195 @@ mod tests {
 
         handle1.shutdown().await;
         handle2.shutdown().await;
+    }
+
+    /// Direct leader flooding: with a connected leader configured, a
+    /// broadcast TX must be pushed as a full body straight to the leader (no
+    /// INV round-trip), and the leader must receive it.
+    #[tokio::test]
+    async fn test_leader_push_direct() {
+        let keypair1 = Keypair::generate_ed25519();
+        let keypair2 = Keypair::generate_ed25519();
+        let peer2 = keypair2.public().to_peer_id();
+
+        let metrics1 = Arc::new(OverlayMetrics::new());
+        let (handle1, _events1, _tx_events1, overlay1) =
+            create_overlay(keypair1, Arc::clone(&metrics1)).unwrap();
+        let (handle2, _events2, mut tx_events2, overlay2) =
+            create_overlay(keypair2, Arc::new(OverlayMetrics::new())).unwrap();
+
+        let listen_port = 24101;
+        tokio::spawn(async move { overlay1.run("127.0.0.1", listen_port).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::spawn(async move { overlay2.run("127.0.0.1", 24102).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let addr: Multiaddr = format!("/ip4/127.0.0.1/udp/{}/quic-v1", listen_port)
+            .parse()
+            .unwrap();
+        handle2.dial(addr).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        handle1.set_leaders(vec![peer2]).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let tx = test_tx_xdr(1);
+        handle1.broadcast_tx(tx.clone()).await;
+
+        // The leader must receive the full TX body.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut received = false;
+        while tokio::time::Instant::now() < deadline && !received {
+            tokio::select! {
+                Some(event) = tx_events2.recv() => {
+                    if let OverlayEvent::TxReceived { tx: recv_tx, .. } = event {
+                        assert_eq!(recv_tx, tx);
+                        received = true;
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+        assert!(received, "Leader should receive directly pushed TX");
+
+        // Pushed directly: one leader push, no INV advertisement.
+        assert_eq!(metrics1.flood_leader_push.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            metrics1.flood_leader_push_bytes.load(Ordering::Relaxed),
+            tx.len() as u64
+        );
+        assert_eq!(metrics1.flood_advertised.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics1.flood_leader_fallback.load(Ordering::Relaxed), 0);
+
+        handle1.shutdown().await;
+        handle2.shutdown().await;
+    }
+
+    /// Direct leader flooding: when the configured leaders are not connected,
+    /// broadcast must fall back to INV flooding so the TX still propagates.
+    #[tokio::test]
+    async fn test_leader_push_fallback_when_leader_disconnected() {
+        let keypair1 = Keypair::generate_ed25519();
+        let keypair2 = Keypair::generate_ed25519();
+
+        let metrics1 = Arc::new(OverlayMetrics::new());
+        let (handle1, _events1, _tx_events1, overlay1) =
+            create_overlay(keypair1, Arc::clone(&metrics1)).unwrap();
+        let (handle2, _events2, mut tx_events2, overlay2) =
+            create_overlay(keypair2, Arc::new(OverlayMetrics::new())).unwrap();
+
+        let listen_port = 24103;
+        tokio::spawn(async move { overlay1.run("127.0.0.1", listen_port).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::spawn(async move { overlay2.run("127.0.0.1", 24104).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let addr: Multiaddr = format!("/ip4/127.0.0.1/udp/{}/quic-v1", listen_port)
+            .parse()
+            .unwrap();
+        handle2.dial(addr).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // A leader that is not connected to overlay1.
+        let unconnected_leader = Keypair::generate_ed25519().public().to_peer_id();
+        handle1.set_leaders(vec![unconnected_leader]).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let tx = test_tx_xdr(2);
+        handle1.broadcast_tx(tx.clone()).await;
+
+        // The peer must still receive the TX via the INV/GETDATA pull path.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut received = false;
+        while tokio::time::Instant::now() < deadline && !received {
+            tokio::select! {
+                Some(event) = tx_events2.recv() => {
+                    if let OverlayEvent::TxReceived { tx: recv_tx, .. } = event {
+                        assert_eq!(recv_tx, tx);
+                        received = true;
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+        assert!(received, "Peer should receive TX via INV fallback");
+
+        assert_eq!(metrics1.flood_leader_push.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics1.flood_leader_fallback.load(Ordering::Relaxed), 1);
+        assert!(metrics1.flood_advertised.load(Ordering::Relaxed) >= 1);
+
+        handle1.shutdown().await;
+        handle2.shutdown().await;
+    }
+
+    /// Direct leader flooding, relay path: a node that pulls a TX via
+    /// INV/GETDATA must forward the full body directly to its connected
+    /// leaders — closing coverage holes when the origin can't reach a leader.
+    #[tokio::test]
+    async fn test_leader_relay_after_pull() {
+        // Topology: A — B — C (A and C not connected). B considers C the
+        // leader; A knows no leaders and INV-floods.
+        let keypair_a = Keypair::generate_ed25519();
+        let keypair_b = Keypair::generate_ed25519();
+        let keypair_c = Keypair::generate_ed25519();
+        let peer_c = keypair_c.public().to_peer_id();
+
+        let metrics_b = Arc::new(OverlayMetrics::new());
+        let (handle_a, _events_a, _tx_events_a, overlay_a) =
+            create_overlay(keypair_a, Arc::new(OverlayMetrics::new())).unwrap();
+        let (handle_b, _events_b, _tx_events_b, overlay_b) =
+            create_overlay(keypair_b, Arc::clone(&metrics_b)).unwrap();
+        let (handle_c, _events_c, mut tx_events_c, overlay_c) =
+            create_overlay(keypair_c, Arc::new(OverlayMetrics::new())).unwrap();
+
+        let port_a = 24105;
+        let port_b = 24106;
+        tokio::spawn(async move { overlay_a.run("127.0.0.1", port_a).await });
+        tokio::spawn(async move { overlay_b.run("127.0.0.1", port_b).await });
+        tokio::spawn(async move { overlay_c.run("127.0.0.1", 24107).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // B dials A; C dials B.
+        let addr_a: Multiaddr = format!("/ip4/127.0.0.1/udp/{}/quic-v1", port_a)
+            .parse()
+            .unwrap();
+        handle_b.dial(addr_a).await;
+        let addr_b: Multiaddr = format!("/ip4/127.0.0.1/udp/{}/quic-v1", port_b)
+            .parse()
+            .unwrap();
+        handle_c.dial(addr_b).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        handle_b.set_leaders(vec![peer_c]).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let tx = test_tx_xdr(3);
+        handle_a.broadcast_tx(tx.clone()).await;
+
+        // C must receive the TX: A INVs to B, B pulls it, then B pushes the
+        // full body directly to its leader C.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut received = false;
+        while tokio::time::Instant::now() < deadline && !received {
+            tokio::select! {
+                Some(event) = tx_events_c.recv() => {
+                    if let OverlayEvent::TxReceived { tx: recv_tx, .. } = event {
+                        assert_eq!(recv_tx, tx);
+                        received = true;
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+        assert!(received, "Leader C should receive TX relayed by B");
+
+        assert_eq!(metrics_b.flood_leader_push.load(Ordering::Relaxed), 1);
+        // B pulled via GETDATA, so it never INV-advertised the TX onward.
+        assert_eq!(metrics_b.flood_advertised.load(Ordering::Relaxed), 0);
+
+        handle_a.shutdown().await;
+        handle_b.shutdown().await;
+        handle_c.shutdown().await;
     }
 
     #[test]

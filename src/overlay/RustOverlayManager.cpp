@@ -376,6 +376,11 @@ RustOverlayManager::syncOverlayMetrics()
     markDelta(m.mAbandonedDemandMeter, "flood_abandoned_demands");
     markDelta(m.mDemandTimeouts, "demand_timeout");
 
+    // Direct leader flooding (docs/direct-leader-flooding.md)
+    markDelta(m.mFloodLeaderPushMeter, "flood_leader_push");
+    markDelta(m.mFloodLeaderPushBytesMeter, "flood_leader_push_bytes");
+    markDelta(m.mFloodLeaderFallbackMeter, "flood_leader_fallback");
+
     // Send meters per message type
     markDelta(m.mSendSCPMessageSetMeter, "send_scp_message");
     markDelta(m.mSendTransactionMeter, "send_transaction");

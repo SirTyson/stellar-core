@@ -75,6 +75,15 @@ pub struct OverlayMetrics {
     /// overlay.demand.timeout — pull mode peer timeouts
     pub demand_timeout: AtomicU64,
 
+    // Direct leader flooding (see docs/direct-leader-flooding.md)
+    /// overlay.flood.leader-push — full TX bodies pushed directly to leaders
+    pub flood_leader_push: AtomicU64,
+    /// overlay.flood.leader-push-bytes — bytes of TX bodies pushed to leaders
+    pub flood_leader_push_bytes: AtomicU64,
+    /// overlay.flood.leader-fallback — TXs INV-flooded because no configured
+    /// leader was connected
+    pub flood_leader_fallback: AtomicU64,
+
     // Connection lifecycle
     /// overlay.inbound.attempt — inbound connection attempts
     pub inbound_attempt: AtomicU64,
@@ -143,6 +152,9 @@ impl Default for OverlayMetrics {
             flood_broadcast: AtomicU64::new(0),
             flood_abandoned_demands: AtomicU64::new(0),
             demand_timeout: AtomicU64::new(0),
+            flood_leader_push: AtomicU64::new(0),
+            flood_leader_push_bytes: AtomicU64::new(0),
+            flood_leader_fallback: AtomicU64::new(0),
             inbound_attempt: AtomicU64::new(0),
             inbound_establish: AtomicU64::new(0),
             inbound_drop: AtomicU64::new(0),
@@ -204,6 +216,9 @@ impl OverlayMetrics {
             flood_broadcast: self.flood_broadcast.load(ORD),
             flood_abandoned_demands: self.flood_abandoned_demands.load(ORD),
             demand_timeout: self.demand_timeout.load(ORD),
+            flood_leader_push: self.flood_leader_push.load(ORD),
+            flood_leader_push_bytes: self.flood_leader_push_bytes.load(ORD),
+            flood_leader_fallback: self.flood_leader_fallback.load(ORD),
             inbound_attempt: self.inbound_attempt.load(ORD),
             inbound_establish: self.inbound_establish.load(ORD),
             inbound_drop: self.inbound_drop.load(ORD),
@@ -273,6 +288,9 @@ pub struct MetricsSnapshot {
     pub flood_broadcast: u64,
     pub flood_abandoned_demands: u64,
     pub demand_timeout: u64,
+    pub flood_leader_push: u64,
+    pub flood_leader_push_bytes: u64,
+    pub flood_leader_fallback: u64,
     pub inbound_attempt: u64,
     pub inbound_establish: u64,
     pub inbound_drop: u64,

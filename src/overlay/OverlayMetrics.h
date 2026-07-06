@@ -56,6 +56,11 @@ struct OverlayMetrics
     medida::Meter& mDemandTimeouts;
     medida::Meter& mAbandonedDemandMeter;
 
+    // ── Direct leader flooding (docs/direct-leader-flooding.md) ──
+    medida::Meter& mFloodLeaderPushMeter;
+    medida::Meter& mFloodLeaderPushBytesMeter;
+    medida::Meter& mFloodLeaderFallbackMeter;
+
     // ── Broadcast / dedup ──
     medida::Meter& mMessagesBroadcast;
     medida::Meter& mUniqueFloodBytesRecv;
