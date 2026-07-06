@@ -6,6 +6,7 @@
 #include "crypto/KeyUtils.h"
 #include "herder/TxSetFrame.h"
 #include "lib/catch.hpp"
+#include "lib/json/json.h"
 #include "overlay/OverlayIPC.h"
 #include "rust/RustBridge.h"
 #include "test/TestUtils.h"
@@ -1009,6 +1010,239 @@ TEST_CASE("leader schedule prediction matches live nomination",
              "Leader schedule prediction test passed ({} slot/node "
              "combinations checked)",
              checked);
+}
+
+/**
+ * Verify the SET_LEADERS push end-to-end (direct leader flooding, roadmap
+ * step 2 / plan step 3; see docs/direct-leader-flooding.md).
+ *
+ * On each ledger close (LCL = L) every validator must push the top
+ * FLOOD_LEADER_COUNT leaders of slot L+2 (seeded by hash(L)) to its overlay,
+ * which maps them to authenticated PeerIds and stores them. The overlay
+ * exposes the stored set in its metrics snapshot, so this test closes 5
+ * ledgers on a real 3-validator network and then asserts each node's overlay
+ * reports exactly computeLeaderSchedule(hash(L), L+2) for that node's final
+ * LCL, and that every leader other than the node itself is a connected,
+ * authenticated peer.
+ */
+TEST_CASE("flood leaders pushed to overlay", "[overlay-ipc][herder][.]")
+{
+    std::string overlayBinary = requireOverlayBinary();
+    Hash networkID = sha256(getTestConfig().NETWORK_PASSPHRASE);
+    auto simulation = std::make_shared<Simulation>(networkID);
+
+    std::vector<SecretKey> keys;
+    for (int i = 0; i < 3; ++i)
+    {
+        keys.push_back(SecretKey::fromSeed(
+            sha256("FLOOD_LEADERS_TEST_NODE_" + std::to_string(i))));
+    }
+
+    SCPQuorumSet qSet;
+    qSet.threshold = 2;
+    for (auto const& k : keys)
+    {
+        qSet.validators.push_back(k.getPublicKey());
+    }
+
+    uint16_t const basePort = 11660;
+    std::vector<Application::pointer> nodes;
+    for (int i = 0; i < 3; ++i)
+    {
+        auto cfg = simulation->newConfig();
+        cfg.PEER_PORT = basePort + i;
+        for (int j = 0; j < 3; ++j)
+        {
+            if (j != i)
+            {
+                cfg.KNOWN_PEERS.push_back("127.0.0.1:" +
+                                          std::to_string(basePort + j));
+            }
+        }
+        nodes.push_back(simulation->addNode(keys[i], qSet, &cfg));
+    }
+    simulation->startAllNodes();
+
+    uint32_t const targetLedger = 5;
+    simulation->crankUntil(
+        [&]() {
+            if (!simulation->haveAllExternalized(targetLedger, 2))
+            {
+                return false;
+            }
+            // computeLeaderSchedule (via getNodeWeight) asserts no ledger is
+            // being applied.
+            for (auto const& node : nodes)
+            {
+                if (node->getLedgerManager().isApplying())
+                {
+                    return false;
+                }
+            }
+            return true;
+        },
+        30 * targetLedger * simulation->getExpectedLedgerCloseTime(), false);
+    REQUIRE(simulation->haveAllExternalized(targetLedger, 2));
+
+    // Ledgers only close while cranking, so each node's LCL -- and therefore
+    // its last SET_LEADERS push -- is now frozen; the overlay processes the
+    // push asynchronously in real time, hence the polling below.
+    for (size_t i = 0; i < nodes.size(); ++i)
+    {
+        auto const& node = nodes[i];
+        auto& herder = static_cast<HerderImpl&>(node->getHerder());
+        auto const& lcl = node->getLedgerManager().getLastClosedLedgerHeader();
+        uint64_t const expectedSlot = lcl.header.ledgerSeq + 2;
+
+        auto leaders = herder.getHerderSCPDriver().computeLeaderSchedule(
+            lcl.hash, expectedSlot, node->getConfig().FLOOD_LEADER_COUNT);
+        REQUIRE(!leaders.empty());
+        std::vector<std::string> expected;
+        for (auto const& id : leaders)
+        {
+            expected.emplace_back(KeyUtils::toStrKey(id));
+        }
+        std::string const selfStrkey =
+            KeyUtils::toStrKey(keys[i].getPublicKey());
+
+        auto& ipc = node->getOverlayManager().getOverlayIPC();
+        bool matched = false;
+        for (int attempt = 0; attempt < 50 && !matched; ++attempt)
+        {
+            auto metricsJson = ipc.requestMetrics(1000);
+            Json::Value root;
+            Json::Reader reader;
+            if (metricsJson.empty() || !reader.parse(metricsJson, root))
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                continue;
+            }
+
+            auto const& reported = root["flood_leaders"];
+            matched = root["flood_leaders_slot"].asUInt64() == expectedSlot &&
+                      reported.isArray() &&
+                      reported.size() == expected.size();
+            for (Json::ArrayIndex j = 0; matched && j < reported.size(); ++j)
+            {
+                matched = reported[j].asString() == expected[j];
+            }
+
+            if (matched)
+            {
+                // Every leader other than ourselves must be a connected,
+                // authenticated peer (there is no self-connection).
+                auto const& connected = root["flood_leaders_connected"];
+                REQUIRE(connected.isArray());
+                REQUIRE(connected.size() == reported.size());
+                for (Json::ArrayIndex j = 0; j < reported.size(); ++j)
+                {
+                    if (reported[j].asString() != selfStrkey)
+                    {
+                        REQUIRE(connected[j].asBool());
+                    }
+                }
+            }
+            else
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            }
+        }
+        REQUIRE(matched);
+    }
+
+    LOG_INFO(DEFAULT_LOG, "Flood leaders pushed to overlay test passed");
+}
+
+/**
+ * End-to-end test of leader-targeted TX routing (direct leader flooding,
+ * roadmap step 3; see docs/direct-leader-flooding.md).
+ *
+ * On a real 3-validator network with the leader schedule flowing (steps 1-2),
+ * a TX submitted to one node must be pushed as a full body directly to the
+ * upcoming leaders (skipping INV/GETDATA) and still be included in a ledger.
+ * Verified via the submitting node's overlay metrics: flood_leader_push > 0.
+ */
+TEST_CASE("TX routed directly to leader", "[overlay-ipc][herder][.]")
+{
+    std::string overlayBinary = requireOverlayBinary();
+    Hash networkID = sha256(getTestConfig().NETWORK_PASSPHRASE);
+    auto simulation = std::make_shared<Simulation>(networkID);
+
+    std::vector<SecretKey> keys;
+    for (int i = 0; i < 3; ++i)
+    {
+        keys.push_back(SecretKey::fromSeed(
+            sha256("LEADER_ROUTING_TEST_NODE_" + std::to_string(i))));
+    }
+
+    SCPQuorumSet qSet;
+    qSet.threshold = 2;
+    for (auto const& k : keys)
+    {
+        qSet.validators.push_back(k.getPublicKey());
+    }
+
+    uint16_t const basePort = 11663;
+    std::vector<Application::pointer> nodes;
+    for (int i = 0; i < 3; ++i)
+    {
+        auto cfg = simulation->newConfig();
+        cfg.PEER_PORT = basePort + i;
+        for (int j = 0; j < 3; ++j)
+        {
+            if (j != i)
+            {
+                cfg.KNOWN_PEERS.push_back("127.0.0.1:" +
+                                          std::to_string(basePort + j));
+            }
+        }
+        nodes.push_back(simulation->addNode(keys[i], qSet, &cfg));
+    }
+    simulation->startAllNodes();
+
+    // Let the network close a few ledgers so every node has pushed (and its
+    // overlay installed) a leader schedule before we submit.
+    simulation->crankUntil(
+        [&]() { return simulation->haveAllExternalized(3, 2); },
+        30 * 3 * simulation->getExpectedLedgerCloseTime(), false);
+    REQUIRE(simulation->haveAllExternalized(3, 2));
+
+    // Submit a TX to node0.
+    auto root = TestAccount{*nodes[0], txtest::getRoot(networkID)};
+    SecretKey destKey = SecretKey::pseudoRandomForTesting();
+    auto tx =
+        root.tx({txtest::createAccount(destKey.getPublicKey(), 500000000000)});
+    REQUIRE(nodes[0]->getHerder().recvTransaction(tx, false) ==
+            TxSubmitStatus::TX_STATUS_PENDING);
+
+    // The TX must be included and applied on all nodes.
+    uint32_t const targetLedger = 6;
+    simulation->crankUntil(
+        [&]() { return simulation->haveAllExternalized(targetLedger, 2); },
+        30 * targetLedger * simulation->getExpectedLedgerCloseTime(), false);
+    REQUIRE(simulation->haveAllExternalized(targetLedger, 2));
+
+    for (auto const& node : nodes)
+    {
+        LedgerTxn ltx(node->getLedgerTxnRoot());
+        REQUIRE(stellar::loadAccount(ltx, destKey.getPublicKey()));
+    }
+
+    // The submitting node's overlay must have pushed the TX body directly to
+    // at least one leader (with 3 validators and FLOOD_LEADER_COUNT=2, at
+    // least one upcoming leader is a remote, connected peer).
+    auto metricsJson =
+        nodes[0]->getOverlayManager().getOverlayIPC().requestMetrics(2000);
+    REQUIRE(!metricsJson.empty());
+    Json::Value root0;
+    Json::Reader reader;
+    REQUIRE(reader.parse(metricsJson, root0));
+    REQUIRE(root0.isMember("flood_leader_push"));
+    REQUIRE(root0["flood_leader_push"].asUInt64() >= 1);
+
+    LOG_INFO(DEFAULT_LOG,
+             "TX routed directly to leader test passed (leader pushes: {})",
+             root0["flood_leader_push"].asUInt64());
 }
 
 /**

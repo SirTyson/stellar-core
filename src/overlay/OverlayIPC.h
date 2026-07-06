@@ -154,6 +154,15 @@ class OverlayIPC
                        std::vector<std::string> const& quorumMembers = {});
 
     /**
+     * Push the upcoming nomination leaders for `slotIndex` to the overlay
+     * (validator strkeys, ordered by election priority). Replaces the
+     * overlay's previous flood-target set. See
+     * docs/direct-leader-flooding.md.
+     */
+    void updateLeaders(uint64_t slotIndex,
+                       std::vector<std::string> const& leaderStrkeys);
+
+    /**
      * Request a TX set by hash from peers (asynchronous).
      *
      * The Rust overlay will fetch from peers and notify via the
