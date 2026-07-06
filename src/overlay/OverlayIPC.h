@@ -49,6 +49,10 @@ class OverlayIPC
     using TxSetReceivedCallback = std::function<void(
         Hash const& hash, GeneralizedTransactionSet const& txSet)>;
 
+    /// Callback when Rust overlay reports quorum connectivity status.
+    using QuorumConnectivityReportCallback =
+        std::function<void(std::vector<std::string> const& missingValidators)>;
+
     /**
      * Create an OverlayIPC instance.
      *
@@ -57,7 +61,9 @@ class OverlayIPC
      * @param peerPort Port for peer TCP connections (passed to overlay)
      */
     OverlayIPC(std::optional<std::string> socketPath,
-               std::optional<std::string> overlayBinaryPath, uint16_t peerPort);
+               std::optional<std::string> overlayBinaryPath, uint16_t peerPort,
+               std::optional<std::string> nodeSeedHex = std::nullopt,
+               uint64_t quorumCheckGraceSecs = 30);
 
     static std::string defaultSocketPath(uint16_t peerPort);
     static std::optional<std::string> findOverlayBinaryPath();
@@ -144,7 +150,8 @@ class OverlayIPC
      */
     void setPeerConfig(std::vector<std::string> const& knownPeers,
                        std::vector<std::string> const& preferredPeers,
-                       uint16_t listenPort);
+                       uint16_t listenPort,
+                       std::vector<std::string> const& quorumMembers = {});
 
     /**
      * Request a TX set by hash from peers (asynchronous).
@@ -176,6 +183,9 @@ class OverlayIPC
 
     /// Set callback for TX set received from peers (async fetch)
     void setOnTxSetReceived(TxSetReceivedCallback cb);
+
+    /// Set callback for quorum connectivity reports.
+    void setOnQuorumConnectivityReport(QuorumConnectivityReportCallback cb);
 
     /**
      * Request overlay metrics snapshot from Rust overlay.
@@ -217,6 +227,9 @@ class OverlayIPC
     std::string mSocketPath;
     std::optional<std::string> mOverlayBinaryPath;
     uint16_t mPeerPort;
+    std::optional<std::string> mNodeSeedHex;
+    uint64_t mQuorumCheckGraceSecs;
+    std::optional<std::string> mStartupConfigPath;
 
     std::unique_ptr<IPCChannel> mChannel;
     std::thread mReaderThread;
@@ -227,6 +240,7 @@ class OverlayIPC
     SCPReceivedCallback mOnSCPReceived;
     ScpStateRequestCallback mOnScpStateRequest;
     TxSetReceivedCallback mOnTxSetReceived;
+    QuorumConnectivityReportCallback mOnQuorumConnectivityReport;
 
     // For synchronous request/response (getTopTransactions)
     std::mutex mRequestMutex;

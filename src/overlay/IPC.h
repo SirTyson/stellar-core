@@ -57,7 +57,7 @@ enum class IPCMessageType : uint32_t
 
     /// Configure bootstrap peer addresses for Kademlia DHT
     /// Payload: JSON { "known_peers": [...], "preferred_peers": [...],
-    /// "listen_port": u16 }
+    /// "listen_port": u16, "quorum_members": [...] }
     SET_PEER_CONFIG = 8,
 
     /// Submit a transaction for flooding
@@ -100,6 +100,9 @@ enum class IPCMessageType : uint32_t
     /// Overlay metrics snapshot (JSON payload)
     /// Response to REQUEST_OVERLAY_METRICS
     OVERLAY_METRICS_RESPONSE = 105,
+
+    /// One-shot quorum connectivity verdict (JSON array of missing strkeys)
+    QUORUM_CONNECTIVITY_REPORT = 106,
 };
 
 /**

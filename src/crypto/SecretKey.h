@@ -46,6 +46,9 @@ class SecretKey
     // Get the seed portion of this secret key as a StrKey string.
     SecretValue getStrKeySeed() const;
 
+    // Get the raw 32-byte seed portion of this secret key.
+    uint256 getSeedBytes() const;
+
     // Get the public key portion of this secret key as a StrKey string.
     std::string getStrKeyPublic() const;
 

@@ -399,6 +399,63 @@ fn cache_tx_set_xdr(
     });
 }
 
+fn decode_hex_32(s: &str) -> Result<[u8; 32], String> {
+    if s.len() != 64 {
+        return Err(format!("expected 64 hex characters, got {}", s.len()));
+    }
+
+    let mut out = [0u8; 32];
+    for (i, chunk) in s.as_bytes().chunks_exact(2).enumerate() {
+        let hex = std::str::from_utf8(chunk).map_err(|e| e.to_string())?;
+        out[i] =
+            u8::from_str_radix(hex, 16).map_err(|e| format!("invalid hex at byte {}: {}", i, e))?;
+    }
+    Ok(out)
+}
+
+fn libp2p_keypair_from_config(config: &Config) -> Result<Libp2pKeypair, String> {
+    match &config.node_seed {
+        Some(seed_hex) => {
+            let seed = decode_hex_32(seed_hex)?;
+            Libp2pKeypair::ed25519_from_bytes(seed)
+                .map_err(|e| format!("failed to derive libp2p identity from NODE_SEED: {}", e))
+        }
+        None => Ok(Libp2pKeypair::generate_ed25519()),
+    }
+}
+
+fn quorum_member_peer_id(strkey: &str) -> Result<PeerId, String> {
+    let stellar_key = stellar_strkey::ed25519::PublicKey::from_string(strkey)
+        .map_err(|e| format!("invalid quorum member strkey {}: {}", strkey, e))?;
+    let ed25519_key = libp2p::identity::ed25519::PublicKey::try_from_bytes(&stellar_key.0)
+        .map_err(|e| format!("invalid ed25519 public key {}: {}", strkey, e))?;
+    let public_key = libp2p::identity::PublicKey::from(ed25519_key);
+    Ok(public_key.to_peer_id())
+}
+
+fn expected_quorum_from_strkeys(
+    quorum_members: &[String],
+) -> Result<HashMap<PeerId, String>, String> {
+    let mut expected = HashMap::new();
+    for member in quorum_members {
+        expected.insert(quorum_member_peer_id(member)?, member.clone());
+    }
+    Ok(expected)
+}
+
+fn missing_quorum_members(
+    expected_quorum: &HashMap<PeerId, String>,
+    connected_quorum: &HashSet<PeerId>,
+) -> Vec<String> {
+    let mut missing: Vec<String> = expected_quorum
+        .iter()
+        .filter(|(peer_id, _)| !connected_quorum.contains(peer_id))
+        .map(|(_, strkey)| strkey.clone())
+        .collect();
+    missing.sort();
+    missing
+}
+
 /// Application state
 struct App {
     core_ipc: CoreIpc,
@@ -429,6 +486,16 @@ struct App {
     /// PeerId → configured hostname, so targeted reconnect can re-resolve DNS
     /// after a pod restart changes the peer's IP address.
     peer_hostnames: Arc<RwLock<HashMap<PeerId, String>>>,
+    /// Expected quorum validators, keyed by authenticated libp2p PeerId.
+    expected_quorum: Arc<RwLock<HashMap<PeerId, String>>>,
+    /// All currently connected authenticated libp2p peers.
+    connected_peers: Arc<RwLock<HashSet<PeerId>>>,
+    /// Currently connected quorum validators.
+    connected_quorum: Arc<RwLock<HashSet<PeerId>>>,
+    /// Whether the one-shot quorum connectivity timer has been scheduled.
+    quorum_check_scheduled: bool,
+    /// Delay before emitting the one-shot quorum connectivity report.
+    quorum_check_grace_secs: u64,
     /// Shared metrics counters for the overlay
     metrics: Arc<OverlayMetrics>,
 }
@@ -468,7 +535,7 @@ impl App {
         });
 
         // Create libp2p QUIC overlay for SCP + TX + TxSet (unified, independent streams)
-        let libp2p_keypair = Libp2pKeypair::generate_ed25519();
+        let libp2p_keypair = libp2p_keypair_from_config(&config)?;
         let metrics = Arc::new(OverlayMetrics::new());
         let (libp2p_handle, libp2p_event_rx, tx_event_rx, libp2p_overlay) =
             create_overlay(libp2p_keypair, Arc::clone(&metrics))
@@ -509,6 +576,11 @@ impl App {
             })),
             known_peers: Arc::new(RwLock::new(HashMap::new())),
             peer_hostnames: Arc::new(RwLock::new(HashMap::new())),
+            expected_quorum: Arc::new(RwLock::new(HashMap::new())),
+            connected_peers: Arc::new(RwLock::new(HashSet::new())),
+            connected_quorum: Arc::new(RwLock::new(HashSet::new())),
+            quorum_check_scheduled: false,
+            quorum_check_grace_secs: config.quorum_check_grace_secs,
             metrics,
         })
     }
@@ -830,6 +902,12 @@ impl App {
             }
 
             LibP2pOverlayEvent::PeerConnected { peer_id, addr } => {
+                self.connected_peers.write().await.insert(peer_id);
+                if self.expected_quorum.read().await.contains_key(&peer_id) {
+                    self.connected_quorum.write().await.insert(peer_id);
+                    info!("Authenticated quorum member connected: {}", peer_id);
+                }
+
                 // Only record the mapping if this peer's address matches a configured peer.
                 // Inbound connections from unconfigured peers must NOT be reconnect-eligible.
                 let clean_addr = strip_p2p_suffix(&addr);
@@ -854,6 +932,11 @@ impl App {
             }
 
             LibP2pOverlayEvent::PeerDisconnected { peer_id } => {
+                self.connected_peers.write().await.remove(&peer_id);
+                if self.connected_quorum.write().await.remove(&peer_id) {
+                    info!("Authenticated quorum member disconnected: {}", peer_id);
+                }
+
                 // Clean up any pending SCP state requests for this peer
                 {
                     let mut pending = self.pending_scp_state_requests.write().await;
@@ -1295,11 +1378,84 @@ impl App {
                             })
                             .unwrap_or_default();
                         let listen_port = config["listen_port"].as_u64().unwrap_or(11625) as u16;
+                        let quorum_members_configured = config.get("quorum_members").is_some();
+                        let quorum_members: Vec<String> = config
+                            .get("quorum_members")
+                            .and_then(|v| v.as_array())
+                            .map(|v| {
+                                v.iter()
+                                    .filter_map(|s| s.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
 
                         info!(
-                            "Parsed peer config: known={:?}, preferred={:?}, port={}",
-                            known, preferred, listen_port
+                            "Parsed peer config: known={:?}, preferred={:?}, port={}, quorum_members={}",
+                            known,
+                            preferred,
+                            listen_port,
+                            quorum_members.len()
                         );
+
+                        if quorum_members_configured {
+                            match expected_quorum_from_strkeys(&quorum_members) {
+                                Ok(expected) => {
+                                    let expected_count = expected.len();
+                                    let connected = self.connected_peers.read().await.clone();
+                                    let connected_quorum: HashSet<PeerId> = expected
+                                        .keys()
+                                        .filter(|peer_id| connected.contains(peer_id))
+                                        .copied()
+                                        .collect();
+                                    *self.expected_quorum.write().await = expected;
+                                    *self.connected_quorum.write().await = connected_quorum;
+
+                                    info!(
+                                        "Configured {} authenticated quorum member PeerIds",
+                                        expected_count
+                                    );
+
+                                    if !self.quorum_check_scheduled {
+                                        self.quorum_check_scheduled = true;
+                                        let expected_quorum = self.expected_quorum.clone();
+                                        let connected_quorum = self.connected_quorum.clone();
+                                        let sender = self.core_ipc.sender.clone();
+                                        let grace =
+                                            Duration::from_secs(self.quorum_check_grace_secs);
+                                        tokio::spawn(async move {
+                                            tokio::time::sleep(grace).await;
+                                            let expected = expected_quorum.read().await;
+                                            let connected = connected_quorum.read().await;
+                                            let missing =
+                                                missing_quorum_members(&expected, &connected);
+                                            match serde_json::to_vec(&missing) {
+                                                Ok(payload) => {
+                                                    let msg = Message::new(
+                                                        MessageType::QuorumConnectivityReport,
+                                                        payload,
+                                                    );
+                                                    if let Err(e) = sender.send(msg) {
+                                                        error!(
+                                                            "Failed to send quorum connectivity report: {}",
+                                                            e
+                                                        );
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    error!(
+                                                        "Failed to serialize quorum connectivity report: {}",
+                                                        e
+                                                    );
+                                                }
+                                            }
+                                        });
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Invalid quorum_members in peer config: {}", e);
+                                }
+                            }
+                        }
 
                         // Resolve and dial all known/preferred peers
                         let all_peers: Vec<_> =
@@ -1516,6 +1672,100 @@ mod tests {
         let mut envelope = ScpEnvelope::default();
         envelope.statement.slot_index = slot_index;
         envelope.to_xdr(Limits::none()).unwrap()
+    }
+
+    /// Cross-language identity vector (RFC 8032, TEST 1): the seed and the
+    /// public key are the RFC's own test vector, and the strkey is Core's
+    /// encoding of that public key (pinned on the C++ side in
+    /// src/crypto/test/CryptoTests.cpp, "ed25519 cross-language identity
+    /// vector"). Unlike the tests below, nothing here is derived from the
+    /// libp2p key itself, so this actually crosses the Stellar-side
+    /// derivation: deriving the libp2p identity from NODE_SEED must produce
+    /// exactly the PeerId Core predicts from the validator's strkey.
+    #[test]
+    fn test_cross_language_identity_vector() {
+        const SEED_HEX: &str = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
+        const PUBLIC_HEX: &str = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+        const STRKEY: &str = "GDLVVGABQKYQVN6VJP7NHSLEA45A5YLS6PNKMIZFV4BBU2HXA5IRVHUR";
+
+        let mut config = Config::default();
+        config.node_seed = Some(SEED_HEX.to_string());
+        let keypair = libp2p_keypair_from_config(&config).unwrap();
+
+        // libp2p must interpret the 32 bytes as an RFC 8032 seed.
+        let public = keypair.public().try_into_ed25519().unwrap().to_bytes();
+        assert_eq!(public, decode_hex_32(PUBLIC_HEX).unwrap());
+
+        // Core's strkey for the same validator must map to the same PeerId
+        // that the seed-derived identity authenticates as.
+        assert_eq!(
+            quorum_member_peer_id(STRKEY).unwrap(),
+            keypair.public().to_peer_id()
+        );
+    }
+
+    #[test]
+    fn test_node_seed_derives_deterministic_peer_id() {
+        let mut config = Config::default();
+        config.node_seed =
+            Some("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f".to_string());
+
+        let peer_a = libp2p_keypair_from_config(&config)
+            .unwrap()
+            .public()
+            .to_peer_id();
+        let peer_b = libp2p_keypair_from_config(&config)
+            .unwrap()
+            .public()
+            .to_peer_id();
+        assert_eq!(peer_a, peer_b);
+    }
+
+    #[test]
+    fn test_quorum_member_strkey_parses_to_expected_peer_id() {
+        let mut config = Config::default();
+        config.node_seed =
+            Some("202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f".to_string());
+        let keypair = libp2p_keypair_from_config(&config).unwrap();
+        let expected_peer_id = keypair.public().to_peer_id();
+        let ed25519_public = keypair.public().try_into_ed25519().unwrap();
+        let strkey = stellar_strkey::ed25519::PublicKey(ed25519_public.to_bytes()).to_string();
+
+        let expected = expected_quorum_from_strkeys(&[strkey.clone()]).unwrap();
+        assert_eq!(expected.get(&expected_peer_id), Some(&strkey));
+    }
+
+    #[test]
+    fn test_missing_quorum_members_reports_only_absent_peers() {
+        let mut config_a = Config::default();
+        config_a.node_seed =
+            Some("404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f".to_string());
+        let keypair_a = libp2p_keypair_from_config(&config_a).unwrap();
+        let peer_a = keypair_a.public().to_peer_id();
+        let strkey_a = stellar_strkey::ed25519::PublicKey(
+            keypair_a.public().try_into_ed25519().unwrap().to_bytes(),
+        )
+        .to_string();
+
+        let mut config_b = Config::default();
+        config_b.node_seed =
+            Some("606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f".to_string());
+        let keypair_b = libp2p_keypair_from_config(&config_b).unwrap();
+        let strkey_b = stellar_strkey::ed25519::PublicKey(
+            keypair_b.public().try_into_ed25519().unwrap().to_bytes(),
+        )
+        .to_string();
+
+        let expected = expected_quorum_from_strkeys(&[strkey_a.clone(), strkey_b.clone()]).unwrap();
+        let connected = HashSet::from([peer_a]);
+
+        assert_eq!(
+            missing_quorum_members(&expected, &connected),
+            vec![strkey_b]
+        );
+
+        let all_connected: HashSet<PeerId> = expected.keys().copied().collect();
+        assert!(missing_quorum_members(&expected, &all_connected).is_empty());
     }
 
     #[test]

@@ -38,7 +38,8 @@ pub enum MessageType {
     Shutdown = 7,
 
     /// Configure peer addresses to connect to
-    /// Payload: JSON { "known_peers": [...], "preferred_peers": [...], "listen_port": u16 }
+    /// Payload: JSON { "known_peers": [...], "preferred_peers": [...], "listen_port": u16,
+    ///                 "quorum_members": [...] }
     SetPeerConfig = 8,
 
     /// Submit a transaction for flooding
@@ -74,6 +75,9 @@ pub enum MessageType {
 
     /// Overlay metrics snapshot response (JSON payload)
     OverlayMetricsResponse = 105,
+
+    /// One-shot quorum connectivity verdict (JSON array of missing strkeys)
+    QuorumConnectivityReport = 106,
 }
 
 impl TryFrom<u32> for MessageType {
@@ -98,6 +102,7 @@ impl TryFrom<u32> for MessageType {
             102 => Ok(MessageType::PeerRequestsScpState),
             103 => Ok(MessageType::TxSetAvailable),
             105 => Ok(MessageType::OverlayMetricsResponse),
+            106 => Ok(MessageType::QuorumConnectivityReport),
             _ => Err(InvalidMessageType(value)),
         }
     }
@@ -294,6 +299,7 @@ mod tests {
             MessageType::PeerRequestsScpState,
             MessageType::TxSetAvailable,
             MessageType::OverlayMetricsResponse,
+            MessageType::QuorumConnectivityReport,
         ];
 
         for msg_type in types {
@@ -379,6 +385,10 @@ mod tests {
             MessageType::try_from(105).unwrap(),
             MessageType::OverlayMetricsResponse
         );
+        assert_eq!(
+            MessageType::try_from(106).unwrap(),
+            MessageType::QuorumConnectivityReport
+        );
     }
 
     #[test]
@@ -387,7 +397,7 @@ mod tests {
         assert!(MessageType::try_from(9).is_err()); // gap between 8 and 10
         assert!(MessageType::try_from(99).is_err());
         assert!(MessageType::try_from(104).is_err());
-        assert!(MessageType::try_from(106).is_err());
+        assert!(MessageType::try_from(107).is_err());
         assert!(MessageType::try_from(u32::MAX).is_err());
     }
 }

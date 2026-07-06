@@ -454,6 +454,24 @@ TEST_CASE("StrKey tests", "[crypto]")
     REQUIRE(detectionRate > 99.99);
 }
 
+TEST_CASE("ed25519 cross-language identity vector", "[crypto]")
+{
+    // RFC 8032 TEST 1 vector, shared with the Rust overlay
+    // (overlay/src/main.rs, test_cross_language_identity_vector). The overlay
+    // derives its libp2p identity from these same NODE_SEED bytes, so this
+    // pins the seed -> public key -> strkey derivation the overlay's
+    // authenticated `validator strkey -> PeerId` mapping depends on (see
+    // docs/direct-leader-flooding.md, step 0).
+    auto seed = hexToBin256(
+        "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60");
+    SecretKey sk = SecretKey::fromSeed(seed);
+    REQUIRE(sk.getSeedBytes() == seed);
+    REQUIRE(binToHex(sk.getPublicKey().ed25519()) ==
+            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
+    REQUIRE(sk.getStrKeyPublic() ==
+            "GDLVVGABQKYQVN6VJP7NHSLEA45A5YLS6PNKMIZFV4BBU2HXA5IRVHUR");
+}
+
 TEST_CASE("key string roundtrip", "[crypto]")
 {
     SignerKey signer;

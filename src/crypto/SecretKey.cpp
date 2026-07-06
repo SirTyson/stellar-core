@@ -116,6 +116,13 @@ SecretKey::getStrKeySeed() const
     return strKey::toStrKey(strKey::STRKEY_SEED_ED25519, getSeed().mSeed);
 }
 
+uint256
+SecretKey::getSeedBytes() const
+{
+    releaseAssert(mKeyType == PUBLIC_KEY_TYPE_ED25519);
+    return getSeed().mSeed;
+}
+
 std::string
 SecretKey::getStrKeyPublic() const
 {

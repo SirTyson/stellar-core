@@ -4,6 +4,7 @@
 
 #include "overlay/OverlayIPC.h"
 #include "crypto/Hex.h"
+#include "lib/json/json.h"
 #include "util/Logging.h"
 #include "xdr/Stellar-ledger.h"
 #include <fmt/format.h>
@@ -11,9 +12,11 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <fcntl.h>
 #include <filesystem>
 #include <signal.h>
 #include <sstream>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
@@ -42,16 +45,36 @@ absoluteIfExecutable(std::string const& path)
     return std::nullopt;
 }
 
+std::string
+tomlEscape(std::string const& value)
+{
+    std::string escaped;
+    escaped.reserve(value.size());
+    for (auto c : value)
+    {
+        if (c == '\\' || c == '"')
+        {
+            escaped.push_back('\\');
+        }
+        escaped.push_back(c);
+    }
+    return escaped;
+}
+
 } // namespace
 
 OverlayIPC::OverlayIPC(std::optional<std::string> socketPath,
                        std::optional<std::string> overlayBinaryPath,
-                       uint16_t peerPort)
+                       uint16_t peerPort,
+                       std::optional<std::string> nodeSeedHex,
+                       uint64_t quorumCheckGraceSecs)
     : mSocketPath(socketPath && !socketPath->empty()
                       ? std::move(*socketPath)
                       : defaultSocketPath(peerPort))
     , mOverlayBinaryPath(std::move(overlayBinaryPath))
     , mPeerPort(peerPort)
+    , mNodeSeedHex(std::move(nodeSeedHex))
+    , mQuorumCheckGraceSecs(quorumCheckGraceSecs)
 {
 }
 
@@ -154,6 +177,11 @@ OverlayIPC::start()
             // Start reader thread
             mRunning = true;
             mReaderThread = std::thread(&OverlayIPC::readerLoop, this);
+            if (mStartupConfigPath)
+            {
+                unlink(mStartupConfigPath->c_str());
+                mStartupConfigPath.reset();
+            }
             return true;
         }
 
@@ -163,6 +191,11 @@ OverlayIPC::start()
 
     CLOG_ERROR(Overlay, "Failed to connect to overlay at {} after {} attempts",
                mSocketPath, MAX_RETRIES);
+    if (mStartupConfigPath)
+    {
+        unlink(mStartupConfigPath->c_str());
+        mStartupConfigPath.reset();
+    }
     shutdown();
     return false;
 }
@@ -219,6 +252,12 @@ OverlayIPC::shutdown()
         }
         mOverlayPid = -1;
     }
+
+    if (mStartupConfigPath)
+    {
+        unlink(mStartupConfigPath->c_str());
+        mStartupConfigPath.reset();
+    }
 }
 
 bool
@@ -231,21 +270,74 @@ OverlayIPC::spawnOverlay()
         return false;
     }
 
+    if (mNodeSeedHex)
+    {
+        std::string tmpl = fmt::format("/tmp/stellar-overlay-{}-{}.toml.XXXXXX",
+                                       getpid(), mPeerPort);
+        std::vector<char> path(tmpl.begin(), tmpl.end());
+        path.push_back('\0');
+        int fd = mkstemp(path.data());
+        if (fd < 0)
+        {
+            CLOG_ERROR(Overlay, "mkstemp() failed for overlay config: {}",
+                       strerror(errno));
+            return false;
+        }
+        if (fchmod(fd, S_IRUSR | S_IWUSR) != 0)
+        {
+            CLOG_ERROR(Overlay, "fchmod() failed for overlay config: {}",
+                       strerror(errno));
+            close(fd);
+            unlink(path.data());
+            return false;
+        }
+
+        std::string config = fmt::format("core_socket = \"{}\"\n"
+                                         "peer_port = {}\n"
+                                         "node_seed = \"{}\"\n"
+                                         "quorum_check_grace_secs = {}\n",
+                                         tomlEscape(mSocketPath), mPeerPort,
+                                         *mNodeSeedHex, mQuorumCheckGraceSecs);
+        ssize_t written = write(fd, config.data(), config.size());
+        if (written < 0 || static_cast<size_t>(written) != config.size())
+        {
+            CLOG_ERROR(Overlay, "write() failed for overlay config: {}",
+                       strerror(errno));
+            close(fd);
+            unlink(path.data());
+            return false;
+        }
+        close(fd);
+        mStartupConfigPath = std::string(path.data());
+    }
+
     pid_t pid = fork();
     if (pid < 0)
     {
         CLOG_ERROR(Overlay, "fork() failed: {}", strerror(errno));
+        if (mStartupConfigPath)
+        {
+            unlink(mStartupConfigPath->c_str());
+            mStartupConfigPath.reset();
+        }
         return false;
     }
 
     if (pid == 0)
     {
-        // Child process - exec overlay binary
-        // Arguments: <binary> --listen <socket-path> --peer-port <port>
-        std::string portStr = std::to_string(mPeerPort);
-        execl(overlayBinaryPath->c_str(), overlayBinaryPath->c_str(),
-              "--listen", mSocketPath.c_str(), "--peer-port", portStr.c_str(),
-              nullptr);
+        // Child process - exec overlay binary.
+        if (mStartupConfigPath)
+        {
+            execl(overlayBinaryPath->c_str(), overlayBinaryPath->c_str(),
+                  "--config", mStartupConfigPath->c_str(), "--listen", nullptr);
+        }
+        else
+        {
+            std::string portStr = std::to_string(mPeerPort);
+            execl(overlayBinaryPath->c_str(), overlayBinaryPath->c_str(),
+                  "--listen", mSocketPath.c_str(), "--peer-port",
+                  portStr.c_str(), nullptr);
+        }
 
         // exec failed
         _exit(1);
@@ -402,6 +494,34 @@ OverlayIPC::handleMessage(IPCMessage const& msg)
 
             auto envelopes = mOnScpStateRequest(ledgerSeq);
             sendScpStateResponse(requestId, envelopes);
+        }
+        break;
+    }
+
+    case IPCMessageType::QUORUM_CONNECTIVITY_REPORT:
+    {
+        std::string jsonStr(msg.payload.begin(), msg.payload.end());
+        Json::Value root;
+        Json::Reader reader;
+        if (!reader.parse(jsonStr, root) || !root.isArray())
+        {
+            CLOG_WARNING(Overlay,
+                         "Failed to parse quorum connectivity report JSON");
+            break;
+        }
+
+        std::vector<std::string> missing;
+        for (auto const& entry : root)
+        {
+            if (entry.isString())
+            {
+                missing.emplace_back(entry.asString());
+            }
+        }
+
+        if (mOnQuorumConnectivityReport)
+        {
+            mOnQuorumConnectivityReport(missing);
         }
         break;
     }
@@ -644,7 +764,8 @@ OverlayIPC::cacheTxSet(Hash const& hash, std::vector<uint8_t> const& xdr)
 void
 OverlayIPC::setPeerConfig(std::vector<std::string> const& knownPeers,
                           std::vector<std::string> const& preferredPeers,
-                          uint16_t listenPort)
+                          uint16_t listenPort,
+                          std::vector<std::string> const& quorumMembers)
 {
     if (!mChannel || !mChannel->isConnected())
     {
@@ -666,7 +787,15 @@ OverlayIPC::setPeerConfig(std::vector<std::string> const& knownPeers,
             json += ",";
         json += "\"" + preferredPeers[i] + "\"";
     }
-    json += "],\"listen_port\":" + std::to_string(listenPort) + "}";
+    json += "],\"quorum_members\":[";
+    for (size_t i = 0; i < quorumMembers.size(); ++i)
+    {
+        if (i > 0)
+            json += ",";
+        json += "\"" + quorumMembers[i] + "\"";
+    }
+    json += "]";
+    json += ",\"listen_port\":" + std::to_string(listenPort) + "}";
 
     IPCMessage msg;
     msg.type = IPCMessageType::SET_PEER_CONFIG;
@@ -712,6 +841,12 @@ void
 OverlayIPC::setOnTxSetReceived(TxSetReceivedCallback cb)
 {
     mOnTxSetReceived = std::move(cb);
+}
+
+void
+OverlayIPC::setOnQuorumConnectivityReport(QuorumConnectivityReportCallback cb)
+{
+    mOnQuorumConnectivityReport = std::move(cb);
 }
 
 void

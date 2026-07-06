@@ -3,10 +3,13 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "overlay/RustOverlayManager.h"
+#include "crypto/Hex.h"
+#include "crypto/KeyUtils.h"
 #include "herder/Herder.h"
 #include "herder/TxSetFrame.h"
 #include "lib/json/json.h"
 #include "main/Application.h"
+#include "scp/LocalNode.h"
 #include "util/Backtrace.h"
 #include "util/Logging.h"
 #include "xdr/Stellar-overlay.h"
@@ -14,6 +17,7 @@
 #include <medida/histogram.h>
 #include <medida/meter.h>
 #include <medida/timer.h>
+#include <sstream>
 
 namespace stellar
 {
@@ -26,8 +30,12 @@ RustOverlayManager::RustOverlayManager(Application& app)
     CLOG_INFO(Overlay, "Creating RustOverlayManager with port={}",
               cfg.PEER_PORT);
 
-    mOverlayIPC = std::make_unique<OverlayIPC>(
-        cfg.OVERLAY_SOCKET_PATH, cfg.OVERLAY_BINARY_PATH, cfg.PEER_PORT);
+    auto seed = cfg.NODE_SEED.getSeedBytes();
+    auto nodeSeedHex = binToHex(ByteSlice(seed.data(), seed.size()));
+
+    mOverlayIPC = std::make_unique<OverlayIPC>(cfg.OVERLAY_SOCKET_PATH,
+                                               cfg.OVERLAY_BINARY_PATH,
+                                               cfg.PEER_PORT, nodeSeedHex);
 }
 
 RustOverlayManager::~RustOverlayManager()
@@ -71,6 +79,45 @@ RustOverlayManager::start()
                 "RustOverlayManager: TxSetReceived");
         });
 
+    mOverlayIPC->setOnQuorumConnectivityReport(
+        [this](std::vector<std::string> const& missing) {
+            if (missing.empty())
+            {
+                CLOG_INFO(Overlay,
+                          "Authenticated quorum connectivity check passed");
+                return;
+            }
+
+            std::ostringstream oss;
+            for (size_t i = 0; i < missing.size(); ++i)
+            {
+                if (i != 0)
+                {
+                    oss << ", ";
+                }
+                oss << missing[i];
+            }
+            auto message = fmt::format(
+                "Authenticated quorum connectivity check failed; missing "
+                "validators: {}",
+                oss.str());
+            // Targeted flooding falls back to INV flooding when leaders are
+            // unreachable, so an incomplete topology degrades bandwidth, not
+            // liveness. Only kill the node when the experiment's fail-fast
+            // dense-mesh assert is explicitly requested.
+            if (mApp.getConfig().QUORUM_CONNECTIVITY_CHECK_FATAL)
+            {
+                CLOG_FATAL(Overlay, "{}", message);
+                mApp.postOnMainThread(
+                    [message]() { throw std::runtime_error(message); },
+                    "RustOverlayManager: QuorumConnectivityReport");
+            }
+            else
+            {
+                CLOG_ERROR(Overlay, "{}", message);
+            }
+        });
+
     if (!mOverlayIPC->start())
     {
         CLOG_ERROR(Overlay, "Failed to start Rust overlay process");
@@ -78,8 +125,18 @@ RustOverlayManager::start()
         throw std::runtime_error("Failed to start Rust overlay");
     }
 
+    std::vector<std::string> quorumMembers;
+    auto self = cfg.NODE_SEED.getPublicKey();
+    LocalNode::forAllNodes(cfg.QUORUM_SET, [&](NodeID const& nodeID) {
+        if (nodeID != self)
+        {
+            quorumMembers.emplace_back(KeyUtils::toStrKey(nodeID));
+        }
+        return true;
+    });
+
     mOverlayIPC->setPeerConfig(cfg.KNOWN_PEERS, cfg.PREFERRED_PEERS,
-                               cfg.PEER_PORT);
+                               cfg.PEER_PORT, quorumMembers);
 
     CLOG_INFO(Overlay, "RustOverlayManager started, peer_port={}",
               cfg.PEER_PORT);

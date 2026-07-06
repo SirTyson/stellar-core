@@ -20,6 +20,13 @@ pub struct Config {
 
     /// Log level
     pub log_level: String,
+
+    /// Optional hex-encoded 32-byte Stellar node seed used as libp2p identity.
+    pub node_seed: Option<String>,
+
+    /// Seconds to wait after receiving quorum_members before reporting
+    /// connectivity completeness to Core.
+    pub quorum_check_grace_secs: u64,
 }
 
 impl Default for Config {
@@ -29,6 +36,8 @@ impl Default for Config {
             libp2p_listen_ip: "0.0.0.0".to_string(), // Bind to all interfaces for internet operation
             peer_port: 11625,
             log_level: "info".to_string(),
+            node_seed: None,
+            quorum_check_grace_secs: 30,
         }
     }
 }
@@ -76,6 +85,8 @@ mod tests {
         );
         assert_eq!(config.peer_port, 11625);
         assert_eq!(config.log_level, "info");
+        assert_eq!(config.node_seed, None);
+        assert_eq!(config.quorum_check_grace_secs, 30);
     }
 
     #[test]
@@ -85,6 +96,8 @@ mod tests {
             libp2p_listen_ip = "127.0.0.1"
             peer_port = 12625
             log_level = "debug"
+            node_seed = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+            quorum_check_grace_secs = 5
         "#;
 
         let config = Config::from_str(toml).unwrap();
@@ -92,6 +105,11 @@ mod tests {
         assert_eq!(config.libp2p_listen_ip, "127.0.0.1");
         assert_eq!(config.peer_port, 12625);
         assert_eq!(config.log_level, "debug");
+        assert_eq!(
+            config.node_seed,
+            Some("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f".to_string())
+        );
+        assert_eq!(config.quorum_check_grace_secs, 5);
     }
 
     // ═══ Parse Error Cases ═══

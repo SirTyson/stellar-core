@@ -2,6 +2,8 @@
 // under the Apache License, Version 2.0. See the COPYING file at the root
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
+#include "crypto/Hex.h"
+#include "crypto/KeyUtils.h"
 #include "herder/TxSetFrame.h"
 #include "lib/catch.hpp"
 #include "overlay/OverlayIPC.h"
@@ -13,6 +15,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <future>
 #include <thread>
 
 using namespace stellar;
@@ -713,6 +716,83 @@ TEST_CASE("Rust overlay TX flooding between peers", "[overlay-ipc][.]")
 
     LOG_INFO(DEFAULT_LOG, "TX flooding between peers test passed - "
                           "TX submitted to A appeared in B's mempool!");
+
+    ipcA->shutdown();
+    ipcB->shutdown();
+}
+
+/**
+ * Test authenticated quorum connectivity reporting (direct leader flooding,
+ * step 0; see docs/direct-leader-flooding.md).
+ *
+ * Two overlays derive their libp2p identities from Stellar node seeds, and
+ * each is told the other's validator strkey as a quorum member. Both
+ * connectivity reports must come back empty, which proves end-to-end that the
+ * PeerId the Rust overlay derives from NODE_SEED matches the PeerId Core
+ * predicts from that validator's strkey -- across the C++/Rust boundary and
+ * through a real authenticated QUIC handshake. A third validator that never
+ * connects must be reported missing.
+ */
+TEST_CASE("Rust overlay quorum connectivity report", "[overlay-ipc][.]")
+{
+    std::string overlayBinary = requireOverlayBinary();
+    TmpDir tmpDirA("overlay_ipc_quorum_conn_a");
+    TmpDir tmpDirB("overlay_ipc_quorum_conn_b");
+    std::string socketPathA = tmpDirA.getName() + "/overlay.sock";
+    std::string socketPathB = tmpDirB.getName() + "/overlay.sock";
+    uint16_t peerPortA = 11650;
+    uint16_t peerPortB = 11651;
+
+    auto keyA = SecretKey::fromSeed(sha256("QUORUM_CONNECTIVITY_NODE_A"));
+    auto keyB = SecretKey::fromSeed(sha256("QUORUM_CONNECTIVITY_NODE_B"));
+    auto keyC = SecretKey::fromSeed(sha256("QUORUM_CONNECTIVITY_NODE_C"));
+
+    auto seedHex = [](SecretKey const& k) {
+        auto seed = k.getSeedBytes();
+        return binToHex(ByteSlice(seed.data(), seed.size()));
+    };
+
+    uint64_t const graceSecs = 2;
+    auto ipcA = std::make_unique<OverlayIPC>(
+        socketPathA, overlayBinary, peerPortA, seedHex(keyA), graceSecs);
+    auto ipcB = std::make_unique<OverlayIPC>(
+        socketPathB, overlayBinary, peerPortB, seedHex(keyB), graceSecs);
+
+    std::promise<std::vector<std::string>> reportA, reportB;
+    ipcA->setOnQuorumConnectivityReport(
+        [&](std::vector<std::string> const& missing) {
+            reportA.set_value(missing);
+        });
+    ipcB->setOnQuorumConnectivityReport(
+        [&](std::vector<std::string> const& missing) {
+            reportB.set_value(missing);
+        });
+
+    REQUIRE(ipcA->start());
+    REQUIRE(ipcB->start());
+
+    // B dials A. A expects B and also validator C, which never connects; B
+    // expects only A.
+    ipcA->setPeerConfig({}, {}, peerPortA,
+                        {KeyUtils::toStrKey(keyB.getPublicKey()),
+                         KeyUtils::toStrKey(keyC.getPublicKey())});
+    ipcB->setPeerConfig({"127.0.0.1:" + std::to_string(peerPortA)}, {},
+                        peerPortB, {KeyUtils::toStrKey(keyA.getPublicKey())});
+
+    auto futureA = reportA.get_future();
+    auto futureB = reportB.get_future();
+    REQUIRE(futureA.wait_for(std::chrono::seconds(20)) ==
+            std::future_status::ready);
+    REQUIRE(futureB.wait_for(std::chrono::seconds(20)) ==
+            std::future_status::ready);
+
+    // B's connection authenticated as keyB, so A's only missing quorum
+    // member is C; B is missing no one.
+    REQUIRE(futureA.get() == std::vector<std::string>{KeyUtils::toStrKey(
+                                 keyC.getPublicKey())});
+    REQUIRE(futureB.get().empty());
+
+    LOG_INFO(DEFAULT_LOG, "Quorum connectivity report test passed");
 
     ipcA->shutdown();
     ipcB->shutdown();
