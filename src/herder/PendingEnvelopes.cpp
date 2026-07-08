@@ -236,23 +236,36 @@ PendingEnvelopes::recvTxSet(Hash const& hash, TxSetXDRFrameConstPtr txset)
     ZoneScoped;
     CLOG_INFO(Herder, "Got TxSet {}", hexAbbrev(hash));
 
-    // Only accept if we were actually fetching this
-    auto it = mPendingTxSetFetches.find(hash);
-    if (it == mPendingTxSetFetches.end())
-    {
-        CLOG_WARNING(Herder, "TxSet {} not in pending fetches - rejecting",
-                     hexAbbrev(hash));
-        return false;
-    }
-
+    // Direct leader flooding (docs/direct-leader-flooding.md): the round-1
+    // leader eagerly pushes its nominated TX set body to all peers, so it can
+    // arrive BEFORE we process the nomination referencing it -- i.e. before the
+    // hash is in mPendingTxSetFetches. We must therefore ACCEPT unsolicited
+    // sets, not reject them: store the set so the nomination later finds it via
+    // getKnownTxSet() and needs no fetch. This is exactly what lets us drop the
+    // GetTxSet request round-trip -- rejecting here (the old pull-only rule)
+    // would silently discard the push and, with no request fallback, wedge the
+    // slot.
+    //
+    // Accepting unsolicited sets is a memory-DoS surface (a peer can push
+    // arbitrary sets); acceptable for the experiment's authenticated dense mesh
+    // and bounded by addTxSet's cache eviction. Revisit before any production
+    // path (e.g. restrict to sets for slots near LCL and/or from current
+    // leaders).
     addTxSet(hash, 0, txset);
-    for (auto& env : it->second)
+
+    // If we were already waiting on this set (nomination processed first),
+    // resume the envelopes that were blocked on it.
+    auto it = mPendingTxSetFetches.find(hash);
+    if (it != mPendingTxSetFetches.end())
     {
-        CLOG_INFO(Herder, "Re-processing envelope after TxSet {} fetch",
-                  hexAbbrev(hash));
-        mApp.getHerder().recvSCPEnvelope(env);
+        for (auto& env : it->second)
+        {
+            CLOG_INFO(Herder, "Re-processing envelope after TxSet {} arrived",
+                      hexAbbrev(hash));
+            mApp.getHerder().recvSCPEnvelope(env);
+        }
+        mPendingTxSetFetches.erase(hash);
     }
-    mPendingTxSetFetches.erase(hash);
     return true;
 }
 
