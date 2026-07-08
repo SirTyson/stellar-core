@@ -50,6 +50,10 @@ OverlayMetrics::OverlayMetrics(Application& app)
           {"overlay", "flood", "leader-push-bytes"}, "byte"))
     , mFloodLeaderFallbackMeter(app.getMetrics().NewMeter(
           {"overlay", "flood", "leader-fallback"}, "message"))
+    , mFloodTxSetPushMeter(app.getMetrics().NewMeter(
+          {"overlay", "flood", "txset-push"}, "message"))
+    , mFloodTxSetPushBytesMeter(app.getMetrics().NewMeter(
+          {"overlay", "flood", "txset-push-bytes"}, "byte"))
     , mMessagesBroadcast(app.getMetrics().NewMeter(
           {"overlay", "message", "broadcast"}, "message"))
     , mUniqueFloodBytesRecv(app.getMetrics().NewMeter(

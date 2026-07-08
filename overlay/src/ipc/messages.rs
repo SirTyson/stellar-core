@@ -63,6 +63,12 @@ pub enum MessageType {
     /// election priority
     SetLeaders = 14,
 
+    /// Eagerly push a locally-built TX set to ALL connected peers (round-1
+    /// leader only): cache it locally AND broadcast the full body, skipping the
+    /// request/response round-trip. See docs/direct-leader-flooding.md.
+    /// Payload: [hash:32][txSetXDR...]
+    BroadcastTxSet = 15,
+
     // ═══ Overlay → Core (Critical Path) ═══
     /// Received SCP envelope from network
     ScpReceived = 100,
@@ -104,6 +110,7 @@ impl TryFrom<u32> for MessageType {
             12 => Ok(MessageType::CacheTxSet),
             13 => Ok(MessageType::RequestOverlayMetrics),
             14 => Ok(MessageType::SetLeaders),
+            15 => Ok(MessageType::BroadcastTxSet),
             100 => Ok(MessageType::ScpReceived),
             101 => Ok(MessageType::TopTxsResponse),
             102 => Ok(MessageType::PeerRequestsScpState),
@@ -302,6 +309,7 @@ mod tests {
             MessageType::CacheTxSet,
             MessageType::RequestOverlayMetrics,
             MessageType::SetLeaders,
+            MessageType::BroadcastTxSet,
             MessageType::ScpReceived,
             MessageType::TopTxsResponse,
             MessageType::PeerRequestsScpState,
@@ -375,6 +383,10 @@ mod tests {
         );
         assert_eq!(MessageType::try_from(14).unwrap(), MessageType::SetLeaders);
         assert_eq!(
+            MessageType::try_from(15).unwrap(),
+            MessageType::BroadcastTxSet
+        );
+        assert_eq!(
             MessageType::try_from(100).unwrap(),
             MessageType::ScpReceived
         );
@@ -404,7 +416,7 @@ mod tests {
     fn test_message_type_try_from_invalid() {
         assert!(MessageType::try_from(0).is_err());
         assert!(MessageType::try_from(9).is_err()); // gap between 8 and 10
-        assert!(MessageType::try_from(15).is_err());
+        assert!(MessageType::try_from(16).is_err()); // gap after BroadcastTxSet
         assert!(MessageType::try_from(99).is_err());
         assert!(MessageType::try_from(104).is_err());
         assert!(MessageType::try_from(107).is_err());
