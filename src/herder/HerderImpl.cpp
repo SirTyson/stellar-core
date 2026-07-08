@@ -1689,17 +1689,50 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
     mPendingEnvelopes.addTxSet(txSetHash, lcl.header.ledgerSeq + 1,
                                proposedSet);
 
-    // Cache the TX set in Rust overlay so it can serve it to other peers.
-    // When a peer receives an SCP message referencing this TX set hash,
-    // they'll request it via TX set fetching, and Rust needs the XDR.
-    // Note: Rust overlay only supports GeneralizedTransactionSet (protocol >=
-    // 20)
+    // Hand the TX set to the Rust overlay. Note: the overlay only supports
+    // GeneralizedTransactionSet (protocol >= 20).
+    //
+    // Direct leader flooding, TxSet dissemination (docs/direct-leader-flooding.md
+    // Step 5): the round-1 leader for the slot being nominated pushes the full
+    // body to every peer *now*, so receivers have it by the time they process
+    // the nomination that references it -- removing the GetTxSet request
+    // round-trip from the nomination critical path. Every other node only
+    // caches its own set locally (cache-for-self; it never proactively floods).
+    //
+    // Round-1 leader is seeded by hash(N-2); when nominating slot N = ledgerSeq
+    // + 1 with lcl = N-1, that seed is exactly lcl.header.previousLedgerHash.
+    // Under application-specific (non-self-biased) weights every node agrees on
+    // this single leader, so exactly one node broadcasts.
+    //
+    // Experiment scope: only round-1 pushes and there is no request fallback
+    // (see PendingEnvelopes), so a slot that advances to a round led by a
+    // non-broadcasting node cannot disseminate that node's set -- convergence
+    // then leans on the round-1 leader's value staying viable. Accepted for the
+    // experiment; revisit before any production path.
     if (proposedSet->isGeneralizedTxSet())
     {
         GeneralizedTransactionSet xdrTxSet;
         proposedSet->toXDR(xdrTxSet);
         auto xdrBytes = xdr::xdr_to_opaque(xdrTxSet);
-        mApp.getOverlayManager().cacheTxSet(txSetHash, xdrBytes);
+
+        auto const round1Leaders = mHerderSCPDriver.computeLeaderSchedule(
+            lcl.header.previousLedgerHash, lcl.header.ledgerSeq + 1,
+            /*count=*/1);
+        bool const selfIsRound1Leader =
+            !round1Leaders.empty() &&
+            round1Leaders.front() == mApp.getConfig().NODE_SEED.getPublicKey();
+
+        if (selfIsRound1Leader)
+        {
+            CLOG_DEBUG(Herder,
+                       "Round-1 leader: eagerly broadcasting TX set {} to peers",
+                       binToHex(txSetHash).substr(0, 8));
+            mApp.getOverlayManager().broadcastTxSet(txSetHash, xdrBytes);
+        }
+        else
+        {
+            mApp.getOverlayManager().cacheTxSet(txSetHash, xdrBytes);
+        }
     }
 
     lcl = mLedgerManager.getLastClosedLedgerHeader();

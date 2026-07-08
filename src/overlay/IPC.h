@@ -82,6 +82,13 @@ enum class IPCMessageType : uint32_t
     /// election priority
     SET_LEADERS = 14,
 
+    /// Eagerly push a locally-built TX set to ALL connected peers (round-1
+    /// leader only), skipping the request/response round-trip. Same payload as
+    /// CACHE_TX_SET; the overlay caches it locally AND broadcasts it. See
+    /// docs/direct-leader-flooding.md (TxSet dissemination, Step 5).
+    /// Payload: [hash:32][txSetXDR...]
+    BROADCAST_TX_SET = 15,
+
     // ═══ Overlay → Core (Critical Path) ═══
 
     /// Received SCP envelope from network

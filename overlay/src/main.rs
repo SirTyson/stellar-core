@@ -1196,6 +1196,52 @@ impl App {
                 );
             }
 
+            MessageType::BroadcastTxSet => {
+                // Round-1 leader eagerly pushes its nominated TX set to all
+                // peers: cache locally (identical to CacheTxSet) AND broadcast
+                // the full body, so receivers hold it before the nomination
+                // referencing it arrives. See docs/direct-leader-flooding.md.
+                // Payload: [hash:32][txSetXDR...]
+                if msg.payload.len() < 33 {
+                    warn!("BroadcastTxSet payload too short");
+                    return true;
+                }
+
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&msg.payload[0..32]);
+                let tx_set_xdr = match xdr::verify_generalized_tx_set_xdr(&hash, &msg.payload[32..])
+                {
+                    Ok(canonical) => canonical,
+                    Err(e) => {
+                        warn!(
+                            "TXSET_BROADCAST_DROP: Dropping invalid TX set {:02x?}... from Core: {}",
+                            &hash[..4],
+                            e
+                        );
+                        return true;
+                    }
+                };
+
+                info!(
+                    "TXSET_BROADCAST_REQ: Caching + pushing locally-built TX set {:02x?}... ({} bytes)",
+                    &hash[..4],
+                    tx_set_xdr.len()
+                );
+
+                cache_tx_set_xdr(
+                    &mut self.tx_set_cache,
+                    self.current_ledger_seq,
+                    hash,
+                    tx_set_xdr.clone(),
+                );
+
+                // Spawn so the main loop never awaits the bounded command channel.
+                let handle = self.libp2p_handle.clone();
+                tokio::spawn(async move {
+                    handle.broadcast_txset(hash, tx_set_xdr).await;
+                });
+            }
+
             MessageType::SubmitTx => {
                 // Parse payload: [fee:i64][numOps:u32][txEnvelope...]
                 if msg.payload.len() < 12 {
