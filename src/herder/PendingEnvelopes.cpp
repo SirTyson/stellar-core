@@ -253,6 +253,10 @@ PendingEnvelopes::recvTxSet(Hash const& hash, TxSetXDRFrameConstPtr txset)
     // leaders).
     addTxSet(hash, 0, txset);
 
+    // Parallel tx set download: no longer awaiting this set. Values referencing
+    // it will now validate fully (getKnownTxSet hits) on the next SCP re-drive.
+    mTxSetWaiting.erase(hash);
+
     // If we were already waiting on this set (nomination processed first),
     // resume the envelopes that were blocked on it.
     auto it = mPendingTxSetFetches.find(hash);
@@ -375,8 +379,11 @@ PendingEnvelopes::recvSCPEnvelope(SCPEnvelope const& envelope)
         }
 
         // we are fetching this envelope
-        // check if we are done fetching it
-        if (isFullyFetched(envelope))
+        // Hand it to SCP once it is ready. Normally that means fully fetched;
+        // with parallel tx set download it also means a current-ledger
+        // nomination/PREPARE whose qset is present but whose tx set is still
+        // arriving (isEnvelopeReady), so SCP can advance while the push lands.
+        if (mHerder.getHerderSCPDriver().isEnvelopeReady(envelope))
         {
             std::chrono::nanoseconds durationNano =
                 mApp.getClock().now() - fetchIt->second;
@@ -603,6 +610,36 @@ PendingEnvelopes::isFullyFetched(SCPEnvelope const& envelope)
                        });
 }
 
+bool
+PendingEnvelopes::isQsetFetched(SCPEnvelope const& envelope)
+{
+    return getKnownQSet(
+               Slot::getCompanionQuorumSetHashFromStatement(envelope.statement),
+               false) != nullptr;
+}
+
+bool
+PendingEnvelopes::areTxSetsFetched(SCPEnvelope const& envelope)
+{
+    auto txSetHashes = getValidatedTxSetHashes(envelope);
+    return std::all_of(std::begin(txSetHashes), std::end(txSetHashes),
+                       [&](Hash const& txSetHash) {
+                           return getKnownTxSet(txSetHash, 0, false) != nullptr;
+                       });
+}
+
+std::optional<std::chrono::milliseconds>
+PendingEnvelopes::getTxSetWaitingTime(Hash const& hash) const
+{
+    auto it = mTxSetWaiting.find(hash);
+    if (it == mTxSetWaiting.end())
+    {
+        return std::nullopt;
+    }
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        mApp.getClock().now() - it->second);
+}
+
 void
 PendingEnvelopes::startFetch(SCPEnvelope const& envelope)
 {
@@ -640,6 +677,10 @@ PendingEnvelopes::startFetch(SCPEnvelope const& envelope)
             // a non-broadcasting node, this envelope stays pending for the slot.
             auto& vec = mPendingTxSetFetches[h2];
             vec.push_back(envelope);
+            // Parallel tx set download: remember when we started awaiting this
+            // tx set so validateValue can treat referencing values as
+            // structurally valid while the push is in flight.
+            mTxSetWaiting.emplace(h2, mApp.getClock().now());
         }
     }
 

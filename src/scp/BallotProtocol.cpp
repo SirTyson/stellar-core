@@ -203,8 +203,37 @@ BallotProtocol::processEnvelope(SCPEnvelopeWrapperPtr envelope, bool self)
         return SCP::EnvelopeState::INVALID;
     }
 
+    // Parallel tx set download (docs/direct-leader-flooding.md): a value that is
+    // only structurally valid (its tx set is still downloading) may drive
+    // PREPARE, and the local node may generate its own CONFIRM once a v-blocking
+    // set votes-to-commit it. But we reject a peer's CONFIRM and any EXTERNALIZE
+    // that we cannot fully validate; the node stalls at commit until the tx set
+    // arrives (see setConfirmPrepared / setConfirmCommit).
+    if (validationRes == SCPDriver::kStructurallyValidValue)
+    {
+        switch (statement.pledges.type())
+        {
+        case SCP_ST_PREPARE:
+            break;
+        case SCP_ST_CONFIRM:
+            if (!self)
+            {
+                return SCP::EnvelopeState::INVALID;
+            }
+            break;
+        case SCP_ST_EXTERNALIZE:
+            return SCP::EnvelopeState::INVALID;
+        default:
+            break;
+        }
+    }
+
     if (mPhase != SCP_PHASE_EXTERNALIZE)
     {
+        // Only a value for a non-current ledger downgrades full validation. A
+        // structurally-valid value (tx set still downloading) does not: the
+        // commit-block guarantees it is fully validated before it can commit,
+        // so the eventually-externalized value is fully validated.
         if (validationRes == SCPDriver::kMaybeValidValue)
         {
             mSlot.setFullyValidated(false);
@@ -1068,8 +1097,28 @@ BallotProtocol::setConfirmPrepared(SCPBallot const& newC, SCPBallot const& newH)
         if (newC.counter != 0)
         {
             dbgAssert(!mCommit);
-            mCommit = makeBallot(newC);
-            didWork = true;
+            // Parallel tx set download (docs/direct-leader-flooding.md): never
+            // vote-to-commit a value whose tx set we have not fully validated.
+            // Re-validate now; if it is only structurally valid (tx set still
+            // downloading) leave mCommit unset -- the node stays in PREPARE
+            // until the pushed tx set arrives and a later SCP re-drive upgrades
+            // the value to fully validated. This is the core safety gate: a
+            // value whose transactions we have not validated cannot be
+            // committed or externalized.
+            auto vl = mSlot.getSCPDriver().validateValue(mSlot.getSlotIndex(),
+                                                         newC.value, false);
+            if (vl == SCPDriver::kStructurallyValidValue)
+            {
+                CLOG_DEBUG(SCP,
+                           "BallotProtocol::setConfirmPrepared i: {} deferring "
+                           "vote-to-commit: tx set still downloading",
+                           mSlot.getSlotIndex());
+            }
+            else
+            {
+                mCommit = makeBallot(newC);
+                didWork = true;
+            }
         }
 
         if (didWork)
@@ -1513,6 +1562,27 @@ BallotProtocol::setConfirmCommit(SCPBallot const& c, SCPBallot const& h)
                "BallotProtocol::setConfirmCommit i: {} new c: {} new h: {}",
                mSlot.getSlotIndex(), mSlot.getSCP().ballotToStr(c),
                mSlot.getSCP().ballotToStr(h));
+
+    // Parallel tx set download (docs/direct-leader-flooding.md): backstop for
+    // the setConfirmPrepared commit-block. Confirm-commit is one step from
+    // externalize, so the value MUST be fully validated (its tx set present and
+    // valid) here -- kMaybeValidNotCurrent is fine for non-LCL+1 slots. Reaching
+    // this with a merely structurally-valid or invalid value would mean
+    // externalizing transactions we never validated: a fatal invariant break.
+    {
+        auto vl = mSlot.getSCPDriver().validateValue(mSlot.getSlotIndex(),
+                                                     c.value, false);
+        if (vl != SCPDriver::kFullyValidatedValue &&
+            vl != SCPDriver::kMaybeValidValue)
+        {
+            CLOG_FATAL(SCP,
+                       "BallotProtocol::setConfirmCommit i: {} confirm-commit "
+                       "on a value that is not fully validated (level {})",
+                       mSlot.getSlotIndex(), static_cast<int>(vl));
+            throw std::runtime_error(
+                "SCP confirm-commit on a not-fully-validated value");
+        }
+    }
 
     mCommit = makeBallot(c);
     mHighBallot = makeBallot(h);

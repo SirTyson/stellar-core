@@ -72,6 +72,13 @@ class HerderSCPDriver : public SCPDriver
     ValueWrapperPtr extractValidValue(uint64_t slotIndex,
                                       Value const& value) override;
 
+    // Parallel tx set download (docs/direct-leader-flooding.md): may
+    // PendingEnvelopes hand this envelope to SCP now? True when the qset is
+    // present and either all tx sets are fetched, or it is a current-ledger
+    // nomination/PREPARE whose tx set is still arriving (so SCP can advance
+    // while the leader's push lands). Unconditional on this experimental branch.
+    bool isEnvelopeReady(SCPEnvelope const& env);
+
     // value marshaling
     std::string toShortString(NodeID const& pk) const override;
     std::string getValueString(Value const& v) const override;

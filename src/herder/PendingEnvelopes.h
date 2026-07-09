@@ -64,6 +64,9 @@ class PendingEnvelopes
     // hashes of txsets/qsets we're currently fetching
     std::map<Hash, std::vector<SCPEnvelope>> mPendingTxSetFetches;
     std::map<Hash, std::vector<SCPEnvelope>> mPendingQSetFetches;
+    // Parallel tx set download: when a tx set hash was first awaited, so
+    // getTxSetWaitingTime can report elapsed wait.
+    std::map<Hash, VirtualClock::time_point> mTxSetWaiting;
 
     using TxSetFramCacheItem = std::pair<uint64, TxSetXDRFrameConstPtr>;
     // recent txsets
@@ -131,6 +134,17 @@ class PendingEnvelopes
   public:
     PendingEnvelopes(Application& app, HerderImpl& herder);
     ~PendingEnvelopes();
+
+    // Parallel tx set download (docs/direct-leader-flooding.md): split fetch
+    // checks so HerderSCPDriver::isEnvelopeReady can hand an envelope to SCP
+    // once its qset is present even if its tx set is still arriving.
+    bool isQsetFetched(SCPEnvelope const& envelope);
+    bool areTxSetsFetched(SCPEnvelope const& envelope);
+    // How long the given tx set hash has been awaited (an envelope referenced
+    // it and we don't have it yet); nullopt if not awaited. Drives the
+    // kStructurallyValidValue decision in HerderSCPDriver::validateValue.
+    std::optional<std::chrono::milliseconds>
+    getTxSetWaitingTime(Hash const& hash) const;
 
 #ifdef BUILD_TESTS
     void clearQSetCache();

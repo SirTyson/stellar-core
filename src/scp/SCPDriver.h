@@ -115,9 +115,15 @@ class SCPDriver
     // NB: validation levels are ordered
     enum ValidationLevel
     {
-        kInvalidValue = 0,       // value is invalid for sure
-        kMaybeValidValue = 1,    // value may be valid
-        kFullyValidatedValue = 2 // value is valid for sure
+        kInvalidValue = 0,    // value is invalid for sure
+        kMaybeValidValue = 1, // may be valid, but for a ledger other than LCL+1
+        // LCL+1 and structurally valid (close time etc), but the tx set it
+        // references is still being downloaded (parallel tx set download; see
+        // docs/direct-leader-flooding.md). Such a value may drive nomination
+        // and PREPARE, but a node must not vote-to-commit or externalize it
+        // until the tx set arrives and it becomes kFullyValidatedValue.
+        kStructurallyValidValue = 2,
+        kFullyValidatedValue = 3 // value is valid for sure
     };
     virtual ValidationLevel
     validateValue(uint64 slotIndex, Value const& value, bool nomination)
