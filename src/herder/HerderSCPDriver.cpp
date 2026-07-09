@@ -306,10 +306,23 @@ HerderSCPDriver::validateValueAgainstLocalState(uint64_t slotIndex,
 
         if (!txSet)
         {
-            CLOG_ERROR(Herder, "validateValue i:{} unknown txSet {}", slotIndex,
-                       hexAbbrev(txSetHash));
-
-            res = SCPDriver::kInvalidValue;
+            // Parallel tx set download (docs/direct-leader-flooding.md): if the
+            // referenced tx set is still on its way (an envelope referenced it
+            // and we are expecting the leader's push), treat the value as
+            // structurally valid so SCP can advance nomination/PREPARE while the
+            // tx set arrives. It cannot be voted-to-commit or externalized until
+            // it becomes fully validated (see BallotProtocol). Enabled
+            // unconditionally on this experimental branch (no protocol gate).
+            if (mPendingEnvelopes.getTxSetWaitingTime(txSetHash).has_value())
+            {
+                res = SCPDriver::kStructurallyValidValue;
+            }
+            else
+            {
+                CLOG_ERROR(Herder, "validateValue i:{} unknown txSet {}",
+                           slotIndex, hexAbbrev(txSetHash));
+                res = SCPDriver::kInvalidValue;
+            }
         }
         else if (!checkAndCacheTxSetValid(*txSet, lcl, closeTimeOffset))
         {
@@ -441,14 +454,48 @@ HerderSCPDriver::extractValidValue(uint64_t slotIndex, Value const& value)
     }
 
     ValueWrapperPtr res;
-    if (validateValueAgainstLocalState(slotIndex, b, true) ==
-        SCPDriver::kFullyValidatedValue)
+    // Parallel tx set download: a structurally-valid value (tx set still
+    // downloading) is also extractable for nomination.
+    if (validateValueAgainstLocalState(slotIndex, b, true) >=
+        SCPDriver::kStructurallyValidValue)
     {
         extractValidUpgrades(b, true);
         res = wrapStellarValue(b);
     }
 
     return res;
+}
+
+bool
+HerderSCPDriver::isEnvelopeReady(SCPEnvelope const& env)
+{
+    // The quorum set is always required before SCP can process an envelope.
+    if (!mPendingEnvelopes.isQsetFetched(env))
+    {
+        return false;
+    }
+    // Fully fetched (qset + all tx sets): ready as usual.
+    if (mPendingEnvelopes.areTxSetsFetched(env))
+    {
+        return true;
+    }
+    // Parallel tx set download (unconditional here): a current-ledger
+    // nomination/PREPARE may be handed to SCP while its tx set is still
+    // arriving. validateValue will report it kStructurallyValidValue so SCP
+    // advances but cannot vote-to-commit/externalize until the tx set lands.
+    // Restrict to LCL+1 while tracking + synced, matching master's guard.
+    auto const type = env.statement.pledges.type();
+    if (type != SCP_ST_NOMINATE && type != SCP_ST_PREPARE)
+    {
+        return false;
+    }
+    auto const& lcl = mLedgerManager.getLastClosedLedgerHeader();
+    if (env.statement.slotIndex != lcl.header.ledgerSeq + 1)
+    {
+        return false;
+    }
+    return mHerder.isTracking() &&
+           mApp.getState() == Application::APP_SYNCED_STATE;
 }
 
 // value marshaling

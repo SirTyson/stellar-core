@@ -63,11 +63,17 @@ class TestSCP : public SCPDriver
         mQuorumSets[qSetHash] = qSet;
     }
 
+    // Configurable so parallel-tx-set-download tests can simulate a value whose
+    // tx set is still downloading (kStructurallyValidValue). Defaults to
+    // kFullyValidatedValue so existing tests are unaffected.
+    SCPDriver::ValidationLevel mValidationLevel =
+        SCPDriver::kFullyValidatedValue;
+
     SCPDriver::ValidationLevel
     validateValue(uint64 slotIndex, Value const& value,
                   bool nomination) override
     {
-        return SCPDriver::kFullyValidatedValue;
+        return mValidationLevel;
     }
 
     void
@@ -655,6 +661,62 @@ makeExternalizeGen(Hash const& qSetHash, SCPBallot const& commitBallot,
 {
     return std::bind(makeExternalize, _1, std::cref(qSetHash), 0,
                      std::cref(commitBallot), nH);
+}
+
+// Parallel tx set download (docs/direct-leader-flooding.md): a value whose tx
+// set is still downloading validates as kStructurallyValidValue. The safety
+// invariant is that such a value can NEVER be externalized -- the node cannot
+// commit it until the tx set arrives and it becomes kFullyValidatedValue. This
+// exercises the BallotProtocol admission rules (reject peer CONFIRM/EXTERNALIZE
+// that are only structurally valid), the setConfirmPrepared commit-block, and
+// the setConfirmCommit backstop.
+TEST_CASE("parallel tx set download: structurally valid value not externalized",
+          "[scp][ballotprotocol]")
+{
+    setupValues();
+    SIMULATION_CREATE_NODE(0);
+    SIMULATION_CREATE_NODE(1);
+    SIMULATION_CREATE_NODE(2);
+    SIMULATION_CREATE_NODE(3);
+    SIMULATION_CREATE_NODE(4);
+
+    SCPQuorumSet qSet;
+    qSet.threshold = 4;
+    qSet.validators.push_back(v0NodeID);
+    qSet.validators.push_back(v1NodeID);
+    qSet.validators.push_back(v2NodeID);
+    qSet.validators.push_back(v3NodeID);
+    qSet.validators.push_back(v4NodeID);
+    uint256 qSetHash = sha256(xdr::xdr_to_opaque(qSet));
+
+    TestSCP scp(v0SecretKey.getPublicKey(), qSet);
+    scp.storeQuorumSet(std::make_shared<SCPQuorumSet>(qSet));
+
+    SCPBallot b(1, xValue);
+
+    // Simulate the referenced tx set still downloading.
+    scp.mValidationLevel = SCPDriver::kStructurallyValidValue;
+
+    // A full quorum tries to drive commit/externalize for a value we cannot
+    // fully validate. Every such message is rejected (peer CONFIRM/EXTERNALIZE
+    // that is only structurally valid), so we never externalize -- and we never
+    // hit the confirm-commit backstop (which would throw).
+    for (auto const& sk : {v1SecretKey, v2SecretKey, v3SecretKey, v4SecretKey})
+    {
+        scp.receiveEnvelope(makeConfirm(sk, qSetHash, 0, 1, b, 1, 1));
+        scp.receiveEnvelope(makeExternalize(sk, qSetHash, 0, b, 1));
+    }
+    REQUIRE(scp.mExternalizedValues.find(0) == scp.mExternalizedValues.end());
+
+    // Once the tx set arrives the value is fully validated, and the same quorum
+    // EXTERNALIZE now drives the node to externalize it.
+    scp.mValidationLevel = SCPDriver::kFullyValidatedValue;
+    for (auto const& sk : {v1SecretKey, v2SecretKey, v3SecretKey, v4SecretKey})
+    {
+        scp.receiveEnvelope(makeExternalize(sk, qSetHash, 0, b, 1));
+    }
+    REQUIRE(scp.mExternalizedValues.find(0) != scp.mExternalizedValues.end());
+    REQUIRE(scp.mExternalizedValues[0] == xValue);
 }
 
 // Testing matrix that covers interesting min/max values for each timeout

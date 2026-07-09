@@ -421,7 +421,9 @@ NominationProtocol::getNewValueFromNomination(SCPNomination const& nom)
     auto pickValue = [&](Value const& value) {
         ValueWrapperPtr valueToNominate;
         auto vl = validateValue(value);
-        if (vl == SCPDriver::kFullyValidatedValue)
+        // Parallel tx set download: nominate values whose tx set is still
+        // downloading (structurally valid) as well as fully-validated ones.
+        if (vl >= SCPDriver::kStructurallyValidValue)
         {
             valueToNominate = mSlot.getSCPDriver().wrapValue(value);
         }
@@ -506,7 +508,9 @@ NominationProtocol::processEnvelope(SCPEnvelopeWrapperPtr envelope)
                     mLatestNominations))
             {
                 auto vl = validateValue(v);
-                if (vl == SCPDriver::kFullyValidatedValue)
+                // Parallel tx set download: accept structurally-valid values
+                // (tx set still downloading) in addition to fully-validated.
+                if (vl >= SCPDriver::kStructurallyValidValue)
                 {
                     mAccepted.emplace(vw);
                     mVotes.emplace(vw);
