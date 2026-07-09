@@ -257,6 +257,11 @@ PendingEnvelopes::recvTxSet(Hash const& hash, TxSetXDRFrameConstPtr txset)
     // it will now validate fully (getKnownTxSet hits) on the next SCP re-drive.
     mTxSetWaiting.erase(hash);
 
+    // Pin the set into any in-flight SCP value/envelope wrappers that were
+    // created before it arrived, so it survives LRU eviction while SCP is still
+    // considering those values (docs/direct-leader-flooding.md).
+    mHerder.getHerderSCPDriver().onTxSetReceived(hash, txset);
+
     // If we were already waiting on this set (nomination processed first),
     // resume the envelopes that were blocked on it.
     auto it = mPendingTxSetFetches.find(hash);

@@ -79,6 +79,11 @@ class HerderSCPDriver : public SCPDriver
     // while the leader's push lands). Unconditional on this experimental branch.
     bool isEnvelopeReady(SCPEnvelope const& env);
 
+    // Parallel tx set download: a tx set arrived; pin it into any in-flight
+    // value/envelope wrappers that were waiting for it. Called from
+    // PendingEnvelopes::recvTxSet.
+    void onTxSetReceived(Hash const& hash, TxSetXDRFrameConstPtr txSet);
+
     // value marshaling
     std::string toShortString(NodeID const& pk) const override;
     std::string getValueString(Value const& v) const override;
@@ -205,6 +210,15 @@ class HerderSCPDriver : public SCPDriver
     Upgrades const& mUpgrades;
     PendingEnvelopes& mPendingEnvelopes;
     SCP mSCP;
+
+    // Parallel tx set download (docs/direct-leader-flooding.md): value/envelope
+    // wrappers created before their tx set arrived, keyed by the awaited tx set
+    // hash. onTxSetReceived pins the set into them; purgeSlotsOutsideRange drops
+    // dead entries. weak_ptr so a wrapper SCP has released can be reclaimed.
+    std::map<Hash, std::vector<std::weak_ptr<ValueWrapper>>>
+        mPendingTxSetWrappers;
+    std::map<Hash, std::vector<std::weak_ptr<SCPEnvelopeWrapper>>>
+        mPendingTxSetEnvelopeWrappers;
 
     struct SCPMetrics
     {
