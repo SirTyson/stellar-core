@@ -88,6 +88,13 @@ pub struct OverlayMetrics {
     pub flood_txset_push: AtomicU64,
     /// overlay.flood.txset-push-bytes — bytes of eagerly pushed TX set bodies
     pub flood_txset_push_bytes: AtomicU64,
+    /// overlay.flood.shard-send — erasure-coded TX set shards sent (primaries +
+    /// relays; successful sends only)
+    pub shard_send: AtomicU64,
+    /// overlay.flood.shard-recv — distinct TX set shards received (post-dedup)
+    pub shard_recv: AtomicU64,
+    /// overlay.flood.shard-reconstruct — TX sets reconstructed from shards
+    pub shard_reconstruct: AtomicU64,
 
     // Connection lifecycle
     /// overlay.inbound.attempt — inbound connection attempts
@@ -162,6 +169,9 @@ impl Default for OverlayMetrics {
             flood_leader_fallback: AtomicU64::new(0),
             flood_txset_push: AtomicU64::new(0),
             flood_txset_push_bytes: AtomicU64::new(0),
+            shard_send: AtomicU64::new(0),
+            shard_recv: AtomicU64::new(0),
+            shard_reconstruct: AtomicU64::new(0),
             inbound_attempt: AtomicU64::new(0),
             inbound_establish: AtomicU64::new(0),
             inbound_drop: AtomicU64::new(0),
@@ -228,6 +238,9 @@ impl OverlayMetrics {
             flood_leader_fallback: self.flood_leader_fallback.load(ORD),
             flood_txset_push: self.flood_txset_push.load(ORD),
             flood_txset_push_bytes: self.flood_txset_push_bytes.load(ORD),
+            shard_send: self.shard_send.load(ORD),
+            shard_recv: self.shard_recv.load(ORD),
+            shard_reconstruct: self.shard_reconstruct.load(ORD),
             inbound_attempt: self.inbound_attempt.load(ORD),
             inbound_establish: self.inbound_establish.load(ORD),
             inbound_drop: self.inbound_drop.load(ORD),
@@ -302,6 +315,9 @@ pub struct MetricsSnapshot {
     pub flood_leader_fallback: u64,
     pub flood_txset_push: u64,
     pub flood_txset_push_bytes: u64,
+    pub shard_send: u64,
+    pub shard_recv: u64,
+    pub shard_reconstruct: u64,
     pub inbound_attempt: u64,
     pub inbound_establish: u64,
     pub inbound_drop: u64,

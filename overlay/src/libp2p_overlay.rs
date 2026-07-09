@@ -38,6 +38,8 @@ use tracing::{debug, error, info, trace, warn};
 pub const SCP_PROTOCOL: StreamProtocol = StreamProtocol::new("/stellar/scp/1.0.0");
 pub const TX_PROTOCOL: StreamProtocol = StreamProtocol::new("/stellar/tx/1.0.0");
 pub const TXSET_PROTOCOL: StreamProtocol = StreamProtocol::new("/stellar/txset/1.0.0");
+pub const TXSETSHARD_PROTOCOL: StreamProtocol =
+    StreamProtocol::new("/stellar/txsetshard/1.0.0");
 
 /// Message frame: 4-byte length prefix + payload
 /// Max message size: 16MB (for large TX sets)
@@ -112,6 +114,7 @@ struct PeerOutboundStreams {
     scp: Mutex<Option<Stream>>,
     tx: Mutex<Option<Stream>>,
     txset: Mutex<Option<Stream>>,
+    txsetshard: Mutex<Option<Stream>>,
 }
 
 impl PeerOutboundStreams {
@@ -120,6 +123,7 @@ impl PeerOutboundStreams {
             scp: Mutex::new(None),
             tx: Mutex::new(None),
             txset: Mutex::new(None),
+            txsetshard: Mutex::new(None),
         }
     }
 }
@@ -313,6 +317,33 @@ impl OverlayHandle {
     }
 }
 
+/// Accumulates erasure-coded TX set shards for one TX set hash until enough
+/// (`data`) have arrived to reconstruct the body. See flood::shred.
+struct ShardBuffer {
+    data: usize,
+    parity: usize,
+    total_len: usize,
+    /// Slot i holds shard index i, or None if not yet received.
+    shards: Vec<Option<Vec<u8>>>,
+    present: usize,
+    /// Set once the body has been reconstructed and handed to Core, so later
+    /// shards for the same hash are ignored.
+    reconstructed: bool,
+}
+
+impl ShardBuffer {
+    fn new(data: usize, parity: usize, total_len: usize) -> Self {
+        Self {
+            data,
+            parity,
+            total_len,
+            shards: vec![None; data + parity],
+            present: 0,
+            reconstructed: false,
+        }
+    }
+}
+
 /// Shared state for stream handlers
 struct SharedState {
     /// Outbound streams per peer - each peer has three independently-locked streams
@@ -327,6 +358,10 @@ struct SharedState {
     txset_sources: RwLock<lru::LruCache<[u8; 32], PeerId>>,
     /// Pending TX set requests: hash -> (peer, request_time) to avoid duplicate fetches and track latency
     pending_txset_requests: RwLock<HashMap<[u8; 32], (PeerId, Instant)>>,
+    /// Erasure-coded TX set shards seen (hash, shard_index) for relay dedup.
+    shard_seen: RwLock<lru::LruCache<([u8; 32], u16), ()>>,
+    /// Per-TX-set shard reconstruction buffers, keyed by TX set hash.
+    shard_buffers: RwLock<lru::LruCache<[u8; 32], ShardBuffer>>,
     /// Event sender for non-TX events (SCP, TxSet - critical path, unbounded)
     event_tx: mpsc::UnboundedSender<OverlayEvent>,
     /// Bounded TX event sender (backpressure - drops allowed)
@@ -377,6 +412,12 @@ impl SharedState {
                 std::num::NonZeroUsize::new(1000).unwrap(),
             )),
             pending_txset_requests: RwLock::new(HashMap::new()),
+            shard_seen: RwLock::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(100000).unwrap(),
+            )),
+            shard_buffers: RwLock::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(64).unwrap(),
+            )),
             event_tx,
             tx_event_tx,
             tx_dropped_count: AtomicU64::new(0),
@@ -529,11 +570,26 @@ impl StellarOverlay {
             }
         };
 
+        let txsetshard_incoming = match self.control.accept(TXSETSHARD_PROTOCOL) {
+            Ok(incoming) => incoming,
+            Err(e) => {
+                error!(
+                    "Failed to accept TxSetShard protocol streams: {:?}. Overlay cannot function.",
+                    e
+                );
+                return;
+            }
+        };
+
         // Spawn inbound stream handlers
         let state = self.state.clone();
         tokio::spawn(handle_inbound_scp_streams(scp_incoming, state.clone()));
         tokio::spawn(handle_inbound_tx_streams(tx_incoming, state.clone()));
         tokio::spawn(handle_inbound_txset_streams(txset_incoming, state.clone()));
+        tokio::spawn(handle_inbound_txsetshard_streams(
+            txsetshard_incoming,
+            state.clone(),
+        ));
 
         // Spawn INV/GETDATA housekeeping task
         tokio::spawn(inv_getdata_housekeeping_task(state.clone()));
@@ -1180,65 +1236,87 @@ impl StellarOverlay {
     /// the nomination critical path. Unlike `send_txset_response`, this is
     /// unsolicited; receivers accept it (the inbound TxSet handler forwards a
     /// `GeneralizedTxSet` frame to Core whether or not it was requested).
-    async fn broadcast_txset(&mut self, hash: [u8; 32], data: Vec<u8>) {
-        let message = match crate::xdr::encode_generalized_tx_set_message(&data, &hash) {
-            Ok(message) => message,
-            Err(e) => {
-                warn!(
-                    "TXSET_BROADCAST_DROP: Dropping invalid TxSet {:02x?}...: {}",
-                    &hash[..4],
-                    e
-                );
-                return;
-            }
+    /// Disperse a TX set to the mesh via erasure-coded shards instead of
+    /// shipping the whole body to every peer (docs/direct-leader-flooding.md).
+    /// The round-1 leader erasure-codes the body into one primary shard per
+    /// connected peer and sends each peer its shard (hop=0); every peer then
+    /// relays its primary shard to the rest (hop=1), a deterministic depth-2
+    /// spanning tree. This bounds the leader's upload to ~one body's worth and
+    /// spreads the rest across the network. Any `data` shards reconstruct.
+    async fn broadcast_txset(&mut self, hash: [u8; 32], body: Vec<u8>) {
+        // Deterministic recipient order (by PeerId bytes) so shard assignment is
+        // reproducible: recipient at rank i is the primary holder of shard i.
+        let mut peers: Vec<PeerId> = {
+            let streams = self.state.peer_streams.read().await;
+            streams.keys().cloned().collect()
         };
-
-        let streams = self.state.peer_streams.read().await;
-        let peers: Vec<PeerId> = streams.keys().cloned().collect();
-        drop(streams);
-
         if peers.is_empty() {
             debug!(
-                "TXSET_BROADCAST_SKIP: no peers to push TX set {:02x?}...",
+                "TXSHARD_SKIP: no peers to disperse TX set {:02x?}...",
                 &hash[..4]
             );
             return;
         }
+        peers.sort_by(|a, b| a.to_bytes().cmp(&b.to_bytes()));
+
+        let params = crate::flood::shred_params_for(peers.len());
+        let total_len = body.len();
+
+        // Encode off the async event loop (CPU-heavy; internally rayon-parallel
+        // across shard byte-columns).
+        let shards = match tokio::task::spawn_blocking(move || {
+            crate::flood::shred_encode(&body, params)
+        })
+        .await
+        {
+            Ok(Ok(shards)) => shards,
+            Ok(Err(e)) => {
+                warn!("TXSHARD_ENCODE_FAIL {:02x?}...: {}", &hash[..4], e);
+                return;
+            }
+            Err(e) => {
+                warn!("TXSHARD_ENCODE_JOIN_FAIL {:02x?}...: {}", &hash[..4], e);
+                return;
+            }
+        };
 
         info!(
-            "TXSET_BROADCAST: Pushing TX set {:02x?}... ({} bytes) to {} peers",
+            "TXSHARD_DISPERSE: TX set {:02x?}... ({} bytes) -> {} data + {} parity shards across {} peers",
             &hash[..4],
-            data.len(),
+            total_len,
+            params.data,
+            params.parity,
             peers.len()
         );
 
-        // Spawn parallel sends so a slow peer doesn't stall the event loop or
-        // the other sends (mirrors broadcast_scp).
-        for peer_id in peers {
+        // Send each peer its primary shard (hop = 0).
+        for (i, peer_id) in peers.into_iter().enumerate() {
+            if i >= shards.len() {
+                break;
+            }
+            let frame = encode_shard_frame(
+                &hash,
+                params.data as u16,
+                params.parity as u16,
+                i as u16,
+                0,
+                total_len as u32,
+                &shards[i],
+            );
             let state = Arc::clone(&self.state);
-            let message = message.clone();
             tokio::spawn(async move {
-                match send_to_peer_stream(&state, peer_id.clone(), StreamType::TxSet, &message)
-                    .await
-                {
+                match send_to_peer_stream(&state, peer_id, StreamType::TxSetShard, &frame).await {
                     Ok(_) => {
-                        // Count under both the generic TxSet-send meter and the
-                        // dedicated eager-push meters (successful sends only).
-                        state.metrics.send_txset.fetch_add(1, Ordering::Relaxed);
-                        state.metrics.flood_txset_push.fetch_add(1, Ordering::Relaxed);
-                        state
-                            .metrics
-                            .flood_txset_push_bytes
-                            .fetch_add(message.len() as u64, Ordering::Relaxed);
+                        state.metrics.shard_send.fetch_add(1, Ordering::Relaxed);
                         state.metrics.message_write.fetch_add(1, Ordering::Relaxed);
                         state
                             .metrics
                             .byte_write
-                            .fetch_add(message.len() as u64, Ordering::Relaxed);
+                            .fetch_add(frame.len() as u64, Ordering::Relaxed);
                     }
                     Err(e) => {
                         state.metrics.error_write.fetch_add(1, Ordering::Relaxed);
-                        warn!("TXSET_BROADCAST_FAIL: push to {} failed: {}", peer_id, e);
+                        warn!("TXSHARD_SEND_FAIL to {}: {}", peer_id, e);
                     }
                 }
             });
@@ -1289,12 +1367,15 @@ async fn open_streams_to_peer(mut control: Control, state: Arc<SharedState>, pee
 
     let mut control2 = control.clone();
     let mut control3 = control.clone();
+    let mut control4 = control.clone();
 
     let scp_fut = async { control.open_stream(peer_id, SCP_PROTOCOL).await };
     let tx_fut = async { control2.open_stream(peer_id, TX_PROTOCOL).await };
     let txset_fut = async { control3.open_stream(peer_id, TXSET_PROTOCOL).await };
+    let txsetshard_fut = async { control4.open_stream(peer_id, TXSETSHARD_PROTOCOL).await };
 
-    let (scp_result, tx_result, txset_result) = tokio::join!(scp_fut, tx_fut, txset_fut);
+    let (scp_result, tx_result, txset_result, txsetshard_result) =
+        tokio::join!(scp_fut, tx_fut, txset_fut, txsetshard_fut);
 
     let scp_stream = match scp_result {
         Ok(s) => {
@@ -1329,6 +1410,17 @@ async fn open_streams_to_peer(mut control: Control, state: Arc<SharedState>, pee
         }
     };
 
+    let txsetshard_stream = match txsetshard_result {
+        Ok(s) => {
+            debug!("Opened TxSetShard stream to {}", peer_id);
+            Some(s)
+        }
+        Err(e) => {
+            warn!("Failed to open TxSetShard stream to {}: {:?}", peer_id, e);
+            None
+        }
+    };
+
     // Store streams
     {
         let streams = state.peer_streams.read().await;
@@ -1341,6 +1433,9 @@ async fn open_streams_to_peer(mut control: Control, state: Arc<SharedState>, pee
             }
             if let Some(stream) = txset_stream {
                 *peer_streams.txset.lock().await = Some(stream);
+            }
+            if let Some(stream) = txsetshard_stream {
+                *peer_streams.txsetshard.lock().await = Some(stream);
             }
         }
     }
@@ -1368,6 +1463,7 @@ enum StreamType {
     Scp,
     Tx,
     TxSet,
+    TxSetShard,
 }
 
 impl StreamType {
@@ -1376,6 +1472,7 @@ impl StreamType {
             StreamType::Scp => SCP_PROTOCOL,
             StreamType::Tx => TX_PROTOCOL,
             StreamType::TxSet => TXSET_PROTOCOL,
+            StreamType::TxSetShard => TXSETSHARD_PROTOCOL,
         }
     }
 }
@@ -1400,6 +1497,7 @@ async fn try_send_to_existing_stream(
         StreamType::Scp => &peer_streams.scp,
         StreamType::Tx => &peer_streams.tx,
         StreamType::TxSet => &peer_streams.txset,
+        StreamType::TxSetShard => &peer_streams.txsetshard,
     };
 
     let mut stream_guard = stream_mutex.lock().await;
@@ -1440,6 +1538,7 @@ async fn send_to_peer_stream(
             StreamType::Scp => &peer_streams.scp,
             StreamType::Tx => &peer_streams.tx,
             StreamType::TxSet => &peer_streams.txset,
+            StreamType::TxSetShard => &peer_streams.txsetshard,
         };
 
         let mut stream_guard = stream_mutex.lock().await;
@@ -2234,6 +2333,236 @@ fn record_recv_transaction_timing(state: &Arc<SharedState>, recv_start: std::tim
 }
 
 /// Handle inbound TxSet streams from peers
+// ============ Erasure-coded TX set shard dispersion ============
+//
+// Wire frame (before write_framed's length prefix):
+//   [hash:32][data:u16 BE][parity:u16 BE][index:u16 BE][hop:u8][total_len:u32 BE][shard bytes...]
+
+const SHARD_HEADER_LEN: usize = 32 + 2 + 2 + 2 + 1 + 4; // 43
+
+fn encode_shard_frame(
+    hash: &[u8; 32],
+    data: u16,
+    parity: u16,
+    index: u16,
+    hop: u8,
+    total_len: u32,
+    shard: &[u8],
+) -> Vec<u8> {
+    let mut f = Vec::with_capacity(SHARD_HEADER_LEN + shard.len());
+    f.extend_from_slice(hash);
+    f.extend_from_slice(&data.to_be_bytes());
+    f.extend_from_slice(&parity.to_be_bytes());
+    f.extend_from_slice(&index.to_be_bytes());
+    f.push(hop);
+    f.extend_from_slice(&total_len.to_be_bytes());
+    f.extend_from_slice(shard);
+    f
+}
+
+struct ShardFrame {
+    hash: [u8; 32],
+    data: u16,
+    parity: u16,
+    index: u16,
+    hop: u8,
+    total_len: u32,
+    shard: Vec<u8>,
+}
+
+fn decode_shard_frame(buf: &[u8]) -> Option<ShardFrame> {
+    if buf.len() < SHARD_HEADER_LEN {
+        return None;
+    }
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&buf[0..32]);
+    Some(ShardFrame {
+        hash,
+        data: u16::from_be_bytes([buf[32], buf[33]]),
+        parity: u16::from_be_bytes([buf[34], buf[35]]),
+        index: u16::from_be_bytes([buf[36], buf[37]]),
+        hop: buf[38],
+        total_len: u32::from_be_bytes([buf[39], buf[40], buf[41], buf[42]]),
+        shard: buf[SHARD_HEADER_LEN..].to_vec(),
+    })
+}
+
+async fn handle_inbound_txsetshard_streams(
+    mut incoming: IncomingStreams,
+    state: Arc<SharedState>,
+) {
+    while let Some((peer_id, mut stream)) = incoming.next().await {
+        debug!("Accepted inbound TxSetShard stream from {}", peer_id);
+        state.metrics.inbound_live.fetch_add(1, Ordering::Relaxed);
+        let state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                match read_framed(&mut stream).await {
+                    Ok(data) => {
+                        state.metrics.message_read.fetch_add(1, Ordering::Relaxed);
+                        state
+                            .metrics
+                            .byte_read
+                            .fetch_add(data.len() as u64, Ordering::Relaxed);
+                        handle_txsetshard_frame(&state, &peer_id, &data).await;
+                    }
+                    Err(e) => {
+                        state.metrics.inbound_live.fetch_sub(1, Ordering::Relaxed);
+                        debug!("TxSetShard stream from {} closed: {}", peer_id, e);
+                        break;
+                    }
+                }
+            }
+        });
+    }
+}
+
+async fn handle_txsetshard_frame(state: &Arc<SharedState>, peer_id: &PeerId, data: &[u8]) {
+    let frame = match decode_shard_frame(data) {
+        Some(f) => f,
+        None => {
+            warn!("TXSHARD_PARSE_ERR: malformed shard frame from {}", peer_id);
+            return;
+        }
+    };
+    let d = frame.data as usize;
+    let p = frame.parity as usize;
+    let idx = frame.index as usize;
+    if d == 0 || idx >= d + p {
+        warn!(
+            "TXSHARD_BAD_PARAMS from {}: data={} parity={} index={}",
+            peer_id, d, p, idx
+        );
+        return;
+    }
+
+    // Relay dedup by (hash, index): only act on the first copy of each shard.
+    let first_time = {
+        let mut seen = state.shard_seen.write().await;
+        seen.put((frame.hash, frame.index), ()).is_none()
+    };
+    if !first_time {
+        return;
+    }
+    state.metrics.shard_recv.fetch_add(1, Ordering::Relaxed);
+
+    // Depth-2 spanning tree: relay only primary shards (hop==0, straight from
+    // the leader) to every peer except the sender, tagged hop=1. Relayed shards
+    // are terminal, so each shard is sent O(N) times network-wide, not O(N^2).
+    if frame.hop == 0 {
+        let relay = encode_shard_frame(
+            &frame.hash,
+            frame.data,
+            frame.parity,
+            frame.index,
+            1,
+            frame.total_len,
+            &frame.shard,
+        );
+        let targets: Vec<PeerId> = {
+            let streams = state.peer_streams.read().await;
+            streams.keys().filter(|p| *p != peer_id).cloned().collect()
+        };
+        for target in targets {
+            let st = Arc::clone(state);
+            let msg = relay.clone();
+            tokio::spawn(async move {
+                if send_to_peer_stream(&st, target, StreamType::TxSetShard, &msg)
+                    .await
+                    .is_ok()
+                {
+                    st.metrics.shard_send.fetch_add(1, Ordering::Relaxed);
+                    st.metrics.message_write.fetch_add(1, Ordering::Relaxed);
+                    st.metrics.byte_write.fetch_add(msg.len() as u64, Ordering::Relaxed);
+                }
+            });
+        }
+    }
+
+    // Accumulate into the per-hash reconstruction buffer; reconstruct once we
+    // hold `data` shards. Snapshot under the lock, reconstruct outside it.
+    let ready: Option<(usize, usize, usize, Vec<Option<Vec<u8>>>)> = {
+        let mut bufs = state.shard_buffers.write().await;
+        if bufs.peek(&frame.hash).is_none() {
+            bufs.put(
+                frame.hash,
+                ShardBuffer::new(d, p, frame.total_len as usize),
+            );
+        }
+        let buf = bufs.get_mut(&frame.hash).unwrap();
+        if buf.reconstructed || buf.data != d || buf.parity != p {
+            None
+        } else {
+            if buf.shards[idx].is_none() {
+                buf.shards[idx] = Some(frame.shard);
+                buf.present += 1;
+            }
+            if buf.present >= buf.data {
+                buf.reconstructed = true;
+                Some((buf.data, buf.parity, buf.total_len, buf.shards.clone()))
+            } else {
+                None
+            }
+        }
+    };
+
+    if let Some((data_n, parity_n, total_len, shards)) = ready {
+        let hash = frame.hash;
+        let from = *peer_id;
+        let state2 = Arc::clone(state);
+        tokio::spawn(async move {
+            let params = crate::flood::ShredParams {
+                data: data_n,
+                parity: parity_n,
+            };
+            let recon = tokio::task::spawn_blocking(move || {
+                crate::flood::shred_reconstruct(shards, params, total_len)
+            })
+            .await;
+            let body = match recon {
+                Ok(Ok(body)) => body,
+                Ok(Err(e)) => {
+                    warn!("TXSHARD_RECONSTRUCT_FAIL {:02x?}...: {}", &hash[..4], e);
+                    return;
+                }
+                Err(e) => {
+                    warn!("TXSHARD_RECONSTRUCT_JOIN_FAIL {:02x?}...: {}", &hash[..4], e);
+                    return;
+                }
+            };
+            // Verify hash + structural validity (rejects corrupt/Byzantine shards).
+            match crate::xdr::verify_generalized_tx_set_xdr(&hash, &body) {
+                Ok(canonical) => {
+                    state2
+                        .metrics
+                        .shard_reconstruct
+                        .fetch_add(1, Ordering::Relaxed);
+                    info!(
+                        "TXSHARD_RECONSTRUCT_OK: TX set {:02x?}... ({} bytes) from {} data shards",
+                        &hash[..4],
+                        canonical.len(),
+                        data_n
+                    );
+                    if let Err(e) = state2.event_tx.send(OverlayEvent::TxSetReceived {
+                        hash,
+                        data: canonical,
+                        from,
+                    }) {
+                        warn!("TXSHARD failed to forward reconstructed TxSet: {}", e);
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "TXSHARD_VERIFY_FAIL {:02x?}...: reconstructed body invalid: {}",
+                        &hash[..4],
+                        e
+                    );
+                }
+            }
+        });
+    }
+}
+
 async fn handle_inbound_txset_streams(mut incoming: IncomingStreams, state: Arc<SharedState>) {
     while let Some((peer_id, mut stream)) = incoming.next().await {
         debug!("Accepted inbound TxSet stream from {}", peer_id);
@@ -3168,13 +3497,13 @@ mod tests {
     }
 
     /// Direct leader flooding (TxSet dissemination, docs/direct-leader-flooding.md):
-    /// the round-1 leader's eager `broadcast_txset` pushes the full body to
-    /// EVERY connected peer, unsolicited. Each peer receives a `TxSetReceived`
-    /// event from a single broadcast call, with no request round-trip -- which
-    /// is the latency win. Uses a 3-node star (leader + 2 peers) to exercise the
-    /// "to all peers" fan-out.
+    /// the round-1 leader erasure-codes the TX set and disperses one primary
+    /// shard per peer; each peer relays its shard, and every node reconstructs
+    /// the body and emits a `TxSetReceived` event -- no request round-trip. Uses
+    /// a 3-node star (leader + 2 peers) to exercise the shard wire path, the
+    /// hop-based relay, reconstruction, and hash verification end to end.
     #[tokio::test]
-    async fn test_broadcast_txset_to_all_peers() {
+    async fn test_txset_sharded_dispersion_to_all_peers() {
         let keypair1 = Keypair::generate_ed25519();
         let keypair2 = Keypair::generate_ed25519();
         let keypair3 = Keypair::generate_ed25519();
@@ -3207,11 +3536,11 @@ mod tests {
         while events2.try_recv().is_ok() {}
         while events3.try_recv().is_ok() {}
 
-        // Leader eagerly pushes a TxSet to all peers. No one requested it.
+        // Leader erasure-codes the TxSet and disperses shards. No one requested it.
         let (want_hash, want_data) = test_txset_xdr(0x37);
         handle1.broadcast_txset(want_hash, want_data.clone()).await;
 
-        // Both peers must receive the unsolicited body from the single push.
+        // Both peers must reconstruct the body from shards and surface it.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let mut got2 = false;
         let mut got3 = false;
@@ -3234,19 +3563,17 @@ mod tests {
                 _ = tokio::time::sleep(Duration::from_millis(10)) => {}
             }
         }
-        assert!(got2, "peer2 should receive the eagerly pushed TxSet");
-        assert!(got3, "peer3 should receive the eagerly pushed TxSet");
+        assert!(got2, "peer2 should reconstruct the TxSet from shards");
+        assert!(got3, "peer3 should reconstruct the TxSet from shards");
 
-        // The leader must not have been asked for it: this is a pure push, so
-        // no peer emits a request and the fan-out is exactly one send per peer.
+        // Pure push: no peer emits a request.
         assert!(
             !matches!(events1.try_recv(), Ok(OverlayEvent::TxSetRequested { .. })),
-            "leader should not receive a TxSet request on the push path"
+            "leader should not receive a TxSet request on the shard-dispersion path"
         );
-        // Exactly one successful push per connected peer.
-        assert_eq!(metrics1.flood_txset_push.load(Ordering::Relaxed), 2);
-        assert_eq!(metrics1.send_txset.load(Ordering::Relaxed), 2);
-        assert!(metrics1.flood_txset_push_bytes.load(Ordering::Relaxed) > 0);
+        // Leader sends exactly one primary shard per connected peer (relays are
+        // counted on the relaying peers, not the leader).
+        assert_eq!(metrics1.shard_send.load(Ordering::Relaxed), 2);
 
         handle1.shutdown().await;
         handle2.shutdown().await;

@@ -54,6 +54,12 @@ OverlayMetrics::OverlayMetrics(Application& app)
           {"overlay", "flood", "txset-push"}, "message"))
     , mFloodTxSetPushBytesMeter(app.getMetrics().NewMeter(
           {"overlay", "flood", "txset-push-bytes"}, "byte"))
+    , mShardSendMeter(app.getMetrics().NewMeter(
+          {"overlay", "flood", "shard-send"}, "message"))
+    , mShardRecvMeter(app.getMetrics().NewMeter(
+          {"overlay", "flood", "shard-recv"}, "message"))
+    , mShardReconstructMeter(app.getMetrics().NewMeter(
+          {"overlay", "flood", "shard-reconstruct"}, "message"))
     , mMessagesBroadcast(app.getMetrics().NewMeter(
           {"overlay", "message", "broadcast"}, "message"))
     , mUniqueFloodBytesRecv(app.getMetrics().NewMeter(

@@ -62,6 +62,9 @@ struct OverlayMetrics
     medida::Meter& mFloodLeaderFallbackMeter;
     medida::Meter& mFloodTxSetPushMeter;
     medida::Meter& mFloodTxSetPushBytesMeter;
+    medida::Meter& mShardSendMeter;
+    medida::Meter& mShardRecvMeter;
+    medida::Meter& mShardReconstructMeter;
 
     // ── Broadcast / dedup ──
     medida::Meter& mMessagesBroadcast;
