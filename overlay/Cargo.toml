@@ -45,12 +45,6 @@ hostname = "0.4"
 # Random
 rand = "0.8"
 
-# Erasure coding (Reed-Solomon) for sharded TxSet dispersion
-reed-solomon-erasure = "6"
-
-# Data parallelism for the compute-heavy erasure encode/decode
-rayon = "1"
-
 [dev-dependencies]
 tempfile = "3.10"
 tokio = { version = "1.36", features = ["test-util"] }

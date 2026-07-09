@@ -7,7 +7,6 @@ mod inv_messages;
 mod inv_tracker;
 mod mempool;
 mod pending_requests;
-mod shred;
 mod tx_buffer;
 mod txset;
 
@@ -16,6 +15,5 @@ pub use inv_messages::{GetData, InvBatch, InvEntry, TxStreamMessage};
 pub use inv_tracker::InvTracker;
 pub use mempool::{Mempool, TxEntry};
 pub use pending_requests::PendingRequests;
-pub use shred::{encode as shred_encode, params_for as shred_params_for, reconstruct as shred_reconstruct, ShredParams};
 pub use tx_buffer::TxBuffer;
 pub use txset::{CachedTxSet, Hash256, TxSetCache};

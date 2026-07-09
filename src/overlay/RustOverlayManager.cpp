@@ -392,9 +392,6 @@ RustOverlayManager::syncOverlayMetrics()
     markDelta(m.mFloodLeaderFallbackMeter, "flood_leader_fallback");
     markDelta(m.mFloodTxSetPushMeter, "flood_txset_push");
     markDelta(m.mFloodTxSetPushBytesMeter, "flood_txset_push_bytes");
-    markDelta(m.mShardSendMeter, "shard_send");
-    markDelta(m.mShardRecvMeter, "shard_recv");
-    markDelta(m.mShardReconstructMeter, "shard_reconstruct");
 
     // Send meters per message type
     markDelta(m.mSendSCPMessageSetMeter, "send_scp_message");
