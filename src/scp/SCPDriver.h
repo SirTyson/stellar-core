@@ -15,6 +15,11 @@
 
 namespace stellar
 {
+// Forward declaration so wrappers can hold/pin a tx set without SCP depending on
+// herder (parallel tx set download; see docs/direct-leader-flooding.md).
+class TxSetXDRFrame;
+using TxSetXDRFrameConstPtr = std::shared_ptr<TxSetXDRFrame const>;
+
 class ValueWrapper : public NonMovableOrCopyable
 {
     Value const mValue;
@@ -27,6 +32,15 @@ class ValueWrapper : public NonMovableOrCopyable
     getValue() const
     {
         return mValue;
+    }
+
+    // Parallel tx set download: back-fill (and thereby pin) the tx set this
+    // value references once it arrives, so the wrapper's shared_ptr keeps the
+    // set alive across LRU eviction. No-op for wrappers that don't reference a
+    // tx set.
+    virtual void
+    setTxSet(TxSetXDRFrameConstPtr)
+    {
     }
 };
 
@@ -58,6 +72,13 @@ class SCPEnvelopeWrapper : public NonMovableOrCopyable
     getStatement() const
     {
         return mEnvelope.statement;
+    }
+
+    // Parallel tx set download: back-fill (and pin) a tx set this envelope
+    // references once it arrives. No-op by default.
+    virtual void
+    addTxSet(TxSetXDRFrameConstPtr)
+    {
     }
 };
 

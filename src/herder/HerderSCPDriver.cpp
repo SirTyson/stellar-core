@@ -116,6 +116,7 @@ class SCPHerderEnvelopeWrapper : public SCPEnvelopeWrapper
 
     SCPQuorumSetPtr mQSet;
     std::vector<TxSetXDRFrameConstPtr> mTxSets;
+    std::vector<Hash> mMissingTxSetHashes;
 
   public:
     explicit SCPHerderEnvelopeWrapper(SCPEnvelope const& e, HerderImpl& herder)
@@ -131,6 +132,12 @@ class SCPHerderEnvelopeWrapper : public SCPEnvelopeWrapper
                            "qset {} from envelope"),
                 hexAbbrev(qSetH)));
         }
+        // Parallel tx set download (docs/direct-leader-flooding.md): do NOT
+        // throw on a tx set that has not arrived yet -- SCP is allowed to
+        // process the envelope while the leader's push is in flight. Pin the
+        // sets we have (the shared_ptr keeps them alive through LRU eviction of
+        // PendingEnvelopes' cache) and record the missing ones so wrapEnvelope
+        // can register this wrapper for back-fill via addTxSet().
         auto txSets = getValidatedTxSetHashes(e);
         for (auto const& txSetH : txSets)
         {
@@ -141,12 +148,21 @@ class SCPHerderEnvelopeWrapper : public SCPEnvelopeWrapper
             }
             else
             {
-                throw std::runtime_error(fmt::format(
-                    FMT_STRING("SCPHerderEnvelopeWrapper: Wrapping an unknown "
-                               "tx set {} from envelope"),
-                    hexAbbrev(txSetH)));
+                mMissingTxSetHashes.emplace_back(txSetH);
             }
         }
+    }
+
+    std::vector<Hash> const&
+    getMissingTxSetHashes() const
+    {
+        return mMissingTxSetHashes;
+    }
+
+    void
+    addTxSet(TxSetXDRFrameConstPtr txSet) override
+    {
+        mTxSets.emplace_back(txSet);
     }
 };
 
@@ -154,6 +170,12 @@ SCPEnvelopeWrapperPtr
 HerderSCPDriver::wrapEnvelope(SCPEnvelope const& envelope)
 {
     auto r = std::make_shared<SCPHerderEnvelopeWrapper>(envelope, mHerder);
+    // Register for tx-set back-fill so the wrapper pins each set the moment it
+    // arrives (parallel tx set download).
+    for (auto const& h : r->getMissingTxSetHashes())
+    {
+        mPendingTxSetEnvelopeWrappers[h].emplace_back(r);
+    }
     return r;
 }
 
@@ -1401,6 +1423,29 @@ HerderSCPDriver::purgeSlotsOutsideRange(std::optional<uint64_t> minSlotIndex,
     }
 
     getSCP().purgeSlotsOutsideRange(minSlotIndex, maxSlotIndex, slotToKeep);
+
+    // Parallel tx set download: drop pending-tx-set-wrapper registry entries
+    // whose wrappers have all expired (e.g. a tx set that never arrived for a
+    // now-purged slot), so the maps don't grow unbounded.
+    auto const dropDeadWrappers = [](auto& registry) {
+        for (auto it = registry.begin(); it != registry.end();)
+        {
+            auto& vec = it->second;
+            vec.erase(std::remove_if(vec.begin(), vec.end(),
+                                     [](auto const& wp) { return wp.expired(); }),
+                      vec.end());
+            if (vec.empty())
+            {
+                it = registry.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+    };
+    dropDeadWrappers(mPendingTxSetWrappers);
+    dropDeadWrappers(mPendingTxSetEnvelopeWrappers);
 }
 
 void
@@ -1414,21 +1459,38 @@ class SCPHerderValueWrapper : public ValueWrapper
 {
     HerderImpl& mHerder;
 
+    Hash mTxSetHash;
     TxSetXDRFrameConstPtr mTxSet;
 
   public:
     explicit SCPHerderValueWrapper(StellarValue const& sv, Value const& value,
                                    HerderImpl& herder)
-        : ValueWrapper(value), mHerder(herder)
+        : ValueWrapper(value), mHerder(herder), mTxSetHash(sv.txSetHash)
     {
+        // Parallel tx set download (docs/direct-leader-flooding.md): bind the
+        // tx set if we have it (pinning it -- the shared_ptr keeps the set alive
+        // through LRU eviction), otherwise leave it null and rely on setTxSet()
+        // back-fill once the leader's push arrives. No longer throws on an
+        // absent tx set.
         mTxSet = mHerder.getTxSet(sv.txSetHash);
-        if (!mTxSet)
-        {
-            throw std::runtime_error(fmt::format(
-                FMT_STRING(
-                    "SCPHerderValueWrapper tried to bind an unknown tx set {}"),
-                hexAbbrev(sv.txSetHash)));
-        }
+    }
+
+    bool
+    hasTxSet() const
+    {
+        return mTxSet != nullptr;
+    }
+
+    Hash const&
+    getTxSetHash() const
+    {
+        return mTxSetHash;
+    }
+
+    void
+    setTxSet(TxSetXDRFrameConstPtr txSet) override
+    {
+        mTxSet = txSet;
     }
 };
 
@@ -1444,6 +1506,10 @@ HerderSCPDriver::wrapValue(Value const& val)
                         binToHex(val)));
     }
     auto res = std::make_shared<SCPHerderValueWrapper>(sv, val, mHerder);
+    if (!res->hasTxSet())
+    {
+        mPendingTxSetWrappers[res->getTxSetHash()].emplace_back(res);
+    }
     return res;
 }
 
@@ -1452,7 +1518,45 @@ HerderSCPDriver::wrapStellarValue(StellarValue const& sv)
 {
     auto val = xdr::xdr_to_opaque(sv);
     auto res = std::make_shared<SCPHerderValueWrapper>(sv, val, mHerder);
+    if (!res->hasTxSet())
+    {
+        mPendingTxSetWrappers[res->getTxSetHash()].emplace_back(res);
+    }
     return res;
+}
+
+void
+HerderSCPDriver::onTxSetReceived(Hash const& hash, TxSetXDRFrameConstPtr txSet)
+{
+    // Parallel tx set download (docs/direct-leader-flooding.md): a tx set that
+    // some in-flight value/envelope wrapper was waiting for has arrived. Hand it
+    // to every still-live wrapper so the wrapper pins it (keeping it alive
+    // through LRU eviction of PendingEnvelopes' cache), then drop the entries.
+    auto vit = mPendingTxSetWrappers.find(hash);
+    if (vit != mPendingTxSetWrappers.end())
+    {
+        for (auto& wp : vit->second)
+        {
+            if (auto sp = wp.lock())
+            {
+                sp->setTxSet(txSet);
+            }
+        }
+        mPendingTxSetWrappers.erase(vit);
+    }
+
+    auto eit = mPendingTxSetEnvelopeWrappers.find(hash);
+    if (eit != mPendingTxSetEnvelopeWrappers.end())
+    {
+        for (auto& wp : eit->second)
+        {
+            if (auto sp = wp.lock())
+            {
+                sp->addTxSet(txSet);
+            }
+        }
+        mPendingTxSetEnvelopeWrappers.erase(eit);
+    }
 }
 
 void
