@@ -1563,26 +1563,15 @@ BallotProtocol::setConfirmCommit(SCPBallot const& c, SCPBallot const& h)
                mSlot.getSlotIndex(), mSlot.getSCP().ballotToStr(c),
                mSlot.getSCP().ballotToStr(h));
 
-    // Parallel tx set download (docs/direct-leader-flooding.md): backstop for
-    // the setConfirmPrepared commit-block. Confirm-commit is one step from
-    // externalize, so the value MUST be fully validated (its tx set present and
-    // valid) here -- kMaybeValidNotCurrent is fine for non-LCL+1 slots. Reaching
-    // this with a merely structurally-valid or invalid value would mean
-    // externalizing transactions we never validated: a fatal invariant break.
-    {
-        auto vl = mSlot.getSCPDriver().validateValue(mSlot.getSlotIndex(),
-                                                     c.value, false);
-        if (vl != SCPDriver::kFullyValidatedValue &&
-            vl != SCPDriver::kMaybeValidValue)
-        {
-            CLOG_FATAL(SCP,
-                       "BallotProtocol::setConfirmCommit i: {} confirm-commit "
-                       "on a value that is not fully validated (level {})",
-                       mSlot.getSlotIndex(), static_cast<int>(vl));
-            throw std::runtime_error(
-                "SCP confirm-commit on a not-fully-validated value");
-        }
-    }
+    // Parallel tx set download (docs/direct-leader-flooding.md): the safety gate
+    // that a value is fully validated before commit lives in setConfirmPrepared
+    // (mCommit is only set for a fully-validated value, and confirm-commit
+    // requires mCommit). We deliberately do NOT re-validate here: unlike master
+    // this branch does not pin the tx set in the value wrapper, so the LRU tx
+    // set caches can evict a set that was present at vote-to-commit. Re-running
+    // validateValue could then transiently report the (already-committed,
+    // already-validated) value as only structurally valid -- a cache artifact,
+    // not invalidity. Throwing on that aborted every node under load.
 
     mCommit = makeBallot(c);
     mHighBallot = makeBallot(h);
