@@ -651,12 +651,23 @@ PendingEnvelopes::startFetch(SCPEnvelope const& envelope)
     ZoneScoped;
     Hash h = Slot::getCompanionQuorumSetHashFromStatement(envelope.statement);
 
+    // startFetch is called more than once for the same envelope (first on
+    // insertion into mFetchingEnvelopes, then again on the "keep waiting" path,
+    // and once per re-receipt from another peer). Dedup so a waiting envelope
+    // is stored at most once per hash -- otherwise the waiting vectors (and the
+    // work recvTxSet later replays) grow with every duplicate flood.
+    auto addWaiter = [&](std::vector<SCPEnvelope>& vec) {
+        if (std::find(vec.begin(), vec.end(), envelope) == vec.end())
+        {
+            vec.push_back(envelope);
+        }
+    };
+
     bool needSomething = false;
     if (!getKnownQSet(h, false))
     {
         // Track that we need this qset - will be requested via IPC
-        auto& vec = mPendingQSetFetches[h];
-        vec.push_back(envelope);
+        addWaiter(mPendingQSetFetches[h]);
         needSomething = true;
     }
 
@@ -666,7 +677,7 @@ PendingEnvelopes::startFetch(SCPEnvelope const& envelope)
         if (it != mPendingTxSetFetches.end())
         {
             // Already fetching - just add envelope to waiting list
-            it->second.push_back(envelope);
+            addWaiter(it->second);
         }
         else if (!getKnownTxSet(h2, 0, false))
         {
@@ -714,6 +725,11 @@ PendingEnvelopes::stopFetch(SCPEnvelope const& envelope)
             if (vec.empty())
             {
                 mPendingTxSetFetches.erase(it);
+                // No one is waiting on this tx set anymore. Drop the
+                // "awaiting" marker too, otherwise it leaks (it is otherwise
+                // only cleared when the set actually arrives via recvTxSet) and
+                // getTxSetWaitingTime keeps reporting a fetch that is gone.
+                mTxSetWaiting.erase(h2);
             }
         }
     }
@@ -813,6 +829,40 @@ PendingEnvelopes::eraseOutsideRange(std::optional<uint64> minSlot,
         while (iter != mEnvelopes.end())
         {
             maybeEraseEnvelope(iter);
+        }
+    }
+
+    // Purge tx-set fetch bookkeeping for slots outside the kept range, in step
+    // with the mEnvelopes purge above. mPendingTxSetFetches holds full
+    // SCPEnvelope copies and mTxSetWaiting holds a per-hash marker; both are
+    // otherwise cleared only when a set actually arrives (recvTxSet) or a
+    // waiter is discarded (stopFetch), so a slot whose pushed set was never
+    // delivered would leak both entries forever (direct leader flooding has no
+    // fetch/timeout fallback -- see startFetch).
+    auto const slotPurged = [&](uint64 slot) {
+        if (slot == slotToKeep)
+        {
+            return false;
+        }
+        return (minSlot && slot < *minSlot) || (maxSlot && slot > *maxSlot);
+    };
+    for (auto it = mPendingTxSetFetches.begin();
+         it != mPendingTxSetFetches.end();)
+    {
+        auto& vec = it->second;
+        vec.erase(std::remove_if(vec.begin(), vec.end(),
+                                 [&](SCPEnvelope const& e) {
+                                     return slotPurged(e.statement.slotIndex);
+                                 }),
+                  vec.end());
+        if (vec.empty())
+        {
+            mTxSetWaiting.erase(it->first);
+            it = mPendingTxSetFetches.erase(it);
+        }
+        else
+        {
+            ++it;
         }
     }
 
