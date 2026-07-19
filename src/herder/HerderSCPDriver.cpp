@@ -702,12 +702,27 @@ HerderSCPDriver::getNominationEmitDelayForTesting() const
 // returns true if l < r
 // lh, rh are the hashes of l,h
 static bool
-compareTxSets(ApplicableTxSetFrame const& l, ApplicableTxSetFrame const& r,
-              Hash const& lh, Hash const& rh, size_t lEncodedSize,
-              size_t rEncodedSize, LedgerHeader const& header, Hash const& s)
+compareTxSets(ApplicableTxSetFrameConstPtr const& l,
+              ApplicableTxSetFrameConstPtr const& r, Hash const& lh,
+              Hash const& rh, std::optional<size_t> lEncodedSize,
+              std::optional<size_t> rEncodedSize, LedgerHeader const& header,
+              Hash const& s)
 {
-    auto lSize = l.size(header);
-    auto rSize = r.size(header);
+    // Parallel tx set download (docs/direct-leader-flooding.md): a candidate's
+    // tx set may still be downloading, in which case its applicable frame is
+    // null. Compare by hash when neither is present, and prefer the one we
+    // actually have when only one is present.
+    if (!l && !r)
+    {
+        return lessThanXored(lh, rh, s);
+    }
+    if (!l || !r)
+    {
+        return !l;
+    }
+
+    auto lSize = l->size(header);
+    auto rSize = r->size(header);
     if (lSize != rSize)
     {
         return lSize < rSize;
@@ -715,8 +730,8 @@ compareTxSets(ApplicableTxSetFrame const& l, ApplicableTxSetFrame const& r,
     if (protocolVersionStartsFrom(header.ledgerVersion,
                                   SOROBAN_PROTOCOL_VERSION))
     {
-        auto lBids = l.getTotalInclusionFees();
-        auto rBids = r.getTotalInclusionFees();
+        auto lBids = l->getTotalInclusionFees();
+        auto rBids = r->getTotalInclusionFees();
         if (lBids != rBids)
         {
             return lBids < rBids;
@@ -724,8 +739,8 @@ compareTxSets(ApplicableTxSetFrame const& l, ApplicableTxSetFrame const& r,
     }
     if (protocolVersionStartsFrom(header.ledgerVersion, ProtocolVersion::V_11))
     {
-        auto lFee = l.getTotalFees(header);
-        auto rFee = r.getTotalFees(header);
+        auto lFee = l->getTotalFees(header);
+        auto rFee = r->getTotalFees(header);
         if (lFee != rFee)
         {
             return lFee < rFee;
@@ -734,10 +749,10 @@ compareTxSets(ApplicableTxSetFrame const& l, ApplicableTxSetFrame const& r,
     if (protocolVersionStartsFrom(header.ledgerVersion,
                                   SOROBAN_PROTOCOL_VERSION))
     {
-        if (lEncodedSize != rEncodedSize)
+        if (lEncodedSize.value() != rEncodedSize.value())
         {
             // Look for the smallest encoded size.
-            return lEncodedSize > rEncodedSize;
+            return lEncodedSize.value() > rEncodedSize.value();
         }
     }
     return lessThanXored(lh, rh, s);
@@ -867,20 +882,31 @@ HerderSCPDriver::combineCandidates(uint64_t slotIndex,
              ++it)
         {
             auto const& sv = *it;
-            auto cTxSet = mPendingEnvelopes.getTxSet(sv.txSetHash);
-            releaseAssert(cTxSet);
+            // Parallel tx set download (docs/direct-leader-flooding.md): the
+            // referenced tx set may still be downloading, so getTxSet can
+            // return null. Do NOT assert -- a candidate whose tx set has not
+            // arrived is still combined; the resulting composite drives the
+            // ballot protocol, which defers commit/externalize until the tx set
+            // arrives and the value becomes fully validated. Asserting here (or
+            // refusing to promote such a value to a candidate) strands the node
+            // in nomination with no ballot flow to carry it -> lost sync.
+            TxSetXDRFrameConstPtr cTxSet =
+                mPendingEnvelopes.getTxSet(sv.txSetHash);
             // Only valid applicable tx sets should be combined.
-            auto cApplicableTxSet = cTxSet->prepareForApply(mApp, lcl.header);
-            releaseAssert(cApplicableTxSet);
-            if (cTxSet->previousLedgerHash() == lcl.hash)
+            ApplicableTxSetFrameConstPtr cApplicableTxSet =
+                cTxSet ? cTxSet->prepareForApply(mApp, lcl.header) : nullptr;
+            if (!cTxSet || cTxSet->previousLedgerHash() == lcl.hash)
             {
-
-                if (!highestTxSet ||
-                    compareTxSets(*highestApplicableTxSet, *cApplicableTxSet,
-                                  highest->txSetHash, sv.txSetHash,
-                                  highestTxSet->encodedSize(),
-                                  cTxSet->encodedSize(), lcl.header,
-                                  candidatesHash))
+                if (highest == candidateValues.cend() ||
+                    compareTxSets(
+                        highestApplicableTxSet, cApplicableTxSet,
+                        highest->txSetHash, sv.txSetHash,
+                        highestTxSet
+                            ? std::make_optional(highestTxSet->encodedSize())
+                            : std::nullopt,
+                        cTxSet ? std::make_optional(cTxSet->encodedSize())
+                               : std::nullopt,
+                        lcl.header, candidatesHash))
                 {
                     highest = it;
                     highestTxSet = cTxSet;

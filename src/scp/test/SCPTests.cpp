@@ -719,16 +719,17 @@ TEST_CASE("parallel tx set download: structurally valid value not externalized",
     REQUIRE(scp.mExternalizedValues[0] == xValue);
 }
 
-TEST_CASE("parallel tx set download: structurally valid value not promoted to "
-          "candidate",
+TEST_CASE("parallel tx set download: structurally valid value drives nomination"
+          " to ballot",
           "[scp][nominationprotocol]")
 {
-    // Regression for the SIGABRT-under-load: a value whose tx set is still
-    // downloading (kStructurallyValidValue) must be acceptable for nomination
-    // but must NOT be promoted to a candidate. Candidates drive
-    // combineCandidates -> ballot -> commit, and combineCandidates dereferences
-    // the actual tx set, which we do not have yet. Promotion is deferred until
-    // the value is fully validated.
+    // Liveness regression: a value whose tx set is still downloading
+    // (kStructurallyValidValue) must flow all the way through nomination --
+    // accepted, ratified, promoted to a candidate, combined, and PREPAREd --
+    // WITHOUT waiting for the tx set. If promotion were gated on full
+    // validation, the node would strand in nomination with no ballot flow to
+    // carry it and eventually lose sync. (Commit/externalize is still deferred
+    // until the value is fully validated; see the ballotprotocol test above.)
     setupValues();
     SIMULATION_CREATE_NODE(0);
     SIMULATION_CREATE_NODE(1);
@@ -749,8 +750,8 @@ TEST_CASE("parallel tx set download: structurally valid value not promoted to "
     uint256 qSetHash0 = scp.mSCP.getLocalNode()->getQuorumSetHash();
     scp.storeQuorumSet(std::make_shared<SCPQuorumSet>(qSet));
 
-    // The tx set referenced by xValue is still downloading: validateValue can
-    // only confirm structural validity, not full validity.
+    // The tx set referenced by xValue is still downloading for the whole test:
+    // validateValue never returns better than structurally valid.
     scp.mValidationLevel = SCPDriver::kStructurallyValidValue;
 
     // v0 (round leader) nominates x.
@@ -761,8 +762,7 @@ TEST_CASE("parallel tx set download: structurally valid value not promoted to "
     votes.emplace_back(xValue);
     verifyNominate(scp.mEnvs[0], v0SecretKey, qSetHash0, 0, votes, accepted);
 
-    // A quorum votes for x -> x is ACCEPTED. Accepting a structurally-valid
-    // value is allowed so the network's nomination keeps progressing.
+    // A quorum votes for x -> x is ACCEPTED.
     scp.receiveEnvelope(makeNominate(v1SecretKey, qSetHash, 0, votes, accepted));
     scp.receiveEnvelope(makeNominate(v2SecretKey, qSetHash, 0, votes, accepted));
     REQUIRE(scp.mEnvs.size() == 1);
@@ -771,25 +771,14 @@ TEST_CASE("parallel tx set download: structurally valid value not promoted to "
     accepted.emplace_back(xValue);
     verifyNominate(scp.mEnvs[1], v0SecretKey, qSetHash0, 0, votes, accepted);
 
-    // A quorum now RATIFIES x. Normally this promotes x to a candidate and
-    // drives combineCandidates -> bumpState -> PREPARE. Because x is only
-    // structurally valid, promotion is deferred: no candidate is formed and no
-    // PREPARE is emitted. (mExpectedCandidates is left empty, so an unexpected
-    // combineCandidates call would fail inside TestSCP::combineCandidates.)
+    // A quorum RATIFIES x. Even though x is only structurally valid, it is
+    // promoted to a candidate, combineCandidates runs, and the node PREPAREs it
+    // -- nomination reaches the ballot protocol without the tx set.
+    scp.mExpectedCandidates.emplace(xValue);
+    scp.mCompositeValue = xValue;
     scp.receiveEnvelope(makeNominate(v1SecretKey, qSetHash, 0, votes, accepted));
     scp.receiveEnvelope(makeNominate(v2SecretKey, qSetHash, 0, votes, accepted));
     scp.receiveEnvelope(makeNominate(v3SecretKey, qSetHash, 0, votes, accepted));
-    // No PREPARE emitted -> no candidate was formed. (If promotion had wrongly
-    // fired, combineCandidates would have been called and failed against the
-    // empty mExpectedCandidates.)
-    REQUIRE(scp.mEnvs.size() == 2);
-
-    // The tx set arrives: x becomes fully validated. The next ratifying
-    // envelope promotes x to a candidate and the node PREPAREs it.
-    scp.mValidationLevel = SCPDriver::kFullyValidatedValue;
-    scp.mExpectedCandidates.emplace(xValue);
-    scp.mCompositeValue = xValue;
-    scp.receiveEnvelope(makeNominate(v4SecretKey, qSetHash, 0, votes, accepted));
     REQUIRE(scp.mEnvs.size() == 3);
     verifyPrepare(scp.mEnvs[2], v0SecretKey, qSetHash0, 0, SCPBallot(1, xValue));
 }
