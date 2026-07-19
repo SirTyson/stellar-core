@@ -539,22 +539,6 @@ NominationProtocol::processEnvelope(SCPEnvelopeWrapperPtr envelope)
             {
                 continue;
             }
-            // Parallel tx set download (docs/direct-leader-flooding.md): a value
-            // may have been accepted (above) while its tx set was still
-            // downloading -- validateValue returned kStructurallyValidValue, not
-            // kFullyValidatedValue. Accepting keeps the network's nomination
-            // progressing, but we must NOT promote such a value to a candidate
-            // yet: the candidate set feeds combineCandidates -> ballot -> commit,
-            // and combineCandidates dereferences the actual tx set (which we do
-            // not have). Defer promotion until the value is fully validated
-            // (the leader's pushed tx set has arrived). This is retried on every
-            // subsequent envelope for the slot, and the ballot protocol carries
-            // us via peers' PREPARE messages if nomination has already quiesced.
-            if (validateValue(a->getValue()) !=
-                SCPDriver::kFullyValidatedValue)
-            {
-                continue;
-            }
             if (mSlot.federatedRatify(
                     std::bind(&NominationProtocol::acceptPredicate,
                               a->getValue(), _1),
