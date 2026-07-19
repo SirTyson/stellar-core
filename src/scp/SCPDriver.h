@@ -9,6 +9,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 
 #include "xdr/Stellar-SCP.h"
@@ -161,6 +162,66 @@ class SCPDriver
     extractValidValue(uint64 slotIndex, Value const& value)
     {
         return nullptr;
+    }
+
+    // Empty-tx-set recovery (docs/direct-leader-flooding.md). A node stuck in
+    // PREPARE on a value whose tx set is only structurally valid (still
+    // downloading) may, after a timeout, replace it with an empty-tx-set value
+    // so the network keeps closing ledgers. The following hooks let the ballot
+    // protocol drive that without depending on herder. Defaults make the
+    // feature a no-op (used by unit-test drivers); HerderSCPDriver overrides.
+
+    // Gate: whether replacing a stuck value with an empty-tx-set value is
+    // allowed at all.
+    virtual bool
+    protocolAllowsEmptyTxSetValues() const
+    {
+        return false;
+    }
+
+    // How long the tx set referenced by `v` has been awaited (nullopt if not
+    // awaited / already present).
+    virtual std::optional<std::chrono::milliseconds>
+    getTxSetDownloadWaitTime(Value const& v) const
+    {
+        return std::nullopt;
+    }
+
+    // How long to wait for a tx set before voting an empty set instead.
+    virtual std::chrono::milliseconds
+    getTxSetDownloadTimeout() const
+    {
+        return std::chrono::milliseconds::max();
+    }
+
+    // Produce an empty-tx-set value derived from `v` (carrying v's original
+    // proposal context + signature, so all replacing nodes agree on the same
+    // value). Default: identity (no replacement).
+    virtual Value
+    makeEmptyTxSetValueFromValue(Value const& v) const
+    {
+        return v;
+    }
+
+    // Whether `v` is an empty-tx-set value.
+    virtual bool
+    isEmptyTxSetValue(Value const& v) const
+    {
+        return false;
+    }
+
+    // Telemetry hooks (no-ops by default).
+    virtual void
+    noteEmptyTxSetValueReplaced(uint64 slotIndex)
+    {
+    }
+    virtual void
+    recordBallotBlockedOnTxSet(uint64 slotIndex, Value const& v)
+    {
+    }
+    virtual void
+    measureAndRecordBallotBlockedOnTxSet(uint64 slotIndex, Value const& v)
+    {
     }
 
     // `getValueString` is used for debugging

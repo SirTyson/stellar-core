@@ -76,6 +76,40 @@ class TestSCP : public SCPDriver
         return mValidationLevel;
     }
 
+    // Empty-tx-set recovery (docs/direct-leader-flooding.md) test controls.
+    // Disabled by default so existing ballot tests are unaffected.
+    bool mSupportsEmptyTxSet = false;
+    std::optional<std::chrono::milliseconds> mTxSetDownloadWait;
+    std::chrono::milliseconds mTxSetDownloadTimeout{
+        std::chrono::milliseconds(5000)};
+    Value mEmptyReplacementValue;
+
+    bool
+    protocolAllowsEmptyTxSetValues() const override
+    {
+        return mSupportsEmptyTxSet;
+    }
+    std::optional<std::chrono::milliseconds>
+    getTxSetDownloadWaitTime(Value const& v) const override
+    {
+        return mTxSetDownloadWait;
+    }
+    std::chrono::milliseconds
+    getTxSetDownloadTimeout() const override
+    {
+        return mTxSetDownloadTimeout;
+    }
+    Value
+    makeEmptyTxSetValueFromValue(Value const& v) const override
+    {
+        return mEmptyReplacementValue.empty() ? v : mEmptyReplacementValue;
+    }
+    bool
+    isEmptyTxSetValue(Value const& v) const override
+    {
+        return !mEmptyReplacementValue.empty() && v == mEmptyReplacementValue;
+    }
+
     void
     ballotDidHearFromQuorum(uint64 slotIndex, SCPBallot const& ballot) override
     {
@@ -781,6 +815,59 @@ TEST_CASE("parallel tx set download: structurally valid value drives nomination"
     scp.receiveEnvelope(makeNominate(v3SecretKey, qSetHash, 0, votes, accepted));
     REQUIRE(scp.mEnvs.size() == 3);
     verifyPrepare(scp.mEnvs[2], v0SecretKey, qSetHash0, 0, SCPBallot(1, xValue));
+}
+
+TEST_CASE("empty-tx-set recovery: stuck structurally-valid value is replaced",
+          "[scp][ballotprotocol]")
+{
+    // A node stuck in PREPARE on a value whose tx set is still downloading
+    // must, once the download times out, replace it with an empty-tx-set value
+    // so the network keeps closing ledgers (docs/direct-leader-flooding.md).
+    // Here the driver "replaces" xValue with zValue (a stand-in for the empty
+    // value); we assert the PREPARE carries the replacement iff timed out.
+    setupValues();
+    SIMULATION_CREATE_NODE(0);
+    SIMULATION_CREATE_NODE(1);
+    SIMULATION_CREATE_NODE(2);
+    SIMULATION_CREATE_NODE(3);
+    SIMULATION_CREATE_NODE(4);
+
+    SCPQuorumSet qSet;
+    qSet.threshold = 4;
+    qSet.validators.push_back(v0NodeID);
+    qSet.validators.push_back(v1NodeID);
+    qSet.validators.push_back(v2NodeID);
+    qSet.validators.push_back(v3NodeID);
+    qSet.validators.push_back(v4NodeID);
+
+    auto driveBump = [&](std::optional<std::chrono::milliseconds> wait,
+                         bool expectReplaced) {
+        TestSCP scp(v0SecretKey.getPublicKey(), qSet);
+        uint256 qSetHash0 = scp.mSCP.getLocalNode()->getQuorumSetHash();
+        scp.storeQuorumSet(std::make_shared<SCPQuorumSet>(qSet));
+
+        // xValue is only structurally valid (tx set downloading); the driver
+        // supports empty-tx-set recovery and would replace it with zValue.
+        scp.mValidationLevel = SCPDriver::kStructurallyValidValue;
+        scp.mSupportsEmptyTxSet = true;
+        scp.mTxSetDownloadTimeout = std::chrono::milliseconds(5000);
+        scp.mTxSetDownloadWait = wait;
+        scp.mEmptyReplacementValue = zValue;
+
+        REQUIRE(scp.bumpState(0, xValue));
+        REQUIRE(scp.mEnvs.size() == 1);
+        verifyPrepare(scp.mEnvs[0], v0SecretKey, qSetHash0, 0,
+                      SCPBallot(1, expectReplaced ? zValue : xValue));
+    };
+
+    SECTION("download timed out -> value replaced with empty tx set")
+    {
+        driveBump(std::chrono::milliseconds(6000), /*expectReplaced=*/true);
+    }
+    SECTION("still within the download window -> value kept")
+    {
+        driveBump(std::chrono::milliseconds(1000), /*expectReplaced=*/false);
+    }
 }
 
 // Testing matrix that covers interesting min/max values for each timeout

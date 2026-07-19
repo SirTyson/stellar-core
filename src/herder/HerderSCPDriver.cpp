@@ -50,6 +50,92 @@ HerderSCPDriver::getHashOf(std::vector<xdr::opaque_vec<>> const& vals) const
     return hasher.finish();
 }
 
+namespace
+{
+bool
+isEmptyTxSetStellarValue(StellarValue const& sv)
+{
+    return sv.ext.v() == STELLAR_VALUE_EMPTY_TX_SET;
+}
+} // namespace
+
+bool
+HerderSCPDriver::protocolAllowsEmptyTxSetValues() const
+{
+    // Empty-tx-set recovery is enabled unconditionally on this experimental
+    // branch (docs/direct-leader-flooding.md).
+    return true;
+}
+
+std::optional<std::chrono::milliseconds>
+HerderSCPDriver::getTxSetDownloadWaitTime(Value const& v) const
+{
+    StellarValue sv;
+    if (!toStellarValue(v, sv))
+    {
+        return std::nullopt;
+    }
+    // How long we have been awaiting the tx set this value references
+    // (nullopt once it has arrived / was never fetched).
+    return mPendingEnvelopes.getTxSetWaitingTime(sv.txSetHash);
+}
+
+std::chrono::milliseconds
+HerderSCPDriver::getTxSetDownloadTimeout() const
+{
+    // How long to wait for the leader's pushed tx set before voting an empty
+    // set instead. Hardcoded for the experiment; must comfortably exceed
+    // normal dissemination latency so empty ledgers are only produced when a
+    // set genuinely cannot be obtained.
+    return std::chrono::milliseconds(5000);
+}
+
+Value
+HerderSCPDriver::makeEmptyTxSetValueFromValue(Value const& v) const
+{
+    StellarValue proposedValue;
+    if (!toStellarValue(v, proposedValue) ||
+        proposedValue.ext.v() != STELLAR_VALUE_SIGNED)
+    {
+        // Only a signed proposal can be dropped to an empty set.
+        return v;
+    }
+    auto const& lcl = mLedgerManager.getLastClosedLedgerHeader();
+
+    // Carry the ORIGINAL proposal's context and signature so that every node
+    // replacing the same stuck value produces the byte-identical empty-tx-set
+    // value -> SCP converges on it immediately. The signature verifies over
+    // the original (txSetHash, closeTime) pair (see verifyStellarValueSignature).
+    StellarValue sv;
+    sv.ext.v(STELLAR_VALUE_EMPTY_TX_SET);
+    sv.txSetHash = Herder::EMPTY_TX_SET_HASH;
+    sv.closeTime = proposedValue.closeTime;
+    sv.upgrades = proposedValue.upgrades;
+    sv.ext.proposedValue().txSetHash = proposedValue.txSetHash;
+    sv.ext.proposedValue().previousLedgerHash = lcl.hash;
+    sv.ext.proposedValue().previousLedgerVersion = lcl.header.ledgerVersion;
+    sv.ext.proposedValue().lcValueSignature =
+        proposedValue.ext.lcValueSignature();
+    return xdr::xdr_to_opaque(sv);
+}
+
+bool
+HerderSCPDriver::isEmptyTxSetValue(Value const& v) const
+{
+    StellarValue sv;
+    if (!toStellarValue(v, sv))
+    {
+        return false;
+    }
+    return isEmptyTxSetStellarValue(sv);
+}
+
+void
+HerderSCPDriver::noteEmptyTxSetValueReplaced(uint64_t slotIndex)
+{
+    mSCPMetrics.mEmptyTxSetValueReplaced.inc();
+}
+
 HerderSCPDriver::SCPMetrics::SCPMetrics(Application& app)
     : mEnvelopeSign(
           app.getMetrics().NewMeter({"scp", "envelope", "sign"}, "envelope"))
@@ -66,6 +152,8 @@ HerderSCPDriver::SCPMetrics::SCPMetrics(Application& app)
           {"scp", "timing", "first-to-self-externalize-lag"}))
     , mSelfToOthersExternalizeLag(app.getMetrics().NewTimer(
           {"scp", "timing", "self-to-others-externalize-lag"}))
+    , mEmptyTxSetValueReplaced(app.getMetrics().NewCounter(
+          {"scp", "empty-tx-set", "value-replaced"}))
 {
 }
 
@@ -321,6 +409,26 @@ HerderSCPDriver::validateValueAgainstLocalState(uint64_t slotIndex,
             return SCPDriver::kInvalidValue;
         }
 
+        // Empty-tx-set recovery (docs/direct-leader-flooding.md): a value that
+        // drops the tx set (STELLAR_VALUE_EMPTY_TX_SET) is fully valid for
+        // LCL+1 as long as it targets our LCL -- there is nothing to download.
+        // It is only ever introduced during balloting to break a tx-set
+        // download stall, never during nomination, so reject it for nomination.
+        if (b.ext.v() == STELLAR_VALUE_EMPTY_TX_SET)
+        {
+            if (nomination)
+            {
+                return SCPDriver::kInvalidValue;
+            }
+            auto const& ov = b.ext.proposedValue();
+            if (ov.previousLedgerHash != lcl.hash ||
+                ov.previousLedgerVersion != lcl.header.ledgerVersion)
+            {
+                return SCPDriver::kInvalidValue;
+            }
+            return SCPDriver::kFullyValidatedValue;
+        }
+
         Hash const& txSetHash = b.txSetHash;
         TxSetXDRFrameConstPtr txSet = mPendingEnvelopes.getTxSet(txSetHash);
 
@@ -383,7 +491,18 @@ HerderSCPDriver::deserializeAndValidateStellarValue(Value const& value,
         return false;
     }
 
-    if (sv.ext.v() != STELLAR_VALUE_SIGNED)
+    // Accept signed values and, for empty-tx-set recovery
+    // (docs/direct-leader-flooding.md), empty-tx-set values. An empty-tx-set
+    // value MUST carry the sentinel tx set hash; its signature is verified
+    // over the original proposal (see verifyStellarValueSignature).
+    if (sv.ext.v() == STELLAR_VALUE_EMPTY_TX_SET)
+    {
+        if (sv.txSetHash != Herder::EMPTY_TX_SET_HASH)
+        {
+            return false;
+        }
+    }
+    else if (sv.ext.v() != STELLAR_VALUE_SIGNED)
     {
         return false;
     }
@@ -1504,7 +1623,11 @@ class SCPHerderValueWrapper : public ValueWrapper
     bool
     hasTxSet() const
     {
-        return mTxSet != nullptr;
+        // An empty-tx-set value (docs/direct-leader-flooding.md) references no
+        // downloadable set, so it is never "missing" -- otherwise wrapValue
+        // would park it in mPendingTxSetWrappers forever waiting for a set
+        // that will never arrive.
+        return mTxSet != nullptr || mTxSetHash == Herder::EMPTY_TX_SET_HASH;
     }
 
     Hash const&

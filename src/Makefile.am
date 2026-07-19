@@ -100,6 +100,13 @@ XDR_FEATURE_FLAGS =
 if ENABLE_CAP_0071
 XDR_FEATURE_FLAGS += -DCAP_0071
 endif
+# Empty-tx-set recovery (docs/direct-leader-flooding.md) is enabled
+# unconditionally on this experimental branch: generate the
+# STELLAR_VALUE_EMPTY_TX_SET arm in the C++ XDR headers. The arm stays behind
+# `#ifdef CAP_0083` in the .x file so hash-xdrs.sh strips it and the
+# C++/Rust XDR-identity hash is unchanged; cap_0083 is deliberately NOT added
+# to the C++/Rust feature list (checkXDRFileIdentity), so no feature mismatch.
+XDR_FEATURE_FLAGS += -DCAP_0083
 
 SUFFIXES = .x .h .rs
 .x.h:

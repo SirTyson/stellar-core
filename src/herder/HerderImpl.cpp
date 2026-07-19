@@ -326,8 +326,21 @@ HerderImpl::processExternalized(uint64 slotIndex, StellarValue const& value,
                      slotIndex, hexAbbrev(value.txSetHash));
     }
 
-    TxSetXDRFrameConstPtr externalizedSet =
-        mPendingEnvelopes.getTxSet(value.txSetHash);
+    TxSetXDRFrameConstPtr externalizedSet;
+    if (value.ext.v() == STELLAR_VALUE_EMPTY_TX_SET)
+    {
+        // Empty-tx-set recovery (docs/direct-leader-flooding.md): the tx set
+        // was dropped to break a download stall. Materialize the canonical
+        // empty set for this ledger (getTxSet(EMPTY_TX_SET_HASH) is null) so
+        // the ledger closes empty.
+        auto const& ov = value.ext.proposedValue();
+        externalizedSet = TxSetXDRFrame::makeEmpty(ov.previousLedgerHash,
+                                                   ov.previousLedgerVersion);
+    }
+    else
+    {
+        externalizedSet = mPendingEnvelopes.getTxSet(value.txSetHash);
+    }
 
     // Notify overlay to clear TXs from mempool (for RustOverlayManager)
     // Extract TX hashes from the externalized set so Rust can remove them
@@ -2758,6 +2771,19 @@ bool
 HerderImpl::verifyStellarValueSignature(StellarValue const& sv)
 {
     ZoneScoped;
+    // Empty-tx-set recovery (docs/direct-leader-flooding.md): an empty-tx-set
+    // value carries the ORIGINAL proposal's signature in proposedValue, signed
+    // over the original (txSetHash, closeTime). Verify against that, not the
+    // (absent) top-level signature arm.
+    if (sv.ext.v() == STELLAR_VALUE_EMPTY_TX_SET)
+    {
+        auto const& ov = sv.ext.proposedValue();
+        auto [b, _] = PubKeyUtils::verifySig(
+            ov.lcValueSignature.nodeID, ov.lcValueSignature.signature,
+            xdr::xdr_to_opaque(mApp.getNetworkID(), ENVELOPE_TYPE_SCPVALUE,
+                               ov.txSetHash, sv.closeTime));
+        return b;
+    }
     auto [b, _] = PubKeyUtils::verifySig(
         sv.ext.lcValueSignature().nodeID, sv.ext.lcValueSignature().signature,
         xdr::xdr_to_opaque(mApp.getNetworkID(), ENVELOPE_TYPE_SCPVALUE,

@@ -80,6 +80,11 @@ class Herder
 
     static std::chrono::minutes const TX_SET_GC_DELAY;
 
+    // Sentinel tx-set hash carried by an empty-tx-set recovery value
+    // (docs/direct-leader-flooding.md); all-zero. Used when a node, blocked
+    // waiting for an undisseminated tx set, votes to close an empty ledger.
+    static Hash const EMPTY_TX_SET_HASH;
+
     enum State
     {
         // Starting up, no state is known

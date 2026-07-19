@@ -173,6 +173,13 @@ class TxSetXDRFrame : public NonMovableOrCopyable
     static TxSetXDRFrameConstPtr
     makeEmpty(LedgerHeaderHistoryEntry const& lclHeader);
 
+    // Empty-tx-set recovery (docs/direct-leader-flooding.md): build a valid
+    // empty TxSetXDRFrame from just the previous ledger hash + protocol
+    // version. Used to materialize the empty set referenced by a
+    // STELLAR_VALUE_EMPTY_TX_SET value, where the full LCL header isn't handy.
+    static TxSetXDRFrameConstPtr makeEmpty(Hash const& previousLedgerHash,
+                                           uint32 previousLedgerVersion);
+
     // `makeFromWire` methods create a TxSetXDRFrame from the XDR messages.
     // These methods don't perform any validation on the XDR.
     static TxSetXDRFrameConstPtr makeFromWire(TransactionSet const& xdrTxSet);

@@ -1,6 +1,7 @@
 ﻿#include "util/asio.h"
 #include "LedgerCloseData.h"
 #include "crypto/Hex.h"
+#include "herder/Herder.h"
 #include "herder/Upgrades.h"
 #include "main/Application.h"
 #include "util/GlobalChecks.h"
@@ -22,7 +23,11 @@ LedgerCloseData::LedgerCloseData(uint32_t ledgerSeq,
     , mValue(v)
     , mExpectedLedgerHash(expectedLedgerHash)
 {
-    releaseAssert(txSet->getContentsHash() == mValue.txSetHash);
+    // Empty-tx-set recovery (docs/direct-leader-flooding.md): an empty-tx-set
+    // value carries the sentinel hash, not the (materialized) empty set's
+    // content hash, so exempt it from the tx-set/value hash match.
+    releaseAssert(mValue.txSetHash == Herder::EMPTY_TX_SET_HASH ||
+                  txSet->getContentsHash() == mValue.txSetHash);
 }
 
 #ifdef BUILD_TESTS
@@ -36,7 +41,11 @@ LedgerCloseData::LedgerCloseData(
     , mExpectedLedgerHash(expectedLedgerHash)
     , mExpectedResults(expectedResults)
 {
-    releaseAssert(txSet->getContentsHash() == mValue.txSetHash);
+    // Empty-tx-set recovery (docs/direct-leader-flooding.md): an empty-tx-set
+    // value carries the sentinel hash, not the (materialized) empty set's
+    // content hash, so exempt it from the tx-set/value hash match.
+    releaseAssert(mValue.txSetHash == Herder::EMPTY_TX_SET_HASH ||
+                  txSet->getContentsHash() == mValue.txSetHash);
 }
 #endif // BUILD_TESTS
 
@@ -49,6 +58,11 @@ stellarValueToString(Config const& c, StellarValue const& sv)
     if (sv.ext.v() == STELLAR_VALUE_SIGNED)
     {
         res << " SIGNED@" << c.toShortString(sv.ext.lcValueSignature().nodeID);
+    }
+    else if (sv.ext.v() == STELLAR_VALUE_EMPTY_TX_SET)
+    {
+        res << " EMPTY_TXSET@"
+            << c.toShortString(sv.ext.proposedValue().lcValueSignature.nodeID);
     }
     res << " txH: " << hexAbbrev(sv.txSetHash) << ", ct: " << sv.closeTime
         << ", upgrades: [";

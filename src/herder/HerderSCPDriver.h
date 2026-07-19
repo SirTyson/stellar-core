@@ -72,6 +72,17 @@ class HerderSCPDriver : public SCPDriver
     ValueWrapperPtr extractValidValue(uint64_t slotIndex,
                                       Value const& value) override;
 
+    // Empty-tx-set recovery (docs/direct-leader-flooding.md): unconditionally
+    // enabled on this experimental branch so a node stuck waiting for an
+    // undisseminated tx set can vote an empty set after a timeout.
+    bool protocolAllowsEmptyTxSetValues() const override;
+    std::optional<std::chrono::milliseconds>
+    getTxSetDownloadWaitTime(Value const& v) const override;
+    std::chrono::milliseconds getTxSetDownloadTimeout() const override;
+    Value makeEmptyTxSetValueFromValue(Value const& v) const override;
+    bool isEmptyTxSetValue(Value const& v) const override;
+    void noteEmptyTxSetValueReplaced(uint64_t slotIndex) override;
+
     // Parallel tx set download (docs/direct-leader-flooding.md): may
     // PendingEnvelopes hand this envelope to SCP now? True when the qset is
     // present and either all tx sets are fetched, or it is a current-ledger
@@ -237,6 +248,10 @@ class HerderSCPDriver : public SCPDriver
         // Timers tracking externalize messages
         medida::Timer& mFirstToSelfExternalizeLag;
         medida::Timer& mSelfToOthersExternalizeLag;
+
+        // Empty-tx-set recovery: how often a stuck value was replaced with an
+        // empty-tx-set value (docs/direct-leader-flooding.md).
+        medida::Counter& mEmptyTxSetValueReplaced;
 
         SCPMetrics(Application& app);
     };

@@ -331,7 +331,10 @@ PendingEnvelopes::recvSCPEnvelope(SCPEnvelope const& envelope)
 
     auto const& values = maybeValues.value();
     if (std::any_of(values.begin(), values.end(), [](auto const& value) {
-            return value.ext.v() != STELLAR_VALUE_SIGNED;
+            // Empty-tx-set recovery values are permitted alongside signed
+            // values (docs/direct-leader-flooding.md).
+            return value.ext.v() != STELLAR_VALUE_SIGNED &&
+                   value.ext.v() != STELLAR_VALUE_EMPTY_TX_SET;
         }))
     {
         CLOG_TRACE(Herder, "Dropping envelope from {} (value not signed)",

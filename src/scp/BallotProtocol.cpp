@@ -404,6 +404,13 @@ BallotProtocol::bumpState(Value const& value, uint32 n)
         newb.value = value;
     }
 
+    // Empty-tx-set recovery (docs/direct-leader-flooding.md): if we are stuck
+    // in PREPARE on a value whose tx set never arrived, replace it with an
+    // empty-tx-set value before bumping, so the network can close an empty
+    // ledger instead of stalling. No-op unless the value has been blocked on
+    // its tx set past the timeout.
+    maybeReplaceValueWithEmptyTxSet(newb.value);
+
     CLOG_TRACE(SCP, "BallotProtocol::bumpState i: {} v: {}",
                mSlot.getSlotIndex(), mSlot.getSCP().ballotToStr(newb));
 
@@ -416,6 +423,46 @@ BallotProtocol::bumpState(Value const& value, uint32 n)
     }
 
     return updated;
+}
+
+bool
+BallotProtocol::maybeReplaceValueWithEmptyTxSet(Value& v) const
+{
+    auto& driver = mSlot.getSCPDriver();
+    // Only meaningful while stuck in PREPARE, and only if the driver supports
+    // empty-tx-set values (unit-test drivers don't -> no-op).
+    if (!driver.protocolAllowsEmptyTxSetValues() || mPhase != SCP_PHASE_PREPARE)
+    {
+        return false;
+    }
+    // Only a value we can *only* structurally validate is a candidate: fully
+    // validated means we have the tx set (nothing to recover), invalid means
+    // we won't commit it anyway (setConfirmPrepared already refuses).
+    if (driver.validateValue(mSlot.getSlotIndex(), v, /*nomination=*/false) !=
+        SCPDriver::kStructurallyValidValue)
+    {
+        return false;
+    }
+    // A structurally-valid value references a real (still-downloading) tx set,
+    // so it cannot already be the empty-tx-set value.
+    releaseAssert(!driver.isEmptyTxSetValue(v));
+
+    // Give the leader's push / fetch until the timeout before giving up on it.
+    auto const waitingTime = driver.getTxSetDownloadWaitTime(v);
+    if (!waitingTime.has_value() ||
+        waitingTime.value() < driver.getTxSetDownloadTimeout())
+    {
+        return false;
+    }
+
+    v = driver.makeEmptyTxSetValueFromValue(v);
+    driver.noteEmptyTxSetValueReplaced(mSlot.getSlotIndex());
+    CLOG_INFO(SCP,
+              "BallotProtocol::maybeReplaceValueWithEmptyTxSet i: {} tx set "
+              "download timed out; voting an empty tx set to keep the network "
+              "moving",
+              mSlot.getSlotIndex());
+    return true;
 }
 
 // updates the local state based to the specified ballot
