@@ -1097,27 +1097,40 @@ BallotProtocol::setConfirmPrepared(SCPBallot const& newC, SCPBallot const& newH)
         if (newC.counter != 0)
         {
             dbgAssert(!mCommit);
-            // Parallel tx set download (docs/direct-leader-flooding.md): never
-            // vote-to-commit a value whose tx set we have not fully validated.
-            // Re-validate now; if it is only structurally valid (tx set still
-            // downloading) leave mCommit unset -- the node stays in PREPARE
-            // until the pushed tx set arrives and a later SCP re-drive upgrades
-            // the value to fully validated. This is the core safety gate: a
-            // value whose transactions we have not validated cannot be
-            // committed or externalized.
+            // Parallel tx set download (docs/direct-leader-flooding.md): only
+            // vote-to-commit a value we can positively validate. Re-validate
+            // now and set mCommit ONLY for a fully-validated LCL+1 value or a
+            // value for a non-current slot we are finalizing (kMaybeValidValue,
+            // e.g. during catch-up) -- matching the values SCP is allowed to
+            // externalize. Every other level leaves mCommit unset so the node
+            // stays in PREPARE:
+            //   - kStructurallyValidValue: the tx set is still downloading;
+            //     commit once the pushed set arrives and a later SCP re-drive
+            //     upgrades the value to fully validated.
+            //   - kInvalidValue: the tx set arrived and failed checkValid (or a
+            //     Byzantine/faulty leader proposed an invalid-but-parseable
+            //     set). We must NOT vote-to-commit it -- doing so would emit a
+            //     spec-violating vote and pin mCommit to a value that can never
+            //     externalize (peers' CONFIRM/EXTERNALIZE for it are rejected),
+            //     wedging this node. Leaving mCommit unset lets the node move to
+            //     a valid value at a higher ballot.
+            // This is the core safety gate: a value whose transactions we have
+            // not validated (or consider invalid) cannot be committed.
             auto vl = mSlot.getSCPDriver().validateValue(mSlot.getSlotIndex(),
                                                          newC.value, false);
-            if (vl == SCPDriver::kStructurallyValidValue)
-            {
-                CLOG_DEBUG(SCP,
-                           "BallotProtocol::setConfirmPrepared i: {} deferring "
-                           "vote-to-commit: tx set still downloading",
-                           mSlot.getSlotIndex());
-            }
-            else
+            if (vl == SCPDriver::kFullyValidatedValue ||
+                vl == SCPDriver::kMaybeValidValue)
             {
                 mCommit = makeBallot(newC);
                 didWork = true;
+            }
+            else
+            {
+                CLOG_DEBUG(SCP,
+                           "BallotProtocol::setConfirmPrepared i: {} NOT "
+                           "voting-to-commit (validation level {}): value not "
+                           "fully validated (tx set downloading or invalid)",
+                           mSlot.getSlotIndex(), static_cast<int>(vl));
             }
         }
 
@@ -1563,15 +1576,19 @@ BallotProtocol::setConfirmCommit(SCPBallot const& c, SCPBallot const& h)
                mSlot.getSlotIndex(), mSlot.getSCP().ballotToStr(c),
                mSlot.getSCP().ballotToStr(h));
 
-    // Parallel tx set download (docs/direct-leader-flooding.md): the safety gate
-    // that a value is fully validated before commit lives in setConfirmPrepared
-    // (mCommit is only set for a fully-validated value, and confirm-commit
-    // requires mCommit). We deliberately do NOT re-validate here: unlike master
-    // this branch does not pin the tx set in the value wrapper, so the LRU tx
-    // set caches can evict a set that was present at vote-to-commit. Re-running
-    // validateValue could then transiently report the (already-committed,
-    // already-validated) value as only structurally valid -- a cache artifact,
-    // not invalidity. Throwing on that aborted every node under load.
+    // Parallel tx set download (docs/direct-leader-flooding.md): reaching
+    // confirm-commit already implies the value is fully validated, so we do not
+    // re-validate here. Two gates guarantee it:
+    //   1. setConfirmPrepared sets mCommit ONLY for a fully-validated (or
+    //      non-current) value, and confirm-commit requires mCommit; and
+    //   2. processEnvelope rejects a peer's CONFIRM and any EXTERNALIZE whose
+    //      value is only structurally valid, so a confirm-commit quorum cannot
+    //      form on a value whose tx set this node lacks.
+    // The tx set is pinned into the value wrapper (commit b286ce283), so it
+    // cannot be LRU-evicted while SCP still holds the committing value. Master
+    // keeps a defensive re-validation throw here; we omit it -- before pinning
+    // it produced false positives on eviction and aborted every node under
+    // load, and post-pinning it is redundant with the two gates above.
 
     mCommit = makeBallot(c);
     mHighBallot = makeBallot(h);
