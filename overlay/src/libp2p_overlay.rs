@@ -2566,7 +2566,9 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let tx = test_tx_xdr(1);
-        handle1.broadcast_tx(tx.clone()).await;
+        handle1
+            .broadcast_tx(ValidatedTx::from_core_trusted(tx.clone(), 0, 1).unwrap())
+            .await;
 
         // The leader must receive the full TX body.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -2575,7 +2577,7 @@ mod tests {
             tokio::select! {
                 Some(event) = tx_events2.recv() => {
                     if let OverlayEvent::TxReceived { tx: recv_tx, .. } = event {
-                        assert_eq!(recv_tx, tx);
+                        assert_eq!(recv_tx.bytes(), tx.as_slice());
                         received = true;
                     }
                 }
@@ -2628,7 +2630,9 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let tx = test_tx_xdr(2);
-        handle1.broadcast_tx(tx.clone()).await;
+        handle1
+            .broadcast_tx(ValidatedTx::from_core_trusted(tx.clone(), 0, 1).unwrap())
+            .await;
 
         // The peer must still receive the TX via the INV/GETDATA pull path.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -2637,7 +2641,7 @@ mod tests {
             tokio::select! {
                 Some(event) = tx_events2.recv() => {
                     if let OverlayEvent::TxReceived { tx: recv_tx, .. } = event {
-                        assert_eq!(recv_tx, tx);
+                        assert_eq!(recv_tx.bytes(), tx.as_slice());
                         received = true;
                     }
                 }
@@ -2696,7 +2700,9 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let tx = test_tx_xdr(3);
-        handle_a.broadcast_tx(tx.clone()).await;
+        handle_a
+            .broadcast_tx(ValidatedTx::from_core_trusted(tx.clone(), 0, 1).unwrap())
+            .await;
 
         // C must receive the TX: A INVs to B, B pulls it, then B pushes the
         // full body directly to its leader C.
@@ -2706,7 +2712,7 @@ mod tests {
             tokio::select! {
                 Some(event) = tx_events_c.recv() => {
                     if let OverlayEvent::TxReceived { tx: recv_tx, .. } = event {
-                        assert_eq!(recv_tx, tx);
+                        assert_eq!(recv_tx.bytes(), tx.as_slice());
                         received = true;
                     }
                 }
