@@ -780,37 +780,20 @@ impl App {
                     from
                 );
 
-                // TX set hashes were extracted during the reader's single
-                // decode. Snapshot the cache-hit check on the main loop, then
-                // move the libp2p cmd_tx awaits into a spawned task so the loop
-                // never blocks on the bounded command channel.
-                if !txset_hashes.is_empty() {
-                    let needs_fetch: HashSet<[u8; 32]> = txset_hashes
-                        .iter()
-                        .filter(|h| self.tx_set_cache.get(h).is_none())
-                        .copied()
-                        .collect();
-                    let handle = self.libp2p_handle.clone();
-                    let from_peer = from;
-                    tokio::spawn(async move {
-                        for txhash in &txset_hashes {
-                            debug!(
-                                "Recording peer {} as source for TX set {:02x?}...",
-                                from_peer,
-                                &txhash[..4]
-                            );
-                            handle.record_txset_source(*txhash, from_peer).await;
-                            if needs_fetch.contains(txhash) {
-                                info!(
-                                    "TXSET_AUTO_FETCH: Proactively fetching TX set {:02x?}... referenced in SCP from {}",
-                                    &txhash[..4],
-                                    from_peer
-                                );
-                                handle.fetch_txset(*txhash).await;
-                            }
-                        }
-                    });
-                }
+                // Leader-push-only tx set dissemination
+                // (docs/direct-leader-flooding.md): the nominating leader
+                // eagerly pushes the full tx set body to every peer, so on a
+                // fully connected network the body arrives without any
+                // request. The old TXSET_AUTO_FETCH here (fetch on every SCP
+                // envelope referencing a non-cached set) amplified into many
+                // redundant multi-MB downloads per slot under load (its dedup
+                // window leaked across receipt/disconnect races and distinct
+                // value hashes), congesting the very path the push needs. If a
+                // push is ever missed, the empty-tx-set recovery closes an
+                // empty ledger rather than stalling. `txset_hashes` (already
+                // extracted by the reader's single decode) is intentionally
+                // unused here.
+                let _ = &txset_hashes;
 
                 // Forward to Core
                 if let Err(e) = self.core_ipc.sender.send_scp_received(envelope) {
