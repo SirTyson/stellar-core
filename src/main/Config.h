@@ -297,6 +297,22 @@ class Config : public std::enable_shared_from_this<Config>
     // should only be enabled when testing.
     bool ARTIFICIALLY_SUPPRESS_TX_SET_FLOOD_FOR_TESTING;
 
+    // Direct leader flooding: submitted TXs stay in the submitter's own
+    // mempool -- no push to leaders, no relay. Combined with
+    // ARTIFICIALLY_DROP_NOMINATED_TX_SET_FOR_TESTING this makes every
+    // leader's nominated set unobtainable by every other node
+    // (deterministic mempool asymmetry -- the limit case of relay lag at
+    // high rate). This config should only be enabled when testing.
+    bool ARTIFICIALLY_KEEP_SUBMITTED_TXS_LOCAL_FOR_TESTING;
+
+    // Direct leader flooding: the leader neither broadcasts NOR caches its
+    // nominated TX set in the overlay, so no peer can obtain the body at all
+    // (the limit case of "delivery too slow"). Lets tests reproduce the
+    // network-wide wedge where every node waits on an unobtainable set and
+    // only the empty-tx-set recovery can unblock the slot. This config should
+    // only be enabled when testing.
+    bool ARTIFICIALLY_DROP_NOMINATED_TX_SET_FOR_TESTING;
+
     // Timeout before publishing externalized values to archive
     std::chrono::seconds PUBLISH_TO_ARCHIVE_DELAY;
 

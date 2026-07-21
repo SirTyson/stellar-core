@@ -152,7 +152,8 @@ class OverlayIPC
                        std::vector<std::string> const& preferredPeers,
                        uint16_t listenPort,
                        std::vector<std::string> const& quorumMembers = {},
-                       size_t txBatchMaxSize = 0);
+                       size_t txBatchMaxSize = 0,
+                       bool suppressTxBroadcast = false);
 
     /**
      * Push the upcoming nomination leaders for `slotIndex` to the overlay

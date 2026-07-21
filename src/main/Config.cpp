@@ -73,6 +73,8 @@ static std::unordered_set<std::string> const TESTING_ONLY_OPTIONS = {
     "ARTIFICIALLY_SKIP_CONNECTION_ADJUSTMENT_FOR_TESTING",
     "ARTIFICIALLY_DELAY_LEDGER_CLOSE_FOR_TESTING",
     "ARTIFICIALLY_SUPPRESS_TX_SET_FLOOD_FOR_TESTING",
+    "ARTIFICIALLY_DROP_NOMINATED_TX_SET_FOR_TESTING",
+    "ARTIFICIALLY_KEEP_SUBMITTED_TXS_LOCAL_FOR_TESTING",
     "SKIP_HIGH_CRITICAL_VALIDATOR_CHECKS_FOR_TESTING",
     "TRANSACTION_QUEUE_SIZE_MULTIPLIER_FOR_TESTING",
     "SOROBAN_TRANSACTION_QUEUE_SIZE_MULTIPLIER_FOR_TESTING"};
@@ -197,6 +199,8 @@ Config::Config() : NODE_SEED(SecretKey::random())
         std::chrono::seconds::zero();
     ARTIFICIALLY_DELAY_LEDGER_CLOSE_FOR_TESTING = std::chrono::milliseconds(0);
     ARTIFICIALLY_SUPPRESS_TX_SET_FLOOD_FOR_TESTING = false;
+    ARTIFICIALLY_DROP_NOMINATED_TX_SET_FOR_TESTING = false;
+    ARTIFICIALLY_KEEP_SUBMITTED_TXS_LOCAL_FOR_TESTING = false;
     ALLOW_LOCALHOST_FOR_TESTING = false;
     USE_CONFIG_FOR_GENESIS = false;
     GENESIS_TEST_ACCOUNT_COUNT = 0;
@@ -1222,6 +1226,16 @@ Config::processConfig(std::shared_ptr<cpptoml::table> t)
                 {"ARTIFICIALLY_SUPPRESS_TX_SET_FLOOD_FOR_TESTING",
                  [&]() {
                      ARTIFICIALLY_SUPPRESS_TX_SET_FLOOD_FOR_TESTING =
+                         readBool(item);
+                 }},
+                {"ARTIFICIALLY_DROP_NOMINATED_TX_SET_FOR_TESTING",
+                 [&]() {
+                     ARTIFICIALLY_DROP_NOMINATED_TX_SET_FOR_TESTING =
+                         readBool(item);
+                 }},
+                {"ARTIFICIALLY_KEEP_SUBMITTED_TXS_LOCAL_FOR_TESTING",
+                 [&]() {
+                     ARTIFICIALLY_KEEP_SUBMITTED_TXS_LOCAL_FOR_TESTING =
                          readBool(item);
                  }},
                 // https://github.com/stellar/stellar-core/issues/4581

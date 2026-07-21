@@ -1568,6 +1568,121 @@ TEST_CASE("TX batching engages on leader push", "[overlay-ipc][herder][.]")
 }
 
 /**
+ * Wedge repro (perf-net failure catalog, builds 3430-3436): when a nominated
+ * tx set cannot be delivered to anyone -- the limit case of "leader egress too
+ * slow" -- the whole network waits on the same missing body: pending-fetching
+ * jumps, fallback fetches hit peers that are equally empty-handed, and on the
+ * perf net the ledger froze until the ~35s herder timeout killed every node.
+ *
+ * With ARTIFICIALLY_DROP_NOMINATED_TX_SET_FOR_TESTING the nominating node
+ * neither pushes nor caches its set, so no fetch can ever succeed. The ONLY
+ * way the network can make progress is the empty-tx-set recovery: after the
+ * 5s download timeout the ballot timer must replace the stuck value with an
+ * empty-tx-set value and close an empty ledger. If this test times out, the
+ * perf-net wedge is reproduced in-tree.
+ */
+TEST_CASE("undeliverable tx set recovers via empty ledger instead of wedging",
+          "[overlay-ipc][herder][.]")
+{
+    std::string overlayBinary = requireOverlayBinary();
+    Hash networkID = sha256(getTestConfig().NETWORK_PASSPHRASE);
+    auto simulation = std::make_shared<Simulation>(networkID);
+
+    // 5 nodes, threshold 4: the tx submitter plus the 2 flood leaders hold
+    // the TXs (leader routing), i.e. at most 3 "haves" -- below quorum. The 2
+    // "have-not" nodes form a blocking set, so the tx-bearing slot stalls
+    // NETWORK-WIDE (the perf-net signature: every node frozen at the same
+    // ledger), and only empty-tx-set recovery can unblock it.
+    int const N = 5;
+    std::vector<SecretKey> keys;
+    for (int i = 0; i < N; ++i)
+    {
+        keys.push_back(SecretKey::fromSeed(
+            sha256("TXSET_WEDGE_TEST_NODE_" + std::to_string(i))));
+    }
+
+    SCPQuorumSet qSet;
+    qSet.threshold = 4;
+    for (auto const& k : keys)
+    {
+        qSet.validators.push_back(k.getPublicKey());
+    }
+
+    uint16_t const basePort = 11703;
+    std::vector<Application::pointer> nodes;
+    for (int i = 0; i < N; ++i)
+    {
+        auto cfg = simulation->newConfig();
+        cfg.PEER_PORT = basePort + i;
+        // Nominated tx sets are unobtainable network-wide, and submitted
+        // TXs stay local to the submitter (deterministic mempool asymmetry:
+        // the limit case of relay lag at high rate).
+        cfg.ARTIFICIALLY_DROP_NOMINATED_TX_SET_FOR_TESTING = true;
+        cfg.ARTIFICIALLY_KEEP_SUBMITTED_TXS_LOCAL_FOR_TESTING = true;
+        for (int j = 0; j < N; ++j)
+        {
+            if (j != i)
+            {
+                cfg.KNOWN_PEERS.push_back("127.0.0.1:" +
+                                          std::to_string(basePort + j));
+            }
+        }
+        nodes.push_back(simulation->addNode(keys[i], qSet, &cfg));
+    }
+    simulation->startAllNodes();
+
+    // With no transactions every node builds the IDENTICAL empty set locally
+    // (same hash), so no dissemination is needed and the drop flag is inert.
+    // Let the network boot that way first.
+    simulation->crankUntil(
+        [&]() { return simulation->haveAllExternalized(3, 2); },
+        30 * 3 * simulation->getExpectedLedgerCloseTime(), false);
+    REQUIRE(simulation->haveAllExternalized(3, 2));
+
+    // Now make the nominated set undeliverable-by-construction: submit TXs to
+    // node0 (leader routing concentrates them at the flood leaders), so the
+    // leader's nominated set contains TXs no other node's locally-built set
+    // has -- a distinct hash whose body nobody can obtain (dropped). This is
+    // the perf-net wedge condition. The TXs themselves can never apply; the
+    // assertion is purely about LIVENESS via empty-tx-set recovery.
+    for (auto const& node : nodes)
+    {
+        auto root = TestAccount{*node, txtest::getRoot(networkID)};
+        auto dest = SecretKey::pseudoRandomForTesting();
+        auto tx = root.tx(
+            {txtest::createAccount(dest.getPublicKey(), 500000000)});
+        REQUIRE(node->getHerder().recvTransaction(tx, false) ==
+                TxSubmitStatus::TX_STATUS_PENDING);
+    }
+
+    // Progress past the tx-bearing slots is possible ONLY through empty-tx-set
+    // recovery (5s download timeout + ballot-timer bumps). Budget generously:
+    // recovery cadence is ~10s+/ledger, and the wedge signature is precisely
+    // "no progress for 35s+", so a 60s/ledger budget cleanly separates
+    // recovery from wedge.
+    uint32_t const targetLedger = 7;
+    simulation->crankUntil(
+        [&]() { return simulation->haveAllExternalized(targetLedger, 4); },
+        std::chrono::seconds(60 * (targetLedger - 3)), false);
+    REQUIRE(simulation->haveAllExternalized(targetLedger, 4));
+
+    // The recovery must actually have fired somewhere (not a fluke of timing).
+    int64_t totalReplaced = 0;
+    for (auto const& node : nodes)
+    {
+        totalReplaced += node->getMetrics()
+                             .NewCounter({"scp", "empty-tx-set",
+                                          "value-replaced"})
+                             .count();
+    }
+    REQUIRE(totalReplaced >= 1);
+
+    LOG_INFO(DEFAULT_LOG,
+             "undeliverable-tx-set recovery test passed (value-replaced: {})",
+             totalReplaced);
+}
+
+/**
  * Stress test: Submit TXs in batches and measure SCP latency.
  *
  * This test verifies that SCP consensus timing remains stable even under

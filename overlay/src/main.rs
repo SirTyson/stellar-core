@@ -520,6 +520,10 @@ struct App {
     connected_quorum: Arc<RwLock<HashSet<PeerId>>>,
     /// Whether the one-shot quorum connectivity timer has been scheduled.
     quorum_check_scheduled: bool,
+    /// TESTING (SetPeerConfig `suppress_tx_broadcast`): submitted TXs go to
+    /// the local mempool only -- no push to leaders, no relay. Simulates the
+    /// mempool asymmetry of relay lag at high rate.
+    suppress_tx_broadcast: bool,
     /// Delay before emitting the one-shot quorum connectivity report.
     quorum_check_grace_secs: u64,
     /// Shared metrics counters for the overlay
@@ -603,6 +607,7 @@ impl App {
             known_peers: Arc::new(RwLock::new(HashMap::new())),
             peer_hostnames: Arc::new(RwLock::new(HashMap::new())),
             leaders: Arc::new(RwLock::new((0, Vec::new()))),
+            suppress_tx_broadcast: false,
             expected_quorum: Arc::new(RwLock::new(HashMap::new())),
             connected_peers: Arc::new(RwLock::new(HashSet::new())),
             connected_quorum: Arc::new(RwLock::new(HashSet::new())),
@@ -1245,10 +1250,12 @@ impl App {
                 self.overlay_handle.submit_tx(Arc::clone(&tx));
 
                 // Broadcast TX via libp2p QUIC (dedicated stream)
-                let handle = self.libp2p_handle.clone();
-                tokio::spawn(async move {
-                    handle.broadcast_tx(tx).await;
-                });
+                if !self.suppress_tx_broadcast {
+                    let handle = self.libp2p_handle.clone();
+                    tokio::spawn(async move {
+                        handle.broadcast_tx(tx).await;
+                    });
+                }
             }
 
             MessageType::RequestScpState => {
@@ -1428,6 +1435,12 @@ impl App {
                         let tx_batch_max_size =
                             config["tx_batch_max_size"].as_u64().unwrap_or(0) as usize;
                         self.libp2p_handle.set_tx_batch_max_size(tx_batch_max_size);
+                        self.suppress_tx_broadcast = config["suppress_tx_broadcast"]
+                            .as_bool()
+                            .unwrap_or(false);
+                        if self.suppress_tx_broadcast {
+                            warn!("TESTING: suppress_tx_broadcast enabled -- submitted TXs stay local");
+                        }
                         let quorum_members_configured = config.get("quorum_members").is_some();
                         let quorum_members: Vec<String> = config
                             .get("quorum_members")

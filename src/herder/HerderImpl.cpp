@@ -1735,8 +1735,19 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
             !round1Leaders.empty() &&
             round1Leaders.front() == mApp.getConfig().NODE_SEED.getPublicKey();
 
-        if (selfIsRound1Leader &&
-            !mApp.getConfig().ARTIFICIALLY_SUPPRESS_TX_SET_FLOOD_FOR_TESTING)
+        if (mApp.getConfig().ARTIFICIALLY_DROP_NOMINATED_TX_SET_FOR_TESTING)
+        {
+            // Wedge-repro testing: the nominated set is neither pushed nor
+            // cached (leader or not), so NO peer can obtain the body -- the
+            // limit case of "leader delivery too slow". Only the empty-tx-set
+            // recovery can unblock the slot.
+            CLOG_INFO(Herder,
+                      "TESTING: dropping nominated TX set {} (not pushed, "
+                      "not cached)",
+                      binToHex(txSetHash).substr(0, 8));
+        }
+        else if (selfIsRound1Leader &&
+                 !mApp.getConfig().ARTIFICIALLY_SUPPRESS_TX_SET_FLOOD_FOR_TESTING)
         {
             CLOG_DEBUG(Herder,
                        "Round-1 leader: eagerly broadcasting TX set {} to peers",

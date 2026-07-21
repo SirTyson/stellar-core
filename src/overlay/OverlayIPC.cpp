@@ -786,7 +786,7 @@ OverlayIPC::setPeerConfig(std::vector<std::string> const& knownPeers,
                           std::vector<std::string> const& preferredPeers,
                           uint16_t listenPort,
                           std::vector<std::string> const& quorumMembers,
-                          size_t txBatchMaxSize)
+                          size_t txBatchMaxSize, bool suppressTxBroadcast)
 {
     if (!mChannel || !mChannel->isConnected())
     {
@@ -817,7 +817,9 @@ OverlayIPC::setPeerConfig(std::vector<std::string> const& knownPeers,
     }
     json += "]";
     json += ",\"listen_port\":" + std::to_string(listenPort);
-    json += ",\"tx_batch_max_size\":" + std::to_string(txBatchMaxSize) + "}";
+    json += ",\"tx_batch_max_size\":" + std::to_string(txBatchMaxSize);
+    json += std::string(",\"suppress_tx_broadcast\":") +
+            (suppressTxBroadcast ? "true" : "false") + "}";
 
     IPCMessage msg;
     msg.type = IPCMessageType::SET_PEER_CONFIG;
