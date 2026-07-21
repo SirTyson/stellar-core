@@ -48,6 +48,13 @@ const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 /// TXs that can't be queued are dropped - they'll be re-requested if needed.
 const TX_EVENT_CHANNEL_CAPACITY: usize = 10_000;
 
+/// How long an outstanding GetTxSet request may go unanswered before a new
+/// fetch for the same hash is allowed to retry against a different peer.
+/// Slightly below Core's ~1s fetch-fallback retry cadence so the retry
+/// actually goes through instead of being deduplicated against the stuck
+/// request (docs/direct-leader-flooding.md).
+const TXSET_FETCH_RETRY_STALE: Duration = Duration::from_millis(900);
+
 /// Events from the overlay to the application
 #[derive(Debug, Clone)]
 pub enum OverlayEvent {
@@ -983,65 +990,57 @@ impl StellarOverlay {
 
     /// Fetch TX set from a peer - preferring the peer who sent us the SCP message referencing it
     async fn fetch_txset(&mut self, hash: [u8; 32]) {
-        // Check if we're already fetching this TxSet from a connected peer (dedup)
-        {
+        // Dedup: skip only if a request for this hash is outstanding, FRESH,
+        // and its peer is still connected. A stale request (the peer accepted
+        // it but never responded -- e.g. it had already evicted the set) must
+        // NOT block forever: fall through and retry against a DIFFERENT peer.
+        // Core drives retries at ~1s intervals (PendingEnvelopes fetch
+        // fallback), so the staleness cutoff sits just below that.
+        let avoid: Option<PeerId> = {
             let pending = self.state.pending_txset_requests.read().await;
-            if let Some((pending_peer, _)) = pending.get(&hash) {
-                // Check if that peer is still connected
+            if let Some((pending_peer, requested_at)) = pending.get(&hash) {
                 let streams = self.state.peer_streams.read().await;
-                if streams.contains_key(pending_peer) {
+                if streams.contains_key(pending_peer)
+                    && requested_at.elapsed() < TXSET_FETCH_RETRY_STALE
+                {
                     debug!(
                         "TXSET_FETCH_SKIP: TxSet {:02x?}... already being fetched from {}, skipping duplicate",
                         &hash[..4], pending_peer
                     );
                     return;
                 }
-                // Otherwise, peer disconnected - we'll re-request below
+                // Stale or disconnected: retry, avoiding the stuck peer.
+                Some(*pending_peer)
+            } else {
+                None
             }
-        }
+        };
 
-        // First check if we know which peer has this TX set (from SCP message)
+        // Prefer a known source (recorded when a peer referenced the set),
+        // otherwise any connected peer -- excluding the peer a stale request
+        // is already stuck on.
         let known_source = {
             let sources = self.state.txset_sources.read().await;
             sources.peek(&hash).cloned()
         };
 
-        let peer = if let Some(source_peer) = known_source {
-            // Verify this peer is still connected
+        let peer = {
             let streams = self.state.peer_streams.read().await;
-            if streams.contains_key(&source_peer) {
-                info!(
-                    "TXSET_FETCH: Fetching TX set {:02x?}... from known source {}",
-                    &hash[..4],
-                    source_peer
-                );
-                source_peer
-            } else {
-                // Source peer disconnected, fall back to any peer
-                match streams.keys().next().cloned() {
-                    Some(p) => {
-                        info!("TXSET_FETCH: Fetching TX set {:02x?}... from fallback peer {} (source {} disconnected)",
-                              &hash[..4], p, source_peer);
-                        p
-                    }
-                    None => {
-                        warn!(
-                            "TXSET_FETCH_FAIL: No peers to fetch TX set {:02x?}... from",
-                            &hash[..4]
-                        );
-                        return;
-                    }
-                }
-            }
-        } else {
-            // No known source, pick any connected peer
-            let streams = self.state.peer_streams.read().await;
-            match streams.keys().next().cloned() {
+            let source_ok = known_source
+                .filter(|p| streams.contains_key(p) && Some(*p) != avoid);
+            match source_ok.or_else(|| {
+                streams
+                    .keys()
+                    .find(|p| Some(**p) != avoid)
+                    .or_else(|| streams.keys().next())
+                    .cloned()
+            }) {
                 Some(p) => {
                     info!(
-                        "TXSET_FETCH: Fetching TX set {:02x?}... from random peer {} (no known source)",
+                        "TXSET_FETCH: Fetching TX set {:02x?}... from {}{}",
                         &hash[..4],
-                        p
+                        p,
+                        if avoid.is_some() { " (retry)" } else { "" }
                     );
                     p
                 }

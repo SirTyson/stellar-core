@@ -1348,6 +1348,113 @@ TEST_CASE("TX set eagerly pushed to peers", "[overlay-ipc][herder][.]")
 }
 
 /**
+ * Flood-miss recovery: flooding is the primary tx set delivery path, but a
+ * missed flood must not strand a node (perf-net finding: a node that missed
+ * one flooded set deadlocked -- SCP envelopes queued in pending-fetching
+ * forever and the node lost sync). This test suppresses the leader's eager
+ * broadcast entirely (ARTIFICIALLY_SUPPRESS_TX_SET_FLOOD_FOR_TESTING), so the
+ * ONLY way any node can obtain a tx set is the bounded fetch fallback:
+ * PendingEnvelopes requests a set still missing after ~500ms from one peer,
+ * and the overlay retries a different peer when a request goes stale.
+ * Consensus proceeding and the TX applying everywhere proves the fallback
+ * delivers real sets (not empty-tx-set recovery ledgers).
+ */
+TEST_CASE("TX set fetch fallback rescues a flood miss",
+          "[overlay-ipc][herder][.]")
+{
+    std::string overlayBinary = requireOverlayBinary();
+    Hash networkID = sha256(getTestConfig().NETWORK_PASSPHRASE);
+    auto simulation = std::make_shared<Simulation>(networkID);
+
+    std::vector<SecretKey> keys;
+    for (int i = 0; i < 3; ++i)
+    {
+        keys.push_back(SecretKey::fromSeed(
+            sha256("TXSET_FETCH_FALLBACK_TEST_NODE_" + std::to_string(i))));
+    }
+
+    SCPQuorumSet qSet;
+    qSet.threshold = 2;
+    for (auto const& k : keys)
+    {
+        qSet.validators.push_back(k.getPublicKey());
+    }
+
+    uint16_t const basePort = 11683;
+    std::vector<Application::pointer> nodes;
+    for (int i = 0; i < 3; ++i)
+    {
+        auto cfg = simulation->newConfig();
+        cfg.PEER_PORT = basePort + i;
+        // Simulate a total flood miss: leaders cache their nominated set (so
+        // it is servable) but never push it.
+        cfg.ARTIFICIALLY_SUPPRESS_TX_SET_FLOOD_FOR_TESTING = true;
+        for (int j = 0; j < 3; ++j)
+        {
+            if (j != i)
+            {
+                cfg.KNOWN_PEERS.push_back("127.0.0.1:" +
+                                          std::to_string(basePort + j));
+            }
+        }
+        nodes.push_back(simulation->addNode(keys[i], qSet, &cfg));
+    }
+    simulation->startAllNodes();
+
+    // With no flooding at all, consensus can only proceed if the fetch
+    // fallback delivers every slot's tx set.
+    simulation->crankUntil(
+        [&]() { return simulation->haveAllExternalized(3, 2); },
+        30 * 3 * simulation->getExpectedLedgerCloseTime(), false);
+    REQUIRE(simulation->haveAllExternalized(3, 2));
+
+    // Submit a TX to node0; it must be included and applied on ALL nodes,
+    // which requires the real (non-empty) tx set to have reached everyone.
+    auto root = TestAccount{*nodes[0], txtest::getRoot(networkID)};
+    SecretKey destKey = SecretKey::pseudoRandomForTesting();
+    auto tx =
+        root.tx({txtest::createAccount(destKey.getPublicKey(), 500000000000)});
+    REQUIRE(nodes[0]->getHerder().recvTransaction(tx, false) ==
+            TxSubmitStatus::TX_STATUS_PENDING);
+
+    uint32_t const targetLedger = 6;
+    simulation->crankUntil(
+        [&]() { return simulation->haveAllExternalized(targetLedger, 2); },
+        30 * targetLedger * simulation->getExpectedLedgerCloseTime(), false);
+    REQUIRE(simulation->haveAllExternalized(targetLedger, 2));
+
+    for (auto const& node : nodes)
+    {
+        LedgerTxn ltx(node->getLedgerTxnRoot());
+        REQUIRE(stellar::loadAccount(ltx, destKey.getPublicKey()));
+    }
+
+    // The flood was suppressed and the fallback did the delivering: no pushes
+    // anywhere; at least one completed fetch somewhere.
+    uint64_t totalTxSetPush = 0;
+    uint64_t totalTxSetFetched = 0;
+    for (auto const& node : nodes)
+    {
+        auto metricsJson =
+            node->getOverlayManager().getOverlayIPC().requestMetrics(2000);
+        REQUIRE(!metricsJson.empty());
+        Json::Value root;
+        Json::Reader reader;
+        REQUIRE(reader.parse(metricsJson, root));
+        REQUIRE(root.isMember("flood_txset_push"));
+        REQUIRE(root.isMember("fetch_txset_count"));
+        totalTxSetPush += root["flood_txset_push"].asUInt64();
+        totalTxSetFetched += root["fetch_txset_count"].asUInt64();
+    }
+    REQUIRE(totalTxSetPush == 0);
+    REQUIRE(totalTxSetFetched >= 1);
+
+    LOG_INFO(DEFAULT_LOG,
+             "TX set fetch fallback test passed (fetched: {}, pushed: {})",
+             totalTxSetFetched, totalTxSetPush);
+}
+
+/**
  * Stress test: Submit TXs in batches and measure SCP latency.
  *
  * This test verifies that SCP consensus timing remains stable even under

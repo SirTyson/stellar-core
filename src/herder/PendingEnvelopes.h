@@ -68,6 +68,17 @@ class PendingEnvelopes
     // getTxSetWaitingTime can report elapsed wait.
     std::map<Hash, VirtualClock::time_point> mTxSetWaiting;
 
+    // Fetch fallback (docs/direct-leader-flooding.md): flooding is the primary
+    // tx set delivery path, but a flood miss must not strand the node -- an
+    // awaited set older than the fallback delay is requested from one peer,
+    // re-requested at a bounded cadence while it remains missing. mTxSetFetch-
+    // Requested tracks the last request per hash (pruned on each tick).
+    VirtualTimer mTxSetFetchFallbackTimer;
+    bool mTxSetFetchFallbackArmed{false};
+    std::map<Hash, VirtualClock::time_point> mTxSetFetchRequested;
+    void maybeArmTxSetFetchFallbackTimer();
+    void txSetFetchFallbackTick();
+
     using TxSetFramCacheItem = std::pair<uint64, TxSetXDRFrameConstPtr>;
     // recent txsets
     // Note on thread-safety: the cache must be maintained strictly by the main

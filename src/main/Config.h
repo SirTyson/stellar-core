@@ -291,6 +291,12 @@ class Config : public std::enable_shared_from_this<Config>
     // be enabled when testing.
     std::chrono::milliseconds ARTIFICIALLY_DELAY_LEDGER_CLOSE_FOR_TESTING;
 
+    // Direct leader flooding: suppress the round-1 leader's eager TX set
+    // broadcast (the set is still cached locally for serving fetches). Lets
+    // tests simulate a flood miss to exercise the fetch fallback. This config
+    // should only be enabled when testing.
+    bool ARTIFICIALLY_SUPPRESS_TX_SET_FLOOD_FOR_TESTING;
+
     // Timeout before publishing externalized values to archive
     std::chrono::seconds PUBLISH_TO_ARCHIVE_DELAY;
 

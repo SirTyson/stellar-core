@@ -72,6 +72,7 @@ static std::unordered_set<std::string> const TESTING_ONLY_OPTIONS = {
     "ARTIFICIALLY_DELAY_NOMINATION_EMIT_FOR_TESTING",
     "ARTIFICIALLY_SKIP_CONNECTION_ADJUSTMENT_FOR_TESTING",
     "ARTIFICIALLY_DELAY_LEDGER_CLOSE_FOR_TESTING",
+    "ARTIFICIALLY_SUPPRESS_TX_SET_FLOOD_FOR_TESTING",
     "SKIP_HIGH_CRITICAL_VALIDATOR_CHECKS_FOR_TESTING",
     "TRANSACTION_QUEUE_SIZE_MULTIPLIER_FOR_TESTING",
     "SOROBAN_TRANSACTION_QUEUE_SIZE_MULTIPLIER_FOR_TESTING"};
@@ -195,6 +196,7 @@ Config::Config() : NODE_SEED(SecretKey::random())
     ARTIFICIALLY_DELAY_BUCKET_APPLICATION_FOR_TESTING =
         std::chrono::seconds::zero();
     ARTIFICIALLY_DELAY_LEDGER_CLOSE_FOR_TESTING = std::chrono::milliseconds(0);
+    ARTIFICIALLY_SUPPRESS_TX_SET_FLOOD_FOR_TESTING = false;
     ALLOW_LOCALHOST_FOR_TESTING = false;
     USE_CONFIG_FOR_GENESIS = false;
     GENESIS_TEST_ACCOUNT_COUNT = 0;
@@ -1216,6 +1218,11 @@ Config::processConfig(std::shared_ptr<cpptoml::table> t)
                  [&]() {
                      ARTIFICIALLY_DELAY_LEDGER_CLOSE_FOR_TESTING =
                          std::chrono::milliseconds(readInt<uint32_t>(item));
+                 }},
+                {"ARTIFICIALLY_SUPPRESS_TX_SET_FLOOD_FOR_TESTING",
+                 [&]() {
+                     ARTIFICIALLY_SUPPRESS_TX_SET_FLOOD_FOR_TESTING =
+                         readBool(item);
                  }},
                 // https://github.com/stellar/stellar-core/issues/4581
                 {"BACKGROUND_EVICTION_SCAN",

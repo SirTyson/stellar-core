@@ -26,10 +26,20 @@ using namespace std;
 namespace stellar
 {
 
+// Tx set fetch fallback (docs/direct-leader-flooding.md): flooding is the
+// primary delivery path; a set still missing after DELAY is requested from a
+// single peer, re-requested every RETRY while missing (the overlay retries a
+// different peer once a request goes stale). DELAY gives the flood a
+// comfortable head start; RETRY bounds the per-hash request rate to ~1/s.
+std::chrono::milliseconds const TXSET_FETCH_FALLBACK_DELAY(500);
+std::chrono::milliseconds const TXSET_FETCH_FALLBACK_RETRY(1000);
+std::chrono::milliseconds const TXSET_FETCH_FALLBACK_TICK(250);
+
 PendingEnvelopes::PendingEnvelopes(Application& app, HerderImpl& herder)
     : mApp(app)
     , mHerder(herder)
     , mQsetCache(QSET_CACHE_SIZE)
+    , mTxSetFetchFallbackTimer(app)
     , mTxSetCache(TXSET_CACHE_SIZE)
     , mValueSizeCache(TXSET_CACHE_SIZE + QSET_CACHE_SIZE)
     , mRebuildQuorum(true)
@@ -700,6 +710,10 @@ PendingEnvelopes::startFetch(SCPEnvelope const& envelope)
             // tx set so validateValue can treat referencing values as
             // structurally valid while the push is in flight.
             mTxSetWaiting.emplace(h2, mApp.getClock().now());
+            // Arm the fetch fallback: if the flood misses us, request the set
+            // rather than waiting forever (a stuck set would otherwise strand
+            // this node on the slot -- flooding is push-only).
+            maybeArmTxSetFetchFallbackTimer();
         }
     }
 
@@ -709,6 +723,72 @@ PendingEnvelopes::startFetch(SCPEnvelope const& envelope)
                    hexAbbrev(xdrSha256(envelope)), envelope.statement.slotIndex,
                    envelope.statement.pledges.type());
     }
+}
+
+void
+PendingEnvelopes::maybeArmTxSetFetchFallbackTimer()
+{
+    if (mTxSetWaiting.empty() || mTxSetFetchFallbackArmed)
+    {
+        return;
+    }
+    mTxSetFetchFallbackArmed = true;
+    mTxSetFetchFallbackTimer.expires_from_now(TXSET_FETCH_FALLBACK_TICK);
+    mTxSetFetchFallbackTimer.async_wait(
+        [this]() {
+            mTxSetFetchFallbackArmed = false;
+            txSetFetchFallbackTick();
+        },
+        VirtualTimer::onFailureNoop);
+}
+
+void
+PendingEnvelopes::txSetFetchFallbackTick()
+{
+    ZoneScoped;
+    auto const now = mApp.getClock().now();
+    for (auto const& [hash, since] : mTxSetWaiting)
+    {
+        if (now - since < TXSET_FETCH_FALLBACK_DELAY)
+        {
+            // Give the flood its head start.
+            continue;
+        }
+        auto it = mTxSetFetchRequested.find(hash);
+        if (it != mTxSetFetchRequested.end() &&
+            now - it->second < TXSET_FETCH_FALLBACK_RETRY)
+        {
+            // A request is in flight; the overlay dedups and, once it goes
+            // stale, retries a different peer on our next request.
+            continue;
+        }
+        CLOG_INFO(Herder,
+                  "TXSET_FETCH_FALLBACK: tx set {} still missing after {} ms; "
+                  "requesting from a peer (flood miss suspected)",
+                  hexAbbrev(hash),
+                  std::chrono::duration_cast<std::chrono::milliseconds>(now -
+                                                                        since)
+                      .count());
+        mApp.getOverlayManager().requestTxSet(hash);
+        mTxSetFetchRequested[hash] = now;
+    }
+
+    // Drop request stamps for hashes no longer awaited (arrived or purged).
+    for (auto it = mTxSetFetchRequested.begin();
+         it != mTxSetFetchRequested.end();)
+    {
+        if (mTxSetWaiting.find(it->first) == mTxSetWaiting.end())
+        {
+            it = mTxSetFetchRequested.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+
+    // Keep ticking while anything is still awaited.
+    maybeArmTxSetFetchFallbackTimer();
 }
 
 void

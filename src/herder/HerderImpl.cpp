@@ -1735,7 +1735,8 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
             !round1Leaders.empty() &&
             round1Leaders.front() == mApp.getConfig().NODE_SEED.getPublicKey();
 
-        if (selfIsRound1Leader)
+        if (selfIsRound1Leader &&
+            !mApp.getConfig().ARTIFICIALLY_SUPPRESS_TX_SET_FLOOD_FOR_TESTING)
         {
             CLOG_DEBUG(Herder,
                        "Round-1 leader: eagerly broadcasting TX set {} to peers",
@@ -1744,6 +1745,8 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
         }
         else
         {
+            // Non-leader, or a test simulating a flood miss: keep the set
+            // servable for fetches without pushing it.
             mApp.getOverlayManager().cacheTxSet(txSetHash, xdrBytes);
         }
     }
