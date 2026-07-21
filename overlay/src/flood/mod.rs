@@ -7,10 +7,12 @@ mod inv_messages;
 mod inv_tracker;
 mod mempool;
 mod pending_requests;
+mod tx_batcher;
 mod tx_buffer;
 mod txset;
 
 pub use inv_batcher::InvBatcher;
+pub use tx_batcher::TxBatcher;
 pub use inv_messages::{GetData, InvBatch, InvEntry, TxStreamMessage};
 pub use inv_tracker::InvTracker;
 pub use mempool::Mempool;

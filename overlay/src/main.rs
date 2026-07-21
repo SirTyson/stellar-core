@@ -1423,6 +1423,11 @@ impl App {
                             })
                             .unwrap_or_default();
                         let listen_port = config["listen_port"].as_u64().unwrap_or(11625) as u16;
+                        // Direct leader flooding: max TXs coalesced into one
+                        // pushed write (0/absent = send each TX immediately).
+                        let tx_batch_max_size =
+                            config["tx_batch_max_size"].as_u64().unwrap_or(0) as usize;
+                        self.libp2p_handle.set_tx_batch_max_size(tx_batch_max_size);
                         let quorum_members_configured = config.get("quorum_members").is_some();
                         let quorum_members: Vec<String> = config
                             .get("quorum_members")

@@ -1455,6 +1455,119 @@ TEST_CASE("TX set fetch fallback rescues a flood miss",
 }
 
 /**
+ * TX batching on the leader push path: with EXPERIMENTAL_TX_BATCH_MAX_SIZE
+ * set, TXs pushed to leaders are coalesced into single stream writes of
+ * concatenated Transaction frames (the receiver's framed-read loop splits
+ * them; wire format unchanged). Perf-net finding: without batching every TX
+ * travels as its own ~200-byte message whose per-message spawn/lock/flush
+ * overhead caps intake around ~2,400-2,600 TPS. This asserts the batched
+ * path is exercised end to end and TXs still apply on every node.
+ */
+TEST_CASE("TX batching engages on leader push", "[overlay-ipc][herder][.]")
+{
+    std::string overlayBinary = requireOverlayBinary();
+    Hash networkID = sha256(getTestConfig().NETWORK_PASSPHRASE);
+    auto simulation = std::make_shared<Simulation>(networkID);
+
+    std::vector<SecretKey> keys;
+    for (int i = 0; i < 3; ++i)
+    {
+        keys.push_back(SecretKey::fromSeed(
+            sha256("TX_BATCH_TEST_NODE_" + std::to_string(i))));
+    }
+
+    SCPQuorumSet qSet;
+    qSet.threshold = 2;
+    for (auto const& k : keys)
+    {
+        qSet.validators.push_back(k.getPublicKey());
+    }
+
+    uint16_t const basePort = 11693;
+    std::vector<Application::pointer> nodes;
+    for (int i = 0; i < 3; ++i)
+    {
+        auto cfg = simulation->newConfig();
+        cfg.PEER_PORT = basePort + i;
+        cfg.EXPERIMENTAL_TX_BATCH_MAX_SIZE = 500;
+        for (int j = 0; j < 3; ++j)
+        {
+            if (j != i)
+            {
+                cfg.KNOWN_PEERS.push_back("127.0.0.1:" +
+                                          std::to_string(basePort + j));
+            }
+        }
+        nodes.push_back(simulation->addNode(keys[i], qSet, &cfg));
+    }
+    simulation->startAllNodes();
+
+    simulation->crankUntil(
+        [&]() { return simulation->haveAllExternalized(3, 2); },
+        30 * 3 * simulation->getExpectedLedgerCloseTime(), false);
+    REQUIRE(simulation->haveAllExternalized(3, 2));
+
+    // Submit a burst of TXs to node0 -- they should coalesce into batched
+    // pushes toward the leaders within the 50ms flush window.
+    auto root = TestAccount{*nodes[0], txtest::getRoot(networkID)};
+    std::vector<SecretKey> destKeys;
+    for (int i = 0; i < 5; ++i)
+    {
+        destKeys.push_back(SecretKey::pseudoRandomForTesting());
+        auto tx = root.tx(
+            {txtest::createAccount(destKeys.back().getPublicKey(), 500000000)});
+        REQUIRE(nodes[0]->getHerder().recvTransaction(tx, false) ==
+                TxSubmitStatus::TX_STATUS_PENDING);
+    }
+
+    // All 5 TXs share the root source account, and a tx set takes at most one
+    // tx per source account per ledger -- so the burst needs ~5 tx-bearing
+    // ledgers from whenever the first lands. Give it generous slack: this
+    // asserts delivery, not latency.
+    uint32_t const targetLedger = 18;
+    simulation->crankUntil(
+        [&]() { return simulation->haveAllExternalized(targetLedger, 2); },
+        30 * targetLedger * simulation->getExpectedLedgerCloseTime(), false);
+    REQUIRE(simulation->haveAllExternalized(targetLedger, 2));
+
+    // Every TX applied on every node.
+    for (auto const& node : nodes)
+    {
+        LedgerTxn ltx(node->getLedgerTxnRoot());
+        for (auto const& dk : destKeys)
+        {
+            REQUIRE(stellar::loadAccount(ltx, dk.getPublicKey()));
+        }
+    }
+
+    // The batched-push path was exercised (every push increments the batch
+    // counter when batching is enabled).
+    uint64_t totalBatches = 0;
+    uint64_t totalBatchedTxs = 0;
+    for (auto const& node : nodes)
+    {
+        auto metricsJson =
+            node->getOverlayManager().getOverlayIPC().requestMetrics(2000);
+        REQUIRE(!metricsJson.empty());
+        Json::Value root;
+        Json::Reader reader;
+        REQUIRE(reader.parse(metricsJson, root));
+        REQUIRE(root.isMember("flood_tx_batch_size_count"));
+        totalBatches += root["flood_tx_batch_size_count"].asUInt64();
+        totalBatchedTxs += root["flood_tx_batch_size_sum"].asUInt64();
+    }
+    REQUIRE(totalBatches >= 1);
+    REQUIRE(totalBatchedTxs >= totalBatches);
+
+    LOG_INFO(DEFAULT_LOG,
+             "TX batching test passed (batches: {}, txs in batches: {}, "
+             "avg batch size: {:.2f})",
+             totalBatches, totalBatchedTxs,
+             totalBatches ? double(totalBatchedTxs) / double(totalBatches)
+                          : 0.0);
+}
+
+/**
  * Stress test: Submit TXs in batches and measure SCP latency.
  *
  * This test verifies that SCP consensus timing remains stable even under
