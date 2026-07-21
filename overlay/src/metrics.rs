@@ -88,6 +88,10 @@ pub struct OverlayMetrics {
     pub flood_txset_push: AtomicU64,
     /// overlay.flood.txset-push-bytes — bytes of eagerly pushed TX set bodies
     pub flood_txset_push_bytes: AtomicU64,
+    /// overlay.flood.txset-push-dropped — queued TX set pushes dropped without
+    /// sending: superseded by a newer slot's set for the same peer, or stale
+    /// (their consensus round completed) by drain time. Latest-wins queueing.
+    pub flood_txset_push_dropped: AtomicU64,
 
     // Connection lifecycle
     /// overlay.inbound.attempt — inbound connection attempts
@@ -161,6 +165,7 @@ impl Default for OverlayMetrics {
             flood_leader_push_bytes: AtomicU64::new(0),
             flood_leader_fallback: AtomicU64::new(0),
             flood_txset_push: AtomicU64::new(0),
+            flood_txset_push_dropped: AtomicU64::new(0),
             flood_txset_push_bytes: AtomicU64::new(0),
             inbound_attempt: AtomicU64::new(0),
             inbound_establish: AtomicU64::new(0),
@@ -227,6 +232,7 @@ impl OverlayMetrics {
             flood_leader_push_bytes: self.flood_leader_push_bytes.load(ORD),
             flood_leader_fallback: self.flood_leader_fallback.load(ORD),
             flood_txset_push: self.flood_txset_push.load(ORD),
+            flood_txset_push_dropped: self.flood_txset_push_dropped.load(ORD),
             flood_txset_push_bytes: self.flood_txset_push_bytes.load(ORD),
             inbound_attempt: self.inbound_attempt.load(ORD),
             inbound_establish: self.inbound_establish.load(ORD),
@@ -301,6 +307,7 @@ pub struct MetricsSnapshot {
     pub flood_leader_push_bytes: u64,
     pub flood_leader_fallback: u64,
     pub flood_txset_push: u64,
+    pub flood_txset_push_dropped: u64,
     pub flood_txset_push_bytes: u64,
     pub inbound_attempt: u64,
     pub inbound_establish: u64,

@@ -175,9 +175,17 @@ pub struct OverlayHandle {
     flood_leaders: Arc<RwLock<Vec<PeerId>>>,
     /// Shared with SharedState; written directly (see flood_leaders).
     tx_batch_max_size: Arc<AtomicUsize>,
+    /// Shared with SharedState; written directly (see flood_leaders).
+    current_ledger_seq: Arc<AtomicU64>,
 }
 
 impl OverlayHandle {
+    /// Report the last closed ledger, so queued tx set pushes for completed
+    /// rounds can be dropped instead of sent.
+    pub fn set_current_ledger(&self, seq: u64) {
+        self.current_ledger_seq.store(seq, Ordering::Relaxed);
+    }
+
     /// Set the max TXs per pushed batch (0 or 1 = send each TX immediately).
     pub fn set_tx_batch_max_size(&self, max: usize) {
         debug!("TX batch max size set to {}", max);
@@ -336,6 +344,14 @@ impl OverlayHandle {
 }
 
 /// Shared state for stream handlers
+#[derive(Default)]
+struct TxSetPushState {
+    /// peer -> (slot the set was nominated for, hash, framed message)
+    pending: HashMap<PeerId, (u64, [u8; 32], Arc<Vec<u8>>)>,
+    /// peers with a live drainer task
+    draining: HashSet<PeerId>,
+}
+
 struct SharedState {
     /// Outbound streams per peer - each peer has three independently-locked streams
     peer_streams: RwLock<HashMap<PeerId, Arc<PeerOutboundStreams>>>,
@@ -381,6 +397,15 @@ struct SharedState {
     /// SetPeerConfig). 0 or 1 disables batching (send-per-TX). Shared with
     /// OverlayHandle, which writes it directly.
     tx_batch_max_size: Arc<AtomicUsize>,
+    /// Last closed ledger as reported by Core (0 until first close). Shared
+    /// with OverlayHandle. Used to drop queued tx set pushes whose consensus
+    /// round has already completed.
+    current_ledger_seq: Arc<AtomicU64>,
+    /// Latest-wins tx set push mailbox: at most ONE queued push per peer
+    /// (newest replaces older undelivered ones), drained by a per-peer task.
+    /// Prevents a slow peer from accumulating an unbounded FIFO of dead
+    /// multi-MB sets that starve the current slot's delivery.
+    txset_push: Mutex<TxSetPushState>,
     /// Overlay metrics (shared with App for IPC reporting)
     metrics: Arc<OverlayMetrics>,
 }
@@ -393,6 +418,7 @@ impl SharedState {
         metrics: Arc<OverlayMetrics>,
         flood_leaders: Arc<RwLock<Vec<PeerId>>>,
         tx_batch_max_size: Arc<AtomicUsize>,
+        current_ledger_seq: Arc<AtomicU64>,
     ) -> Self {
         Self {
             peer_streams: RwLock::new(HashMap::new()),
@@ -421,6 +447,8 @@ impl SharedState {
             flood_leaders,
             tx_batcher: RwLock::new(TxBatcher::new()),
             tx_batch_max_size,
+            current_ledger_seq,
+            txset_push: Mutex::new(TxSetPushState::default()),
             metrics,
         }
     }
@@ -491,6 +519,7 @@ pub fn create_overlay(
 
     let flood_leaders = Arc::new(RwLock::new(Vec::new()));
     let tx_batch_max_size = Arc::new(AtomicUsize::new(0));
+    let current_ledger_seq = Arc::new(AtomicU64::new(0));
     let state = Arc::new(SharedState::new(
         event_tx,
         tx_event_tx,
@@ -498,6 +527,7 @@ pub fn create_overlay(
         metrics,
         Arc::clone(&flood_leaders),
         Arc::clone(&tx_batch_max_size),
+        Arc::clone(&current_ledger_seq),
     ));
 
     let overlay = StellarOverlay {
@@ -511,6 +541,7 @@ pub fn create_overlay(
         cmd_tx,
         flood_leaders,
         tx_batch_max_size,
+        current_ledger_seq,
     };
 
     Ok((handle, event_rx, tx_event_rx, overlay))
@@ -768,6 +799,11 @@ impl StellarOverlay {
                     {
                         let mut batcher = self.state.tx_batcher.write().await;
                         batcher.remove_peer(&peer_id);
+                    }
+                    // Drop any queued tx set push for this peer
+                    {
+                        let mut st = self.state.txset_push.lock().await;
+                        st.pending.remove(&peer_id);
                     }
                     // Notify main loop to clean up any pending requests for this peer
                     if let Err(e) = self.state.event_tx.send(OverlayEvent::PeerDisconnected {
@@ -1243,36 +1279,29 @@ impl StellarOverlay {
             peers.len()
         );
 
-        // Spawn parallel sends so a slow peer doesn't stall the event loop or
-        // the other sends (mirrors broadcast_scp).
+        // Latest-wins enqueue: at most ONE queued push per peer. A slow peer
+        // must never accumulate a FIFO of dead multi-MB sets -- for consensus
+        // data only the NEWEST set matters, so a newer set replaces an
+        // undelivered older one, and the drainer skips sets whose round has
+        // already completed. One shared buffer (no per-peer clones).
+        let message = Arc::new(message);
+        // The set being broadcast is for the slot currently being voted.
+        let slot = self.state.current_ledger_seq.load(Ordering::Relaxed) + 1;
+        let mut st = self.state.txset_push.lock().await;
         for peer_id in peers {
-            let state = Arc::clone(&self.state);
-            let message = message.clone();
-            tokio::spawn(async move {
-                match send_to_peer_stream(&state, peer_id.clone(), StreamType::TxSet, &message)
-                    .await
-                {
-                    Ok(_) => {
-                        // Count under both the generic TxSet-send meter and the
-                        // dedicated eager-push meters (successful sends only).
-                        state.metrics.send_txset.fetch_add(1, Ordering::Relaxed);
-                        state.metrics.flood_txset_push.fetch_add(1, Ordering::Relaxed);
-                        state
-                            .metrics
-                            .flood_txset_push_bytes
-                            .fetch_add(message.len() as u64, Ordering::Relaxed);
-                        state.metrics.message_write.fetch_add(1, Ordering::Relaxed);
-                        state
-                            .metrics
-                            .byte_write
-                            .fetch_add(message.len() as u64, Ordering::Relaxed);
-                    }
-                    Err(e) => {
-                        state.metrics.error_write.fetch_add(1, Ordering::Relaxed);
-                        warn!("TXSET_BROADCAST_FAIL: push to {} failed: {}", peer_id, e);
-                    }
-                }
-            });
+            if st
+                .pending
+                .insert(peer_id, (slot, hash, Arc::clone(&message)))
+                .is_some()
+            {
+                self.state
+                    .metrics
+                    .flood_txset_push_dropped
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if st.draining.insert(peer_id) {
+                tokio::spawn(drain_txset_pushes(Arc::clone(&self.state), peer_id));
+            }
         }
     }
 
@@ -2085,6 +2114,64 @@ async fn push_tx_to_peers(
     }
     for (peer, batch) in full {
         send_tx_batch(state, peer, batch);
+    }
+}
+
+/// Drain the latest-wins tx set push mailbox for `peer`: repeatedly take the
+/// newest queued set, drop it if its consensus round already completed, else
+/// send it. Exits (and clears the draining flag) when the mailbox is empty.
+async fn drain_txset_pushes(state: Arc<SharedState>, peer: PeerId) {
+    loop {
+        let (slot, hash, message) = {
+            let mut st = state.txset_push.lock().await;
+            match st.pending.remove(&peer) {
+                Some(entry) => entry,
+                None => {
+                    st.draining.remove(&peer);
+                    return;
+                }
+            }
+        };
+
+        let lcl = state.current_ledger_seq.load(Ordering::Relaxed);
+        if lcl >= slot {
+            // The round this set was nominated for has closed; pushing it now
+            // is pure waste and delays whatever is queued next.
+            debug!(
+                "TXSET_PUSH_STALE: dropping TX set {:02x?}... for closed slot {} (lcl {}) to {}",
+                &hash[..4],
+                slot,
+                lcl,
+                peer
+            );
+            state
+                .metrics
+                .flood_txset_push_dropped
+                .fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+
+        match send_to_peer_stream(&state, peer, StreamType::TxSet, &message).await {
+            Ok(_) => {
+                // Count under both the generic TxSet-send meter and the
+                // dedicated eager-push meters (successful sends only).
+                state.metrics.send_txset.fetch_add(1, Ordering::Relaxed);
+                state.metrics.flood_txset_push.fetch_add(1, Ordering::Relaxed);
+                state
+                    .metrics
+                    .flood_txset_push_bytes
+                    .fetch_add(message.len() as u64, Ordering::Relaxed);
+                state.metrics.message_write.fetch_add(1, Ordering::Relaxed);
+                state
+                    .metrics
+                    .byte_write
+                    .fetch_add(message.len() as u64, Ordering::Relaxed);
+            }
+            Err(e) => {
+                state.metrics.error_write.fetch_add(1, Ordering::Relaxed);
+                warn!("TXSET_BROADCAST_FAIL: push to {} failed: {}", peer, e);
+            }
+        }
     }
 }
 

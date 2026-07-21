@@ -1287,8 +1287,10 @@ impl App {
                     let ledger_seq = u32::from_le_bytes(msg.payload[0..4].try_into().unwrap());
                     info!("Ledger {} closed", ledger_seq);
 
-                    // Update current ledger
+                    // Update current ledger (also reported to the overlay so
+                    // queued tx set pushes for completed rounds get dropped)
                     self.current_ledger_seq = ledger_seq;
+                    self.libp2p_handle.set_current_ledger(ledger_seq as u64);
 
                     // Evict old TX sets from cache
                     self.tx_set_cache
