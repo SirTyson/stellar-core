@@ -435,17 +435,61 @@ BallotProtocol::maybeReplaceValueWithEmptyTxSet(Value& v) const
     {
         return false;
     }
-    // Only a value we can *only* structurally validate is a candidate: fully
-    // validated means we have the tx set (nothing to recover), invalid means
-    // we won't commit it anyway (setConfirmPrepared already refuses).
-    if (driver.validateValue(mSlot.getSlotIndex(), v, /*nomination=*/false) !=
-        SCPDriver::kStructurallyValidValue)
+    auto const vl =
+        driver.validateValue(mSlot.getSlotIndex(), v, /*nomination=*/false);
+    if (vl == SCPDriver::kFullyValidatedValue && !driver.isEmptyTxSetValue(v))
+    {
+        // We have the tx set; nothing to recover.
+        return false;
+    }
+
+    // ADOPT before minting: if any peer is already balloting an empty-tx-set
+    // value for this slot (fully validated -- carries our LCL context), join
+    // it instead of minting our own. Without this, nodes stuck on different
+    // proposals (or whose download-tracking diverged) each mint a DIFFERENT
+    // empty value and the recovery fragments below quorum -- the reproduced
+    // network wedge. Pick the smallest such value so every adopter converges
+    // on the same one deterministically.
+    std::optional<Value> adopted;
+    if (driver.isEmptyTxSetValue(v))
+    {
+        // Our own already-minted recovery value participates in the choice.
+        adopted = v;
+    }
+    for (auto const& e : mLatestEnvelopes)
+    {
+        auto const wb = getWorkingBallot(e.second->getStatement());
+        if (driver.isEmptyTxSetValue(wb.value) &&
+            driver.validateValue(mSlot.getSlotIndex(), wb.value,
+                                 /*nomination=*/false) ==
+                SCPDriver::kFullyValidatedValue &&
+            (!adopted.has_value() || wb.value < adopted.value()))
+        {
+            adopted = wb.value;
+        }
+    }
+    if (adopted.has_value())
+    {
+        if (adopted.value() == v)
+        {
+            // Already on the smallest known recovery value.
+            return false;
+        }
+        v = adopted.value();
+        driver.noteEmptyTxSetValueReplaced(mSlot.getSlotIndex());
+        CLOG_INFO(SCP,
+                  "BallotProtocol::maybeReplaceValueWithEmptyTxSet i: {} "
+                  "adopting a peer's empty-tx-set recovery value",
+                  mSlot.getSlotIndex());
+        return true;
+    }
+
+    // Only a value we can *only* structurally validate may be dropped to an
+    // empty set (it references a real, still-downloading tx set).
+    if (vl != SCPDriver::kStructurallyValidValue)
     {
         return false;
     }
-    // A structurally-valid value references a real (still-downloading) tx set,
-    // so it cannot already be the empty-tx-set value.
-    releaseAssert(!driver.isEmptyTxSetValue(v));
 
     // Give the leader's push / fetch until the timeout before giving up on it.
     auto const waitingTime = driver.getTxSetDownloadWaitTime(v);

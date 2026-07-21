@@ -773,6 +773,22 @@ PendingEnvelopes::txSetFetchFallbackTick()
         mTxSetFetchRequested[hash] = now;
     }
 
+    // Age out waiting markers that can no longer matter: any slot resolves
+    // (externalize/purge) well within this horizon, so a marker this old is
+    // garbage from an abandoned slot, not an active download.
+    auto const maxAge = std::chrono::minutes(5);
+    for (auto it = mTxSetWaiting.begin(); it != mTxSetWaiting.end();)
+    {
+        if (now - it->second > maxAge)
+        {
+            it = mTxSetWaiting.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+
     // Drop request stamps for hashes no longer awaited (arrived or purged).
     for (auto it = mTxSetFetchRequested.begin();
          it != mTxSetFetchRequested.end();)
@@ -808,11 +824,16 @@ PendingEnvelopes::stopFetch(SCPEnvelope const& envelope)
             if (vec.empty())
             {
                 mPendingTxSetFetches.erase(it);
-                // No one is waiting on this tx set anymore. Drop the
-                // "awaiting" marker too, otherwise it leaks (it is otherwise
-                // only cleared when the set actually arrives via recvTxSet) and
-                // getTxSetWaitingTime keeps reporting a fetch that is gone.
-                mTxSetWaiting.erase(h2);
+                // Deliberately KEEP mTxSetWaiting[h2]: early-delivered
+                // envelopes are no longer in the waiter list, but the slot's
+                // values still validate as structurally-valid against this
+                // marker. Erasing it here turned one discarded envelope into
+                // network deafness: every later statement carrying the hash
+                // validated kInvalidValue and was rejected, counters stopped
+                // propagating, ballot timers died (the reproduced wedge).
+                // The marker is cleared on arrival (recvTxSet), on slot purge
+                // (eraseOutsideRange), or by the age sweep in the fetch
+                // fallback tick.
             }
         }
     }

@@ -1146,9 +1146,35 @@ impl StellarOverlay {
         // Send from a task: a multi-MB response through a congested or cold
         // link must not stall the overlay event loop (when many peers fetch
         // the same set, inline sends serialized the server's whole loop).
+        //
+        // Serve on a FRESH QUIC stream, not the cached per-peer TxSet stream:
+        // the cached stream is where flood pushes queue, and QUIC streams are
+        // FIFO -- a fetch response behind a jammed multi-MB push would wait
+        // out the very congestion it is rescuing the requester from (the
+        // perf-net wedge). A new stream gets independent flow control. Fall
+        // back to the cached stream if the fresh one cannot be opened.
         let state = Arc::clone(&self.state);
+        let mut control = self.control.clone();
         tokio::spawn(async move {
-            match send_to_peer_stream(&state, peer, StreamType::TxSet, &response).await {
+            let fresh = async {
+                let mut stream = control
+                    .open_stream(peer, TXSET_PROTOCOL)
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::NotConnected, e.to_string()))?;
+                write_framed(&mut stream, &response).await
+            }
+            .await;
+            let send_res = match fresh {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    debug!(
+                        "TXSET_SEND: fresh stream to {} failed ({}), using cached stream",
+                        peer, e
+                    );
+                    send_to_peer_stream(&state, peer, StreamType::TxSet, &response).await
+                }
+            };
+            match send_res {
                 Ok(_) => {
                     state.metrics.send_txset.fetch_add(1, Ordering::Relaxed);
                     state.metrics.message_write.fetch_add(1, Ordering::Relaxed);

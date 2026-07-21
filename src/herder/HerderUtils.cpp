@@ -3,6 +3,7 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "herder/HerderUtils.h"
+#include "herder/Herder.h"
 #include "crypto/KeyUtils.h"
 #include "lib/json/json.h"
 #include "main/Config.h"
@@ -60,7 +61,16 @@ getValidatedTxSetHashes(SCPEnvelope const& envelope)
                         "StellarValues",
                         KeyUtils::toStrKey(st.nodeID), st.slotIndex));
     }
-    return maybeHashes.value();
+    // Empty-tx-set recovery values carry the sentinel EMPTY_TX_SET_HASH,
+    // which references no downloadable body: it must never be tracked,
+    // fetched, or waited on, or envelopes carrying recovery values (e.g.
+    // their CONFIRM/EXTERNALIZE) would wait forever for a body that does not
+    // exist.
+    auto hashes = maybeHashes.value();
+    hashes.erase(std::remove(hashes.begin(), hashes.end(),
+                             Herder::EMPTY_TX_SET_HASH),
+                 hashes.end());
+    return hashes;
 }
 
 std::optional<std::vector<StellarValue>>

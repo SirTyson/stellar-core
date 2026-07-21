@@ -1389,6 +1389,11 @@ TEST_CASE("TX set fetch fallback rescues a flood miss",
         // Simulate a total flood miss: leaders cache their nominated set (so
         // it is servable) but never push it.
         cfg.ARTIFICIALLY_SUPPRESS_TX_SET_FLOOD_FOR_TESTING = true;
+        // Keep submitted TXs local so every tx-bearing nominated set exists
+        // ONLY at its builder -- other nodes MUST fetch the body (otherwise
+        // mempool relay lets everyone build the identical set locally and no
+        // fetch is exercised at all).
+        cfg.ARTIFICIALLY_KEEP_SUBMITTED_TXS_LOCAL_FOR_TESTING = true;
         for (int j = 0; j < 3; ++j)
         {
             if (j != i)
@@ -1408,26 +1413,48 @@ TEST_CASE("TX set fetch fallback rescues a flood miss",
         30 * 3 * simulation->getExpectedLedgerCloseTime(), false);
     REQUIRE(simulation->haveAllExternalized(3, 2));
 
-    // Submit a TX to node0; it must be included and applied on ALL nodes,
-    // which requires the real (non-empty) tx set to have reached everyone.
-    auto root = TestAccount{*nodes[0], txtest::getRoot(networkID)};
-    SecretKey destKey = SecretKey::pseudoRandomForTesting();
-    auto tx =
-        root.tx({txtest::createAccount(destKey.getPublicKey(), 500000000000)});
-    REQUIRE(nodes[0]->getHerder().recvTransaction(tx, false) ==
-            TxSubmitStatus::TX_STATUS_PENDING);
+    // Submit a distinct TX to every node: every subsequent slot's nominated
+    // set contains a TX only its builder holds, so the other nodes MUST fetch
+    // the body for any tx-bearing ledger to close.
+    std::vector<SecretKey> destKeys;
+    for (auto const& node : nodes)
+    {
+        auto root = TestAccount{*node, txtest::getRoot(networkID)};
+        destKeys.push_back(SecretKey::pseudoRandomForTesting());
+        auto tx = root.tx(
+            {txtest::createAccount(destKeys.back().getPublicKey(), 500000000)});
+        REQUIRE(node->getHerder().recvTransaction(tx, false) ==
+                TxSubmitStatus::TX_STATUS_PENDING);
+    }
 
-    uint32_t const targetLedger = 6;
+    uint32_t const targetLedger = 8;
     simulation->crankUntil(
         [&]() { return simulation->haveAllExternalized(targetLedger, 2); },
         30 * targetLedger * simulation->getExpectedLedgerCloseTime(), false);
     REQUIRE(simulation->haveAllExternalized(targetLedger, 2));
 
-    for (auto const& node : nodes)
+    // At least one tx-bearing ledger must have closed (all slots are
+    // tx-bearing once the submissions land), and its account must exist on
+    // EVERY node -- possible only if the fetched body reached everyone.
+    int applied = 0;
+    for (auto const& dk : destKeys)
     {
-        LedgerTxn ltx(node->getLedgerTxnRoot());
-        REQUIRE(stellar::loadAccount(ltx, destKey.getPublicKey()));
+        bool onAll = true;
+        for (auto const& node : nodes)
+        {
+            LedgerTxn ltx(node->getLedgerTxnRoot());
+            if (!stellar::loadAccount(ltx, dk.getPublicKey()))
+            {
+                onAll = false;
+                break;
+            }
+        }
+        if (onAll)
+        {
+            ++applied;
+        }
     }
+    REQUIRE(applied >= 1);
 
     // The flood was suppressed and the fallback did the delivering: no pushes
     // anywhere; at least one completed fetch somewhere.
