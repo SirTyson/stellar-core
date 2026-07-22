@@ -63,11 +63,51 @@ class TestSCP : public SCPDriver
         mQuorumSets[qSetHash] = qSet;
     }
 
+    // Configurable so parallel-tx-set-download tests can simulate a value whose
+    // tx set is still downloading (kStructurallyValidValue). Defaults to
+    // kFullyValidatedValue so existing tests are unaffected.
+    SCPDriver::ValidationLevel mValidationLevel =
+        SCPDriver::kFullyValidatedValue;
+
     SCPDriver::ValidationLevel
     validateValue(uint64 slotIndex, Value const& value,
                   bool nomination) override
     {
-        return SCPDriver::kFullyValidatedValue;
+        return mValidationLevel;
+    }
+
+    // Empty-tx-set recovery (docs/direct-leader-flooding.md) test controls.
+    // Disabled by default so existing ballot tests are unaffected.
+    bool mSupportsEmptyTxSet = false;
+    std::optional<std::chrono::milliseconds> mTxSetDownloadWait;
+    std::chrono::milliseconds mTxSetDownloadTimeout{
+        std::chrono::milliseconds(5000)};
+    Value mEmptyReplacementValue;
+
+    bool
+    protocolAllowsEmptyTxSetValues() const override
+    {
+        return mSupportsEmptyTxSet;
+    }
+    std::optional<std::chrono::milliseconds>
+    getTxSetDownloadWaitTime(Value const& v) const override
+    {
+        return mTxSetDownloadWait;
+    }
+    std::chrono::milliseconds
+    getTxSetDownloadTimeout() const override
+    {
+        return mTxSetDownloadTimeout;
+    }
+    Value
+    makeEmptyTxSetValueFromValue(Value const& v) const override
+    {
+        return mEmptyReplacementValue.empty() ? v : mEmptyReplacementValue;
+    }
+    bool
+    isEmptyTxSetValue(Value const& v) const override
+    {
+        return !mEmptyReplacementValue.empty() && v == mEmptyReplacementValue;
     }
 
     void
@@ -655,6 +695,179 @@ makeExternalizeGen(Hash const& qSetHash, SCPBallot const& commitBallot,
 {
     return std::bind(makeExternalize, _1, std::cref(qSetHash), 0,
                      std::cref(commitBallot), nH);
+}
+
+// Parallel tx set download (docs/direct-leader-flooding.md): a value whose tx
+// set is still downloading validates as kStructurallyValidValue. The safety
+// invariant is that such a value can NEVER be externalized -- the node cannot
+// commit it until the tx set arrives and it becomes kFullyValidatedValue. This
+// exercises the BallotProtocol admission rules (reject peer CONFIRM/EXTERNALIZE
+// that are only structurally valid), the setConfirmPrepared commit-block, and
+// the setConfirmCommit backstop.
+TEST_CASE("parallel tx set download: structurally valid value not externalized",
+          "[scp][ballotprotocol]")
+{
+    setupValues();
+    SIMULATION_CREATE_NODE(0);
+    SIMULATION_CREATE_NODE(1);
+    SIMULATION_CREATE_NODE(2);
+    SIMULATION_CREATE_NODE(3);
+    SIMULATION_CREATE_NODE(4);
+
+    SCPQuorumSet qSet;
+    qSet.threshold = 4;
+    qSet.validators.push_back(v0NodeID);
+    qSet.validators.push_back(v1NodeID);
+    qSet.validators.push_back(v2NodeID);
+    qSet.validators.push_back(v3NodeID);
+    qSet.validators.push_back(v4NodeID);
+    uint256 qSetHash = sha256(xdr::xdr_to_opaque(qSet));
+
+    TestSCP scp(v0SecretKey.getPublicKey(), qSet);
+    scp.storeQuorumSet(std::make_shared<SCPQuorumSet>(qSet));
+
+    SCPBallot b(1, xValue);
+
+    // Simulate the referenced tx set still downloading.
+    scp.mValidationLevel = SCPDriver::kStructurallyValidValue;
+
+    // A full quorum tries to drive commit/externalize for a value we cannot
+    // fully validate. Every such message is rejected (peer CONFIRM/EXTERNALIZE
+    // that is only structurally valid), so we never externalize -- and we never
+    // hit the confirm-commit backstop (which would throw).
+    for (auto const& sk : {v1SecretKey, v2SecretKey, v3SecretKey, v4SecretKey})
+    {
+        scp.receiveEnvelope(makeConfirm(sk, qSetHash, 0, 1, b, 1, 1));
+        scp.receiveEnvelope(makeExternalize(sk, qSetHash, 0, b, 1));
+    }
+    REQUIRE(scp.mExternalizedValues.find(0) == scp.mExternalizedValues.end());
+
+    // Once the tx set arrives the value is fully validated, and the same quorum
+    // EXTERNALIZE now drives the node to externalize it.
+    scp.mValidationLevel = SCPDriver::kFullyValidatedValue;
+    for (auto const& sk : {v1SecretKey, v2SecretKey, v3SecretKey, v4SecretKey})
+    {
+        scp.receiveEnvelope(makeExternalize(sk, qSetHash, 0, b, 1));
+    }
+    REQUIRE(scp.mExternalizedValues.find(0) != scp.mExternalizedValues.end());
+    REQUIRE(scp.mExternalizedValues[0] == xValue);
+}
+
+TEST_CASE("parallel tx set download: structurally valid value drives nomination"
+          " to ballot",
+          "[scp][nominationprotocol]")
+{
+    // Liveness regression: a value whose tx set is still downloading
+    // (kStructurallyValidValue) must flow all the way through nomination --
+    // accepted, ratified, promoted to a candidate, combined, and PREPAREd --
+    // WITHOUT waiting for the tx set. If promotion were gated on full
+    // validation, the node would strand in nomination with no ballot flow to
+    // carry it and eventually lose sync. (Commit/externalize is still deferred
+    // until the value is fully validated; see the ballotprotocol test above.)
+    setupValues();
+    SIMULATION_CREATE_NODE(0);
+    SIMULATION_CREATE_NODE(1);
+    SIMULATION_CREATE_NODE(2);
+    SIMULATION_CREATE_NODE(3);
+    SIMULATION_CREATE_NODE(4);
+
+    SCPQuorumSet qSet;
+    qSet.threshold = 4;
+    qSet.validators.push_back(v0NodeID);
+    qSet.validators.push_back(v1NodeID);
+    qSet.validators.push_back(v2NodeID);
+    qSet.validators.push_back(v3NodeID);
+    qSet.validators.push_back(v4NodeID);
+    uint256 qSetHash = sha256(xdr::xdr_to_opaque(qSet));
+
+    TestSCP scp(v0SecretKey.getPublicKey(), qSet);
+    uint256 qSetHash0 = scp.mSCP.getLocalNode()->getQuorumSetHash();
+    scp.storeQuorumSet(std::make_shared<SCPQuorumSet>(qSet));
+
+    // The tx set referenced by xValue is still downloading for the whole test:
+    // validateValue never returns better than structurally valid.
+    scp.mValidationLevel = SCPDriver::kStructurallyValidValue;
+
+    // v0 (round leader) nominates x.
+    REQUIRE(scp.nominate(0, xValue, false));
+    REQUIRE(scp.mEnvs.size() == 1);
+
+    std::vector<Value> votes, accepted;
+    votes.emplace_back(xValue);
+    verifyNominate(scp.mEnvs[0], v0SecretKey, qSetHash0, 0, votes, accepted);
+
+    // A quorum votes for x -> x is ACCEPTED.
+    scp.receiveEnvelope(makeNominate(v1SecretKey, qSetHash, 0, votes, accepted));
+    scp.receiveEnvelope(makeNominate(v2SecretKey, qSetHash, 0, votes, accepted));
+    REQUIRE(scp.mEnvs.size() == 1);
+    scp.receiveEnvelope(makeNominate(v3SecretKey, qSetHash, 0, votes, accepted));
+    REQUIRE(scp.mEnvs.size() == 2);
+    accepted.emplace_back(xValue);
+    verifyNominate(scp.mEnvs[1], v0SecretKey, qSetHash0, 0, votes, accepted);
+
+    // A quorum RATIFIES x. Even though x is only structurally valid, it is
+    // promoted to a candidate, combineCandidates runs, and the node PREPAREs it
+    // -- nomination reaches the ballot protocol without the tx set.
+    scp.mExpectedCandidates.emplace(xValue);
+    scp.mCompositeValue = xValue;
+    scp.receiveEnvelope(makeNominate(v1SecretKey, qSetHash, 0, votes, accepted));
+    scp.receiveEnvelope(makeNominate(v2SecretKey, qSetHash, 0, votes, accepted));
+    scp.receiveEnvelope(makeNominate(v3SecretKey, qSetHash, 0, votes, accepted));
+    REQUIRE(scp.mEnvs.size() == 3);
+    verifyPrepare(scp.mEnvs[2], v0SecretKey, qSetHash0, 0, SCPBallot(1, xValue));
+}
+
+TEST_CASE("empty-tx-set recovery: stuck structurally-valid value is replaced",
+          "[scp][ballotprotocol]")
+{
+    // A node stuck in PREPARE on a value whose tx set is still downloading
+    // must, once the download times out, replace it with an empty-tx-set value
+    // so the network keeps closing ledgers (docs/direct-leader-flooding.md).
+    // Here the driver "replaces" xValue with zValue (a stand-in for the empty
+    // value); we assert the PREPARE carries the replacement iff timed out.
+    setupValues();
+    SIMULATION_CREATE_NODE(0);
+    SIMULATION_CREATE_NODE(1);
+    SIMULATION_CREATE_NODE(2);
+    SIMULATION_CREATE_NODE(3);
+    SIMULATION_CREATE_NODE(4);
+
+    SCPQuorumSet qSet;
+    qSet.threshold = 4;
+    qSet.validators.push_back(v0NodeID);
+    qSet.validators.push_back(v1NodeID);
+    qSet.validators.push_back(v2NodeID);
+    qSet.validators.push_back(v3NodeID);
+    qSet.validators.push_back(v4NodeID);
+
+    auto driveBump = [&](std::optional<std::chrono::milliseconds> wait,
+                         bool expectReplaced) {
+        TestSCP scp(v0SecretKey.getPublicKey(), qSet);
+        uint256 qSetHash0 = scp.mSCP.getLocalNode()->getQuorumSetHash();
+        scp.storeQuorumSet(std::make_shared<SCPQuorumSet>(qSet));
+
+        // xValue is only structurally valid (tx set downloading); the driver
+        // supports empty-tx-set recovery and would replace it with zValue.
+        scp.mValidationLevel = SCPDriver::kStructurallyValidValue;
+        scp.mSupportsEmptyTxSet = true;
+        scp.mTxSetDownloadTimeout = std::chrono::milliseconds(5000);
+        scp.mTxSetDownloadWait = wait;
+        scp.mEmptyReplacementValue = zValue;
+
+        REQUIRE(scp.bumpState(0, xValue));
+        REQUIRE(scp.mEnvs.size() == 1);
+        verifyPrepare(scp.mEnvs[0], v0SecretKey, qSetHash0, 0,
+                      SCPBallot(1, expectReplaced ? zValue : xValue));
+    };
+
+    SECTION("download timed out -> value replaced with empty tx set")
+    {
+        driveBump(std::chrono::milliseconds(6000), /*expectReplaced=*/true);
+    }
+    SECTION("still within the download window -> value kept")
+    {
+        driveBump(std::chrono::milliseconds(1000), /*expectReplaced=*/false);
+    }
 }
 
 // Testing matrix that covers interesting min/max values for each timeout

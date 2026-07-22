@@ -4,8 +4,12 @@
 
 #include "crypto/SHA.h"
 #include "herder/HerderImpl.h"
+#include "herder/HerderSCPDriver.h"
+#include "herder/LedgerCloseData.h"
 #include "herder/PendingEnvelopes.h"
+#include "herder/TxSetFrame.h"
 #include "herder/test/TestTxSetUtils.h"
+#include "ledger/LedgerManager.h"
 #include "main/Application.h"
 #include "test/Catch2.h"
 #include "test/TestAccount.h"
@@ -17,6 +21,93 @@
 
 using namespace stellar;
 using namespace stellar::txtest;
+
+// Empty-tx-set recovery (docs/direct-leader-flooding.md): end-to-end check of
+// the REAL herder/apply chain that the SCP-level unit test stubs out. A signed
+// proposal referencing a never-disseminated tx set is dropped to an
+// empty-tx-set value; that value must carry the original proposer's signature
+// (verifiable), validate as fully valid for LCL+1 in balloting (and be
+// rejected for nomination), and close an actual empty ledger through
+// LedgerCloseData -> LedgerManager (exercising the sentinel-hash exemptions).
+TEST_CASE("empty-tx-set recovery closes an empty ledger", "[herder]")
+{
+    VirtualClock clock;
+    auto cfg = getTestConfig();
+    Application::pointer app = createTestApplication(clock, cfg);
+
+    auto& herder = static_cast<HerderImpl&>(app->getHerder());
+    auto& driver = herder.getHerderSCPDriver();
+    auto const lcl = app->getLedgerManager().getLastClosedLedgerHeader();
+
+    // The original leader proposal, referencing a tx set nobody ever receives.
+    Hash const missingTxSetHash = sha256(ByteSlice("never-disseminated"));
+    uint64_t const closeTime = lcl.header.scpValue.closeTime + 1;
+    StellarValue const proposal = herder.makeStellarValue(
+        missingTxSetHash, closeTime, emptyUpgradeSteps, cfg.NODE_SEED);
+    Value const proposalVal = xdr::xdr_to_opaque(proposal);
+    REQUIRE(!driver.isEmptyTxSetValue(proposalVal));
+
+    // Drop the tx set: build the empty-tx-set replacement value.
+    Value const emptyVal = driver.makeEmptyTxSetValueFromValue(proposalVal);
+    REQUIRE(emptyVal != proposalVal);
+    REQUIRE(driver.isEmptyTxSetValue(emptyVal));
+
+    StellarValue emptySv;
+    xdr::xdr_from_opaque(emptyVal, emptySv);
+    REQUIRE(emptySv.ext.v() == STELLAR_VALUE_EMPTY_TX_SET);
+    REQUIRE(emptySv.txSetHash == Herder::EMPTY_TX_SET_HASH);
+    REQUIRE(emptySv.closeTime == closeTime);
+    auto const& ov = emptySv.ext.proposedValue();
+    REQUIRE(ov.txSetHash == missingTxSetHash);
+    REQUIRE(ov.previousLedgerHash == lcl.hash);
+    REQUIRE(ov.previousLedgerVersion == lcl.header.ledgerVersion);
+
+    // The ORIGINAL proposer's signature must verify on the replacement, so
+    // every node dropping the same stuck value converges on one value.
+    REQUIRE(herder.verifyStellarValueSignature(emptySv));
+
+    // Balloting: fully valid for LCL+1. Nomination: rejected.
+    REQUIRE(driver.validateValue(lcl.header.ledgerSeq + 1, emptyVal,
+                                 /*nomination=*/false) ==
+            SCPDriver::kFullyValidatedValue);
+    REQUIRE(driver.validateValue(lcl.header.ledgerSeq + 1, emptyVal,
+                                 /*nomination=*/true) ==
+            SCPDriver::kInvalidValue);
+    // A mismatched previous-ledger context must not validate.
+    {
+        StellarValue bad = emptySv;
+        bad.ext.proposedValue().previousLedgerHash =
+            sha256(ByteSlice("wrong-lcl"));
+        REQUIRE(driver.validateValue(lcl.header.ledgerSeq + 1,
+                                     xdr::xdr_to_opaque(bad),
+                                     /*nomination=*/false) ==
+                SCPDriver::kInvalidValue);
+    }
+
+    // The canonical empty set the value implies must be applicable.
+    auto const emptySet =
+        TxSetXDRFrame::makeEmpty(ov.previousLedgerHash, ov.previousLedgerVersion);
+    REQUIRE(emptySet->prepareForApply(*app, lcl.header) != nullptr);
+
+    // Externalize through the REAL herder entry point: this exercises
+    // HerderImpl::processExternalized's empty-set materialization, the
+    // LedgerCloseData ctor and LedgerManagerImpl sentinel-hash exemptions,
+    // and the actual empty apply.
+    uint32_t const seqToClose = lcl.header.ledgerSeq + 1;
+    // In production, tracking advances when the EXTERNALIZE statement is
+    // processed, before valueExternalized fires; mirror that here.
+    herder.setTrackingSCPState(seqToClose, emptySv, /*isTrackingNetwork=*/true);
+    herder.valueExternalized(seqToClose, emptySv, /*isLatestSlot=*/true);
+    while (app->getLedgerManager().getLastClosedLedgerNum() < seqToClose)
+    {
+        clock.crank(true);
+    }
+
+    auto const& lclAfter = app->getLedgerManager().getLastClosedLedgerHeader();
+    REQUIRE(lclAfter.header.ledgerSeq == seqToClose);
+    REQUIRE(lclAfter.header.scpValue.ext.v() == STELLAR_VALUE_EMPTY_TX_SET);
+    REQUIRE(lclAfter.header.scpValue.txSetHash == Herder::EMPTY_TX_SET_HASH);
+}
 
 // TODO(leader-schedule): Temporarily disabled. This test fails on this branch
 // independently of the leader-schedule change -- the slot-2 txSet it builds
