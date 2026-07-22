@@ -203,8 +203,37 @@ BallotProtocol::processEnvelope(SCPEnvelopeWrapperPtr envelope, bool self)
         return SCP::EnvelopeState::INVALID;
     }
 
+    // Parallel tx set download (docs/direct-leader-flooding.md): a value that is
+    // only structurally valid (its tx set is still downloading) may drive
+    // PREPARE, and the local node may generate its own CONFIRM once a v-blocking
+    // set votes-to-commit it. But we reject a peer's CONFIRM and any EXTERNALIZE
+    // that we cannot fully validate; the node stalls at commit until the tx set
+    // arrives (see setConfirmPrepared / setConfirmCommit).
+    if (validationRes == SCPDriver::kStructurallyValidValue)
+    {
+        switch (statement.pledges.type())
+        {
+        case SCP_ST_PREPARE:
+            break;
+        case SCP_ST_CONFIRM:
+            if (!self)
+            {
+                return SCP::EnvelopeState::INVALID;
+            }
+            break;
+        case SCP_ST_EXTERNALIZE:
+            return SCP::EnvelopeState::INVALID;
+        default:
+            break;
+        }
+    }
+
     if (mPhase != SCP_PHASE_EXTERNALIZE)
     {
+        // Only a value for a non-current ledger downgrades full validation. A
+        // structurally-valid value (tx set still downloading) does not: the
+        // commit-block guarantees it is fully validated before it can commit,
+        // so the eventually-externalized value is fully validated.
         if (validationRes == SCPDriver::kMaybeValidValue)
         {
             mSlot.setFullyValidated(false);
@@ -375,6 +404,13 @@ BallotProtocol::bumpState(Value const& value, uint32 n)
         newb.value = value;
     }
 
+    // Empty-tx-set recovery (docs/direct-leader-flooding.md): if we are stuck
+    // in PREPARE on a value whose tx set never arrived, replace it with an
+    // empty-tx-set value before bumping, so the network can close an empty
+    // ledger instead of stalling. No-op unless the value has been blocked on
+    // its tx set past the timeout.
+    maybeReplaceValueWithEmptyTxSet(newb.value);
+
     CLOG_TRACE(SCP, "BallotProtocol::bumpState i: {} v: {}",
                mSlot.getSlotIndex(), mSlot.getSCP().ballotToStr(newb));
 
@@ -387,6 +423,90 @@ BallotProtocol::bumpState(Value const& value, uint32 n)
     }
 
     return updated;
+}
+
+bool
+BallotProtocol::maybeReplaceValueWithEmptyTxSet(Value& v) const
+{
+    auto& driver = mSlot.getSCPDriver();
+    // Only meaningful while stuck in PREPARE, and only if the driver supports
+    // empty-tx-set values (unit-test drivers don't -> no-op).
+    if (!driver.protocolAllowsEmptyTxSetValues() || mPhase != SCP_PHASE_PREPARE)
+    {
+        return false;
+    }
+    auto const vl =
+        driver.validateValue(mSlot.getSlotIndex(), v, /*nomination=*/false);
+    if (vl == SCPDriver::kFullyValidatedValue && !driver.isEmptyTxSetValue(v))
+    {
+        // We have the tx set; nothing to recover.
+        return false;
+    }
+
+    // ADOPT before minting: if any peer is already balloting an empty-tx-set
+    // value for this slot (fully validated -- carries our LCL context), join
+    // it instead of minting our own. Without this, nodes stuck on different
+    // proposals (or whose download-tracking diverged) each mint a DIFFERENT
+    // empty value and the recovery fragments below quorum -- the reproduced
+    // network wedge. Pick the smallest such value so every adopter converges
+    // on the same one deterministically.
+    std::optional<Value> adopted;
+    if (driver.isEmptyTxSetValue(v))
+    {
+        // Our own already-minted recovery value participates in the choice.
+        adopted = v;
+    }
+    for (auto const& e : mLatestEnvelopes)
+    {
+        auto const wb = getWorkingBallot(e.second->getStatement());
+        if (driver.isEmptyTxSetValue(wb.value) &&
+            driver.validateValue(mSlot.getSlotIndex(), wb.value,
+                                 /*nomination=*/false) ==
+                SCPDriver::kFullyValidatedValue &&
+            (!adopted.has_value() || wb.value < adopted.value()))
+        {
+            adopted = wb.value;
+        }
+    }
+    if (adopted.has_value())
+    {
+        if (adopted.value() == v)
+        {
+            // Already on the smallest known recovery value.
+            return false;
+        }
+        v = adopted.value();
+        driver.noteEmptyTxSetValueReplaced(mSlot.getSlotIndex());
+        CLOG_INFO(SCP,
+                  "BallotProtocol::maybeReplaceValueWithEmptyTxSet i: {} "
+                  "adopting a peer's empty-tx-set recovery value",
+                  mSlot.getSlotIndex());
+        return true;
+    }
+
+    // Only a value we can *only* structurally validate may be dropped to an
+    // empty set (it references a real, still-downloading tx set).
+    if (vl != SCPDriver::kStructurallyValidValue)
+    {
+        return false;
+    }
+
+    // Give the leader's push / fetch until the timeout before giving up on it.
+    auto const waitingTime = driver.getTxSetDownloadWaitTime(v);
+    if (!waitingTime.has_value() ||
+        waitingTime.value() < driver.getTxSetDownloadTimeout())
+    {
+        return false;
+    }
+
+    v = driver.makeEmptyTxSetValueFromValue(v);
+    driver.noteEmptyTxSetValueReplaced(mSlot.getSlotIndex());
+    CLOG_INFO(SCP,
+              "BallotProtocol::maybeReplaceValueWithEmptyTxSet i: {} tx set "
+              "download timed out; voting an empty tx set to keep the network "
+              "moving",
+              mSlot.getSlotIndex());
+    return true;
 }
 
 // updates the local state based to the specified ballot
@@ -1068,8 +1188,41 @@ BallotProtocol::setConfirmPrepared(SCPBallot const& newC, SCPBallot const& newH)
         if (newC.counter != 0)
         {
             dbgAssert(!mCommit);
-            mCommit = makeBallot(newC);
-            didWork = true;
+            // Parallel tx set download (docs/direct-leader-flooding.md): only
+            // vote-to-commit a value we can positively validate. Re-validate
+            // now and set mCommit ONLY for a fully-validated LCL+1 value or a
+            // value for a non-current slot we are finalizing (kMaybeValidValue,
+            // e.g. during catch-up) -- matching the values SCP is allowed to
+            // externalize. Every other level leaves mCommit unset so the node
+            // stays in PREPARE:
+            //   - kStructurallyValidValue: the tx set is still downloading;
+            //     commit once the pushed set arrives and a later SCP re-drive
+            //     upgrades the value to fully validated.
+            //   - kInvalidValue: the tx set arrived and failed checkValid (or a
+            //     Byzantine/faulty leader proposed an invalid-but-parseable
+            //     set). We must NOT vote-to-commit it -- doing so would emit a
+            //     spec-violating vote and pin mCommit to a value that can never
+            //     externalize (peers' CONFIRM/EXTERNALIZE for it are rejected),
+            //     wedging this node. Leaving mCommit unset lets the node move to
+            //     a valid value at a higher ballot.
+            // This is the core safety gate: a value whose transactions we have
+            // not validated (or consider invalid) cannot be committed.
+            auto vl = mSlot.getSCPDriver().validateValue(mSlot.getSlotIndex(),
+                                                         newC.value, false);
+            if (vl == SCPDriver::kFullyValidatedValue ||
+                vl == SCPDriver::kMaybeValidValue)
+            {
+                mCommit = makeBallot(newC);
+                didWork = true;
+            }
+            else
+            {
+                CLOG_DEBUG(SCP,
+                           "BallotProtocol::setConfirmPrepared i: {} NOT "
+                           "voting-to-commit (validation level {}): value not "
+                           "fully validated (tx set downloading or invalid)",
+                           mSlot.getSlotIndex(), static_cast<int>(vl));
+            }
         }
 
         if (didWork)
@@ -1513,6 +1666,20 @@ BallotProtocol::setConfirmCommit(SCPBallot const& c, SCPBallot const& h)
                "BallotProtocol::setConfirmCommit i: {} new c: {} new h: {}",
                mSlot.getSlotIndex(), mSlot.getSCP().ballotToStr(c),
                mSlot.getSCP().ballotToStr(h));
+
+    // Parallel tx set download (docs/direct-leader-flooding.md): reaching
+    // confirm-commit already implies the value is fully validated, so we do not
+    // re-validate here. Two gates guarantee it:
+    //   1. setConfirmPrepared sets mCommit ONLY for a fully-validated (or
+    //      non-current) value, and confirm-commit requires mCommit; and
+    //   2. processEnvelope rejects a peer's CONFIRM and any EXTERNALIZE whose
+    //      value is only structurally valid, so a confirm-commit quorum cannot
+    //      form on a value whose tx set this node lacks.
+    // The tx set is pinned into the value wrapper (commit b286ce283), so it
+    // cannot be LRU-evicted while SCP still holds the committing value. Master
+    // keeps a defensive re-validation throw here; we omit it -- before pinning
+    // it produced false positives on eviction and aborted every node under
+    // load, and post-pinning it is redundant with the two gates above.
 
     mCommit = makeBallot(c);
     mHighBallot = makeBallot(h);

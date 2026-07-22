@@ -520,6 +520,10 @@ struct App {
     connected_quorum: Arc<RwLock<HashSet<PeerId>>>,
     /// Whether the one-shot quorum connectivity timer has been scheduled.
     quorum_check_scheduled: bool,
+    /// TESTING (SetPeerConfig `suppress_tx_broadcast`): submitted TXs go to
+    /// the local mempool only -- no push to leaders, no relay. Simulates the
+    /// mempool asymmetry of relay lag at high rate.
+    suppress_tx_broadcast: bool,
     /// Delay before emitting the one-shot quorum connectivity report.
     quorum_check_grace_secs: u64,
     /// Shared metrics counters for the overlay
@@ -603,6 +607,7 @@ impl App {
             known_peers: Arc::new(RwLock::new(HashMap::new())),
             peer_hostnames: Arc::new(RwLock::new(HashMap::new())),
             leaders: Arc::new(RwLock::new((0, Vec::new()))),
+            suppress_tx_broadcast: false,
             expected_quorum: Arc::new(RwLock::new(HashMap::new())),
             connected_peers: Arc::new(RwLock::new(HashSet::new())),
             connected_quorum: Arc::new(RwLock::new(HashSet::new())),
@@ -780,37 +785,20 @@ impl App {
                     from
                 );
 
-                // TX set hashes were extracted during the reader's single
-                // decode. Snapshot the cache-hit check on the main loop, then
-                // move the libp2p cmd_tx awaits into a spawned task so the loop
-                // never blocks on the bounded command channel.
-                if !txset_hashes.is_empty() {
-                    let needs_fetch: HashSet<[u8; 32]> = txset_hashes
-                        .iter()
-                        .filter(|h| self.tx_set_cache.get(h).is_none())
-                        .copied()
-                        .collect();
-                    let handle = self.libp2p_handle.clone();
-                    let from_peer = from;
-                    tokio::spawn(async move {
-                        for txhash in &txset_hashes {
-                            debug!(
-                                "Recording peer {} as source for TX set {:02x?}...",
-                                from_peer,
-                                &txhash[..4]
-                            );
-                            handle.record_txset_source(*txhash, from_peer).await;
-                            if needs_fetch.contains(txhash) {
-                                info!(
-                                    "TXSET_AUTO_FETCH: Proactively fetching TX set {:02x?}... referenced in SCP from {}",
-                                    &txhash[..4],
-                                    from_peer
-                                );
-                                handle.fetch_txset(*txhash).await;
-                            }
-                        }
-                    });
-                }
+                // Leader-push-only tx set dissemination
+                // (docs/direct-leader-flooding.md): the nominating leader
+                // eagerly pushes the full tx set body to every peer, so on a
+                // fully connected network the body arrives without any
+                // request. The old TXSET_AUTO_FETCH here (fetch on every SCP
+                // envelope referencing a non-cached set) amplified into many
+                // redundant multi-MB downloads per slot under load (its dedup
+                // window leaked across receipt/disconnect races and distinct
+                // value hashes), congesting the very path the push needs. If a
+                // push is ever missed, the empty-tx-set recovery closes an
+                // empty ledger rather than stalling. `txset_hashes` (already
+                // extracted by the reader's single decode) is intentionally
+                // unused here.
+                let _ = &txset_hashes;
 
                 // Forward to Core
                 if let Err(e) = self.core_ipc.sender.send_scp_received(envelope) {
@@ -1262,10 +1250,12 @@ impl App {
                 self.overlay_handle.submit_tx(Arc::clone(&tx));
 
                 // Broadcast TX via libp2p QUIC (dedicated stream)
-                let handle = self.libp2p_handle.clone();
-                tokio::spawn(async move {
-                    handle.broadcast_tx(tx).await;
-                });
+                if !self.suppress_tx_broadcast {
+                    let handle = self.libp2p_handle.clone();
+                    tokio::spawn(async move {
+                        handle.broadcast_tx(tx).await;
+                    });
+                }
             }
 
             MessageType::RequestScpState => {
@@ -1297,8 +1287,10 @@ impl App {
                     let ledger_seq = u32::from_le_bytes(msg.payload[0..4].try_into().unwrap());
                     info!("Ledger {} closed", ledger_seq);
 
-                    // Update current ledger
+                    // Update current ledger (also reported to the overlay so
+                    // queued tx set pushes for completed rounds get dropped)
                     self.current_ledger_seq = ledger_seq;
+                    self.libp2p_handle.set_current_ledger(ledger_seq as u64);
 
                     // Evict old TX sets from cache
                     self.tx_set_cache
@@ -1440,6 +1432,17 @@ impl App {
                             })
                             .unwrap_or_default();
                         let listen_port = config["listen_port"].as_u64().unwrap_or(11625) as u16;
+                        // Direct leader flooding: max TXs coalesced into one
+                        // pushed write (0/absent = send each TX immediately).
+                        let tx_batch_max_size =
+                            config["tx_batch_max_size"].as_u64().unwrap_or(0) as usize;
+                        self.libp2p_handle.set_tx_batch_max_size(tx_batch_max_size);
+                        self.suppress_tx_broadcast = config["suppress_tx_broadcast"]
+                            .as_bool()
+                            .unwrap_or(false);
+                        if self.suppress_tx_broadcast {
+                            warn!("TESTING: suppress_tx_broadcast enabled -- submitted TXs stay local");
+                        }
                         let quorum_members_configured = config.get("quorum_members").is_some();
                         let quorum_members: Vec<String> = config
                             .get("quorum_members")

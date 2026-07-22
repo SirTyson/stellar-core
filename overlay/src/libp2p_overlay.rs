@@ -12,7 +12,8 @@
 //! QUIC provides independent loss recovery per stream.
 
 use crate::flood::{
-    GetData, InvBatch, InvBatcher, InvEntry, InvTracker, PendingRequests, TxBuffer, TxStreamMessage,
+    GetData, InvBatch, InvBatcher, InvEntry, InvTracker, PendingRequests, TxBatcher, TxBuffer,
+    TxStreamMessage,
 };
 use crate::metrics::OverlayMetrics;
 use crate::wire::ValidatedTx;
@@ -29,7 +30,7 @@ use libp2p::{
 use libp2p_stream::{Behaviour as StreamBehaviour, Control, IncomingStreams};
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex, RwLock};
@@ -47,6 +48,13 @@ const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 /// Bounded channel capacity for TX events (backpressure for TX flooding)
 /// TXs that can't be queued are dropped - they'll be re-requested if needed.
 const TX_EVENT_CHANNEL_CAPACITY: usize = 10_000;
+
+/// How long an outstanding GetTxSet request may go unanswered before a new
+/// fetch for the same hash is allowed to retry against a different peer.
+/// Slightly below Core's ~1s fetch-fallback retry cadence so the retry
+/// actually goes through instead of being deduplicated against the stuck
+/// request (docs/direct-leader-flooding.md).
+const TXSET_FETCH_RETRY_STALE: Duration = Duration::from_millis(900);
 
 /// Events from the overlay to the application
 #[derive(Debug, Clone)]
@@ -165,9 +173,25 @@ pub struct OverlayHandle {
     /// dispatch loop behind slow overlay commands, while still being ordered:
     /// the write completes before the caller processes its next message.
     flood_leaders: Arc<RwLock<Vec<PeerId>>>,
+    /// Shared with SharedState; written directly (see flood_leaders).
+    tx_batch_max_size: Arc<AtomicUsize>,
+    /// Shared with SharedState; written directly (see flood_leaders).
+    current_ledger_seq: Arc<AtomicU64>,
 }
 
 impl OverlayHandle {
+    /// Report the last closed ledger, so queued tx set pushes for completed
+    /// rounds can be dropped instead of sent.
+    pub fn set_current_ledger(&self, seq: u64) {
+        self.current_ledger_seq.store(seq, Ordering::Relaxed);
+    }
+
+    /// Set the max TXs per pushed batch (0 or 1 = send each TX immediately).
+    pub fn set_tx_batch_max_size(&self, max: usize) {
+        debug!("TX batch max size set to {}", max);
+        self.tx_batch_max_size.store(max, Ordering::Relaxed);
+    }
+
     pub async fn broadcast_scp(&self, envelope: Vec<u8>) {
         if let Err(e) = self
             .cmd_tx
@@ -320,6 +344,14 @@ impl OverlayHandle {
 }
 
 /// Shared state for stream handlers
+#[derive(Default)]
+struct TxSetPushState {
+    /// peer -> (slot the set was nominated for, hash, framed message)
+    pending: HashMap<PeerId, (u64, [u8; 32], Arc<Vec<u8>>)>,
+    /// peers with a live drainer task
+    draining: HashSet<PeerId>,
+}
+
 struct SharedState {
     /// Outbound streams per peer - each peer has three independently-locked streams
     peer_streams: RwLock<HashMap<PeerId, Arc<PeerOutboundStreams>>>,
@@ -356,6 +388,24 @@ struct SharedState {
     /// leader schedule is known and TXs are INV-flooded to all peers. Shared
     /// with OverlayHandle, which writes it directly.
     flood_leaders: Arc<RwLock<Vec<PeerId>>>,
+    /// Batches TX bodies per destination before pushing (leader routing).
+    /// One flushed batch = one stream write of concatenated Transaction
+    /// frames -- the receiver's framed-read loop splits them, so the wire
+    /// format is unchanged. See flood/tx_batcher.rs.
+    tx_batcher: RwLock<TxBatcher>,
+    /// Max TXs per pushed batch (Core's EXPERIMENTAL_TX_BATCH_MAX_SIZE via
+    /// SetPeerConfig). 0 or 1 disables batching (send-per-TX). Shared with
+    /// OverlayHandle, which writes it directly.
+    tx_batch_max_size: Arc<AtomicUsize>,
+    /// Last closed ledger as reported by Core (0 until first close). Shared
+    /// with OverlayHandle. Used to drop queued tx set pushes whose consensus
+    /// round has already completed.
+    current_ledger_seq: Arc<AtomicU64>,
+    /// Latest-wins tx set push mailbox: at most ONE queued push per peer
+    /// (newest replaces older undelivered ones), drained by a per-peer task.
+    /// Prevents a slow peer from accumulating an unbounded FIFO of dead
+    /// multi-MB sets that starve the current slot's delivery.
+    txset_push: Mutex<TxSetPushState>,
     /// Overlay metrics (shared with App for IPC reporting)
     metrics: Arc<OverlayMetrics>,
 }
@@ -367,6 +417,8 @@ impl SharedState {
         control: Control,
         metrics: Arc<OverlayMetrics>,
         flood_leaders: Arc<RwLock<Vec<PeerId>>>,
+        tx_batch_max_size: Arc<AtomicUsize>,
+        current_ledger_seq: Arc<AtomicU64>,
     ) -> Self {
         Self {
             peer_streams: RwLock::new(HashMap::new()),
@@ -393,6 +445,10 @@ impl SharedState {
             pending_getdata: RwLock::new(PendingRequests::new()),
             tx_buffer: RwLock::new(TxBuffer::new()),
             flood_leaders,
+            tx_batcher: RwLock::new(TxBatcher::new()),
+            tx_batch_max_size,
+            current_ledger_seq,
+            txset_push: Mutex::new(TxSetPushState::default()),
             metrics,
         }
     }
@@ -462,12 +518,16 @@ pub fn create_overlay(
     let (tx_event_tx, tx_event_rx) = mpsc::channel(TX_EVENT_CHANNEL_CAPACITY);
 
     let flood_leaders = Arc::new(RwLock::new(Vec::new()));
+    let tx_batch_max_size = Arc::new(AtomicUsize::new(0));
+    let current_ledger_seq = Arc::new(AtomicU64::new(0));
     let state = Arc::new(SharedState::new(
         event_tx,
         tx_event_tx,
         control.clone(),
         metrics,
         Arc::clone(&flood_leaders),
+        Arc::clone(&tx_batch_max_size),
+        Arc::clone(&current_ledger_seq),
     ));
 
     let overlay = StellarOverlay {
@@ -480,6 +540,8 @@ pub fn create_overlay(
     let handle = OverlayHandle {
         cmd_tx,
         flood_leaders,
+        tx_batch_max_size,
+        current_ledger_seq,
     };
 
     Ok((handle, event_rx, tx_event_rx, overlay))
@@ -733,6 +795,16 @@ impl StellarOverlay {
                             );
                         }
                     }
+                    // Drop any TX batch queued for this peer
+                    {
+                        let mut batcher = self.state.tx_batcher.write().await;
+                        batcher.remove_peer(&peer_id);
+                    }
+                    // Drop any queued tx set push for this peer
+                    {
+                        let mut st = self.state.txset_push.lock().await;
+                        st.pending.remove(&peer_id);
+                    }
                     // Notify main loop to clean up any pending requests for this peer
                     if let Err(e) = self.state.event_tx.send(OverlayEvent::PeerDisconnected {
                         peer_id: peer_id.clone(),
@@ -983,65 +1055,72 @@ impl StellarOverlay {
 
     /// Fetch TX set from a peer - preferring the peer who sent us the SCP message referencing it
     async fn fetch_txset(&mut self, hash: [u8; 32]) {
-        // Check if we're already fetching this TxSet from a connected peer (dedup)
-        {
+        // Dedup: skip only if a request for this hash is outstanding, FRESH,
+        // and its peer is still connected. A stale request (the peer accepted
+        // it but never responded -- e.g. it had already evicted the set) must
+        // NOT block forever: fall through and retry against a DIFFERENT peer.
+        // Core drives retries at ~1s intervals (PendingEnvelopes fetch
+        // fallback), so the staleness cutoff sits just below that.
+        let avoid: Option<PeerId> = {
             let pending = self.state.pending_txset_requests.read().await;
-            if let Some((pending_peer, _)) = pending.get(&hash) {
-                // Check if that peer is still connected
+            if let Some((pending_peer, requested_at)) = pending.get(&hash) {
                 let streams = self.state.peer_streams.read().await;
-                if streams.contains_key(pending_peer) {
+                if streams.contains_key(pending_peer)
+                    && requested_at.elapsed() < TXSET_FETCH_RETRY_STALE
+                {
                     debug!(
                         "TXSET_FETCH_SKIP: TxSet {:02x?}... already being fetched from {}, skipping duplicate",
                         &hash[..4], pending_peer
                     );
                     return;
                 }
-                // Otherwise, peer disconnected - we'll re-request below
+                // Stale or disconnected: retry, avoiding the stuck peer.
+                Some(*pending_peer)
+            } else {
+                None
             }
-        }
+        };
 
-        // First check if we know which peer has this TX set (from SCP message)
+        // Peer preference order:
+        // 1. a known source (recorded when a peer referenced the set);
+        // 2. a connected flood LEADER -- the round-1 leader built the set it
+        //    nominated and always holds it, so it is the highest-probability
+        //    server for exactly the set we are stuck on;
+        // 3. a RANDOM connected peer, so successive retries rotate over the
+        //    whole mesh instead of oscillating between the first map entries.
+        // All choices exclude the peer a stale request is already stuck on.
         let known_source = {
             let sources = self.state.txset_sources.read().await;
             sources.peek(&hash).cloned()
         };
+        let leaders = self.state.flood_leaders.read().await.clone();
 
-        let peer = if let Some(source_peer) = known_source {
-            // Verify this peer is still connected
+        let peer = {
             let streams = self.state.peer_streams.read().await;
-            if streams.contains_key(&source_peer) {
-                info!(
-                    "TXSET_FETCH: Fetching TX set {:02x?}... from known source {}",
-                    &hash[..4],
-                    source_peer
-                );
-                source_peer
-            } else {
-                // Source peer disconnected, fall back to any peer
-                match streams.keys().next().cloned() {
-                    Some(p) => {
-                        info!("TXSET_FETCH: Fetching TX set {:02x?}... from fallback peer {} (source {} disconnected)",
-                              &hash[..4], p, source_peer);
-                        p
-                    }
-                    None => {
-                        warn!(
-                            "TXSET_FETCH_FAIL: No peers to fetch TX set {:02x?}... from",
-                            &hash[..4]
-                        );
-                        return;
-                    }
-                }
-            }
-        } else {
-            // No known source, pick any connected peer
-            let streams = self.state.peer_streams.read().await;
-            match streams.keys().next().cloned() {
+            let source_ok = known_source
+                .filter(|p| streams.contains_key(p) && Some(*p) != avoid);
+            let leader_ok = || {
+                leaders
+                    .iter()
+                    .find(|p| streams.contains_key(p) && Some(**p) != avoid)
+                    .cloned()
+            };
+            match source_ok.or_else(leader_ok).or_else(|| {
+                use rand::seq::IteratorRandom;
+                let mut rng = rand::thread_rng();
+                streams
+                    .keys()
+                    .filter(|p| Some(**p) != avoid)
+                    .choose(&mut rng)
+                    .or_else(|| streams.keys().next())
+                    .cloned()
+            }) {
                 Some(p) => {
                     info!(
-                        "TXSET_FETCH: Fetching TX set {:02x?}... from random peer {} (no known source)",
+                        "TXSET_FETCH: Fetching TX set {:02x?}... from {}{}",
                         &hash[..4],
-                        p
+                        p,
+                        if avoid.is_some() { " (retry)" } else { "" }
                     );
                     p
                 }
@@ -1064,26 +1143,27 @@ impl StellarOverlay {
 
         let request = crate::xdr::frame_get_tx_set(hash);
 
-        match send_to_peer_stream(&self.state, peer.clone(), StreamType::TxSet, &request).await {
-            Ok(_) => info!(
-                "TXSET_FETCH_SENT: Sent request for TxSet {:02x?}... to {}",
-                &hash[..4],
-                peer
-            ),
-            Err(e) => {
-                warn!(
-                    "TXSET_FETCH_FAIL: Failed to send TxSet request {:02x?}... to {}: {}",
+        // Send from a task: a congested TxSet stream to this peer must not
+        // stall the overlay event loop (that stall was itself a wedge vector).
+        let state = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            match send_to_peer_stream(&state, peer.clone(), StreamType::TxSet, &request).await {
+                Ok(_) => info!(
+                    "TXSET_FETCH_SENT: Sent request for TxSet {:02x?}... to {}",
                     &hash[..4],
-                    peer,
-                    e
-                );
-                self.state
-                    .pending_txset_requests
-                    .write()
-                    .await
-                    .remove(&hash);
+                    peer
+                ),
+                Err(e) => {
+                    warn!(
+                        "TXSET_FETCH_FAIL: Failed to send TxSet request {:02x?}... to {}: {}",
+                        &hash[..4],
+                        peer,
+                        e
+                    );
+                    state.pending_txset_requests.write().await.remove(&hash);
+                }
             }
-        }
+        });
     }
 
     /// Send TX set response to a specific peer
@@ -1099,40 +1179,63 @@ impl StellarOverlay {
         // built locally (trusted core); frame by concatenation.
         let response = crate::xdr::frame_tx_set(&data);
 
-        match send_to_peer_stream(&self.state, peer, StreamType::TxSet, &response).await {
-            Ok(_) => {
-                self.state
-                    .metrics
-                    .send_txset
-                    .fetch_add(1, Ordering::Relaxed);
-                self.state
-                    .metrics
-                    .message_write
-                    .fetch_add(1, Ordering::Relaxed);
-                self.state
-                    .metrics
-                    .byte_write
-                    .fetch_add(response.len() as u64, Ordering::Relaxed);
-                info!(
-                    "TXSET_SEND_OK: Successfully sent TX set {:02x?}... ({} bytes on wire) to {}",
-                    &hash[..4],
-                    response.len(),
-                    peer
-                );
+        // Send from a task: a multi-MB response through a congested or cold
+        // link must not stall the overlay event loop (when many peers fetch
+        // the same set, inline sends serialized the server's whole loop).
+        //
+        // Serve on a FRESH QUIC stream, not the cached per-peer TxSet stream:
+        // the cached stream is where flood pushes queue, and QUIC streams are
+        // FIFO -- a fetch response behind a jammed multi-MB push would wait
+        // out the very congestion it is rescuing the requester from (the
+        // perf-net wedge). A new stream gets independent flow control. Fall
+        // back to the cached stream if the fresh one cannot be opened.
+        let state = Arc::clone(&self.state);
+        let mut control = self.control.clone();
+        tokio::spawn(async move {
+            let fresh = async {
+                let mut stream = control
+                    .open_stream(peer, TXSET_PROTOCOL)
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::NotConnected, e.to_string()))?;
+                write_framed(&mut stream, &response).await
             }
-            Err(e) => {
-                self.state
-                    .metrics
-                    .error_write
-                    .fetch_add(1, Ordering::Relaxed);
-                warn!(
-                    "TXSET_SEND_FAIL: Failed to send TxSet {:02x?}... to {}: {}",
-                    &hash[..4],
-                    peer,
-                    e
-                );
+            .await;
+            let send_res = match fresh {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    debug!(
+                        "TXSET_SEND: fresh stream to {} failed ({}), using cached stream",
+                        peer, e
+                    );
+                    send_to_peer_stream(&state, peer, StreamType::TxSet, &response).await
+                }
+            };
+            match send_res {
+                Ok(_) => {
+                    state.metrics.send_txset.fetch_add(1, Ordering::Relaxed);
+                    state.metrics.message_write.fetch_add(1, Ordering::Relaxed);
+                    state
+                        .metrics
+                        .byte_write
+                        .fetch_add(response.len() as u64, Ordering::Relaxed);
+                    info!(
+                        "TXSET_SEND_OK: Successfully sent TX set {:02x?}... ({} bytes on wire) to {}",
+                        &hash[..4],
+                        response.len(),
+                        peer
+                    );
+                }
+                Err(e) => {
+                    state.metrics.error_write.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        "TXSET_SEND_FAIL: Failed to send TxSet {:02x?}... to {}: {}",
+                        &hash[..4],
+                        peer,
+                        e
+                    );
+                }
             }
-        }
+        });
     }
 
     /// Eagerly broadcast a TX set body to every connected peer.
@@ -1176,36 +1279,29 @@ impl StellarOverlay {
             peers.len()
         );
 
-        // Spawn parallel sends so a slow peer doesn't stall the event loop or
-        // the other sends (mirrors broadcast_scp).
+        // Latest-wins enqueue: at most ONE queued push per peer. A slow peer
+        // must never accumulate a FIFO of dead multi-MB sets -- for consensus
+        // data only the NEWEST set matters, so a newer set replaces an
+        // undelivered older one, and the drainer skips sets whose round has
+        // already completed. One shared buffer (no per-peer clones).
+        let message = Arc::new(message);
+        // The set being broadcast is for the slot currently being voted.
+        let slot = self.state.current_ledger_seq.load(Ordering::Relaxed) + 1;
+        let mut st = self.state.txset_push.lock().await;
         for peer_id in peers {
-            let state = Arc::clone(&self.state);
-            let message = message.clone();
-            tokio::spawn(async move {
-                match send_to_peer_stream(&state, peer_id.clone(), StreamType::TxSet, &message)
-                    .await
-                {
-                    Ok(_) => {
-                        // Count under both the generic TxSet-send meter and the
-                        // dedicated eager-push meters (successful sends only).
-                        state.metrics.send_txset.fetch_add(1, Ordering::Relaxed);
-                        state.metrics.flood_txset_push.fetch_add(1, Ordering::Relaxed);
-                        state
-                            .metrics
-                            .flood_txset_push_bytes
-                            .fetch_add(message.len() as u64, Ordering::Relaxed);
-                        state.metrics.message_write.fetch_add(1, Ordering::Relaxed);
-                        state
-                            .metrics
-                            .byte_write
-                            .fetch_add(message.len() as u64, Ordering::Relaxed);
-                    }
-                    Err(e) => {
-                        state.metrics.error_write.fetch_add(1, Ordering::Relaxed);
-                        warn!("TXSET_BROADCAST_FAIL: push to {} failed: {}", peer_id, e);
-                    }
-                }
-            });
+            if st
+                .pending
+                .insert(peer_id, (slot, hash, Arc::clone(&message)))
+                .is_some()
+            {
+                self.state
+                    .metrics
+                    .flood_txset_push_dropped
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if st.draining.insert(peer_id) {
+                tokio::spawn(drain_txset_pushes(Arc::clone(&self.state), peer_id));
+            }
         }
     }
 
@@ -1370,6 +1466,28 @@ async fn send_to_peer_stream(
     stream_type: StreamType,
     data: &[u8],
 ) -> io::Result<()> {
+    send_to_peer_stream_inner(state, peer_id, stream_type, data, false).await
+}
+
+/// Send bytes that already carry their own per-message length prefixes (a
+/// coalesced batch of frames) as ONE write. The receiver's framed-read loop
+/// splits them back into individual messages.
+async fn send_preframed_to_peer_stream(
+    state: &SharedState,
+    peer_id: PeerId,
+    stream_type: StreamType,
+    data: &[u8],
+) -> io::Result<()> {
+    send_to_peer_stream_inner(state, peer_id, stream_type, data, true).await
+}
+
+async fn send_to_peer_stream_inner(
+    state: &SharedState,
+    peer_id: PeerId,
+    stream_type: StreamType,
+    data: &[u8],
+    preframed: bool,
+) -> io::Result<()> {
     // Retry up to 2 times (3 attempts total) for reliability
     const MAX_RETRIES: usize = 2;
 
@@ -1448,7 +1566,12 @@ async fn send_to_peer_stream(
         }
 
         let stream = stream_guard.as_mut().unwrap();
-        match write_framed(stream, data).await {
+        let write_res = if preframed {
+            write_raw(stream, data).await
+        } else {
+            write_framed(stream, data).await
+        };
+        match write_res {
             Ok(()) => return Ok(()),
             Err(e) => {
                 // Clear the broken stream
@@ -1480,6 +1603,13 @@ async fn send_to_peer_stream(
 async fn write_framed(stream: &mut Stream, data: &[u8]) -> io::Result<()> {
     let len = data.len() as u32;
     stream.write_all(&len.to_be_bytes()).await?;
+    stream.write_all(data).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// Write bytes that already contain their own frame length prefixes.
+async fn write_raw(stream: &mut Stream, data: &[u8]) -> io::Result<()> {
     stream.write_all(data).await?;
     stream.flush().await?;
     Ok(())
@@ -1958,42 +2088,148 @@ async fn push_tx_to_peers(
     hash: &[u8; 32],
     fee_per_op: i64,
 ) {
-    // The TX was validated once by the reader; build the flood frame directly
-    // from its canonical bytes (perf fix #5357 -- no redundant re-encode).
-    let encoded = tx.to_flood_frame();
-    let tx_len = tx.bytes().len() as u64;
+    let _ = (hash, fee_per_op); // identity travels inside the ValidatedTx
+    let max_batch = state.tx_batch_max_size.load(Ordering::Relaxed);
+    if max_batch <= 1 {
+        // Batching disabled: push each TX immediately as its own write.
+        for peer in peers {
+            send_tx_batch(state, *peer, vec![Arc::clone(tx)]);
+        }
+        return;
+    }
 
-    for peer in peers {
-        let state_clone = Arc::clone(state);
-        let peer = *peer;
-        let encoded = encoded.clone();
-        let hash = *hash;
-        tokio::spawn(async move {
-            match send_to_peer_stream(&state_clone, peer, StreamType::Tx, &encoded).await {
-                Ok(()) => {
-                    let m = &state_clone.metrics;
-                    m.flood_leader_push.fetch_add(1, Ordering::Relaxed);
-                    m.flood_leader_push_bytes.fetch_add(tx_len, Ordering::Relaxed);
-                    m.message_write.fetch_add(1, Ordering::Relaxed);
-                    m.byte_write
-                        .fetch_add(encoded.len() as u64, Ordering::Relaxed);
-                }
-                Err(e) => {
-                    state_clone
-                        .metrics
-                        .error_write
-                        .fetch_add(1, Ordering::Relaxed);
-                    warn!(
-                        "TX_LEADER_PUSH_FAIL: TX {:02x?}... to {}: {} — rescuing via INV flood",
-                        &hash[..4],
-                        peer,
-                        e
-                    );
-                    announce_tx_inv_to_all(&state_clone, &hash, fee_per_op).await;
+    // Batching: queue per destination; a batch flushes here when a size
+    // threshold is hit, otherwise the 50ms housekeeping tick flushes it.
+    // Coalescing many TXs into one write collapses the per-TX spawn / stream
+    // lock / flush (~one QUIC packet per 200-byte TX) that caps intake at
+    // high rates.
+    let mut full: Vec<(PeerId, Vec<Arc<ValidatedTx>>)> = Vec::new();
+    {
+        let mut batcher = state.tx_batcher.write().await;
+        for peer in peers {
+            if let Some(batch) = batcher.add(*peer, Arc::clone(tx), max_batch) {
+                full.push((*peer, batch));
+            }
+        }
+    }
+    for (peer, batch) in full {
+        send_tx_batch(state, peer, batch);
+    }
+}
+
+/// Drain the latest-wins tx set push mailbox for `peer`: repeatedly take the
+/// newest queued set, drop it if its consensus round already completed, else
+/// send it. Exits (and clears the draining flag) when the mailbox is empty.
+async fn drain_txset_pushes(state: Arc<SharedState>, peer: PeerId) {
+    loop {
+        let (slot, hash, message) = {
+            let mut st = state.txset_push.lock().await;
+            match st.pending.remove(&peer) {
+                Some(entry) => entry,
+                None => {
+                    st.draining.remove(&peer);
+                    return;
                 }
             }
-        });
+        };
+
+        let lcl = state.current_ledger_seq.load(Ordering::Relaxed);
+        if lcl >= slot {
+            // The round this set was nominated for has closed; pushing it now
+            // is pure waste and delays whatever is queued next.
+            debug!(
+                "TXSET_PUSH_STALE: dropping TX set {:02x?}... for closed slot {} (lcl {}) to {}",
+                &hash[..4],
+                slot,
+                lcl,
+                peer
+            );
+            state
+                .metrics
+                .flood_txset_push_dropped
+                .fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+
+        match send_to_peer_stream(&state, peer, StreamType::TxSet, &message).await {
+            Ok(_) => {
+                // Count under both the generic TxSet-send meter and the
+                // dedicated eager-push meters (successful sends only).
+                state.metrics.send_txset.fetch_add(1, Ordering::Relaxed);
+                state.metrics.flood_txset_push.fetch_add(1, Ordering::Relaxed);
+                state
+                    .metrics
+                    .flood_txset_push_bytes
+                    .fetch_add(message.len() as u64, Ordering::Relaxed);
+                state.metrics.message_write.fetch_add(1, Ordering::Relaxed);
+                state
+                    .metrics
+                    .byte_write
+                    .fetch_add(message.len() as u64, Ordering::Relaxed);
+            }
+            Err(e) => {
+                state.metrics.error_write.fetch_add(1, Ordering::Relaxed);
+                warn!("TXSET_BROADCAST_FAIL: push to {} failed: {}", peer, e);
+            }
+        }
     }
+}
+
+/// Send a batch of TXs to `peer` as ONE stream write of concatenated
+/// length-prefixed Transaction frames (the receiver's framed-read loop splits
+/// them; wire format unchanged). On failure every TX in the batch is rescued
+/// via INV flood so it stays pullable.
+fn send_tx_batch(state: &Arc<SharedState>, peer: PeerId, batch: Vec<Arc<ValidatedTx>>) {
+    if batch.is_empty() {
+        return;
+    }
+    // Concatenate LENGTH-PREFIXED frames: the per-message length prefix is
+    // normally added by the writer, so inline it here for each message and
+    // send the whole batch pre-framed in one write.
+    let mut encoded = Vec::new();
+    let mut tx_bytes_total: u64 = 0;
+    for tx in &batch {
+        let frame = tx.to_flood_frame();
+        encoded.extend_from_slice(&(frame.len() as u32).to_be_bytes());
+        encoded.extend_from_slice(&frame);
+        tx_bytes_total += tx.bytes().len() as u64;
+    }
+    let batch_len = batch.len() as u64;
+
+    let state_clone = Arc::clone(state);
+    tokio::spawn(async move {
+        match send_preframed_to_peer_stream(&state_clone, peer, StreamType::Tx, &encoded).await {
+            Ok(()) => {
+                let m = &state_clone.metrics;
+                // One "push" per write; bytes/push rising above a single TX's
+                // size is the observable sign batching is engaged.
+                m.flood_leader_push.fetch_add(1, Ordering::Relaxed);
+                m.flood_leader_push_bytes
+                    .fetch_add(tx_bytes_total, Ordering::Relaxed);
+                m.message_write.fetch_add(1, Ordering::Relaxed);
+                m.byte_write
+                    .fetch_add(encoded.len() as u64, Ordering::Relaxed);
+                m.flood_tx_batch_size_sum
+                    .fetch_add(batch_len, Ordering::Relaxed);
+                m.flood_tx_batch_size_count.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                state_clone
+                    .metrics
+                    .error_write
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    "TX_LEADER_PUSH_FAIL: batch of {} TXs to {}: {} — rescuing via INV flood",
+                    batch.len(),
+                    peer,
+                    e
+                );
+                for tx in &batch {
+                    announce_tx_inv_to_all(&state_clone, tx.hash(), tx.fee_per_op()).await;
+                }
+            }
+        }
+    });
 }
 
 async fn handle_tx_response(state: &Arc<SharedState>, peer_id: &PeerId, tx: Arc<ValidatedTx>) {
@@ -2292,6 +2528,21 @@ async fn inv_getdata_housekeeping_task(state: Arc<SharedState>) {
             flush_inv_batch_to_peer(&state, peer_id).await;
         }
 
+        // 1b. Flush TX push batches that have aged past TX_BATCH_MAX_DELAY.
+        let expired_tx_peers = {
+            let batcher = state.tx_batcher.read().await;
+            batcher.expired_peers()
+        };
+        for peer_id in expired_tx_peers {
+            let batch = {
+                let mut batcher = state.tx_batcher.write().await;
+                batcher.flush(&peer_id)
+            };
+            if let Some(batch) = batch {
+                send_tx_batch(&state, peer_id, batch);
+            }
+        }
+
         // 2. Handle GETDATA timeouts
         let (to_retry, gave_up) = {
             let mut pending = state.pending_getdata.write().await;
@@ -2566,7 +2817,9 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let tx = test_tx_xdr(1);
-        handle1.broadcast_tx(tx.clone()).await;
+        handle1
+            .broadcast_tx(ValidatedTx::from_core_trusted(tx.clone(), 0, 1).unwrap())
+            .await;
 
         // The leader must receive the full TX body.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -2575,7 +2828,7 @@ mod tests {
             tokio::select! {
                 Some(event) = tx_events2.recv() => {
                     if let OverlayEvent::TxReceived { tx: recv_tx, .. } = event {
-                        assert_eq!(recv_tx, tx);
+                        assert_eq!(recv_tx.bytes(), tx.as_slice());
                         received = true;
                     }
                 }
@@ -2628,7 +2881,9 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let tx = test_tx_xdr(2);
-        handle1.broadcast_tx(tx.clone()).await;
+        handle1
+            .broadcast_tx(ValidatedTx::from_core_trusted(tx.clone(), 0, 1).unwrap())
+            .await;
 
         // The peer must still receive the TX via the INV/GETDATA pull path.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -2637,7 +2892,7 @@ mod tests {
             tokio::select! {
                 Some(event) = tx_events2.recv() => {
                     if let OverlayEvent::TxReceived { tx: recv_tx, .. } = event {
-                        assert_eq!(recv_tx, tx);
+                        assert_eq!(recv_tx.bytes(), tx.as_slice());
                         received = true;
                     }
                 }
@@ -2696,7 +2951,9 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let tx = test_tx_xdr(3);
-        handle_a.broadcast_tx(tx.clone()).await;
+        handle_a
+            .broadcast_tx(ValidatedTx::from_core_trusted(tx.clone(), 0, 1).unwrap())
+            .await;
 
         // C must receive the TX: A INVs to B, B pulls it, then B pushes the
         // full body directly to its leader C.
@@ -2706,7 +2963,7 @@ mod tests {
             tokio::select! {
                 Some(event) = tx_events_c.recv() => {
                     if let OverlayEvent::TxReceived { tx: recv_tx, .. } = event {
-                        assert_eq!(recv_tx, tx);
+                        assert_eq!(recv_tx.bytes(), tx.as_slice());
                         received = true;
                     }
                 }

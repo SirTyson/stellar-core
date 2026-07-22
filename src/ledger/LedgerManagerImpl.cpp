@@ -1554,7 +1554,11 @@ LedgerManagerImpl::applyLedger(LedgerCloseData const& ledgerData,
         throw std::runtime_error("txset mismatch");
     }
 
-    if (txSet->getContentsHash() != ledgerData.getValue().txSetHash)
+    // Empty-tx-set recovery (docs/direct-leader-flooding.md): an empty-tx-set
+    // value reports the sentinel hash rather than the materialized empty set's
+    // content hash, so skip the mismatch check for it.
+    if (ledgerData.getValue().txSetHash != Herder::EMPTY_TX_SET_HASH &&
+        txSet->getContentsHash() != ledgerData.getValue().txSetHash)
     {
         CLOG_ERROR(
             Ledger,

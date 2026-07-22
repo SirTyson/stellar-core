@@ -50,6 +50,92 @@ HerderSCPDriver::getHashOf(std::vector<xdr::opaque_vec<>> const& vals) const
     return hasher.finish();
 }
 
+namespace
+{
+bool
+isEmptyTxSetStellarValue(StellarValue const& sv)
+{
+    return sv.ext.v() == STELLAR_VALUE_EMPTY_TX_SET;
+}
+} // namespace
+
+bool
+HerderSCPDriver::protocolAllowsEmptyTxSetValues() const
+{
+    // Empty-tx-set recovery is enabled unconditionally on this experimental
+    // branch (docs/direct-leader-flooding.md).
+    return true;
+}
+
+std::optional<std::chrono::milliseconds>
+HerderSCPDriver::getTxSetDownloadWaitTime(Value const& v) const
+{
+    StellarValue sv;
+    if (!toStellarValue(v, sv))
+    {
+        return std::nullopt;
+    }
+    // How long we have been awaiting the tx set this value references
+    // (nullopt once it has arrived / was never fetched).
+    return mPendingEnvelopes.getTxSetWaitingTime(sv.txSetHash);
+}
+
+std::chrono::milliseconds
+HerderSCPDriver::getTxSetDownloadTimeout() const
+{
+    // How long to wait for the leader's pushed tx set before voting an empty
+    // set instead. Hardcoded for the experiment; must comfortably exceed
+    // normal dissemination latency so empty ledgers are only produced when a
+    // set genuinely cannot be obtained.
+    return std::chrono::milliseconds(5000);
+}
+
+Value
+HerderSCPDriver::makeEmptyTxSetValueFromValue(Value const& v) const
+{
+    StellarValue proposedValue;
+    if (!toStellarValue(v, proposedValue) ||
+        proposedValue.ext.v() != STELLAR_VALUE_SIGNED)
+    {
+        // Only a signed proposal can be dropped to an empty set.
+        return v;
+    }
+    auto const& lcl = mLedgerManager.getLastClosedLedgerHeader();
+
+    // Carry the ORIGINAL proposal's context and signature so that every node
+    // replacing the same stuck value produces the byte-identical empty-tx-set
+    // value -> SCP converges on it immediately. The signature verifies over
+    // the original (txSetHash, closeTime) pair (see verifyStellarValueSignature).
+    StellarValue sv;
+    sv.ext.v(STELLAR_VALUE_EMPTY_TX_SET);
+    sv.txSetHash = Herder::EMPTY_TX_SET_HASH;
+    sv.closeTime = proposedValue.closeTime;
+    sv.upgrades = proposedValue.upgrades;
+    sv.ext.proposedValue().txSetHash = proposedValue.txSetHash;
+    sv.ext.proposedValue().previousLedgerHash = lcl.hash;
+    sv.ext.proposedValue().previousLedgerVersion = lcl.header.ledgerVersion;
+    sv.ext.proposedValue().lcValueSignature =
+        proposedValue.ext.lcValueSignature();
+    return xdr::xdr_to_opaque(sv);
+}
+
+bool
+HerderSCPDriver::isEmptyTxSetValue(Value const& v) const
+{
+    StellarValue sv;
+    if (!toStellarValue(v, sv))
+    {
+        return false;
+    }
+    return isEmptyTxSetStellarValue(sv);
+}
+
+void
+HerderSCPDriver::noteEmptyTxSetValueReplaced(uint64_t slotIndex)
+{
+    mSCPMetrics.mEmptyTxSetValueReplaced.inc();
+}
+
 HerderSCPDriver::SCPMetrics::SCPMetrics(Application& app)
     : mEnvelopeSign(
           app.getMetrics().NewMeter({"scp", "envelope", "sign"}, "envelope"))
@@ -66,6 +152,8 @@ HerderSCPDriver::SCPMetrics::SCPMetrics(Application& app)
           {"scp", "timing", "first-to-self-externalize-lag"}))
     , mSelfToOthersExternalizeLag(app.getMetrics().NewTimer(
           {"scp", "timing", "self-to-others-externalize-lag"}))
+    , mEmptyTxSetValueReplaced(app.getMetrics().NewCounter(
+          {"scp", "empty-tx-set", "value-replaced"}))
 {
 }
 
@@ -116,6 +204,7 @@ class SCPHerderEnvelopeWrapper : public SCPEnvelopeWrapper
 
     SCPQuorumSetPtr mQSet;
     std::vector<TxSetXDRFrameConstPtr> mTxSets;
+    std::vector<Hash> mMissingTxSetHashes;
 
   public:
     explicit SCPHerderEnvelopeWrapper(SCPEnvelope const& e, HerderImpl& herder)
@@ -131,6 +220,12 @@ class SCPHerderEnvelopeWrapper : public SCPEnvelopeWrapper
                            "qset {} from envelope"),
                 hexAbbrev(qSetH)));
         }
+        // Parallel tx set download (docs/direct-leader-flooding.md): do NOT
+        // throw on a tx set that has not arrived yet -- SCP is allowed to
+        // process the envelope while the leader's push is in flight. Pin the
+        // sets we have (the shared_ptr keeps them alive through LRU eviction of
+        // PendingEnvelopes' cache) and record the missing ones so wrapEnvelope
+        // can register this wrapper for back-fill via addTxSet().
         auto txSets = getValidatedTxSetHashes(e);
         for (auto const& txSetH : txSets)
         {
@@ -141,12 +236,21 @@ class SCPHerderEnvelopeWrapper : public SCPEnvelopeWrapper
             }
             else
             {
-                throw std::runtime_error(fmt::format(
-                    FMT_STRING("SCPHerderEnvelopeWrapper: Wrapping an unknown "
-                               "tx set {} from envelope"),
-                    hexAbbrev(txSetH)));
+                mMissingTxSetHashes.emplace_back(txSetH);
             }
         }
+    }
+
+    std::vector<Hash> const&
+    getMissingTxSetHashes() const
+    {
+        return mMissingTxSetHashes;
+    }
+
+    void
+    addTxSet(TxSetXDRFrameConstPtr txSet) override
+    {
+        mTxSets.emplace_back(txSet);
     }
 };
 
@@ -154,6 +258,12 @@ SCPEnvelopeWrapperPtr
 HerderSCPDriver::wrapEnvelope(SCPEnvelope const& envelope)
 {
     auto r = std::make_shared<SCPHerderEnvelopeWrapper>(envelope, mHerder);
+    // Register for tx-set back-fill so the wrapper pins each set the moment it
+    // arrives (parallel tx set download).
+    for (auto const& h : r->getMissingTxSetHashes())
+    {
+        mPendingTxSetEnvelopeWrappers[h].emplace_back(r);
+    }
     return r;
 }
 
@@ -299,6 +409,26 @@ HerderSCPDriver::validateValueAgainstLocalState(uint64_t slotIndex,
             return SCPDriver::kInvalidValue;
         }
 
+        // Empty-tx-set recovery (docs/direct-leader-flooding.md): a value that
+        // drops the tx set (STELLAR_VALUE_EMPTY_TX_SET) is fully valid for
+        // LCL+1 as long as it targets our LCL -- there is nothing to download.
+        // It is only ever introduced during balloting to break a tx-set
+        // download stall, never during nomination, so reject it for nomination.
+        if (b.ext.v() == STELLAR_VALUE_EMPTY_TX_SET)
+        {
+            if (nomination)
+            {
+                return SCPDriver::kInvalidValue;
+            }
+            auto const& ov = b.ext.proposedValue();
+            if (ov.previousLedgerHash != lcl.hash ||
+                ov.previousLedgerVersion != lcl.header.ledgerVersion)
+            {
+                return SCPDriver::kInvalidValue;
+            }
+            return SCPDriver::kFullyValidatedValue;
+        }
+
         Hash const& txSetHash = b.txSetHash;
         TxSetXDRFrameConstPtr txSet = mPendingEnvelopes.getTxSet(txSetHash);
 
@@ -306,10 +436,23 @@ HerderSCPDriver::validateValueAgainstLocalState(uint64_t slotIndex,
 
         if (!txSet)
         {
-            CLOG_ERROR(Herder, "validateValue i:{} unknown txSet {}", slotIndex,
-                       hexAbbrev(txSetHash));
-
-            res = SCPDriver::kInvalidValue;
+            // Parallel tx set download (docs/direct-leader-flooding.md): if the
+            // referenced tx set is still on its way (an envelope referenced it
+            // and we are expecting the leader's push), treat the value as
+            // structurally valid so SCP can advance nomination/PREPARE while the
+            // tx set arrives. It cannot be voted-to-commit or externalized until
+            // it becomes fully validated (see BallotProtocol). Enabled
+            // unconditionally on this experimental branch (no protocol gate).
+            if (mPendingEnvelopes.getTxSetWaitingTime(txSetHash).has_value())
+            {
+                res = SCPDriver::kStructurallyValidValue;
+            }
+            else
+            {
+                CLOG_ERROR(Herder, "validateValue i:{} unknown txSet {}",
+                           slotIndex, hexAbbrev(txSetHash));
+                res = SCPDriver::kInvalidValue;
+            }
         }
         else if (!checkAndCacheTxSetValid(*txSet, lcl, closeTimeOffset))
         {
@@ -348,7 +491,18 @@ HerderSCPDriver::deserializeAndValidateStellarValue(Value const& value,
         return false;
     }
 
-    if (sv.ext.v() != STELLAR_VALUE_SIGNED)
+    // Accept signed values and, for empty-tx-set recovery
+    // (docs/direct-leader-flooding.md), empty-tx-set values. An empty-tx-set
+    // value MUST carry the sentinel tx set hash; its signature is verified
+    // over the original proposal (see verifyStellarValueSignature).
+    if (sv.ext.v() == STELLAR_VALUE_EMPTY_TX_SET)
+    {
+        if (sv.txSetHash != Herder::EMPTY_TX_SET_HASH)
+        {
+            return false;
+        }
+    }
+    else if (sv.ext.v() != STELLAR_VALUE_SIGNED)
     {
         return false;
     }
@@ -441,14 +595,48 @@ HerderSCPDriver::extractValidValue(uint64_t slotIndex, Value const& value)
     }
 
     ValueWrapperPtr res;
-    if (validateValueAgainstLocalState(slotIndex, b, true) ==
-        SCPDriver::kFullyValidatedValue)
+    // Parallel tx set download: a structurally-valid value (tx set still
+    // downloading) is also extractable for nomination.
+    if (validateValueAgainstLocalState(slotIndex, b, true) >=
+        SCPDriver::kStructurallyValidValue)
     {
         extractValidUpgrades(b, true);
         res = wrapStellarValue(b);
     }
 
     return res;
+}
+
+bool
+HerderSCPDriver::isEnvelopeReady(SCPEnvelope const& env)
+{
+    // The quorum set is always required before SCP can process an envelope.
+    if (!mPendingEnvelopes.isQsetFetched(env))
+    {
+        return false;
+    }
+    // Fully fetched (qset + all tx sets): ready as usual.
+    if (mPendingEnvelopes.areTxSetsFetched(env))
+    {
+        return true;
+    }
+    // Parallel tx set download (unconditional here): a current-ledger
+    // nomination/PREPARE may be handed to SCP while its tx set is still
+    // arriving. validateValue will report it kStructurallyValidValue so SCP
+    // advances but cannot vote-to-commit/externalize until the tx set lands.
+    // Restrict to LCL+1 while tracking + synced, matching master's guard.
+    auto const type = env.statement.pledges.type();
+    if (type != SCP_ST_NOMINATE && type != SCP_ST_PREPARE)
+    {
+        return false;
+    }
+    auto const& lcl = mLedgerManager.getLastClosedLedgerHeader();
+    if (env.statement.slotIndex != lcl.header.ledgerSeq + 1)
+    {
+        return false;
+    }
+    return mHerder.isTracking() &&
+           mApp.getState() == Application::APP_SYNCED_STATE;
 }
 
 // value marshaling
@@ -633,12 +821,27 @@ HerderSCPDriver::getNominationEmitDelayForTesting() const
 // returns true if l < r
 // lh, rh are the hashes of l,h
 static bool
-compareTxSets(ApplicableTxSetFrame const& l, ApplicableTxSetFrame const& r,
-              Hash const& lh, Hash const& rh, size_t lEncodedSize,
-              size_t rEncodedSize, LedgerHeader const& header, Hash const& s)
+compareTxSets(ApplicableTxSetFrameConstPtr const& l,
+              ApplicableTxSetFrameConstPtr const& r, Hash const& lh,
+              Hash const& rh, std::optional<size_t> lEncodedSize,
+              std::optional<size_t> rEncodedSize, LedgerHeader const& header,
+              Hash const& s)
 {
-    auto lSize = l.size(header);
-    auto rSize = r.size(header);
+    // Parallel tx set download (docs/direct-leader-flooding.md): a candidate's
+    // tx set may still be downloading, in which case its applicable frame is
+    // null. Compare by hash when neither is present, and prefer the one we
+    // actually have when only one is present.
+    if (!l && !r)
+    {
+        return lessThanXored(lh, rh, s);
+    }
+    if (!l || !r)
+    {
+        return !l;
+    }
+
+    auto lSize = l->size(header);
+    auto rSize = r->size(header);
     if (lSize != rSize)
     {
         return lSize < rSize;
@@ -646,8 +849,8 @@ compareTxSets(ApplicableTxSetFrame const& l, ApplicableTxSetFrame const& r,
     if (protocolVersionStartsFrom(header.ledgerVersion,
                                   SOROBAN_PROTOCOL_VERSION))
     {
-        auto lBids = l.getTotalInclusionFees();
-        auto rBids = r.getTotalInclusionFees();
+        auto lBids = l->getTotalInclusionFees();
+        auto rBids = r->getTotalInclusionFees();
         if (lBids != rBids)
         {
             return lBids < rBids;
@@ -655,8 +858,8 @@ compareTxSets(ApplicableTxSetFrame const& l, ApplicableTxSetFrame const& r,
     }
     if (protocolVersionStartsFrom(header.ledgerVersion, ProtocolVersion::V_11))
     {
-        auto lFee = l.getTotalFees(header);
-        auto rFee = r.getTotalFees(header);
+        auto lFee = l->getTotalFees(header);
+        auto rFee = r->getTotalFees(header);
         if (lFee != rFee)
         {
             return lFee < rFee;
@@ -665,10 +868,10 @@ compareTxSets(ApplicableTxSetFrame const& l, ApplicableTxSetFrame const& r,
     if (protocolVersionStartsFrom(header.ledgerVersion,
                                   SOROBAN_PROTOCOL_VERSION))
     {
-        if (lEncodedSize != rEncodedSize)
+        if (lEncodedSize.value() != rEncodedSize.value())
         {
             // Look for the smallest encoded size.
-            return lEncodedSize > rEncodedSize;
+            return lEncodedSize.value() > rEncodedSize.value();
         }
     }
     return lessThanXored(lh, rh, s);
@@ -798,20 +1001,31 @@ HerderSCPDriver::combineCandidates(uint64_t slotIndex,
              ++it)
         {
             auto const& sv = *it;
-            auto cTxSet = mPendingEnvelopes.getTxSet(sv.txSetHash);
-            releaseAssert(cTxSet);
+            // Parallel tx set download (docs/direct-leader-flooding.md): the
+            // referenced tx set may still be downloading, so getTxSet can
+            // return null. Do NOT assert -- a candidate whose tx set has not
+            // arrived is still combined; the resulting composite drives the
+            // ballot protocol, which defers commit/externalize until the tx set
+            // arrives and the value becomes fully validated. Asserting here (or
+            // refusing to promote such a value to a candidate) strands the node
+            // in nomination with no ballot flow to carry it -> lost sync.
+            TxSetXDRFrameConstPtr cTxSet =
+                mPendingEnvelopes.getTxSet(sv.txSetHash);
             // Only valid applicable tx sets should be combined.
-            auto cApplicableTxSet = cTxSet->prepareForApply(mApp, lcl.header);
-            releaseAssert(cApplicableTxSet);
-            if (cTxSet->previousLedgerHash() == lcl.hash)
+            ApplicableTxSetFrameConstPtr cApplicableTxSet =
+                cTxSet ? cTxSet->prepareForApply(mApp, lcl.header) : nullptr;
+            if (!cTxSet || cTxSet->previousLedgerHash() == lcl.hash)
             {
-
-                if (!highestTxSet ||
-                    compareTxSets(*highestApplicableTxSet, *cApplicableTxSet,
-                                  highest->txSetHash, sv.txSetHash,
-                                  highestTxSet->encodedSize(),
-                                  cTxSet->encodedSize(), lcl.header,
-                                  candidatesHash))
+                if (highest == candidateValues.cend() ||
+                    compareTxSets(
+                        highestApplicableTxSet, cApplicableTxSet,
+                        highest->txSetHash, sv.txSetHash,
+                        highestTxSet
+                            ? std::make_optional(highestTxSet->encodedSize())
+                            : std::nullopt,
+                        cTxSet ? std::make_optional(cTxSet->encodedSize())
+                               : std::nullopt,
+                        lcl.header, candidatesHash))
                 {
                     highest = it;
                     highestTxSet = cTxSet;
@@ -1354,6 +1568,29 @@ HerderSCPDriver::purgeSlotsOutsideRange(std::optional<uint64_t> minSlotIndex,
     }
 
     getSCP().purgeSlotsOutsideRange(minSlotIndex, maxSlotIndex, slotToKeep);
+
+    // Parallel tx set download: drop pending-tx-set-wrapper registry entries
+    // whose wrappers have all expired (e.g. a tx set that never arrived for a
+    // now-purged slot), so the maps don't grow unbounded.
+    auto const dropDeadWrappers = [](auto& registry) {
+        for (auto it = registry.begin(); it != registry.end();)
+        {
+            auto& vec = it->second;
+            vec.erase(std::remove_if(vec.begin(), vec.end(),
+                                     [](auto const& wp) { return wp.expired(); }),
+                      vec.end());
+            if (vec.empty())
+            {
+                it = registry.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+    };
+    dropDeadWrappers(mPendingTxSetWrappers);
+    dropDeadWrappers(mPendingTxSetEnvelopeWrappers);
 }
 
 void
@@ -1367,21 +1604,42 @@ class SCPHerderValueWrapper : public ValueWrapper
 {
     HerderImpl& mHerder;
 
+    Hash mTxSetHash;
     TxSetXDRFrameConstPtr mTxSet;
 
   public:
     explicit SCPHerderValueWrapper(StellarValue const& sv, Value const& value,
                                    HerderImpl& herder)
-        : ValueWrapper(value), mHerder(herder)
+        : ValueWrapper(value), mHerder(herder), mTxSetHash(sv.txSetHash)
     {
+        // Parallel tx set download (docs/direct-leader-flooding.md): bind the
+        // tx set if we have it (pinning it -- the shared_ptr keeps the set alive
+        // through LRU eviction), otherwise leave it null and rely on setTxSet()
+        // back-fill once the leader's push arrives. No longer throws on an
+        // absent tx set.
         mTxSet = mHerder.getTxSet(sv.txSetHash);
-        if (!mTxSet)
-        {
-            throw std::runtime_error(fmt::format(
-                FMT_STRING(
-                    "SCPHerderValueWrapper tried to bind an unknown tx set {}"),
-                hexAbbrev(sv.txSetHash)));
-        }
+    }
+
+    bool
+    hasTxSet() const
+    {
+        // An empty-tx-set value (docs/direct-leader-flooding.md) references no
+        // downloadable set, so it is never "missing" -- otherwise wrapValue
+        // would park it in mPendingTxSetWrappers forever waiting for a set
+        // that will never arrive.
+        return mTxSet != nullptr || mTxSetHash == Herder::EMPTY_TX_SET_HASH;
+    }
+
+    Hash const&
+    getTxSetHash() const
+    {
+        return mTxSetHash;
+    }
+
+    void
+    setTxSet(TxSetXDRFrameConstPtr txSet) override
+    {
+        mTxSet = txSet;
     }
 };
 
@@ -1397,6 +1655,10 @@ HerderSCPDriver::wrapValue(Value const& val)
                         binToHex(val)));
     }
     auto res = std::make_shared<SCPHerderValueWrapper>(sv, val, mHerder);
+    if (!res->hasTxSet())
+    {
+        mPendingTxSetWrappers[res->getTxSetHash()].emplace_back(res);
+    }
     return res;
 }
 
@@ -1405,7 +1667,45 @@ HerderSCPDriver::wrapStellarValue(StellarValue const& sv)
 {
     auto val = xdr::xdr_to_opaque(sv);
     auto res = std::make_shared<SCPHerderValueWrapper>(sv, val, mHerder);
+    if (!res->hasTxSet())
+    {
+        mPendingTxSetWrappers[res->getTxSetHash()].emplace_back(res);
+    }
     return res;
+}
+
+void
+HerderSCPDriver::onTxSetReceived(Hash const& hash, TxSetXDRFrameConstPtr txSet)
+{
+    // Parallel tx set download (docs/direct-leader-flooding.md): a tx set that
+    // some in-flight value/envelope wrapper was waiting for has arrived. Hand it
+    // to every still-live wrapper so the wrapper pins it (keeping it alive
+    // through LRU eviction of PendingEnvelopes' cache), then drop the entries.
+    auto vit = mPendingTxSetWrappers.find(hash);
+    if (vit != mPendingTxSetWrappers.end())
+    {
+        for (auto& wp : vit->second)
+        {
+            if (auto sp = wp.lock())
+            {
+                sp->setTxSet(txSet);
+            }
+        }
+        mPendingTxSetWrappers.erase(vit);
+    }
+
+    auto eit = mPendingTxSetEnvelopeWrappers.find(hash);
+    if (eit != mPendingTxSetEnvelopeWrappers.end())
+    {
+        for (auto& wp : eit->second)
+        {
+            if (auto sp = wp.lock())
+            {
+                sp->addTxSet(txSet);
+            }
+        }
+        mPendingTxSetEnvelopeWrappers.erase(eit);
+    }
 }
 
 void

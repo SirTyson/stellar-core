@@ -326,8 +326,21 @@ HerderImpl::processExternalized(uint64 slotIndex, StellarValue const& value,
                      slotIndex, hexAbbrev(value.txSetHash));
     }
 
-    TxSetXDRFrameConstPtr externalizedSet =
-        mPendingEnvelopes.getTxSet(value.txSetHash);
+    TxSetXDRFrameConstPtr externalizedSet;
+    if (value.ext.v() == STELLAR_VALUE_EMPTY_TX_SET)
+    {
+        // Empty-tx-set recovery (docs/direct-leader-flooding.md): the tx set
+        // was dropped to break a download stall. Materialize the canonical
+        // empty set for this ledger (getTxSet(EMPTY_TX_SET_HASH) is null) so
+        // the ledger closes empty.
+        auto const& ov = value.ext.proposedValue();
+        externalizedSet = TxSetXDRFrame::makeEmpty(ov.previousLedgerHash,
+                                                   ov.previousLedgerVersion);
+    }
+    else
+    {
+        externalizedSet = mPendingEnvelopes.getTxSet(value.txSetHash);
+    }
 
     // Notify overlay to clear TXs from mempool (for RustOverlayManager)
     // Extract TX hashes from the externalized set so Rust can remove them
@@ -1722,7 +1735,19 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
             !round1Leaders.empty() &&
             round1Leaders.front() == mApp.getConfig().NODE_SEED.getPublicKey();
 
-        if (selfIsRound1Leader)
+        if (mApp.getConfig().ARTIFICIALLY_DROP_NOMINATED_TX_SET_FOR_TESTING)
+        {
+            // Wedge-repro testing: the nominated set is neither pushed nor
+            // cached (leader or not), so NO peer can obtain the body -- the
+            // limit case of "leader delivery too slow". Only the empty-tx-set
+            // recovery can unblock the slot.
+            CLOG_INFO(Herder,
+                      "TESTING: dropping nominated TX set {} (not pushed, "
+                      "not cached)",
+                      binToHex(txSetHash).substr(0, 8));
+        }
+        else if (selfIsRound1Leader &&
+                 !mApp.getConfig().ARTIFICIALLY_SUPPRESS_TX_SET_FLOOD_FOR_TESTING)
         {
             CLOG_DEBUG(Herder,
                        "Round-1 leader: eagerly broadcasting TX set {} to peers",
@@ -1731,6 +1756,8 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
         }
         else
         {
+            // Non-leader, or a test simulating a flood miss: keep the set
+            // servable for fetches without pushing it.
             mApp.getOverlayManager().cacheTxSet(txSetHash, xdrBytes);
         }
     }
@@ -2758,6 +2785,19 @@ bool
 HerderImpl::verifyStellarValueSignature(StellarValue const& sv)
 {
     ZoneScoped;
+    // Empty-tx-set recovery (docs/direct-leader-flooding.md): an empty-tx-set
+    // value carries the ORIGINAL proposal's signature in proposedValue, signed
+    // over the original (txSetHash, closeTime). Verify against that, not the
+    // (absent) top-level signature arm.
+    if (sv.ext.v() == STELLAR_VALUE_EMPTY_TX_SET)
+    {
+        auto const& ov = sv.ext.proposedValue();
+        auto [b, _] = PubKeyUtils::verifySig(
+            ov.lcValueSignature.nodeID, ov.lcValueSignature.signature,
+            xdr::xdr_to_opaque(mApp.getNetworkID(), ENVELOPE_TYPE_SCPVALUE,
+                               ov.txSetHash, sv.closeTime));
+        return b;
+    }
     auto [b, _] = PubKeyUtils::verifySig(
         sv.ext.lcValueSignature().nodeID, sv.ext.lcValueSignature().signature,
         xdr::xdr_to_opaque(mApp.getNetworkID(), ENVELOPE_TYPE_SCPVALUE,

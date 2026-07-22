@@ -135,8 +135,10 @@ RustOverlayManager::start()
         return true;
     });
 
-    mOverlayIPC->setPeerConfig(cfg.KNOWN_PEERS, cfg.PREFERRED_PEERS,
-                               cfg.PEER_PORT, quorumMembers);
+    mOverlayIPC->setPeerConfig(
+        cfg.KNOWN_PEERS, cfg.PREFERRED_PEERS, cfg.PEER_PORT, quorumMembers,
+        cfg.EXPERIMENTAL_TX_BATCH_MAX_SIZE,
+        cfg.ARTIFICIALLY_KEEP_SUBMITTED_TXS_LOCAL_FOR_TESTING);
 
     CLOG_INFO(Overlay, "RustOverlayManager started, peer_port={}",
               cfg.PEER_PORT);

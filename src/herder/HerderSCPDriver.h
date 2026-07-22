@@ -72,6 +72,29 @@ class HerderSCPDriver : public SCPDriver
     ValueWrapperPtr extractValidValue(uint64_t slotIndex,
                                       Value const& value) override;
 
+    // Empty-tx-set recovery (docs/direct-leader-flooding.md): unconditionally
+    // enabled on this experimental branch so a node stuck waiting for an
+    // undisseminated tx set can vote an empty set after a timeout.
+    bool protocolAllowsEmptyTxSetValues() const override;
+    std::optional<std::chrono::milliseconds>
+    getTxSetDownloadWaitTime(Value const& v) const override;
+    std::chrono::milliseconds getTxSetDownloadTimeout() const override;
+    Value makeEmptyTxSetValueFromValue(Value const& v) const override;
+    bool isEmptyTxSetValue(Value const& v) const override;
+    void noteEmptyTxSetValueReplaced(uint64_t slotIndex) override;
+
+    // Parallel tx set download (docs/direct-leader-flooding.md): may
+    // PendingEnvelopes hand this envelope to SCP now? True when the qset is
+    // present and either all tx sets are fetched, or it is a current-ledger
+    // nomination/PREPARE whose tx set is still arriving (so SCP can advance
+    // while the leader's push lands). Unconditional on this experimental branch.
+    bool isEnvelopeReady(SCPEnvelope const& env);
+
+    // Parallel tx set download: a tx set arrived; pin it into any in-flight
+    // value/envelope wrappers that were waiting for it. Called from
+    // PendingEnvelopes::recvTxSet.
+    void onTxSetReceived(Hash const& hash, TxSetXDRFrameConstPtr txSet);
+
     // value marshaling
     std::string toShortString(NodeID const& pk) const override;
     std::string getValueString(Value const& v) const override;
@@ -199,6 +222,15 @@ class HerderSCPDriver : public SCPDriver
     PendingEnvelopes& mPendingEnvelopes;
     SCP mSCP;
 
+    // Parallel tx set download (docs/direct-leader-flooding.md): value/envelope
+    // wrappers created before their tx set arrived, keyed by the awaited tx set
+    // hash. onTxSetReceived pins the set into them; purgeSlotsOutsideRange drops
+    // dead entries. weak_ptr so a wrapper SCP has released can be reclaimed.
+    std::map<Hash, std::vector<std::weak_ptr<ValueWrapper>>>
+        mPendingTxSetWrappers;
+    std::map<Hash, std::vector<std::weak_ptr<SCPEnvelopeWrapper>>>
+        mPendingTxSetEnvelopeWrappers;
+
     struct SCPMetrics
     {
         medida::Meter& mEnvelopeSign;
@@ -216,6 +248,10 @@ class HerderSCPDriver : public SCPDriver
         // Timers tracking externalize messages
         medida::Timer& mFirstToSelfExternalizeLag;
         medida::Timer& mSelfToOthersExternalizeLag;
+
+        // Empty-tx-set recovery: how often a stuck value was replaced with an
+        // empty-tx-set value (docs/direct-leader-flooding.md).
+        medida::Counter& mEmptyTxSetValueReplaced;
 
         SCPMetrics(Application& app);
     };

@@ -9,12 +9,18 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 
 #include "xdr/Stellar-SCP.h"
 
 namespace stellar
 {
+// Forward declaration so wrappers can hold/pin a tx set without SCP depending on
+// herder (parallel tx set download; see docs/direct-leader-flooding.md).
+class TxSetXDRFrame;
+using TxSetXDRFrameConstPtr = std::shared_ptr<TxSetXDRFrame const>;
+
 class ValueWrapper : public NonMovableOrCopyable
 {
     Value const mValue;
@@ -27,6 +33,15 @@ class ValueWrapper : public NonMovableOrCopyable
     getValue() const
     {
         return mValue;
+    }
+
+    // Parallel tx set download: back-fill (and thereby pin) the tx set this
+    // value references once it arrives, so the wrapper's shared_ptr keeps the
+    // set alive across LRU eviction. No-op for wrappers that don't reference a
+    // tx set.
+    virtual void
+    setTxSet(TxSetXDRFrameConstPtr)
+    {
     }
 };
 
@@ -58,6 +73,13 @@ class SCPEnvelopeWrapper : public NonMovableOrCopyable
     getStatement() const
     {
         return mEnvelope.statement;
+    }
+
+    // Parallel tx set download: back-fill (and pin) a tx set this envelope
+    // references once it arrives. No-op by default.
+    virtual void
+    addTxSet(TxSetXDRFrameConstPtr)
+    {
     }
 };
 
@@ -115,9 +137,15 @@ class SCPDriver
     // NB: validation levels are ordered
     enum ValidationLevel
     {
-        kInvalidValue = 0,       // value is invalid for sure
-        kMaybeValidValue = 1,    // value may be valid
-        kFullyValidatedValue = 2 // value is valid for sure
+        kInvalidValue = 0,    // value is invalid for sure
+        kMaybeValidValue = 1, // may be valid, but for a ledger other than LCL+1
+        // LCL+1 and structurally valid (close time etc), but the tx set it
+        // references is still being downloaded (parallel tx set download; see
+        // docs/direct-leader-flooding.md). Such a value may drive nomination
+        // and PREPARE, but a node must not vote-to-commit or externalize it
+        // until the tx set arrives and it becomes kFullyValidatedValue.
+        kStructurallyValidValue = 2,
+        kFullyValidatedValue = 3 // value is valid for sure
     };
     virtual ValidationLevel
     validateValue(uint64 slotIndex, Value const& value, bool nomination)
@@ -134,6 +162,66 @@ class SCPDriver
     extractValidValue(uint64 slotIndex, Value const& value)
     {
         return nullptr;
+    }
+
+    // Empty-tx-set recovery (docs/direct-leader-flooding.md). A node stuck in
+    // PREPARE on a value whose tx set is only structurally valid (still
+    // downloading) may, after a timeout, replace it with an empty-tx-set value
+    // so the network keeps closing ledgers. The following hooks let the ballot
+    // protocol drive that without depending on herder. Defaults make the
+    // feature a no-op (used by unit-test drivers); HerderSCPDriver overrides.
+
+    // Gate: whether replacing a stuck value with an empty-tx-set value is
+    // allowed at all.
+    virtual bool
+    protocolAllowsEmptyTxSetValues() const
+    {
+        return false;
+    }
+
+    // How long the tx set referenced by `v` has been awaited (nullopt if not
+    // awaited / already present).
+    virtual std::optional<std::chrono::milliseconds>
+    getTxSetDownloadWaitTime(Value const& v) const
+    {
+        return std::nullopt;
+    }
+
+    // How long to wait for a tx set before voting an empty set instead.
+    virtual std::chrono::milliseconds
+    getTxSetDownloadTimeout() const
+    {
+        return std::chrono::milliseconds::max();
+    }
+
+    // Produce an empty-tx-set value derived from `v` (carrying v's original
+    // proposal context + signature, so all replacing nodes agree on the same
+    // value). Default: identity (no replacement).
+    virtual Value
+    makeEmptyTxSetValueFromValue(Value const& v) const
+    {
+        return v;
+    }
+
+    // Whether `v` is an empty-tx-set value.
+    virtual bool
+    isEmptyTxSetValue(Value const& v) const
+    {
+        return false;
+    }
+
+    // Telemetry hooks (no-ops by default).
+    virtual void
+    noteEmptyTxSetValueReplaced(uint64 slotIndex)
+    {
+    }
+    virtual void
+    recordBallotBlockedOnTxSet(uint64 slotIndex, Value const& v)
+    {
+    }
+    virtual void
+    measureAndRecordBallotBlockedOnTxSet(uint64 slotIndex, Value const& v)
+    {
     }
 
     // `getValueString` is used for debugging

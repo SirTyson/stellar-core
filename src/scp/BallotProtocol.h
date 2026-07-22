@@ -294,6 +294,14 @@ class BallotProtocol
     // we have.
     bool updateCurrentValue(SCPBallot const& ballot);
 
+    // Empty-tx-set recovery (docs/direct-leader-flooding.md): if we are stuck
+    // in PREPARE on a value whose tx set is only structurally valid (still
+    // downloading) past the download timeout, rewrite `v` in place to an
+    // empty-tx-set value so the network can close an empty ledger. Returns
+    // true if `v` was replaced. No-op unless the driver supports empty-tx-set
+    // values.
+    bool maybeReplaceValueWithEmptyTxSet(Value& v) const;
+
     // emits a statement reflecting the nodes' current state
     // and attempts to make progress
     void emitCurrentStateStatement();

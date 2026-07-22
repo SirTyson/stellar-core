@@ -26,10 +26,20 @@ using namespace std;
 namespace stellar
 {
 
+// Tx set fetch fallback (docs/direct-leader-flooding.md): flooding is the
+// primary delivery path; a set still missing after DELAY is requested from a
+// single peer, re-requested every RETRY while missing (the overlay retries a
+// different peer once a request goes stale). DELAY gives the flood a
+// comfortable head start; RETRY bounds the per-hash request rate to ~1/s.
+std::chrono::milliseconds const TXSET_FETCH_FALLBACK_DELAY(500);
+std::chrono::milliseconds const TXSET_FETCH_FALLBACK_RETRY(1000);
+std::chrono::milliseconds const TXSET_FETCH_FALLBACK_TICK(250);
+
 PendingEnvelopes::PendingEnvelopes(Application& app, HerderImpl& herder)
     : mApp(app)
     , mHerder(herder)
     , mQsetCache(QSET_CACHE_SIZE)
+    , mTxSetFetchFallbackTimer(app)
     , mTxSetCache(TXSET_CACHE_SIZE)
     , mValueSizeCache(TXSET_CACHE_SIZE + QSET_CACHE_SIZE)
     , mRebuildQuorum(true)
@@ -253,6 +263,15 @@ PendingEnvelopes::recvTxSet(Hash const& hash, TxSetXDRFrameConstPtr txset)
     // leaders).
     addTxSet(hash, 0, txset);
 
+    // Parallel tx set download: no longer awaiting this set. Values referencing
+    // it will now validate fully (getKnownTxSet hits) on the next SCP re-drive.
+    mTxSetWaiting.erase(hash);
+
+    // Pin the set into any in-flight SCP value/envelope wrappers that were
+    // created before it arrived, so it survives LRU eviction while SCP is still
+    // considering those values (docs/direct-leader-flooding.md).
+    mHerder.getHerderSCPDriver().onTxSetReceived(hash, txset);
+
     // If we were already waiting on this set (nomination processed first),
     // resume the envelopes that were blocked on it.
     auto it = mPendingTxSetFetches.find(hash);
@@ -322,7 +341,10 @@ PendingEnvelopes::recvSCPEnvelope(SCPEnvelope const& envelope)
 
     auto const& values = maybeValues.value();
     if (std::any_of(values.begin(), values.end(), [](auto const& value) {
-            return value.ext.v() != STELLAR_VALUE_SIGNED;
+            // Empty-tx-set recovery values are permitted alongside signed
+            // values (docs/direct-leader-flooding.md).
+            return value.ext.v() != STELLAR_VALUE_SIGNED &&
+                   value.ext.v() != STELLAR_VALUE_EMPTY_TX_SET;
         }))
     {
         CLOG_TRACE(Herder, "Dropping envelope from {} (value not signed)",
@@ -375,8 +397,11 @@ PendingEnvelopes::recvSCPEnvelope(SCPEnvelope const& envelope)
         }
 
         // we are fetching this envelope
-        // check if we are done fetching it
-        if (isFullyFetched(envelope))
+        // Hand it to SCP once it is ready. Normally that means fully fetched;
+        // with parallel tx set download it also means a current-ledger
+        // nomination/PREPARE whose qset is present but whose tx set is still
+        // arriving (isEnvelopeReady), so SCP can advance while the push lands.
+        if (mHerder.getHerderSCPDriver().isEnvelopeReady(envelope))
         {
             std::chrono::nanoseconds durationNano =
                 mApp.getClock().now() - fetchIt->second;
@@ -603,18 +628,59 @@ PendingEnvelopes::isFullyFetched(SCPEnvelope const& envelope)
                        });
 }
 
+bool
+PendingEnvelopes::isQsetFetched(SCPEnvelope const& envelope)
+{
+    return getKnownQSet(
+               Slot::getCompanionQuorumSetHashFromStatement(envelope.statement),
+               false) != nullptr;
+}
+
+bool
+PendingEnvelopes::areTxSetsFetched(SCPEnvelope const& envelope)
+{
+    auto txSetHashes = getValidatedTxSetHashes(envelope);
+    return std::all_of(std::begin(txSetHashes), std::end(txSetHashes),
+                       [&](Hash const& txSetHash) {
+                           return getKnownTxSet(txSetHash, 0, false) != nullptr;
+                       });
+}
+
+std::optional<std::chrono::milliseconds>
+PendingEnvelopes::getTxSetWaitingTime(Hash const& hash) const
+{
+    auto it = mTxSetWaiting.find(hash);
+    if (it == mTxSetWaiting.end())
+    {
+        return std::nullopt;
+    }
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        mApp.getClock().now() - it->second);
+}
+
 void
 PendingEnvelopes::startFetch(SCPEnvelope const& envelope)
 {
     ZoneScoped;
     Hash h = Slot::getCompanionQuorumSetHashFromStatement(envelope.statement);
 
+    // startFetch is called more than once for the same envelope (first on
+    // insertion into mFetchingEnvelopes, then again on the "keep waiting" path,
+    // and once per re-receipt from another peer). Dedup so a waiting envelope
+    // is stored at most once per hash -- otherwise the waiting vectors (and the
+    // work recvTxSet later replays) grow with every duplicate flood.
+    auto addWaiter = [&](std::vector<SCPEnvelope>& vec) {
+        if (std::find(vec.begin(), vec.end(), envelope) == vec.end())
+        {
+            vec.push_back(envelope);
+        }
+    };
+
     bool needSomething = false;
     if (!getKnownQSet(h, false))
     {
         // Track that we need this qset - will be requested via IPC
-        auto& vec = mPendingQSetFetches[h];
-        vec.push_back(envelope);
+        addWaiter(mPendingQSetFetches[h]);
         needSomething = true;
     }
 
@@ -624,7 +690,7 @@ PendingEnvelopes::startFetch(SCPEnvelope const& envelope)
         if (it != mPendingTxSetFetches.end())
         {
             // Already fetching - just add envelope to waiting list
-            it->second.push_back(envelope);
+            addWaiter(it->second);
         }
         else if (!getKnownTxSet(h2, 0, false))
         {
@@ -640,6 +706,14 @@ PendingEnvelopes::startFetch(SCPEnvelope const& envelope)
             // a non-broadcasting node, this envelope stays pending for the slot.
             auto& vec = mPendingTxSetFetches[h2];
             vec.push_back(envelope);
+            // Parallel tx set download: remember when we started awaiting this
+            // tx set so validateValue can treat referencing values as
+            // structurally valid while the push is in flight.
+            mTxSetWaiting.emplace(h2, mApp.getClock().now());
+            // Arm the fetch fallback: if the flood misses us, request the set
+            // rather than waiting forever (a stuck set would otherwise strand
+            // this node on the slot -- flooding is push-only).
+            maybeArmTxSetFetchFallbackTimer();
         }
     }
 
@@ -649,6 +723,88 @@ PendingEnvelopes::startFetch(SCPEnvelope const& envelope)
                    hexAbbrev(xdrSha256(envelope)), envelope.statement.slotIndex,
                    envelope.statement.pledges.type());
     }
+}
+
+void
+PendingEnvelopes::maybeArmTxSetFetchFallbackTimer()
+{
+    if (mTxSetWaiting.empty() || mTxSetFetchFallbackArmed)
+    {
+        return;
+    }
+    mTxSetFetchFallbackArmed = true;
+    mTxSetFetchFallbackTimer.expires_from_now(TXSET_FETCH_FALLBACK_TICK);
+    mTxSetFetchFallbackTimer.async_wait(
+        [this]() {
+            mTxSetFetchFallbackArmed = false;
+            txSetFetchFallbackTick();
+        },
+        VirtualTimer::onFailureNoop);
+}
+
+void
+PendingEnvelopes::txSetFetchFallbackTick()
+{
+    ZoneScoped;
+    auto const now = mApp.getClock().now();
+    for (auto const& [hash, since] : mTxSetWaiting)
+    {
+        if (now - since < TXSET_FETCH_FALLBACK_DELAY)
+        {
+            // Give the flood its head start.
+            continue;
+        }
+        auto it = mTxSetFetchRequested.find(hash);
+        if (it != mTxSetFetchRequested.end() &&
+            now - it->second < TXSET_FETCH_FALLBACK_RETRY)
+        {
+            // A request is in flight; the overlay dedups and, once it goes
+            // stale, retries a different peer on our next request.
+            continue;
+        }
+        CLOG_INFO(Herder,
+                  "TXSET_FETCH_FALLBACK: tx set {} still missing after {} ms; "
+                  "requesting from a peer (flood miss suspected)",
+                  hexAbbrev(hash),
+                  std::chrono::duration_cast<std::chrono::milliseconds>(now -
+                                                                        since)
+                      .count());
+        mApp.getOverlayManager().requestTxSet(hash);
+        mTxSetFetchRequested[hash] = now;
+    }
+
+    // Age out waiting markers that can no longer matter: any slot resolves
+    // (externalize/purge) well within this horizon, so a marker this old is
+    // garbage from an abandoned slot, not an active download.
+    auto const maxAge = std::chrono::minutes(5);
+    for (auto it = mTxSetWaiting.begin(); it != mTxSetWaiting.end();)
+    {
+        if (now - it->second > maxAge)
+        {
+            it = mTxSetWaiting.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+
+    // Drop request stamps for hashes no longer awaited (arrived or purged).
+    for (auto it = mTxSetFetchRequested.begin();
+         it != mTxSetFetchRequested.end();)
+    {
+        if (mTxSetWaiting.find(it->first) == mTxSetWaiting.end())
+        {
+            it = mTxSetFetchRequested.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+
+    // Keep ticking while anything is still awaited.
+    maybeArmTxSetFetchFallbackTimer();
 }
 
 void
@@ -668,6 +824,16 @@ PendingEnvelopes::stopFetch(SCPEnvelope const& envelope)
             if (vec.empty())
             {
                 mPendingTxSetFetches.erase(it);
+                // Deliberately KEEP mTxSetWaiting[h2]: early-delivered
+                // envelopes are no longer in the waiter list, but the slot's
+                // values still validate as structurally-valid against this
+                // marker. Erasing it here turned one discarded envelope into
+                // network deafness: every later statement carrying the hash
+                // validated kInvalidValue and was rejected, counters stopped
+                // propagating, ballot timers died (the reproduced wedge).
+                // The marker is cleared on arrival (recvTxSet), on slot purge
+                // (eraseOutsideRange), or by the age sweep in the fetch
+                // fallback tick.
             }
         }
     }
@@ -767,6 +933,40 @@ PendingEnvelopes::eraseOutsideRange(std::optional<uint64> minSlot,
         while (iter != mEnvelopes.end())
         {
             maybeEraseEnvelope(iter);
+        }
+    }
+
+    // Purge tx-set fetch bookkeeping for slots outside the kept range, in step
+    // with the mEnvelopes purge above. mPendingTxSetFetches holds full
+    // SCPEnvelope copies and mTxSetWaiting holds a per-hash marker; both are
+    // otherwise cleared only when a set actually arrives (recvTxSet) or a
+    // waiter is discarded (stopFetch), so a slot whose pushed set was never
+    // delivered would leak both entries forever (direct leader flooding has no
+    // fetch/timeout fallback -- see startFetch).
+    auto const slotPurged = [&](uint64 slot) {
+        if (slot == slotToKeep)
+        {
+            return false;
+        }
+        return (minSlot && slot < *minSlot) || (maxSlot && slot > *maxSlot);
+    };
+    for (auto it = mPendingTxSetFetches.begin();
+         it != mPendingTxSetFetches.end();)
+    {
+        auto& vec = it->second;
+        vec.erase(std::remove_if(vec.begin(), vec.end(),
+                                 [&](SCPEnvelope const& e) {
+                                     return slotPurged(e.statement.slotIndex);
+                                 }),
+                  vec.end());
+        if (vec.empty())
+        {
+            mTxSetWaiting.erase(it->first);
+            it = mPendingTxSetFetches.erase(it);
+        }
+        else
+        {
+            ++it;
         }
     }
 
