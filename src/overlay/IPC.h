@@ -76,6 +76,12 @@ enum class IPCMessageType : uint32_t
     /// Response: OVERLAY_METRICS_RESPONSE with JSON payload
     REQUEST_OVERLAY_METRICS = 13,
 
+    /// Upcoming nomination leaders to flood transactions to (replaces the
+    /// previous set; see docs/direct-leader-flooding.md)
+    /// Payload: JSON { "slot": u64, "leaders": ["G...", ...] } ordered by
+    /// election priority
+    SET_LEADERS = 14,
+
     // ═══ Overlay → Core (Critical Path) ═══
 
     /// Received SCP envelope from network

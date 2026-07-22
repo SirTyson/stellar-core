@@ -807,6 +807,34 @@ OverlayIPC::setPeerConfig(std::vector<std::string> const& knownPeers,
 }
 
 void
+OverlayIPC::updateLeaders(uint64_t slotIndex,
+                          std::vector<std::string> const& leaderStrkeys)
+{
+    if (!mChannel || !mChannel->isConnected())
+    {
+        return;
+    }
+
+    std::string json = "{\"slot\":" + std::to_string(slotIndex);
+    json += ",\"leaders\":[";
+    for (size_t i = 0; i < leaderStrkeys.size(); ++i)
+    {
+        if (i > 0)
+            json += ",";
+        json += "\"" + leaderStrkeys[i] + "\"";
+    }
+    json += "]}";
+
+    IPCMessage msg;
+    msg.type = IPCMessageType::SET_LEADERS;
+    msg.payload.assign(json.begin(), json.end());
+
+    CLOG_DEBUG(Overlay, "Sending flood leaders: {}", json);
+    std::lock_guard<std::mutex> lock(mSendMutex);
+    mChannel->send(msg);
+}
+
+void
 OverlayIPC::requestScpState(uint32_t ledgerSeq)
 {
     if (!mChannel || !mChannel->isConnected())

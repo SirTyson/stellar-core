@@ -245,6 +245,15 @@ class HerderImpl : public Herder
 
     void setupTriggerNextLedger();
 
+    // With LCL = L, compute the top FLOOD_LEADER_COUNT nomination leaders of
+    // slot L+2 (newly determined by hash(L)) and push them to the overlay so
+    // it can flood transactions to them during L+1's window. See
+    // docs/direct-leader-flooding.md.
+    void pushLeaderSchedule();
+
+    // One-shot flag for pushLeaderSchedule's old-style-election warning.
+    bool mWarnedOldStyleLeaderSchedule{false};
+
     // Compute the trigger-timer anchor point using the local node's
     // prepare-start timestamp for the previous slot. Returns a pessimistic
     // estimate (now - expectedClose) if no prepare-start is recorded.
