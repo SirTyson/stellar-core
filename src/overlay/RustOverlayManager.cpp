@@ -241,6 +241,16 @@ RustOverlayManager::cacheTxSet(Hash const& txSetHash,
     }
 }
 
+void
+RustOverlayManager::broadcastTxSet(Hash const& txSetHash,
+                                   std::vector<uint8_t> const& xdr)
+{
+    if (mOverlayIPC && !mShuttingDown)
+    {
+        mOverlayIPC->broadcastTxSet(txSetHash, xdr);
+    }
+}
+
 std::vector<TransactionEnvelope>
 RustOverlayManager::getTopTransactions(size_t count, int timeoutMs)
 {
@@ -380,6 +390,8 @@ RustOverlayManager::syncOverlayMetrics()
     markDelta(m.mFloodLeaderPushMeter, "flood_leader_push");
     markDelta(m.mFloodLeaderPushBytesMeter, "flood_leader_push_bytes");
     markDelta(m.mFloodLeaderFallbackMeter, "flood_leader_fallback");
+    markDelta(m.mFloodTxSetPushMeter, "flood_txset_push");
+    markDelta(m.mFloodTxSetPushBytesMeter, "flood_txset_push_bytes");
 
     // Send meters per message type
     markDelta(m.mSendSCPMessageSetMeter, "send_scp_message");

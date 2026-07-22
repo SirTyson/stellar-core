@@ -1246,6 +1246,108 @@ TEST_CASE("TX routed directly to leader", "[overlay-ipc][herder][.]")
 }
 
 /**
+ * End-to-end test of eager TX set dissemination (direct leader flooding, TxSet
+ * push; see docs/direct-leader-flooding.md). The round-1 leader pushes its
+ * nominated TX set body to all peers, and the GetTxSet request path is removed
+ * from live nomination.
+ *
+ * On a real 3-validator network, a TX submitted to one node must still be
+ * included and applied on ALL nodes. With no request fallback, a non-leader can
+ * only validate (and thus vote for) the nominated value if it obtained the TX
+ * set via the eager push -- so inclusion-on-all-nodes exercises the push path
+ * end-to-end. The network must also report at least one eager TX set push
+ * (flood_txset_push) on the node(s) that led a round.
+ */
+TEST_CASE("TX set eagerly pushed to peers", "[overlay-ipc][herder][.]")
+{
+    std::string overlayBinary = requireOverlayBinary();
+    Hash networkID = sha256(getTestConfig().NETWORK_PASSPHRASE);
+    auto simulation = std::make_shared<Simulation>(networkID);
+
+    std::vector<SecretKey> keys;
+    for (int i = 0; i < 3; ++i)
+    {
+        keys.push_back(SecretKey::fromSeed(
+            sha256("TXSET_PUSH_TEST_NODE_" + std::to_string(i))));
+    }
+
+    SCPQuorumSet qSet;
+    qSet.threshold = 2;
+    for (auto const& k : keys)
+    {
+        qSet.validators.push_back(k.getPublicKey());
+    }
+
+    uint16_t const basePort = 11673;
+    std::vector<Application::pointer> nodes;
+    for (int i = 0; i < 3; ++i)
+    {
+        auto cfg = simulation->newConfig();
+        cfg.PEER_PORT = basePort + i;
+        for (int j = 0; j < 3; ++j)
+        {
+            if (j != i)
+            {
+                cfg.KNOWN_PEERS.push_back("127.0.0.1:" +
+                                          std::to_string(basePort + j));
+            }
+        }
+        nodes.push_back(simulation->addNode(keys[i], qSet, &cfg));
+    }
+    simulation->startAllNodes();
+
+    // Close a few ledgers so the leader schedule is installed everywhere.
+    simulation->crankUntil(
+        [&]() { return simulation->haveAllExternalized(3, 2); },
+        30 * 3 * simulation->getExpectedLedgerCloseTime(), false);
+    REQUIRE(simulation->haveAllExternalized(3, 2));
+
+    // Submit a TX to node0.
+    auto root = TestAccount{*nodes[0], txtest::getRoot(networkID)};
+    SecretKey destKey = SecretKey::pseudoRandomForTesting();
+    auto tx =
+        root.tx({txtest::createAccount(destKey.getPublicKey(), 500000000000)});
+    REQUIRE(nodes[0]->getHerder().recvTransaction(tx, false) ==
+            TxSubmitStatus::TX_STATUS_PENDING);
+
+    // The TX must be included and applied on ALL nodes -- only possible if the
+    // nominated TX set reached every node via the eager push (no request path).
+    uint32_t const targetLedger = 6;
+    simulation->crankUntil(
+        [&]() { return simulation->haveAllExternalized(targetLedger, 2); },
+        30 * targetLedger * simulation->getExpectedLedgerCloseTime(), false);
+    REQUIRE(simulation->haveAllExternalized(targetLedger, 2));
+
+    for (auto const& node : nodes)
+    {
+        LedgerTxn ltx(node->getLedgerTxnRoot());
+        REQUIRE(stellar::loadAccount(ltx, destKey.getPublicKey()));
+    }
+
+    // At least one node acted as a round-1 leader and eagerly pushed its TX set
+    // body to peers. Sum across the network so the assertion is independent of
+    // which node happened to lead the closed slots.
+    uint64_t totalTxSetPush = 0;
+    for (auto const& node : nodes)
+    {
+        auto metricsJson =
+            node->getOverlayManager().getOverlayIPC().requestMetrics(2000);
+        REQUIRE(!metricsJson.empty());
+        Json::Value root;
+        Json::Reader reader;
+        REQUIRE(reader.parse(metricsJson, root));
+        REQUIRE(root.isMember("flood_txset_push"));
+        totalTxSetPush += root["flood_txset_push"].asUInt64();
+    }
+    REQUIRE(totalTxSetPush >= 1);
+
+    LOG_INFO(DEFAULT_LOG,
+             "TX set eagerly pushed to peers test passed (total txset pushes: "
+             "{})",
+             totalTxSetPush);
+}
+
+/**
  * Stress test: Submit TXs in batches and measure SCP latency.
  *
  * This test verifies that SCP consensus timing remains stable even under

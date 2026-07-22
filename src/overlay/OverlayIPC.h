@@ -184,6 +184,20 @@ class OverlayIPC
      */
     void cacheTxSet(Hash const& hash, std::vector<uint8_t> const& xdr);
 
+    /**
+     * Eagerly push a locally-built TX set to all connected peers.
+     *
+     * Like cacheTxSet, but in addition to caching the set the overlay
+     * broadcasts the full body to every connected peer immediately, so
+     * receivers have it before/when they process the nomination that
+     * references it -- removing the GetTxSet request round-trip from the
+     * nomination critical path. Intended for the round-1 leader only.
+     *
+     * @param hash The TX set hash
+     * @param xdr The serialized TX set XDR
+     */
+    void broadcastTxSet(Hash const& hash, std::vector<uint8_t> const& xdr);
+
     /// Set callback for received SCP envelopes
     void setOnSCPReceived(SCPReceivedCallback cb);
 

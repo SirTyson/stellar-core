@@ -762,6 +762,26 @@ OverlayIPC::cacheTxSet(Hash const& hash, std::vector<uint8_t> const& xdr)
 }
 
 void
+OverlayIPC::broadcastTxSet(Hash const& hash, std::vector<uint8_t> const& xdr)
+{
+    if (!mChannel || !mChannel->isConnected())
+    {
+        return;
+    }
+
+    IPCMessage msg;
+    msg.type = IPCMessageType::BROADCAST_TX_SET;
+    msg.payload.resize(32 + xdr.size());
+    std::memcpy(msg.payload.data(), hash.data(), 32);
+    std::memcpy(msg.payload.data() + 32, xdr.data(), xdr.size());
+
+    CLOG_DEBUG(Overlay, "Broadcasting TX set {} ({} bytes) to all peers",
+               hexAbbrev(hash), xdr.size());
+    std::lock_guard<std::mutex> lock(mSendMutex);
+    mChannel->send(msg);
+}
+
+void
 OverlayIPC::setPeerConfig(std::vector<std::string> const& knownPeers,
                           std::vector<std::string> const& preferredPeers,
                           uint16_t listenPort,

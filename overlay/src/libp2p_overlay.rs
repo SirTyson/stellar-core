@@ -91,6 +91,9 @@ pub enum OverlayCommand {
         data: Vec<u8>,
         to: PeerId,
     },
+    /// Eagerly broadcast a TX set body to all connected peers (round-1 leader
+    /// pushes its nominated set so receivers skip the GetTxSet round-trip)
+    BroadcastTxSet { hash: [u8; 32], data: Vec<u8> },
     /// Record that a peer has a specific TX set (learned from SCP message)
     RecordTxSetSource { hash: [u8; 32], peer: PeerId },
     /// Connect to a peer by address (bootstrap — PeerId unknown)
@@ -211,6 +214,20 @@ impl OverlayHandle {
         {
             warn!(
                 "Overlay command channel closed, failed to send SendTxSet: {}",
+                e
+            );
+        }
+    }
+
+    /// Eagerly broadcast a TX set body to all connected peers.
+    pub async fn broadcast_txset(&self, hash: [u8; 32], data: Vec<u8>) {
+        if let Err(e) = self
+            .cmd_tx
+            .send(OverlayCommand::BroadcastTxSet { hash, data })
+            .await
+        {
+            warn!(
+                "Overlay command channel closed, failed to send BroadcastTxSet: {}",
                 e
             );
         }
@@ -546,6 +563,9 @@ impl StellarOverlay {
                         }
                         OverlayCommand::SendTxSet { hash, data, to } => {
                             self.send_txset_response(to, hash, data).await;
+                        }
+                        OverlayCommand::BroadcastTxSet { hash, data } => {
+                            self.broadcast_txset(hash, data).await;
                         }
                         OverlayCommand::RecordTxSetSource { hash, peer } => {
                             let mut sources = self.state.txset_sources.write().await;
@@ -1112,6 +1132,80 @@ impl StellarOverlay {
                     e
                 );
             }
+        }
+    }
+
+    /// Eagerly broadcast a TX set body to every connected peer.
+    ///
+    /// Direct leader flooding (docs/direct-leader-flooding.md): the round-1
+    /// leader pushes its nominated set to all peers so they hold it before the
+    /// nomination referencing it arrives, removing the GetTxSet round-trip from
+    /// the nomination critical path. Unlike `send_txset_response`, this is
+    /// unsolicited; receivers accept it (the inbound TxSet handler forwards a
+    /// `GeneralizedTxSet` frame to Core whether or not it was requested).
+    async fn broadcast_txset(&mut self, hash: [u8; 32], data: Vec<u8>) {
+        // `data` is our trusted local core's nominated set; skip the redundant
+        // decode/re-encode (perf fix #5357) but still guard against a
+        // hash/bytes mismatch that would make the set unfetchable network-wide,
+        // then frame by concatenation (mirrors send_txset_response).
+        if !crate::xdr::tx_set_hash_matches(&hash, &data) {
+            warn!(
+                "TXSET_BROADCAST_DROP: Dropping TxSet {:02x?}...: hash/bytes mismatch",
+                &hash[..4]
+            );
+            return;
+        }
+        let message = crate::xdr::frame_tx_set(&data);
+
+        let streams = self.state.peer_streams.read().await;
+        let peers: Vec<PeerId> = streams.keys().cloned().collect();
+        drop(streams);
+
+        if peers.is_empty() {
+            debug!(
+                "TXSET_BROADCAST_SKIP: no peers to push TX set {:02x?}...",
+                &hash[..4]
+            );
+            return;
+        }
+
+        info!(
+            "TXSET_BROADCAST: Pushing TX set {:02x?}... ({} bytes) to {} peers",
+            &hash[..4],
+            data.len(),
+            peers.len()
+        );
+
+        // Spawn parallel sends so a slow peer doesn't stall the event loop or
+        // the other sends (mirrors broadcast_scp).
+        for peer_id in peers {
+            let state = Arc::clone(&self.state);
+            let message = message.clone();
+            tokio::spawn(async move {
+                match send_to_peer_stream(&state, peer_id.clone(), StreamType::TxSet, &message)
+                    .await
+                {
+                    Ok(_) => {
+                        // Count under both the generic TxSet-send meter and the
+                        // dedicated eager-push meters (successful sends only).
+                        state.metrics.send_txset.fetch_add(1, Ordering::Relaxed);
+                        state.metrics.flood_txset_push.fetch_add(1, Ordering::Relaxed);
+                        state
+                            .metrics
+                            .flood_txset_push_bytes
+                            .fetch_add(message.len() as u64, Ordering::Relaxed);
+                        state.metrics.message_write.fetch_add(1, Ordering::Relaxed);
+                        state
+                            .metrics
+                            .byte_write
+                            .fetch_add(message.len() as u64, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        state.metrics.error_write.fetch_add(1, Ordering::Relaxed);
+                        warn!("TXSET_BROADCAST_FAIL: push to {} failed: {}", peer_id, e);
+                    }
+                }
+            });
         }
     }
 
@@ -2997,6 +3091,92 @@ mod tests {
 
         handle1.shutdown().await;
         handle2.shutdown().await;
+    }
+
+    /// Direct leader flooding (TxSet dissemination, docs/direct-leader-flooding.md):
+    /// the round-1 leader's eager `broadcast_txset` pushes the full body to
+    /// EVERY connected peer, unsolicited. Each peer receives a `TxSetReceived`
+    /// event from a single broadcast call, with no request round-trip -- which
+    /// is the latency win. Uses a 3-node star (leader + 2 peers) to exercise the
+    /// "to all peers" fan-out.
+    #[tokio::test]
+    async fn test_broadcast_txset_to_all_peers() {
+        let keypair1 = Keypair::generate_ed25519();
+        let keypair2 = Keypair::generate_ed25519();
+        let keypair3 = Keypair::generate_ed25519();
+
+        let metrics1 = Arc::new(OverlayMetrics::new());
+        let (handle1, mut events1, _tx_events1, overlay1) =
+            create_overlay(keypair1, Arc::clone(&metrics1)).unwrap();
+        let (handle2, mut events2, _tx_events2, overlay2) =
+            create_overlay(keypair2, Arc::new(OverlayMetrics::new())).unwrap();
+        let (handle3, mut events3, _tx_events3, overlay3) =
+            create_overlay(keypair3, Arc::new(OverlayMetrics::new())).unwrap();
+
+        let listen_port = 24201;
+        tokio::spawn(async move { overlay1.run("127.0.0.1", listen_port).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::spawn(async move { overlay2.run("127.0.0.1", 24202).await });
+        tokio::spawn(async move { overlay3.run("127.0.0.1", 24203).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Both peers connect to the leader (node1).
+        let addr: Multiaddr = format!("/ip4/127.0.0.1/udp/{}/quic-v1", listen_port)
+            .parse()
+            .unwrap();
+        handle2.dial(addr.clone()).await;
+        handle3.dial(addr).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Drain connection-setup events.
+        while events1.try_recv().is_ok() {}
+        while events2.try_recv().is_ok() {}
+        while events3.try_recv().is_ok() {}
+
+        // Leader eagerly pushes a TxSet to all peers. No one requested it.
+        let (want_hash, want_data) = test_txset_xdr(0x37);
+        handle1.broadcast_txset(want_hash, want_data.clone()).await;
+
+        // Both peers must receive the unsolicited body from the single push.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut got2 = false;
+        let mut got3 = false;
+        while tokio::time::Instant::now() < deadline && !(got2 && got3) {
+            tokio::select! {
+                Some(event) = events2.recv() => {
+                    if let OverlayEvent::TxSetReceived { hash, data, .. } = event {
+                        assert_eq!(hash, want_hash);
+                        assert_eq!(data, want_data);
+                        got2 = true;
+                    }
+                }
+                Some(event) = events3.recv() => {
+                    if let OverlayEvent::TxSetReceived { hash, data, .. } = event {
+                        assert_eq!(hash, want_hash);
+                        assert_eq!(data, want_data);
+                        got3 = true;
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+        }
+        assert!(got2, "peer2 should receive the eagerly pushed TxSet");
+        assert!(got3, "peer3 should receive the eagerly pushed TxSet");
+
+        // The leader must not have been asked for it: this is a pure push, so
+        // no peer emits a request and the fan-out is exactly one send per peer.
+        assert!(
+            !matches!(events1.try_recv(), Ok(OverlayEvent::TxSetRequested { .. })),
+            "leader should not receive a TxSet request on the push path"
+        );
+        // Exactly one successful push per connected peer.
+        assert_eq!(metrics1.flood_txset_push.load(Ordering::Relaxed), 2);
+        assert_eq!(metrics1.send_txset.load(Ordering::Relaxed), 2);
+        assert!(metrics1.flood_txset_push_bytes.load(Ordering::Relaxed) > 0);
+
+        handle1.shutdown().await;
+        handle2.shutdown().await;
+        handle3.shutdown().await;
     }
 
     /// Test multiple TXs flood with correct ordering (by fee)
