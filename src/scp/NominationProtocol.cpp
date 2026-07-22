@@ -245,33 +245,9 @@ NominationProtocol::updateRoundLeaders()
     int iterationsRemaining = 1000;
     while (mRoundLeaders.size() < maxLeaderCount)
     {
-        // initialize priority with value derived from self
-        std::set<NodeID> newRoundLeaders;
-
-        newRoundLeaders.insert(localID);
-        uint64 topPriority = getNodePriority(localID, myQSet);
-
-        LocalNode::forAllNodes(myQSet, [&](NodeID const& cur) {
-            uint64 w = getNodePriority(cur, myQSet);
-            if (w > topPriority)
-            {
-                topPriority = w;
-                newRoundLeaders.clear();
-            }
-            if (w == topPriority && w > 0)
-            {
-                newRoundLeaders.insert(cur);
-            }
-            return true;
-        });
-
-        if (topPriority == 0)
-        {
-            // No one had priority, so all nodes would choose themselves
-            // resulting in a timeout. Clear newRoundLeaders, allowing the
-            // algorithm to fast timeout and try again.
-            newRoundLeaders.clear();
-        }
+        std::set<NodeID> newRoundLeaders = computeRoundLeaders(
+            mSlot.getSCPDriver(), mLeaderElectionSeed, mSlot.getSlotIndex(),
+            mRoundNumber, myQSet, localID);
 
         // expand mRoundLeaders with the newly computed leaders
         auto oldSize = mRoundLeaders.size();
@@ -308,13 +284,119 @@ NominationProtocol::updateRoundLeaders()
     CLOG_DEBUG(SCP, "updateRoundLeaders: nothing to do");
 }
 
-uint64
-NominationProtocol::hashNode(bool isPriority, NodeID const& nodeID)
+std::set<NodeID>
+NominationProtocol::computeRoundLeaders(SCPDriver& driver, Value const& seed,
+                                       uint64 slotIndex, int32_t roundNumber,
+                                       SCPQuorumSet const& qset,
+                                       NodeID const& localID)
 {
     ZoneScoped;
-    dbgAssert(!mPreviousValue.empty());
-    return mSlot.getSCPDriver().computeHashNode(
-        mSlot.getSlotIndex(), mPreviousValue, isPriority, mRoundNumber, nodeID);
+    dbgAssert(!seed.empty());
+
+    // Priority of `nodeID` for this round, computed exactly as the historical
+    // getNodePriority/hashNode pair, but from explicit inputs (seed, slot,
+    // round) so the same election can be replayed ahead of time.
+    auto nodePriority = [&](NodeID const& nodeID) -> uint64 {
+        uint64 w = driver.getNodeWeight(nodeID, qset, nodeID == localID);
+        // if w > 0; w is inclusive here as 0 <= hashNode <= UINT64_MAX
+        if (w > 0 && driver.computeHashNode(slotIndex, seed, /* isPriority */
+                                            false, roundNumber, nodeID) <= w)
+        {
+            return driver.computeHashNode(slotIndex, seed, /* isPriority */ true,
+                                          roundNumber, nodeID);
+        }
+        return 0;
+    };
+
+    // initialize priority with value derived from self
+    std::set<NodeID> newRoundLeaders;
+    newRoundLeaders.insert(localID);
+    uint64 topPriority = nodePriority(localID);
+
+    LocalNode::forAllNodes(qset, [&](NodeID const& cur) {
+        uint64 w = nodePriority(cur);
+        if (w > topPriority)
+        {
+            topPriority = w;
+            newRoundLeaders.clear();
+        }
+        if (w == topPriority && w > 0)
+        {
+            newRoundLeaders.insert(cur);
+        }
+        return true;
+    });
+
+    if (topPriority == 0)
+    {
+        // No one had priority, so all nodes would choose themselves resulting
+        // in a timeout. Clear newRoundLeaders, allowing the algorithm to fast
+        // timeout and try again.
+        newRoundLeaders.clear();
+    }
+    return newRoundLeaders;
+}
+
+std::vector<NodeID>
+NominationProtocol::computeLeaderSchedule(SCPDriver& driver, Value const& seed,
+                                          uint64 slotIndex, size_t count,
+                                          SCPQuorumSet const& qset,
+                                          NodeID const& localID)
+{
+    ZoneScoped;
+    std::vector<NodeID> schedule;
+    if (count == 0)
+    {
+        return schedule;
+    }
+
+    // The maximum number of distinct leaders that can ever be elected is the
+    // number of nodes with non-zero weight; this bounds the round walk exactly
+    // as updateRoundLeaders does.
+    size_t maxLeaderCount = 0;
+    if (driver.getNodeWeight(localID, qset, true) > 0)
+    {
+        ++maxLeaderCount;
+    }
+    LocalNode::forAllNodes(qset, [&](NodeID const& cur) {
+        if (driver.getNodeWeight(cur, qset, false) > 0)
+        {
+            ++maxLeaderCount;
+        }
+        return true;
+    });
+
+    std::set<NodeID> seen;
+    int32_t roundNumber = 0;
+    // Cap the number of iterations to prevent infinite loops, matching
+    // updateRoundLeaders.
+    int iterationsRemaining = 1000;
+    while (schedule.size() < count && seen.size() < maxLeaderCount &&
+           iterationsRemaining-- > 0)
+    {
+        // updateRoundLeaders increments the round number before computing each
+        // round, so the first evaluated round is 1.
+        ++roundNumber;
+        std::set<NodeID> roundLeaders = computeRoundLeaders(
+            driver, seed, slotIndex, roundNumber, qset, localID);
+
+        // `roundLeaders` is ordered by NodeID; within a round every leader
+        // shares the same (top) priority, so NodeID is the deterministic
+        // tie-break. Rounds are appended in order, so earlier rounds rank
+        // ahead of later ones.
+        for (auto const& leader : roundLeaders)
+        {
+            if (seen.insert(leader).second)
+            {
+                schedule.push_back(leader);
+                if (schedule.size() == count)
+                {
+                    break;
+                }
+            }
+        }
+    }
+    return schedule;
 }
 
 uint64
@@ -324,28 +406,6 @@ NominationProtocol::hashValue(Value const& value)
     dbgAssert(!mPreviousValue.empty());
     return mSlot.getSCPDriver().computeValueHash(
         mSlot.getSlotIndex(), mPreviousValue, mRoundNumber, value);
-}
-
-uint64
-NominationProtocol::getNodePriority(NodeID const& nodeID,
-                                    SCPQuorumSet const& qset)
-{
-    ZoneScoped;
-    uint64 res;
-    uint64 w = mSlot.getSCPDriver().getNodeWeight(
-        nodeID, qset, nodeID == mSlot.getLocalNode()->getNodeID());
-
-    // if w > 0; w is inclusive here as
-    // 0 <= hashNode <= UINT64_MAX
-    if (w > 0 && hashNode(false, nodeID) <= w)
-    {
-        res = hashNode(true, nodeID);
-    }
-    else
-    {
-        res = 0;
-    }
-    return res;
 }
 
 ValueWrapperPtr
@@ -554,7 +614,7 @@ NominationProtocol::stripUpgrades(ValueWrapperPtr& value) const
 // attempts to nominate a value for consensus
 bool
 NominationProtocol::nominate(ValueWrapperPtr value, Value const& previousValue,
-                             bool timedout)
+                             Value const& leaderElectionSeed, bool timedout)
 {
     ZoneScoped;
 
@@ -587,6 +647,7 @@ NominationProtocol::nominate(ValueWrapperPtr value, Value const& previousValue,
     mNominationStarted = true;
 
     mPreviousValue = previousValue;
+    mLeaderElectionSeed = leaderElectionSeed;
 
     mRoundNumber++;
     updateRoundLeaders();
@@ -672,8 +733,8 @@ NominationProtocol::nominate(ValueWrapperPtr value, Value const& previousValue,
     std::shared_ptr<Slot> slot = mSlot.shared_from_this();
     mSlot.getSCPDriver().setupTimer(
         mSlot.getSlotIndex(), Slot::NOMINATION_TIMER, timeout,
-        [slot, value, previousValue]() {
-            slot->nominate(value, previousValue, true);
+        [slot, value, previousValue, leaderElectionSeed]() {
+            slot->nominate(value, previousValue, leaderElectionSeed, true);
         });
 
 #ifdef BUILD_TESTS

@@ -158,6 +158,15 @@ class HerderSCPDriver : public SCPDriver
     // 2. Higher quality orgs win more frequently than lower quality orgs.
     uint64 getNodeWeight(NodeID const& nodeID, SCPQuorumSet const& qset,
                          bool isLocalNode) const override;
+
+    // Computes, ahead of time, the ordered list of up to `count` upcoming
+    // nomination leaders for `slotIndex`, seeded by `seed` (= hash(slotIndex -
+    // 2); see docs/direct-leader-flooding.md). Uses the local node's quorum set
+    // and the application-specific weight function, so the result matches the
+    // leaders SCP elects live for `slotIndex`. Used to pre-load the upcoming
+    // proposer(s) for direct leader flooding.
+    std::vector<NodeID> computeLeaderSchedule(Hash const& seed,
+                                              uint64_t slotIndex, size_t count);
     // For caching TxSet validity. Consist of {lcl.hash, txSetHash,
     // lowerBoundCloseTimeOffset, upperBoundCloseTimeOffset}
     using TxSetValidityKey = std::tuple<Hash, Hash, uint64_t, uint64_t>;
