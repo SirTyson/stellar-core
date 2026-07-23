@@ -87,7 +87,8 @@ class HerderSCPDriver : public SCPDriver
     // PendingEnvelopes hand this envelope to SCP now? True when the qset is
     // present and either all tx sets are fetched, or it is a current-ledger
     // nomination/PREPARE whose tx set is still arriving (so SCP can advance
-    // while the leader's push lands). Unconditional on this experimental branch.
+    // while the leader's push lands). Unconditional on this experimental
+    // branch.
     bool isEnvelopeReady(SCPEnvelope const& env);
 
     // Parallel tx set download: a tx set arrived; pin it into any in-flight
@@ -224,8 +225,9 @@ class HerderSCPDriver : public SCPDriver
 
     // Parallel tx set download (docs/direct-leader-flooding.md): value/envelope
     // wrappers created before their tx set arrived, keyed by the awaited tx set
-    // hash. onTxSetReceived pins the set into them; purgeSlotsOutsideRange drops
-    // dead entries. weak_ptr so a wrapper SCP has released can be reclaimed.
+    // hash. onTxSetReceived pins the set into them; purgeSlotsOutsideRange
+    // drops dead entries. weak_ptr so a wrapper SCP has released can be
+    // reclaimed.
     std::map<Hash, std::vector<std::weak_ptr<ValueWrapper>>>
         mPendingTxSetWrappers;
     std::map<Hash, std::vector<std::weak_ptr<SCPEnvelopeWrapper>>>

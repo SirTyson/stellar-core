@@ -412,13 +412,17 @@ sortedForApplyParallel(TxStageFrameList const& stages, Hash const& txSetHash)
 bool
 addWireTxsToList(Hash const& networkID,
                  xdr::xvector<TransactionEnvelope> const& xdrTxs,
-                 TxFrameList& txList)
+                 TxFrameList& txList,
+                 PrebuiltTxFrames* prebuiltFrames = nullptr)
 {
     auto prevSize = txList.size();
     txList.reserve(prevSize + xdrTxs.size());
     for (auto const& env : xdrTxs)
     {
-        auto tx = TransactionFrameBase::makeTransactionFromWire(networkID, env);
+        auto tx =
+            prebuiltFrames
+                ? prebuiltFrames->next()
+                : TransactionFrameBase::makeTransactionFromWire(networkID, env);
         if (!tx->XDRProvidesValidFee())
         {
             return false;
@@ -962,7 +966,7 @@ makeTxSetFromTransactions(
 
 TxSetXDRFrameConstPtr
 TxSetXDRFrame::makeEmpty(Hash const& previousLedgerHash,
-                        uint32 previousLedgerVersion)
+                         uint32 previousLedgerVersion)
 {
     if (protocolVersionStartsFrom(previousLedgerVersion,
                                   SOROBAN_PROTOCOL_VERSION))
@@ -1115,11 +1119,49 @@ TxSetXDRFrame::prepareForApply(Application& app,
         }
         auto const& xdrPhases = xdrTxSet.v1TxSet().phases;
 
+        // Collect every envelope in the exact order the phase construction
+        // below consumes them, and build the tx frames (XDR decode + hashing,
+        // the bulk of this function's cost) on the tx-validation pool.
+        std::vector<TransactionEnvelope const*> envelopes;
+        for (auto const& xdrPhase : xdrPhases)
+        {
+            switch (xdrPhase.v())
+            {
+            case 0:
+                for (auto const& component : xdrPhase.v0Components())
+                {
+                    for (auto const& env :
+                         component.txsMaybeDiscountedFee().txs)
+                    {
+                        envelopes.push_back(&env);
+                    }
+                }
+                break;
+            case 1:
+                for (auto const& xdrStage :
+                     xdrPhase.parallelTxsComponent().executionStages)
+                {
+                    for (auto const& xdrCluster : xdrStage)
+                    {
+                        for (auto const& env : xdrCluster)
+                        {
+                            envelopes.push_back(&env);
+                        }
+                    }
+                }
+                break;
+            default:
+                releaseAssert(false);
+            }
+        }
+        PrebuiltTxFrames prebuiltFrames(TxSetUtils::buildTxFramesParallel(
+            app.getNetworkID(), envelopes, app));
+
         for (size_t phaseId = 0; phaseId < xdrPhases.size(); ++phaseId)
         {
             auto maybePhase = TxSetPhaseFrame::makeFromWire(
                 static_cast<TxSetPhase>(phaseId), app.getNetworkID(),
-                xdrPhases[phaseId]);
+                xdrPhases[phaseId], &prebuiltFrames);
             if (!maybePhase)
             {
                 return nullptr;
@@ -1430,7 +1472,8 @@ TxSetPhaseFrame::Iterator::operator!=(Iterator const& other) const
 
 std::optional<TxSetPhaseFrame>
 TxSetPhaseFrame::makeFromWire(TxSetPhase phase, Hash const& networkID,
-                              TransactionPhase const& xdrPhase)
+                              TransactionPhase const& xdrPhase,
+                              PrebuiltTxFrames* prebuiltFrames)
 {
     auto inclusionFeeMapPtr = std::make_shared<InclusionFeeMap>();
     auto& inclusionFeeMap = *inclusionFeeMapPtr;
@@ -1461,7 +1504,7 @@ TxSetPhaseFrame::makeFromWire(TxSetPhase phase, Hash const& networkID,
                 size_t prevSize = txList.size();
                 if (!addWireTxsToList(networkID,
                                       component.txsMaybeDiscountedFee().txs,
-                                      txList))
+                                      txList, prebuiltFrames))
                 {
                     CLOG_DEBUG(Herder,
                                "Got bad generalized txSet: transactions "
@@ -1507,8 +1550,11 @@ TxSetPhaseFrame::makeFromWire(TxSetPhase phase, Hash const& networkID,
                 cluster.reserve(xdrCluster.size());
                 for (auto const& env : xdrCluster)
                 {
-                    auto tx = TransactionFrameBase::makeTransactionFromWire(
-                        networkID, env);
+                    auto tx =
+                        prebuiltFrames
+                            ? prebuiltFrames->next()
+                            : TransactionFrameBase::makeTransactionFromWire(
+                                  networkID, env);
                     if (!tx->XDRProvidesValidFee())
                     {
                         CLOG_DEBUG(Herder, "Got bad generalized txSet: "

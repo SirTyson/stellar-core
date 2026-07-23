@@ -105,7 +105,8 @@ HerderSCPDriver::makeEmptyTxSetValueFromValue(Value const& v) const
     // Carry the ORIGINAL proposal's context and signature so that every node
     // replacing the same stuck value produces the byte-identical empty-tx-set
     // value -> SCP converges on it immediately. The signature verifies over
-    // the original (txSetHash, closeTime) pair (see verifyStellarValueSignature).
+    // the original (txSetHash, closeTime) pair (see
+    // verifyStellarValueSignature).
     StellarValue sv;
     sv.ext.v(STELLAR_VALUE_EMPTY_TX_SET);
     sv.txSetHash = Herder::EMPTY_TX_SET_HASH;
@@ -439,9 +440,9 @@ HerderSCPDriver::validateValueAgainstLocalState(uint64_t slotIndex,
             // Parallel tx set download (docs/direct-leader-flooding.md): if the
             // referenced tx set is still on its way (an envelope referenced it
             // and we are expecting the leader's push), treat the value as
-            // structurally valid so SCP can advance nomination/PREPARE while the
-            // tx set arrives. It cannot be voted-to-commit or externalized until
-            // it becomes fully validated (see BallotProtocol). Enabled
+            // structurally valid so SCP can advance nomination/PREPARE while
+            // the tx set arrives. It cannot be voted-to-commit or externalized
+            // until it becomes fully validated (see BallotProtocol). Enabled
             // unconditionally on this experimental branch (no protocol gate).
             if (mPendingEnvelopes.getTxSetWaitingTime(txSetHash).has_value())
             {
@@ -1576,9 +1577,10 @@ HerderSCPDriver::purgeSlotsOutsideRange(std::optional<uint64_t> minSlotIndex,
         for (auto it = registry.begin(); it != registry.end();)
         {
             auto& vec = it->second;
-            vec.erase(std::remove_if(vec.begin(), vec.end(),
-                                     [](auto const& wp) { return wp.expired(); }),
-                      vec.end());
+            vec.erase(
+                std::remove_if(vec.begin(), vec.end(),
+                               [](auto const& wp) { return wp.expired(); }),
+                vec.end());
             if (vec.empty())
             {
                 it = registry.erase(it);
@@ -1613,10 +1615,10 @@ class SCPHerderValueWrapper : public ValueWrapper
         : ValueWrapper(value), mHerder(herder), mTxSetHash(sv.txSetHash)
     {
         // Parallel tx set download (docs/direct-leader-flooding.md): bind the
-        // tx set if we have it (pinning it -- the shared_ptr keeps the set alive
-        // through LRU eviction), otherwise leave it null and rely on setTxSet()
-        // back-fill once the leader's push arrives. No longer throws on an
-        // absent tx set.
+        // tx set if we have it (pinning it -- the shared_ptr keeps the set
+        // alive through LRU eviction), otherwise leave it null and rely on
+        // setTxSet() back-fill once the leader's push arrives. No longer throws
+        // on an absent tx set.
         mTxSet = mHerder.getTxSet(sv.txSetHash);
     }
 
@@ -1678,8 +1680,8 @@ void
 HerderSCPDriver::onTxSetReceived(Hash const& hash, TxSetXDRFrameConstPtr txSet)
 {
     // Parallel tx set download (docs/direct-leader-flooding.md): a tx set that
-    // some in-flight value/envelope wrapper was waiting for has arrived. Hand it
-    // to every still-live wrapper so the wrapper pins it (keeping it alive
+    // some in-flight value/envelope wrapper was waiting for has arrived. Hand
+    // it to every still-live wrapper so the wrapper pins it (keeping it alive
     // through LRU eviction of PendingEnvelopes' cache), then drop the entries.
     auto vit = mPendingTxSetWrappers.find(hash);
     if (vit != mPendingTxSetWrappers.end())
@@ -1860,7 +1862,7 @@ HerderSCPDriver::getNodeWeight(NodeID const& nodeID, SCPQuorumSet const& qset,
 
 std::vector<NodeID>
 HerderSCPDriver::computeLeaderSchedule(Hash const& seed, uint64_t slotIndex,
-                                      size_t count)
+                                       size_t count)
 {
     // Use the local node's quorum set, normalized with self excluded, exactly
     // as the live nomination path does in
@@ -1871,8 +1873,8 @@ HerderSCPDriver::computeLeaderSchedule(Hash const& seed, uint64_t slotIndex,
     normalizeQSet(qSet, &localID);
 
     Value seedValue(seed.begin(), seed.end());
-    return NominationProtocol::computeLeaderSchedule(*this, seedValue, slotIndex,
-                                                     count, qSet, localID);
+    return NominationProtocol::computeLeaderSchedule(
+        *this, seedValue, slotIndex, count, qSet, localID);
 }
 
 std::optional<int64_t>

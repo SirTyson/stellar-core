@@ -56,8 +56,7 @@ class SCP
     // leaderElectionSeed seeds leader election for this slot (see
     // NominationProtocol::mLeaderElectionSeed)
     bool nominate(uint64 slotIndex, ValueWrapperPtr value,
-                  Value const& previousValue,
-                  Value const& leaderElectionSeed);
+                  Value const& previousValue, Value const& leaderElectionSeed);
 
     // stops nomination for a slot
     void stopNomination(uint64 slotIndex);

@@ -101,6 +101,9 @@ class ApplicationImpl : public Application
                                      std::string jobName) override;
     virtual void postOnLedgerCloseThread(std::function<void()>&& f,
                                          std::string jobName) override;
+    virtual void postOnTxValidationThread(std::function<void()>&& f,
+                                          std::string jobName) override;
+    virtual size_t getTxValidationThreadCount() const override;
     virtual void start() override;
     void startServices();
 
@@ -175,6 +178,9 @@ class ApplicationImpl : public Application
     std::unique_ptr<asio::io_context> mLedgerCloseIOContext;
     std::unique_ptr<asio::io_context::work> mLedgerCloseWork;
 
+    std::unique_ptr<asio::io_context> mTxValidationIOContext;
+    std::unique_ptr<asio::io_context::work> mTxValidationWork;
+
     std::unique_ptr<BucketManager> mBucketManager;
     std::unique_ptr<Database> mDatabase;
     std::unique_ptr<RustOverlayManager> mOverlayManager;
@@ -232,6 +238,10 @@ class ApplicationImpl : public Application
     std::unique_ptr<std::thread> mOverlayThread;
     std::unique_ptr<std::thread> mLedgerCloseThread;
 
+    // Medium-priority pool for parallel transaction validation (see
+    // Config::TX_VALIDATION_THREADS).
+    std::vector<std::unique_ptr<std::thread>> mTxValidationThreads;
+
     // Unlike mWorkerThreads (which are low priority), eviction scans require a
     // medium priority thread. In the future, this may become a more general
     // higher-priority worker thread type, but for now we only need a single
@@ -260,6 +270,7 @@ class ApplicationImpl : public Application
     medida::Timer& mPostOnBackgroundThreadDelay;
     medida::Timer& mPostOnOverlayThreadDelay;
     medida::Timer& mPostOnLedgerCloseThreadDelay;
+    medida::Timer& mPostOnTxValidationThreadDelay;
 
     VirtualClock::system_time_point mStartedOn;
 

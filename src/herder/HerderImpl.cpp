@@ -15,6 +15,7 @@
 #include "herder/LedgerCloseData.h"
 #include "herder/QuorumIntersectionChecker.h"
 #include "herder/RustQuorumCheckerAdaptor.h"
+#include "herder/TxFloodValidation.h"
 #include "herder/TxSetFrame.h"
 #include "herder/TxSetUtils.h"
 #include "ledger/LedgerManager.h"
@@ -608,9 +609,8 @@ HerderImpl::broadcast(SCPEnvelope const& e)
 
         mSCPMetrics.mEnvelopeEmit.Mark();
 
-        // Route through overlay (RustOverlayManager handles IPC to Rust
-        // overlay, OverlayManagerImpl handles built-in overlay in standalone
-        // mode)
+        // Route through the Rust overlay via IPC (no-op in standalone mode,
+        // where no overlay process runs)
         auto m = std::make_shared<StellarMessage>();
         m->type(SCP_MESSAGE);
         m->envelope() = e;
@@ -665,9 +665,46 @@ HerderImpl::recvTransaction(TransactionFrameBasePtr tx, bool submittedFromSelf,
                hexAbbrev(tx->getFullHash()),
                KeyUtils::toShortString(tx->getSourceID()));
 
-    auto const& env = tx->getEnvelope();
-    mApp.getOverlayManager().broadcastTransaction(env, tx->getFullFee(),
-                                                  tx->getNumOperations());
+    bool skipValidation = force;
+#ifdef BUILD_TESTS
+    // Loadgen txs are locally generated and known-valid; validating them
+    // would also fail in overlay-only mode where on-disk seqnums are frozen.
+    skipValidation = skipValidation || isLoadgenTx;
+#endif
+    if (skipValidation)
+    {
+        auto const& env = tx->getEnvelope();
+        mApp.getOverlayManager().broadcastTransaction(env, tx->getFullFee(),
+                                                      tx->getNumOperations());
+        return TxSubmitStatus::TX_STATUS_PENDING;
+    }
+
+    // Pre-flood validation gate: run the overlay validity checks on the
+    // tx-validation pool and only hand the tx to the overlay if they pass.
+    // The overlay IPC submit is mutex-guarded, so the callback can invoke it
+    // directly from the pool thread.
+    auto envelopes = std::make_shared<std::vector<TransactionEnvelope>>(
+        1, tx->getEnvelope());
+    int64_t fullFee = tx->getFullFee();
+    uint32_t numOps = tx->getNumOperations();
+    Hash fullHash = tx->getFullHash();
+    validateTxBatchForFlooding(
+        mApp, envelopes,
+        [this, envelopes, fullFee, numOps,
+         fullHash](TxFloodVerdicts const& verdicts) {
+            if (verdicts.size() == 1 && verdicts[0])
+            {
+                mApp.getOverlayManager().broadcastTransaction((*envelopes)[0],
+                                                              fullFee, numOps);
+            }
+            else
+            {
+                CLOG_DEBUG(Herder,
+                           "Dropping submitted tx {} that failed pre-flood "
+                           "validation",
+                           hexAbbrev(fullHash));
+            }
+        });
     return TxSubmitStatus::TX_STATUS_PENDING;
 }
 
@@ -1637,16 +1674,22 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
               txEnvelopes.size());
 
     // Convert TransactionEnvelopes to TransactionFrameBasePtrs and place them
-    // into the phase expected by TxSetFrame.
+    // into the phase expected by TxSetFrame. Frame construction (XDR decode +
+    // hashing) fans out to the tx-validation pool.
     TxFrameList classicTxs;
     TxFrameList sorobanTxs;
     Hash const& networkID = mApp.getNetworkID();
     bool const supportsSoroban = protocolVersionStartsFrom(
         lcl.header.ledgerVersion, SOROBAN_PROTOCOL_VERSION);
+    std::vector<TransactionEnvelope const*> envPtrs;
+    envPtrs.reserve(txEnvelopes.size());
     for (auto const& env : txEnvelopes)
     {
-        auto txFrame =
-            TransactionFrameBase::makeTransactionFromWire(networkID, env);
+        envPtrs.push_back(&env);
+    }
+    for (auto const& txFrame :
+         TxSetUtils::buildTxFramesParallel(networkID, envPtrs, mApp))
+    {
         if (txFrame->isSoroban())
         {
             if (supportsSoroban)
@@ -1705,12 +1748,13 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
     // Hand the TX set to the Rust overlay. Note: the overlay only supports
     // GeneralizedTransactionSet (protocol >= 20).
     //
-    // Direct leader flooding, TxSet dissemination (docs/direct-leader-flooding.md
-    // Step 5): the round-1 leader for the slot being nominated pushes the full
-    // body to every peer *now*, so receivers have it by the time they process
-    // the nomination that references it -- removing the GetTxSet request
-    // round-trip from the nomination critical path. Every other node only
-    // caches its own set locally (cache-for-self; it never proactively floods).
+    // Direct leader flooding, TxSet dissemination
+    // (docs/direct-leader-flooding.md Step 5): the round-1 leader for the slot
+    // being nominated pushes the full body to every peer *now*, so receivers
+    // have it by the time they process the nomination that references it --
+    // removing the GetTxSet request round-trip from the nomination critical
+    // path. Every other node only caches its own set locally (cache-for-self;
+    // it never proactively floods).
     //
     // Round-1 leader is seeded by hash(N-2); when nominating slot N = ledgerSeq
     // + 1 with lcl = N-1, that seed is exactly lcl.header.previousLedgerHash.
@@ -1747,11 +1791,13 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
                       binToHex(txSetHash).substr(0, 8));
         }
         else if (selfIsRound1Leader &&
-                 !mApp.getConfig().ARTIFICIALLY_SUPPRESS_TX_SET_FLOOD_FOR_TESTING)
+                 !mApp.getConfig()
+                      .ARTIFICIALLY_SUPPRESS_TX_SET_FLOOD_FOR_TESTING)
         {
-            CLOG_DEBUG(Herder,
-                       "Round-1 leader: eagerly broadcasting TX set {} to peers",
-                       binToHex(txSetHash).substr(0, 8));
+            CLOG_DEBUG(
+                Herder,
+                "Round-1 leader: eagerly broadcasting TX set {} to peers",
+                binToHex(txSetHash).substr(0, 8));
             mApp.getOverlayManager().broadcastTxSet(txSetHash, xdrBytes);
         }
         else

@@ -24,6 +24,7 @@ namespace stellar
 class Application;
 class TxSetXDRFrame;
 class ApplicableTxSetFrame;
+class PrebuiltTxFrames;
 using TxSetXDRFrameConstPtr = std::shared_ptr<TxSetXDRFrame const>;
 using ApplicableTxSetFrameConstPtr =
     std::unique_ptr<ApplicableTxSetFrame const>;
@@ -397,10 +398,13 @@ class TxSetPhaseFrame
                     std::shared_ptr<InclusionFeeMap> inclusionFeeMap);
 
     // Creates a new phase from `TransactionPhase` XDR coming from a
-    // `GeneralizedTransactionSet`.
+    // `GeneralizedTransactionSet`. When `prebuiltFrames` is provided, tx
+    // frames are consumed from it (in wire order) instead of being
+    // constructed inline; see TxSetUtils::buildTxFramesParallel.
     static std::optional<TxSetPhaseFrame>
     makeFromWire(TxSetPhase phase, Hash const& networkID,
-                 TransactionPhase const& xdrPhase);
+                 TransactionPhase const& xdrPhase,
+                 PrebuiltTxFrames* prebuiltFrames = nullptr);
 
     // Creates a new phase from all the transactions in the legacy
     // `TransactionSet` XDR.

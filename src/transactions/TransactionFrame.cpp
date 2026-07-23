@@ -1933,8 +1933,10 @@ TransactionFrame::checkValidWithOptionallyChargedFee(
     // Load sorobanConfig for all transactions at protocol >= V20.
     if (protocolVersionStartsFrom(ledgerVersion, SOROBAN_PROTOCOL_VERSION))
     {
-        sorobanConfig =
-            &app.getLedgerManager().getLastClosedSorobanNetworkConfig();
+        // Source the config from the ledger view so this path stays valid on
+        // background validation threads (the AppConnector accessor is
+        // main-thread-only).
+        sorobanConfig = &ledgerView.getSorobanNetworkConfig(app);
         if (isSoroban())
         {
             sorobanResourceFee = computePreApplySorobanResourceFee(

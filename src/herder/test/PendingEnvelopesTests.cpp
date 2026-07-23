@@ -78,15 +78,14 @@ TEST_CASE("empty-tx-set recovery closes an empty ledger", "[herder]")
         StellarValue bad = emptySv;
         bad.ext.proposedValue().previousLedgerHash =
             sha256(ByteSlice("wrong-lcl"));
-        REQUIRE(driver.validateValue(lcl.header.ledgerSeq + 1,
-                                     xdr::xdr_to_opaque(bad),
-                                     /*nomination=*/false) ==
-                SCPDriver::kInvalidValue);
+        REQUIRE(driver.validateValue(
+                    lcl.header.ledgerSeq + 1, xdr::xdr_to_opaque(bad),
+                    /*nomination=*/false) == SCPDriver::kInvalidValue);
     }
 
     // The canonical empty set the value implies must be applicable.
-    auto const emptySet =
-        TxSetXDRFrame::makeEmpty(ov.previousLedgerHash, ov.previousLedgerVersion);
+    auto const emptySet = TxSetXDRFrame::makeEmpty(ov.previousLedgerHash,
+                                                   ov.previousLedgerVersion);
     REQUIRE(emptySet->prepareForApply(*app, lcl.header) != nullptr);
 
     // Externalize through the REAL herder entry point: this exercises

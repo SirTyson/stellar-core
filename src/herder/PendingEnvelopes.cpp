@@ -697,13 +697,15 @@ PendingEnvelopes::startFetch(SCPEnvelope const& envelope)
             // Track the envelope as waiting on this TX set, but do NOT request
             // it. Direct leader flooding (docs/direct-leader-flooding.md, TxSet
             // dissemination Step 5): the round-1 leader eagerly pushes the full
-            // body to every peer, so on the happy path it arrives on its own and
-            // resumes this envelope via addTxSet(). The GetTxSet request/response
-            // round-trip is removed from the nomination critical path.
+            // body to every peer, so on the happy path it arrives on its own
+            // and resumes this envelope via addTxSet(). The GetTxSet
+            // request/response round-trip is removed from the nomination
+            // critical path.
             //
             // Experiment tradeoff: there is no request fallback, so if the push
-            // is missed (churn/reconnect) or the slot advances to a round led by
-            // a non-broadcasting node, this envelope stays pending for the slot.
+            // is missed (churn/reconnect) or the slot advances to a round led
+            // by a non-broadcasting node, this envelope stays pending for the
+            // slot.
             auto& vec = mPendingTxSetFetches[h2];
             vec.push_back(envelope);
             // Parallel tx set download: remember when we started awaiting this
@@ -762,13 +764,13 @@ PendingEnvelopes::txSetFetchFallbackTick()
             // stale, retries a different peer on our next request.
             continue;
         }
-        CLOG_INFO(Herder,
-                  "TXSET_FETCH_FALLBACK: tx set {} still missing after {} ms; "
-                  "requesting from a peer (flood miss suspected)",
-                  hexAbbrev(hash),
-                  std::chrono::duration_cast<std::chrono::milliseconds>(now -
-                                                                        since)
-                      .count());
+        CLOG_INFO(
+            Herder,
+            "TXSET_FETCH_FALLBACK: tx set {} still missing after {} ms; "
+            "requesting from a peer (flood miss suspected)",
+            hexAbbrev(hash),
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - since)
+                .count());
         mApp.getOverlayManager().requestTxSet(hash);
         mTxSetFetchRequested[hash] = now;
     }

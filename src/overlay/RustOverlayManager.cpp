@@ -6,6 +6,7 @@
 #include "crypto/Hex.h"
 #include "crypto/KeyUtils.h"
 #include "herder/Herder.h"
+#include "herder/TxFloodValidation.h"
 #include "herder/TxSetFrame.h"
 #include "lib/json/json.h"
 #include "main/Application.h"
@@ -77,6 +78,40 @@ RustOverlayManager::start()
                     mApp.getHerder().recvTxSet(hash, frame);
                 },
                 "RustOverlayManager: TxSetReceived");
+        });
+
+    mOverlayIPC->setOnValidateTxs(
+        [this](uint64_t batchId,
+               std::vector<std::optional<TransactionEnvelope>> const& txs) {
+            // Called from IPC reader thread. Validation fans out on the
+            // tx-validation pool and never blocks this thread; unparseable
+            // envelopes keep their slot with a reject verdict.
+            auto envelopes =
+                std::make_shared<std::vector<TransactionEnvelope>>();
+            auto positions = std::make_shared<std::vector<size_t>>();
+            envelopes->reserve(txs.size());
+            for (size_t i = 0; i < txs.size(); ++i)
+            {
+                if (txs[i])
+                {
+                    envelopes->push_back(*txs[i]);
+                    positions->push_back(i);
+                }
+            }
+            size_t total = txs.size();
+            validateTxBatchForFlooding(
+                mApp, std::move(envelopes),
+                [this, batchId, positions,
+                 total](TxFloodVerdicts const& verdicts) {
+                    // Runs on a tx-validation pool thread; the IPC send is
+                    // mutex-guarded and safe from here.
+                    std::vector<uint8_t> expanded(total, 0);
+                    for (size_t i = 0; i < verdicts.size(); ++i)
+                    {
+                        expanded[(*positions)[i]] = verdicts[i];
+                    }
+                    mOverlayIPC->sendTxValidationVerdicts(batchId, expanded);
+                });
         });
 
     mOverlayIPC->setOnQuorumConnectivityReport(

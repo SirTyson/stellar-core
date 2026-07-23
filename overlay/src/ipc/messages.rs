@@ -69,6 +69,11 @@ pub enum MessageType {
     /// Payload: [hash:32][txSetXDR...]
     BroadcastTxSet = 15,
 
+    /// Response to ValidateTxs: per-tx verdicts for a batch, in the batch's
+    /// order (1 = valid, flood it; 0 = invalid, drop it).
+    /// Payload: [batchId:8][count:4][verdicts:count]
+    TxValidationVerdicts = 16,
+
     // ═══ Overlay → Core (Critical Path) ═══
     /// Received SCP envelope from network
     ScpReceived = 100,
@@ -90,6 +95,13 @@ pub enum MessageType {
 
     /// One-shot quorum connectivity verdict (JSON array of missing strkeys)
     QuorumConnectivityReport = 106,
+
+    /// Ask Core to validate a batch of network-received transactions before
+    /// flooding them onward. Core answers with TxValidationVerdicts carrying
+    /// the same batchId. (104 is reserved: Core's enum has
+    /// QUORUM_SET_AVAILABLE there.)
+    /// Payload: [batchId:8][count:4]([len:4][txEnvelopeXDR:len])*
+    ValidateTxs = 107,
 }
 
 impl TryFrom<u32> for MessageType {
@@ -111,12 +123,14 @@ impl TryFrom<u32> for MessageType {
             13 => Ok(MessageType::RequestOverlayMetrics),
             14 => Ok(MessageType::SetLeaders),
             15 => Ok(MessageType::BroadcastTxSet),
+            16 => Ok(MessageType::TxValidationVerdicts),
             100 => Ok(MessageType::ScpReceived),
             101 => Ok(MessageType::TopTxsResponse),
             102 => Ok(MessageType::PeerRequestsScpState),
             103 => Ok(MessageType::TxSetAvailable),
             105 => Ok(MessageType::OverlayMetricsResponse),
             106 => Ok(MessageType::QuorumConnectivityReport),
+            107 => Ok(MessageType::ValidateTxs),
             _ => Err(InvalidMessageType(value)),
         }
     }
@@ -387,6 +401,10 @@ mod tests {
             MessageType::BroadcastTxSet
         );
         assert_eq!(
+            MessageType::try_from(16).unwrap(),
+            MessageType::TxValidationVerdicts
+        );
+        assert_eq!(
             MessageType::try_from(100).unwrap(),
             MessageType::ScpReceived
         );
@@ -410,16 +428,21 @@ mod tests {
             MessageType::try_from(106).unwrap(),
             MessageType::QuorumConnectivityReport
         );
+        assert_eq!(
+            MessageType::try_from(107).unwrap(),
+            MessageType::ValidateTxs
+        );
     }
 
     #[test]
     fn test_message_type_try_from_invalid() {
         assert!(MessageType::try_from(0).is_err());
         assert!(MessageType::try_from(9).is_err()); // gap between 8 and 10
-        assert!(MessageType::try_from(16).is_err()); // gap after BroadcastTxSet
+        assert!(MessageType::try_from(17).is_err()); // gap after TxValidationVerdicts
         assert!(MessageType::try_from(99).is_err());
+        // 104 stays reserved on the Rust side (Core's QUORUM_SET_AVAILABLE)
         assert!(MessageType::try_from(104).is_err());
-        assert!(MessageType::try_from(107).is_err());
+        assert!(MessageType::try_from(108).is_err());
         assert!(MessageType::try_from(u32::MAX).is_err());
     }
 }

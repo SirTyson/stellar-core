@@ -526,8 +526,79 @@ struct App {
     suppress_tx_broadcast: bool,
     /// Delay before emitting the one-shot quorum connectivity report.
     quorum_check_grace_secs: u64,
+    /// Pre-flood validation gate: network-received TXs are held here until
+    /// Core returns per-tx verdicts (ValidateTxs / TxValidationVerdicts);
+    /// only valid TXs enter the mempool and get relayed.
+    validation_gate: ValidationGate,
     /// Shared metrics counters for the overlay
     metrics: Arc<OverlayMetrics>,
+}
+
+/// Flush the accumulating validation batch when it reaches this many TXs
+/// (a timer in the main loop flushes smaller batches).
+const VALIDATION_BATCH_MAX: usize = 128;
+
+/// Drop pending batches that Core hasn't answered within this window; the
+/// TXs stay in `tx_seen`, so they are not re-requested, just never relayed.
+const VALIDATION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A network-received TX waiting for Core's validity verdict.
+struct PendingValidationTx {
+    tx: Arc<ValidatedTx>,
+    from: PeerId,
+}
+
+/// State for the pre-flood validation gate. TXs accumulate into a batch,
+/// batches go to Core over IPC, and each verdict releases (or drops) the
+/// corresponding TXs. Correlation is by batch id.
+#[derive(Default)]
+struct ValidationGate {
+    next_batch_id: u64,
+    accumulating: Vec<PendingValidationTx>,
+    in_flight: HashMap<u64, (std::time::Instant, Vec<PendingValidationTx>)>,
+}
+
+impl ValidationGate {
+    fn enqueue(&mut self, tx: Arc<ValidatedTx>, from: PeerId) -> bool {
+        self.accumulating.push(PendingValidationTx { tx, from });
+        self.accumulating.len() >= VALIDATION_BATCH_MAX
+    }
+
+    /// Move the accumulating batch to in-flight and return (id, txs to send).
+    fn take_batch(&mut self) -> Option<(u64, Vec<Arc<ValidatedTx>>)> {
+        if self.accumulating.is_empty() {
+            return None;
+        }
+        let batch_id = self.next_batch_id;
+        self.next_batch_id += 1;
+        let entries = std::mem::take(&mut self.accumulating);
+        let txs: Vec<Arc<ValidatedTx>> = entries.iter().map(|e| Arc::clone(&e.tx)).collect();
+        self.in_flight
+            .insert(batch_id, (std::time::Instant::now(), entries));
+        Some((batch_id, txs))
+    }
+
+    fn resolve(&mut self, batch_id: u64) -> Option<Vec<PendingValidationTx>> {
+        self.in_flight.remove(&batch_id).map(|(_, txs)| txs)
+    }
+
+    /// Drop batches Core never answered. Returns the number of TXs dropped.
+    fn sweep_expired(&mut self) -> usize {
+        let now = std::time::Instant::now();
+        let expired: Vec<u64> = self
+            .in_flight
+            .iter()
+            .filter(|(_, (sent_at, _))| now.duration_since(*sent_at) > VALIDATION_TIMEOUT)
+            .map(|(id, _)| *id)
+            .collect();
+        let mut dropped = 0;
+        for id in expired {
+            if let Some((_, txs)) = self.in_flight.remove(&id) {
+                dropped += txs.len();
+            }
+        }
+        dropped
+    }
 }
 
 /// Peer addresses configured via SetPeerConfig, used for reconnection.
@@ -608,6 +679,7 @@ impl App {
             peer_hostnames: Arc::new(RwLock::new(HashMap::new())),
             leaders: Arc::new(RwLock::new((0, Vec::new()))),
             suppress_tx_broadcast: false,
+            validation_gate: ValidationGate::default(),
             expected_quorum: Arc::new(RwLock::new(HashMap::new())),
             connected_peers: Arc::new(RwLock::new(HashSet::new())),
             connected_quorum: Arc::new(RwLock::new(HashSet::new())),
@@ -627,6 +699,11 @@ impl App {
         // This is a fallback — targeted reconnection on disconnect handles the fast path.
         let mut reconnect_interval = tokio::time::interval(Duration::from_secs(30));
         reconnect_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        // Flush partially-filled validation batches to Core and reclaim
+        // batches Core never answered (see ValidationGate).
+        let mut validation_flush_interval = tokio::time::interval(Duration::from_millis(10));
+        validation_flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
@@ -653,6 +730,15 @@ impl App {
                 // Receive TX events from libp2p (bounded channel, may drop under backpressure)
                 Some(event) = self.tx_events.recv() => {
                     self.handle_libp2p_event(event).await;
+                }
+
+                // Flush the pre-flood validation batch and expire unanswered ones
+                _ = validation_flush_interval.tick() => {
+                    self.flush_validation_batch();
+                    let dropped = self.validation_gate.sweep_expired();
+                    if dropped > 0 {
+                        warn!("VALIDATION_TIMEOUT: dropped {} TXs awaiting Core verdicts", dropped);
+                    }
                 }
 
                 // Safety-net reconnect: PeerId-based dials for known peers,
@@ -820,7 +906,12 @@ impl App {
                     from,
                     tx.bytes().len()
                 );
-                self.overlay_handle.submit_tx(tx);
+                // Hold for Core's validity verdict before mempool admission
+                // and relay (fix for unvalidated flooding). Batches flush on
+                // size here and on a timer in the main loop.
+                if self.validation_gate.enqueue(tx, from) {
+                    self.flush_validation_batch();
+                }
             }
             LibP2pOverlayEvent::TxSetReceived { hash, data, from } => {
                 // `data` was strict-decoded and its content hash verified in the
@@ -1038,6 +1129,87 @@ impl App {
     }
 
     /// Handle a message from Core. Returns false to signal shutdown.
+    /// Send the accumulating validation batch (if any) to Core.
+    fn flush_validation_batch(&mut self) {
+        if let Some((batch_id, txs)) = self.validation_gate.take_batch() {
+            let tx_bytes: Vec<&[u8]> = txs.iter().map(|t| t.bytes()).collect();
+            debug!(
+                "VALIDATE_TXS: sending batch {} ({} txs) to Core",
+                batch_id,
+                tx_bytes.len()
+            );
+            if let Err(e) = self.core_ipc.sender.send_validate_txs(batch_id, &tx_bytes) {
+                // Leave the batch in-flight; the timeout sweep reclaims it.
+                warn!(
+                    "Failed to send ValidateTxs batch {} to Core: {}",
+                    batch_id, e
+                );
+            }
+        }
+    }
+
+    /// Handle TxValidationVerdicts from Core: admit valid TXs to the mempool
+    /// and relay them; drop invalid ones (they stay in tx_seen, so they are
+    /// not re-fetched or re-validated).
+    fn handle_validation_verdicts(&mut self, payload: &[u8]) {
+        if payload.len() < 12 {
+            warn!("TxValidationVerdicts payload too short");
+            return;
+        }
+        let batch_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+        let count = u32::from_le_bytes(payload[8..12].try_into().unwrap()) as usize;
+        let verdicts = &payload[12..];
+        if verdicts.len() < count {
+            warn!(
+                "TxValidationVerdicts batch {}: {} verdicts for count {}",
+                batch_id,
+                verdicts.len(),
+                count
+            );
+            return;
+        }
+        let Some(entries) = self.validation_gate.resolve(batch_id) else {
+            warn!(
+                "TxValidationVerdicts for unknown/expired batch {}",
+                batch_id
+            );
+            return;
+        };
+        if entries.len() != count {
+            warn!(
+                "TxValidationVerdicts batch {}: count {} != pending {}",
+                batch_id,
+                count,
+                entries.len()
+            );
+            return;
+        }
+
+        let mut valid = 0usize;
+        for (entry, verdict) in entries.into_iter().zip(verdicts.iter()) {
+            if *verdict == 1 {
+                valid += 1;
+                self.overlay_handle.submit_tx(Arc::clone(&entry.tx));
+                if !self.suppress_tx_broadcast {
+                    let handle = self.libp2p_handle.clone();
+                    tokio::spawn(async move {
+                        handle.relay_validated_tx(entry.tx, entry.from).await;
+                    });
+                }
+            } else {
+                debug!(
+                    "TX_INVALID_DROP: dropping TX {:02x?}... from {} (failed Core validation)",
+                    &entry.tx.hash()[..4],
+                    entry.from
+                );
+            }
+        }
+        debug!(
+            "VALIDATION_VERDICTS: batch {} -> {}/{} valid",
+            batch_id, valid, count
+        );
+    }
+
     async fn handle_core_message(&mut self, msg: Message) -> bool {
         match msg.msg_type {
             MessageType::Shutdown => {
@@ -1246,7 +1418,9 @@ impl App {
                     }
                 };
 
-                // Add to mempool
+                // Add to mempool. Core validated this tx before submitting
+                // (HerderImpl::recvTransaction pre-flood gate), so no
+                // ValidateTxs round-trip is needed here.
                 self.overlay_handle.submit_tx(Arc::clone(&tx));
 
                 // Broadcast TX via libp2p QUIC (dedicated stream)
@@ -1256,6 +1430,10 @@ impl App {
                         handle.broadcast_tx(tx).await;
                     });
                 }
+            }
+
+            MessageType::TxValidationVerdicts => {
+                self.handle_validation_verdicts(&msg.payload);
             }
 
             MessageType::RequestScpState => {
@@ -1437,9 +1615,8 @@ impl App {
                         let tx_batch_max_size =
                             config["tx_batch_max_size"].as_u64().unwrap_or(0) as usize;
                         self.libp2p_handle.set_tx_batch_max_size(tx_batch_max_size);
-                        self.suppress_tx_broadcast = config["suppress_tx_broadcast"]
-                            .as_bool()
-                            .unwrap_or(false);
+                        self.suppress_tx_broadcast =
+                            config["suppress_tx_broadcast"].as_bool().unwrap_or(false);
                         if self.suppress_tx_broadcast {
                             warn!("TESTING: suppress_tx_broadcast enabled -- submitted TXs stay local");
                         }
@@ -1897,16 +2074,14 @@ mod tests {
         );
 
         // Empty leader list is valid (no one elected).
-        let (slot, leaders) =
-            parse_leaders_payload(br#"{"slot": 7, "leaders": []}"#).unwrap();
+        let (slot, leaders) = parse_leaders_payload(br#"{"slot": 7, "leaders": []}"#).unwrap();
         assert_eq!(slot, 7);
         assert!(leaders.is_empty());
 
         // Any invalid entry rejects the whole payload.
-        let bad = serde_json::to_vec(
-            &serde_json::json!({"slot": 1, "leaders": [strkey_a, "GNOTAKEY"]}),
-        )
-        .unwrap();
+        let bad =
+            serde_json::to_vec(&serde_json::json!({"slot": 1, "leaders": [strkey_a, "GNOTAKEY"]}))
+                .unwrap();
         assert!(parse_leaders_payload(&bad).is_err());
 
         // Missing fields / malformed JSON are rejected.
@@ -2341,5 +2516,87 @@ mod tests {
         let bare: Multiaddr = "/ip4/10.0.0.1/udp/9000/quic-v1".parse().unwrap();
         let stripped = strip_p2p_suffix(&bare);
         assert_eq!(stripped, bare);
+    }
+
+    // === Pre-flood validation gate ===
+
+    fn gate_tx(seed: u8) -> Arc<ValidatedTx> {
+        // Distinct sequence per seed -> distinct hash. Fee/ops don't matter
+        // for gate bookkeeping.
+        let bytes = crate::xdr::tests::valid_transaction_xdr(100 + seed as u32, seed as i64, 1);
+        ValidatedTx::from_core_trusted(bytes, 100 + seed as u64, 1).unwrap()
+    }
+
+    #[test]
+    fn test_validation_gate_batches_and_resolves() {
+        let mut gate = ValidationGate::default();
+        let peer = PeerId::random();
+
+        // Below the size threshold, enqueue reports no flush needed.
+        for i in 0..3 {
+            assert!(!gate.enqueue(gate_tx(i), peer));
+        }
+        let (batch_id, txs) = gate.take_batch().expect("non-empty batch");
+        assert_eq!(txs.len(), 3);
+
+        // Nothing accumulating -> no batch.
+        assert!(gate.take_batch().is_none());
+
+        // Resolving returns the entries in enqueue order.
+        let entries = gate.resolve(batch_id).expect("batch pending");
+        assert_eq!(entries.len(), 3);
+        for (i, entry) in entries.iter().enumerate() {
+            assert_eq!(entry.tx.hash(), gate_tx(i as u8).hash());
+            assert_eq!(entry.from, peer);
+        }
+
+        // Double-resolve is a no-op.
+        assert!(gate.resolve(batch_id).is_none());
+    }
+
+    #[test]
+    fn test_validation_gate_flush_threshold() {
+        let mut gate = ValidationGate::default();
+        let peer = PeerId::random();
+        for i in 0..(VALIDATION_BATCH_MAX - 1) {
+            assert!(!gate.enqueue(gate_tx((i % 251) as u8), peer));
+        }
+        // Hitting the threshold requests a flush.
+        assert!(gate.enqueue(gate_tx(255), peer));
+        let (_, txs) = gate.take_batch().unwrap();
+        assert_eq!(txs.len(), VALIDATION_BATCH_MAX);
+    }
+
+    #[test]
+    fn test_validation_gate_batch_ids_unique() {
+        let mut gate = ValidationGate::default();
+        let peer = PeerId::random();
+        gate.enqueue(gate_tx(1), peer);
+        let (id1, _) = gate.take_batch().unwrap();
+        gate.enqueue(gate_tx(2), peer);
+        let (id2, _) = gate.take_batch().unwrap();
+        assert_ne!(id1, id2);
+        // Both batches independently resolvable.
+        assert_eq!(gate.resolve(id1).unwrap().len(), 1);
+        assert_eq!(gate.resolve(id2).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_validation_gate_sweep_expired() {
+        let mut gate = ValidationGate::default();
+        let peer = PeerId::random();
+        gate.enqueue(gate_tx(1), peer);
+        gate.enqueue(gate_tx(2), peer);
+        let (batch_id, _) = gate.take_batch().unwrap();
+
+        // Fresh batch is not swept.
+        assert_eq!(gate.sweep_expired(), 0);
+        assert!(gate.in_flight.contains_key(&batch_id));
+
+        // Backdate the batch past the timeout, then sweep.
+        gate.in_flight.get_mut(&batch_id).unwrap().0 =
+            std::time::Instant::now() - VALIDATION_TIMEOUT - Duration::from_secs(1);
+        assert_eq!(gate.sweep_expired(), 2);
+        assert!(gate.resolve(batch_id).is_none());
     }
 }

@@ -765,6 +765,14 @@ class Config : public std::enable_shared_from_this<Config>
     // thread-management config
     int WORKER_THREADS;
 
+    // Number of threads in the transaction-validation pool. These run
+    // parallel checkValid fan-outs (tx set creation and validation, and
+    // pre-flood validation of received transactions), which sit on the
+    // consensus critical path, so they run at medium priority — unlike the
+    // low-priority WORKER_THREADS pool whose long-running jobs (bucket
+    // merges) would otherwise delay validation.
+    int TX_VALIDATION_THREADS;
+
     // Number of threads to serve query commands
     int QUERY_THREAD_POOL_SIZE;
 

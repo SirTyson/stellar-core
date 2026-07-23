@@ -683,6 +683,20 @@ TEST_CASE("Rust overlay TX flooding between peers", "[overlay-ipc][.]")
     auto ipcB =
         std::make_unique<OverlayIPC>(socketPathB, overlayBinary, peerPortB);
 
+    // Network-received TXs are held by the overlay's pre-flood validation
+    // gate until Core returns verdicts. There is no Core here, so play its
+    // role and approve everything.
+    auto approveAll = [](OverlayIPC* ipc) {
+        ipc->setOnValidateTxs(
+            [ipc](uint64_t batchId,
+                  std::vector<std::optional<TransactionEnvelope>> const& txs) {
+                ipc->sendTxValidationVerdicts(
+                    batchId, std::vector<uint8_t>(txs.size(), 1));
+            });
+    };
+    approveAll(ipcA.get());
+    approveAll(ipcB.get());
+
     REQUIRE(ipcA->start());
     REQUIRE(ipcB->start());
 
@@ -791,8 +805,8 @@ TEST_CASE("Rust overlay quorum connectivity report", "[overlay-ipc][.]")
 
     // B's connection authenticated as keyB, so A's only missing quorum
     // member is C; B is missing no one.
-    REQUIRE(futureA.get() == std::vector<std::string>{KeyUtils::toStrKey(
-                                 keyC.getPublicKey())});
+    REQUIRE(futureA.get() ==
+            std::vector<std::string>{KeyUtils::toStrKey(keyC.getPublicKey())});
     REQUIRE(futureB.get().empty());
 
     LOG_INFO(DEFAULT_LOG, "Quorum connectivity report test passed");
@@ -999,8 +1013,7 @@ TEST_CASE("leader schedule prediction matches live nomination",
             }
             auto schedule = herder.getHerderSCPDriver().computeLeaderSchedule(
                 seedIt->second, slot, live.size());
-            REQUIRE(std::set<NodeID>(schedule.begin(), schedule.end()) ==
-                    live);
+            REQUIRE(std::set<NodeID>(schedule.begin(), schedule.end()) == live);
             ++checked;
         }
     }
@@ -1120,8 +1133,7 @@ TEST_CASE("flood leaders pushed to overlay", "[overlay-ipc][herder][.]")
 
             auto const& reported = root["flood_leaders"];
             matched = root["flood_leaders_slot"].asUInt64() == expectedSlot &&
-                      reported.isArray() &&
-                      reported.size() == expected.size();
+                      reported.isArray() && reported.size() == expected.size();
             for (Json::ArrayIndex j = 0; matched && j < reported.size(); ++j)
             {
                 matched = reported[j].asString() == expected[j];
@@ -1676,8 +1688,8 @@ TEST_CASE("undeliverable tx set recovers via empty ledger instead of wedging",
     {
         auto root = TestAccount{*node, txtest::getRoot(networkID)};
         auto dest = SecretKey::pseudoRandomForTesting();
-        auto tx = root.tx(
-            {txtest::createAccount(dest.getPublicKey(), 500000000)});
+        auto tx =
+            root.tx({txtest::createAccount(dest.getPublicKey(), 500000000)});
         REQUIRE(node->getHerder().recvTransaction(tx, false) ==
                 TxSubmitStatus::TX_STATUS_PENDING);
     }
@@ -1697,10 +1709,10 @@ TEST_CASE("undeliverable tx set recovers via empty ledger instead of wedging",
     int64_t totalReplaced = 0;
     for (auto const& node : nodes)
     {
-        totalReplaced += node->getMetrics()
-                             .NewCounter({"scp", "empty-tx-set",
-                                          "value-replaced"})
-                             .count();
+        totalReplaced +=
+            node->getMetrics()
+                .NewCounter({"scp", "empty-tx-set", "value-replaced"})
+                .count();
     }
     REQUIRE(totalReplaced >= 1);
 
@@ -1858,9 +1870,17 @@ TEST_CASE("Rust overlay SCP latency under TX load", "[overlay-ipc-large]")
                 {txtest::createAccount(destKey.getPublicKey(), 100000000000)});
             node0->getHerder().recvTransaction(createTx, false);
 
-            // Crank to apply create account
+            // Crank until the create actually APPLIES before submitting the
+            // payments. Waiting for a ledger number instead is a race: if the
+            // create shares a ledger with the first payment batch, hash-ordered
+            // apply can run payments before the create exists, failing them.
             simulation->crankUntil(
-                [&]() { return simulation->haveAllExternalized(3, 2); },
+                [&]() {
+                    auto view =
+                        node0->getAppConnector().copyImmutableLedgerView();
+                    return static_cast<bool>(
+                        view.getAccount(destKey.getPublicKey()));
+                },
                 30 * simulation->getExpectedLedgerCloseTime(), false);
 
             // Track start ledger
@@ -2077,10 +2097,10 @@ TEST_CASE("Rust overlay 15-node 2000 TPS stress test", "[overlay-ipc-large]")
 
     // Test parameters
     int const numNodes = 15;
-    // Rate kept within the sustainable TX-ingestion envelope so PAY_PREGENERATED
-    // loadgen completes (the 2000 TPS variant is blocked by an ingestion limit
-    // orthogonal to consensus; see git history). This still drives real
-    // multi-ledger load through parallel tx set downloading.
+    // Rate kept within the sustainable TX-ingestion envelope so
+    // PAY_PREGENERATED loadgen completes (the 2000 TPS variant is blocked by an
+    // ingestion limit orthogonal to consensus; see git history). This still
+    // drives real multi-ledger load through parallel tx set downloading.
     int const txPerLedger = 2000;
     int const ledgerCount = 5;
     int const totalTxs = txPerLedger * ledgerCount; // 10,000 txs total

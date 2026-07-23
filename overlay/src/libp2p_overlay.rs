@@ -102,6 +102,11 @@ pub enum OverlayCommand {
     /// Eagerly broadcast a TX set body to all connected peers (round-1 leader
     /// pushes its nominated set so receivers skip the GetTxSet round-trip)
     BroadcastTxSet { hash: [u8; 32], data: Vec<u8> },
+    /// Relay a network-received TX that Core has validated (see the
+    /// validation gate in main.rs): store it for GETDATA service, then push
+    /// to connected leaders (or INV-announce as fallback), excluding the
+    /// origin peer and peers already known to have it.
+    RelayValidatedTx { tx: Arc<ValidatedTx>, from: PeerId },
     /// Record that a peer has a specific TX set (learned from SCP message)
     RecordTxSetSource { hash: [u8; 32], peer: PeerId },
     /// Connect to a peer by address (bootstrap — PeerId unknown)
@@ -209,6 +214,20 @@ impl OverlayHandle {
         if let Err(e) = self.cmd_tx.send(OverlayCommand::BroadcastTx(tx)).await {
             warn!(
                 "Overlay command channel closed, failed to send BroadcastTx: {}",
+                e
+            );
+        }
+    }
+
+    /// Relay a Core-validated received TX (see OverlayCommand::RelayValidatedTx).
+    pub async fn relay_validated_tx(&self, tx: Arc<ValidatedTx>, from: PeerId) {
+        if let Err(e) = self
+            .cmd_tx
+            .send(OverlayCommand::RelayValidatedTx { tx, from })
+            .await
+        {
+            warn!(
+                "Overlay command channel closed, failed to send RelayValidatedTx: {}",
                 e
             );
         }
@@ -620,6 +639,9 @@ impl StellarOverlay {
                         OverlayCommand::BroadcastTx(tx) => {
                             self.broadcast_tx(tx).await;
                         }
+                        OverlayCommand::RelayValidatedTx { tx, from } => {
+                            relay_validated_tx(&self.state, tx, from).await;
+                        }
                         OverlayCommand::FetchTxSet { hash } => {
                             self.fetch_txset(hash).await;
                         }
@@ -978,8 +1000,7 @@ impl StellarOverlay {
                         &hash[..4],
                         connected_leaders.len()
                     );
-                    push_tx_to_peers(&self.state, &connected_leaders, &tx, &hash, fee_per_op)
-                        .await;
+                    push_tx_to_peers(&self.state, &connected_leaders, &tx, &hash, fee_per_op).await;
                     return;
                 }
             }
@@ -1097,8 +1118,7 @@ impl StellarOverlay {
 
         let peer = {
             let streams = self.state.peer_streams.read().await;
-            let source_ok = known_source
-                .filter(|p| streams.contains_key(p) && Some(*p) != avoid);
+            let source_ok = known_source.filter(|p| streams.contains_key(p) && Some(*p) != avoid);
             let leader_ok = || {
                 leaders
                     .iter()
@@ -2156,7 +2176,10 @@ async fn drain_txset_pushes(state: Arc<SharedState>, peer: PeerId) {
                 // Count under both the generic TxSet-send meter and the
                 // dedicated eager-push meters (successful sends only).
                 state.metrics.send_txset.fetch_add(1, Ordering::Relaxed);
-                state.metrics.flood_txset_push.fetch_add(1, Ordering::Relaxed);
+                state
+                    .metrics
+                    .flood_txset_push
+                    .fetch_add(1, Ordering::Relaxed);
                 state
                     .metrics
                     .flood_txset_push_bytes
@@ -2235,7 +2258,6 @@ fn send_tx_batch(state: &Arc<SharedState>, peer: PeerId, batch: Vec<Arc<Validate
 async fn handle_tx_response(state: &Arc<SharedState>, peer_id: &PeerId, tx: Arc<ValidatedTx>) {
     // `tx` was validated in the stream reader's single decode.
     let hash = *tx.hash();
-    let fee_per_op = tx.fee_per_op();
     let recv_start = std::time::Instant::now();
     let tx_len = tx.bytes().len() as u64;
 
@@ -2277,12 +2299,6 @@ async fn handle_tx_response(state: &Arc<SharedState>, peer_id: &PeerId, tx: Arc<
         }
     }
 
-    // Store in buffer for responding to others' GETDATA
-    {
-        let mut buffer = state.tx_buffer.write().await;
-        buffer.insert(hash, tx.bytes().to_vec());
-    }
-
     debug!(
         "TX_RECV: Received TX {:02x?}... ({} bytes) from {}",
         &hash[..4],
@@ -2290,7 +2306,11 @@ async fn handle_tx_response(state: &Arc<SharedState>, peer_id: &PeerId, tx: Arc<
         peer_id
     );
 
-    // Forward to Core via bounded TX channel
+    // Hand to Core for validation via the bounded TX channel. Relay (and
+    // GETDATA-buffer insertion, and mempool admission) happen only after
+    // Core's verdict comes back — see the validation gate in main.rs and
+    // OverlayCommand::RelayValidatedTx. A dropped event here means the tx is
+    // simply not relayed; the origin's own leader push still stands.
     if let Err(_) = state.tx_event_tx.try_send(OverlayEvent::TxReceived {
         tx: Arc::clone(&tx),
         from: peer_id.clone(),
@@ -2306,6 +2326,24 @@ async fn handle_tx_response(state: &Arc<SharedState>, peer_id: &PeerId, tx: Arc<
         }
     }
 
+    record_recv_transaction_timing(state, recv_start);
+}
+
+/// Relay a Core-validated received TX: store it for GETDATA service, then
+/// with a known leader schedule push the full body directly to the connected
+/// leaders that don't already have it — this closes coverage holes when the
+/// origin couldn't reach every leader. Without a schedule (or with all
+/// leaders disconnected, for liveness), INV-announce to all peers.
+async fn relay_validated_tx(state: &Arc<SharedState>, tx: Arc<ValidatedTx>, from: PeerId) {
+    let hash = *tx.hash();
+    let fee_per_op = tx.fee_per_op();
+
+    // Store in buffer for responding to others' GETDATA
+    {
+        let mut buffer = state.tx_buffer.write().await;
+        buffer.insert(hash, tx.bytes().to_vec());
+    }
+
     // Peers who already know about this TX (INV'd us or sent it to us)
     let known_sources: HashSet<PeerId> = {
         let tracker = state.inv_tracker.read().await;
@@ -2315,17 +2353,12 @@ async fn handle_tx_response(state: &Arc<SharedState>, peer_id: &PeerId, tx: Arc<
             .unwrap_or_default()
     };
 
-    // RELAY. With a known leader schedule, forward the full body directly to
-    // the connected leaders that don't already have it — this closes coverage
-    // holes when the origin couldn't reach every leader. Without a schedule
-    // (or with all leaders disconnected, for liveness), INV-announce to all
-    // peers as before.
     let connected_leaders = connected_flood_leaders(state).await;
     if let Some(leaders) = &connected_leaders {
         if !leaders.is_empty() {
             let targets: Vec<PeerId> = leaders
                 .iter()
-                .filter(|p| **p != *peer_id && !known_sources.contains(p))
+                .filter(|p| **p != from && !known_sources.contains(p))
                 .cloned()
                 .collect();
             if !targets.is_empty() {
@@ -2336,7 +2369,6 @@ async fn handle_tx_response(state: &Arc<SharedState>, peer_id: &PeerId, tx: Arc<
                 );
                 push_tx_to_peers(state, &targets, &tx, &hash, fee_per_op).await;
             }
-            record_recv_transaction_timing(state, recv_start);
             return;
         }
         // Leaders known but none connected: INV relay below.
@@ -2350,7 +2382,7 @@ async fn handle_tx_response(state: &Arc<SharedState>, peer_id: &PeerId, tx: Arc<
         let streams = state.peer_streams.read().await;
         streams
             .keys()
-            .filter(|p| **p != *peer_id && !known_sources.contains(p))
+            .filter(|p| **p != from && !known_sources.contains(p))
             .cloned()
             .collect()
     };
@@ -2375,8 +2407,6 @@ async fn handle_tx_response(state: &Arc<SharedState>, peer_id: &PeerId, tx: Arc<
             }
         }
     }
-
-    record_recv_transaction_timing(state, recv_start);
 }
 
 /// Record recv-transaction timing metrics for handle_tx_response.
@@ -2924,7 +2954,7 @@ mod tests {
         let metrics_b = Arc::new(OverlayMetrics::new());
         let (handle_a, _events_a, _tx_events_a, overlay_a) =
             create_overlay(keypair_a, Arc::new(OverlayMetrics::new())).unwrap();
-        let (handle_b, _events_b, _tx_events_b, overlay_b) =
+        let (handle_b, _events_b, mut tx_events_b, overlay_b) =
             create_overlay(keypair_b, Arc::clone(&metrics_b)).unwrap();
         let (handle_c, _events_c, mut tx_events_c, overlay_c) =
             create_overlay(keypair_c, Arc::new(OverlayMetrics::new())).unwrap();
@@ -2954,6 +2984,26 @@ mod tests {
         handle_a
             .broadcast_tx(ValidatedTx::from_core_trusted(tx.clone(), 0, 1).unwrap())
             .await;
+
+        // B pulls the body via GETDATA. Receive no longer auto-relays (the
+        // pre-flood validation gate holds TXs for Core's verdict), so stand
+        // in for Core: on B's TxReceived, mark the tx valid to trigger the
+        // leader relay to C.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut b_received = false;
+        while tokio::time::Instant::now() < deadline && !b_received {
+            tokio::select! {
+                Some(event) = tx_events_b.recv() => {
+                    if let OverlayEvent::TxReceived { tx: recv_tx, from } = event {
+                        assert_eq!(recv_tx.bytes(), tx.as_slice());
+                        handle_b.relay_validated_tx(recv_tx, from).await;
+                        b_received = true;
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+        assert!(b_received, "B should pull the TX body from A");
 
         // C must receive the TX: A INVs to B, B pulls it, then B pushes the
         // full body directly to its leader C.
@@ -4951,6 +5001,10 @@ async fn test_inv_getdata_three_node_relay() {
                     );
                     if tx.bytes() == test_tx.as_slice() && from == peer1_id {
                         node2_received = true;
+                        // Receive no longer auto-relays: relay waits for
+                        // Core's validity verdict (pre-flood validation
+                        // gate). Stand in for Core here and mark it valid.
+                        handle2.relay_validated_tx(tx, from).await;
                     }
                 }
             }

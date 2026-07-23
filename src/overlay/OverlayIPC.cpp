@@ -498,6 +498,68 @@ OverlayIPC::handleMessage(IPCMessage const& msg)
         break;
     }
 
+    case IPCMessageType::VALIDATE_TXS:
+    {
+        // Payload: [batchId:8][count:4]([len:4][txEnvelopeXDR:len])*
+        if (msg.payload.size() < 12)
+        {
+            CLOG_WARNING(Overlay, "VALIDATE_TXS payload too short");
+            break;
+        }
+        if (!mOnValidateTxs)
+        {
+            CLOG_WARNING(Overlay, "VALIDATE_TXS but no callback registered");
+            break;
+        }
+
+        uint64_t batchId;
+        uint32_t txCount;
+        std::memcpy(&batchId, msg.payload.data(), 8);
+        std::memcpy(&txCount, msg.payload.data() + 8, 4);
+
+        std::vector<std::optional<TransactionEnvelope>> txs;
+        txs.reserve(txCount);
+        size_t offset = 12;
+        for (uint32_t i = 0; i < txCount && offset + 4 <= msg.payload.size();
+             ++i)
+        {
+            uint32_t txLen;
+            std::memcpy(&txLen, msg.payload.data() + offset, 4);
+            offset += 4;
+            if (offset + txLen > msg.payload.size())
+            {
+                break;
+            }
+            try
+            {
+                TransactionEnvelope tx;
+                std::vector<uint8_t> txData(msg.payload.begin() + offset,
+                                            msg.payload.begin() + offset +
+                                                txLen);
+                xdr::xdr_from_opaque(txData, tx);
+                txs.emplace_back(std::move(tx));
+            }
+            catch (std::exception const& e)
+            {
+                CLOG_WARNING(Overlay, "VALIDATE_TXS: failed to parse tx {}: {}",
+                             i, e.what());
+                txs.emplace_back(std::nullopt);
+            }
+            offset += txLen;
+        }
+        // Short payloads leave trailing txs unparsed; give them explicit
+        // reject verdicts rather than dropping them from the batch.
+        while (txs.size() < txCount)
+        {
+            txs.emplace_back(std::nullopt);
+        }
+
+        CLOG_DEBUG(Overlay, "VALIDATE_TXS: batch {} with {} txs", batchId,
+                   txs.size());
+        mOnValidateTxs(batchId, txs);
+        break;
+    }
+
     case IPCMessageType::QUORUM_CONNECTIVITY_REPORT:
     {
         std::string jsonStr(msg.payload.begin(), msg.payload.end());
@@ -718,6 +780,38 @@ OverlayIPC::submitTransaction(TransactionEnvelope const& tx, int64_t fee,
     offset += 4;
 
     std::memcpy(msg.payload.data() + offset, txData.data(), txData.size());
+
+    std::lock_guard<std::mutex> lock(mSendMutex);
+    mChannel->send(msg);
+}
+
+void
+OverlayIPC::setOnValidateTxs(ValidateTxsCallback cb)
+{
+    mOnValidateTxs = std::move(cb);
+}
+
+void
+OverlayIPC::sendTxValidationVerdicts(uint64_t batchId,
+                                     std::vector<uint8_t> const& verdicts)
+{
+    if (!mChannel || !mChannel->isConnected())
+    {
+        return;
+    }
+
+    IPCMessage msg;
+    msg.type = IPCMessageType::TX_VALIDATION_VERDICTS;
+
+    // Payload: [batchId:8][count:4][verdicts:count]
+    uint32_t count = static_cast<uint32_t>(verdicts.size());
+    msg.payload.resize(8 + 4 + verdicts.size());
+    std::memcpy(msg.payload.data(), &batchId, 8);
+    std::memcpy(msg.payload.data() + 8, &count, 4);
+    if (!verdicts.empty())
+    {
+        std::memcpy(msg.payload.data() + 12, verdicts.data(), verdicts.size());
+    }
 
     std::lock_guard<std::mutex> lock(mSendMutex);
     mChannel->send(msg);

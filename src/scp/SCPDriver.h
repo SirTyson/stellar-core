@@ -16,8 +16,8 @@
 
 namespace stellar
 {
-// Forward declaration so wrappers can hold/pin a tx set without SCP depending on
-// herder (parallel tx set download; see docs/direct-leader-flooding.md).
+// Forward declaration so wrappers can hold/pin a tx set without SCP depending
+// on herder (parallel tx set download; see docs/direct-leader-flooding.md).
 class TxSetXDRFrame;
 using TxSetXDRFrameConstPtr = std::shared_ptr<TxSetXDRFrame const>;
 

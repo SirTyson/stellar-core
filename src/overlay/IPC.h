@@ -89,6 +89,11 @@ enum class IPCMessageType : uint32_t
     /// Payload: [hash:32][txSetXDR...]
     BROADCAST_TX_SET = 15,
 
+    /// Response to VALIDATE_TXS: per-tx verdicts for a batch, in the batch's
+    /// order (1 = valid, flood it; 0 = invalid, drop it).
+    /// Payload: [batchId:8][count:4][verdicts:count]
+    TX_VALIDATION_VERDICTS = 16,
+
     // ═══ Overlay → Core (Critical Path) ═══
 
     /// Received SCP envelope from network
@@ -116,6 +121,12 @@ enum class IPCMessageType : uint32_t
 
     /// One-shot quorum connectivity verdict (JSON array of missing strkeys)
     QUORUM_CONNECTIVITY_REPORT = 106,
+
+    /// Ask Core to validate a batch of network-received transactions before
+    /// the overlay floods them onward (see docs/direct-leader-flooding.md).
+    /// Core answers with TX_VALIDATION_VERDICTS carrying the same batchId.
+    /// Payload: [batchId:8][count:4]([len:4][txEnvelopeXDR:len])*
+    VALIDATE_TXS = 107,
 };
 
 /**

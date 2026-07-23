@@ -286,9 +286,9 @@ NominationProtocol::updateRoundLeaders()
 
 std::set<NodeID>
 NominationProtocol::computeRoundLeaders(SCPDriver& driver, Value const& seed,
-                                       uint64 slotIndex, int32_t roundNumber,
-                                       SCPQuorumSet const& qset,
-                                       NodeID const& localID)
+                                        uint64 slotIndex, int32_t roundNumber,
+                                        SCPQuorumSet const& qset,
+                                        NodeID const& localID)
 {
     ZoneScoped;
     dbgAssert(!seed.empty());
@@ -302,8 +302,8 @@ NominationProtocol::computeRoundLeaders(SCPDriver& driver, Value const& seed,
         if (w > 0 && driver.computeHashNode(slotIndex, seed, /* isPriority */
                                             false, roundNumber, nodeID) <= w)
         {
-            return driver.computeHashNode(slotIndex, seed, /* isPriority */ true,
-                                          roundNumber, nodeID);
+            return driver.computeHashNode(
+                slotIndex, seed, /* isPriority */ true, roundNumber, nodeID);
         }
         return 0;
     };

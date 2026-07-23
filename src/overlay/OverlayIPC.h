@@ -53,6 +53,14 @@ class OverlayIPC
     using QuorumConnectivityReportCallback =
         std::function<void(std::vector<std::string> const& missingValidators)>;
 
+    /// Callback when the overlay asks Core to validate a batch of received
+    /// transactions before flooding them. Invoked on the IPC reader thread;
+    /// implementations must not block. Envelopes that failed to parse are
+    /// represented as std::nullopt and must receive a verdict of 0.
+    using ValidateTxsCallback = std::function<void(
+        uint64_t batchId,
+        std::vector<std::optional<TransactionEnvelope>> const& txs)>;
+
     /**
      * Create an OverlayIPC instance.
      *
@@ -212,6 +220,14 @@ class OverlayIPC
     /// Set callback for quorum connectivity reports.
     void setOnQuorumConnectivityReport(QuorumConnectivityReportCallback cb);
 
+    /// Set callback for pre-flood tx validation requests from the overlay.
+    void setOnValidateTxs(ValidateTxsCallback cb);
+
+    /// Send the per-tx verdicts for a VALIDATE_TXS batch back to the overlay.
+    /// Thread-safe; callable from any thread.
+    void sendTxValidationVerdicts(uint64_t batchId,
+                                  std::vector<uint8_t> const& verdicts);
+
     /**
      * Request overlay metrics snapshot from Rust overlay.
      *
@@ -266,6 +282,7 @@ class OverlayIPC
     ScpStateRequestCallback mOnScpStateRequest;
     TxSetReceivedCallback mOnTxSetReceived;
     QuorumConnectivityReportCallback mOnQuorumConnectivityReport;
+    ValidateTxsCallback mOnValidateTxs;
 
     // For synchronous request/response (getTopTransactions)
     std::mutex mRequestMutex;

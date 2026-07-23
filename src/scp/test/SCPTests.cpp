@@ -797,10 +797,13 @@ TEST_CASE("parallel tx set download: structurally valid value drives nomination"
     verifyNominate(scp.mEnvs[0], v0SecretKey, qSetHash0, 0, votes, accepted);
 
     // A quorum votes for x -> x is ACCEPTED.
-    scp.receiveEnvelope(makeNominate(v1SecretKey, qSetHash, 0, votes, accepted));
-    scp.receiveEnvelope(makeNominate(v2SecretKey, qSetHash, 0, votes, accepted));
+    scp.receiveEnvelope(
+        makeNominate(v1SecretKey, qSetHash, 0, votes, accepted));
+    scp.receiveEnvelope(
+        makeNominate(v2SecretKey, qSetHash, 0, votes, accepted));
     REQUIRE(scp.mEnvs.size() == 1);
-    scp.receiveEnvelope(makeNominate(v3SecretKey, qSetHash, 0, votes, accepted));
+    scp.receiveEnvelope(
+        makeNominate(v3SecretKey, qSetHash, 0, votes, accepted));
     REQUIRE(scp.mEnvs.size() == 2);
     accepted.emplace_back(xValue);
     verifyNominate(scp.mEnvs[1], v0SecretKey, qSetHash0, 0, votes, accepted);
@@ -810,11 +813,15 @@ TEST_CASE("parallel tx set download: structurally valid value drives nomination"
     // -- nomination reaches the ballot protocol without the tx set.
     scp.mExpectedCandidates.emplace(xValue);
     scp.mCompositeValue = xValue;
-    scp.receiveEnvelope(makeNominate(v1SecretKey, qSetHash, 0, votes, accepted));
-    scp.receiveEnvelope(makeNominate(v2SecretKey, qSetHash, 0, votes, accepted));
-    scp.receiveEnvelope(makeNominate(v3SecretKey, qSetHash, 0, votes, accepted));
+    scp.receiveEnvelope(
+        makeNominate(v1SecretKey, qSetHash, 0, votes, accepted));
+    scp.receiveEnvelope(
+        makeNominate(v2SecretKey, qSetHash, 0, votes, accepted));
+    scp.receiveEnvelope(
+        makeNominate(v3SecretKey, qSetHash, 0, votes, accepted));
     REQUIRE(scp.mEnvs.size() == 3);
-    verifyPrepare(scp.mEnvs[2], v0SecretKey, qSetHash0, 0, SCPBallot(1, xValue));
+    verifyPrepare(scp.mEnvs[2], v0SecretKey, qSetHash0, 0,
+                  SCPBallot(1, xValue));
 }
 
 TEST_CASE("empty-tx-set recovery: stuck structurally-valid value is replaced",

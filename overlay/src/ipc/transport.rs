@@ -90,6 +90,21 @@ impl CoreSender {
         payload.extend_from_slice(&xdr);
         self.send(Message::new(MessageType::TxSetAvailable, payload))
     }
+
+    /// Convenience: ask Core to validate a batch of received transactions
+    /// before flooding (answered by TxValidationVerdicts with the same id).
+    /// Payload: [batchId:8][count:4]([len:4][tx:len])*
+    pub fn send_validate_txs(&self, batch_id: u64, txs: &[&[u8]]) -> Result<(), IpcError> {
+        let total: usize = 12 + txs.iter().map(|tx| 4 + tx.len()).sum::<usize>();
+        let mut payload = Vec::with_capacity(total);
+        payload.extend_from_slice(&batch_id.to_le_bytes());
+        payload.extend_from_slice(&(txs.len() as u32).to_le_bytes());
+        for tx in txs {
+            payload.extend_from_slice(&(tx.len() as u32).to_le_bytes());
+            payload.extend_from_slice(tx);
+        }
+        self.send(Message::new(MessageType::ValidateTxs, payload))
+    }
 }
 
 /// Handle for receiving messages from Core.

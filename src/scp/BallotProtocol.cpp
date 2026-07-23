@@ -203,12 +203,12 @@ BallotProtocol::processEnvelope(SCPEnvelopeWrapperPtr envelope, bool self)
         return SCP::EnvelopeState::INVALID;
     }
 
-    // Parallel tx set download (docs/direct-leader-flooding.md): a value that is
-    // only structurally valid (its tx set is still downloading) may drive
-    // PREPARE, and the local node may generate its own CONFIRM once a v-blocking
-    // set votes-to-commit it. But we reject a peer's CONFIRM and any EXTERNALIZE
-    // that we cannot fully validate; the node stalls at commit until the tx set
-    // arrives (see setConfirmPrepared / setConfirmCommit).
+    // Parallel tx set download (docs/direct-leader-flooding.md): a value that
+    // is only structurally valid (its tx set is still downloading) may drive
+    // PREPARE, and the local node may generate its own CONFIRM once a
+    // v-blocking set votes-to-commit it. But we reject a peer's CONFIRM and any
+    // EXTERNALIZE that we cannot fully validate; the node stalls at commit
+    // until the tx set arrives (see setConfirmPrepared / setConfirmCommit).
     if (validationRes == SCPDriver::kStructurallyValidValue)
     {
         switch (statement.pledges.type())
@@ -1203,8 +1203,8 @@ BallotProtocol::setConfirmPrepared(SCPBallot const& newC, SCPBallot const& newH)
             //     set). We must NOT vote-to-commit it -- doing so would emit a
             //     spec-violating vote and pin mCommit to a value that can never
             //     externalize (peers' CONFIRM/EXTERNALIZE for it are rejected),
-            //     wedging this node. Leaving mCommit unset lets the node move to
-            //     a valid value at a higher ballot.
+            //     wedging this node. Leaving mCommit unset lets the node move
+            //     to a valid value at a higher ballot.
             // This is the core safety gate: a value whose transactions we have
             // not validated (or consider invalid) cannot be committed.
             auto vl = mSlot.getSCPDriver().validateValue(mSlot.getSlotIndex(),
