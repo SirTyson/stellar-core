@@ -26,7 +26,7 @@
 [submodule "src/protocol-curr/xdr"]
 	path = src/protocol-curr/xdr
 	url = https://github.com/SirTyson/stellar-xdr
-	branch = empty-tx-set-recovery
+	branch = empty-tx-set-recovery-p27
 [submodule "src/rust/soroban/p21"]
 	path = src/rust/soroban/p21
 	url = https://github.com/stellar/rs-soroban-env
