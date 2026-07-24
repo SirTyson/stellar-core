@@ -544,8 +544,16 @@ class Config : public std::enable_shared_from_this<Config>
     // Enable parallel block application (experimental)
     bool PARALLEL_LEDGER_APPLY;
 
-    // Disable expensive Soroban metrics for performance testing
+    // Disable expensive Soroban metrics for performance testing. This also
+    // disables all SimpleTimer updates (e.g. the bucket point-load timers),
+    // since some of them sit on hot paths shared by the parallel apply
+    // threads, where they become a cross-thread contention point.
     bool DISABLE_SOROBAN_METRICS_FOR_TESTING;
+
+    // Disable transaction metadata collection in test builds for benchmarking.
+    // When true, BUILD_TESTS overrides that force ledgerCloseMeta allocation
+    // and enableTxMeta are suppressed, avoiding significant XDR copy overhead.
+    bool DISABLE_TX_META_FOR_TESTING;
 
     // Batch transactions for flooding purposes (experimental).
     // Has no effect on non-test builds.
@@ -772,6 +780,9 @@ class Config : public std::enable_shared_from_this<Config>
     // low-priority WORKER_THREADS pool whose long-running jobs (bucket
     // merges) would otherwise delay validation.
     int TX_VALIDATION_THREADS;
+
+    // Number of threads to use during ledger close parallelism
+    int LEDGER_CLOSE_WORKER_THREADS;
 
     // Number of threads to serve query commands
     int QUERY_THREAD_POOL_SIZE;

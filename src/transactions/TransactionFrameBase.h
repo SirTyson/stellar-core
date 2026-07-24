@@ -15,6 +15,7 @@
 #include "util/TxResource.h"
 #include "util/UnorderedSet.h"
 #include "util/types.h"
+#include <atomic>
 #include <optional>
 
 #include "ledger/SorobanMetrics.h"
@@ -44,12 +45,65 @@ using TransactionFrameBasePtr = std::shared_ptr<TransactionFrameBase const>;
 using TransactionFrameBaseConstPtr =
     std::shared_ptr<TransactionFrameBase const>;
 
+class ParallelApplyLedgerKey
+{
+  public:
+    ParallelApplyLedgerKey() = default;
+    ParallelApplyLedgerKey(LedgerKey const& ledgerKey) : mLedgerKey(ledgerKey)
+    {
+    }
+
+    LedgerKey const&
+    ledgerKey() const
+    {
+        return mLedgerKey;
+    }
+
+    operator LedgerKey const&() const
+    {
+        return mLedgerKey;
+    }
+
+    size_t
+    hash() const
+    {
+        if (mHash != 0)
+        {
+            return mHash;
+        }
+        mHash = std::hash<LedgerKey>{}(mLedgerKey);
+        return mHash;
+    }
+
+  private:
+    mutable size_t mHash{0};
+    LedgerKey mLedgerKey;
+};
+
+inline bool
+operator==(ParallelApplyLedgerKey const& lhs, ParallelApplyLedgerKey const& rhs)
+{
+    return lhs.ledgerKey() == rhs.ledgerKey();
+}
+
+using ParallelApplyLedgerKeySet = UnorderedSet<ParallelApplyLedgerKey>;
+
+template <typename T>
+using ParallelApplyLedgerKeyMap = UnorderedMap<ParallelApplyLedgerKey, T>;
+
 // Tracks entry updates within a transaction during parallel apply phases. If
 // the transaction succeeds, the thread's ParallelApplyEntryMap should be
 // updated with the entries from the TxModifiedEntryMap.
 using TxParApplyLedgerEntry =
     ScopedLedgerEntry<StaticLedgerEntryScope::TxParApply>;
-using TxModifiedEntryMap = UnorderedMap<LedgerKey, TxParApplyLedgerEntryOpt>;
+using TxModifiedEntryMap = ParallelApplyLedgerKeyMap<TxParApplyLedgerEntryOpt>;
+
+struct ParallelPreApplyInfo
+{
+    bool mUpdateSeqNum = false;
+    bool mRemoveOneTimeSigners = false;
+    bool mUpdateSorobanMetrics = false;
+};
 
 // Used to track the current state of an entry during parallel apply phases. Can
 // be updated by successful transactions.
@@ -59,22 +113,47 @@ template <StaticLedgerEntryScope S> struct ParallelApplyEntry
     // it due to hitting read limits.
     ScopedLedgerEntryOpt<S> mLedgerEntry;
     bool mIsDirty;
+    // True if this entry was newly created during the parallel apply phase
+    // (did not exist in persistent state before). Used by
+    // commitChangesToLedgerTxn to choose createWithoutLoading (INIT) vs
+    // updateWithoutLoading (LIVE) without expensive existence checks.
+    bool mIsNew{false};
     static ParallelApplyEntry
     clean(ScopedLedgerEntryOpt<S> const& e)
     {
-        return ParallelApplyEntry{e, false};
+        return ParallelApplyEntry{e, false, false};
+    }
+    static ParallelApplyEntry
+    clean(ScopedLedgerEntryOpt<S>&& e)
+    {
+        return ParallelApplyEntry{std::move(e), false, false};
     }
     static ParallelApplyEntry
     dirty(ScopedLedgerEntryOpt<S> const& e)
     {
-        return ParallelApplyEntry{e, true};
+        return ParallelApplyEntry{e, true, false};
+    }
+    static ParallelApplyEntry
+    dirty(ScopedLedgerEntryOpt<S>&& e)
+    {
+        return ParallelApplyEntry{std::move(e), true, false};
     }
     template <StaticLedgerEntryScope S2>
     ParallelApplyEntry<S2>
-    rescope(LedgerEntryScope<S> const& s1, LedgerEntryScope<S2> const& s2) const
+    rescope(LedgerEntryScope<S> const& s1,
+            LedgerEntryScope<S2> const& s2) const&
     {
         auto adoptedEntry = s2.scopeAdoptEntryOptFrom(mLedgerEntry, s1);
-        return ParallelApplyEntry<S2>{adoptedEntry, mIsDirty};
+        return ParallelApplyEntry<S2>{adoptedEntry, mIsDirty, mIsNew};
+    }
+    template <StaticLedgerEntryScope S2>
+    ParallelApplyEntry<S2>
+    rescope(LedgerEntryScope<S> const& s1, LedgerEntryScope<S2> const& s2) &&
+    {
+        auto adoptedEntry =
+            s2.scopeAdoptEntryOptFrom(std::move(mLedgerEntry), s1);
+        return ParallelApplyEntry<S2>{std::move(adoptedEntry), mIsDirty,
+                                      mIsNew};
     }
 };
 using GlobalParallelApplyEntry =
@@ -90,7 +169,7 @@ using TxParallelApplyEntry =
 // threads return, the updates from each threads entry map should be committed
 // to LedgerTxn.
 template <StaticLedgerEntryScope S>
-using ParallelApplyEntryMap = UnorderedMap<LedgerKey, ParallelApplyEntry<S>>;
+using ParallelApplyEntryMap = ParallelApplyLedgerKeyMap<ParallelApplyEntry<S>>;
 using GlobalParallelApplyEntryMap =
     ParallelApplyEntryMap<StaticLedgerEntryScope::GlobalParApply>;
 using ThreadParallelApplyEntryMap =
@@ -161,6 +240,18 @@ class TransactionFrameBase
                      TransactionMetaBuilder& meta,
                      MutableTransactionResultBase& txResult,
                      SorobanNetworkConfig const& sorobanConfig) const = 0;
+
+    virtual void
+    preParallelApplyReadOnly(AppConnector& app, CheckValidLedgerViewWrapper const& ls,
+                             TransactionMetaBuilder& meta,
+                             MutableTransactionResultBase& txResult,
+                             SorobanNetworkConfig const& sorobanConfig,
+                             ParallelPreApplyInfo& info) const = 0;
+
+    virtual void
+    preParallelApplyWrite(AppConnector& app, AbstractLedgerTxn& ltx,
+                          TransactionMetaBuilder& meta,
+                          ParallelPreApplyInfo const& info) const = 0;
 
     // If the transaction fails during parallel apply, returns std::nullopt.
     // Otherwise returns a ParallelTxSuccessVal containing the modified entries
@@ -300,5 +391,30 @@ class TransactionFrameBase
     virtual bool isRestoreFootprintTx() const = 0;
 
     virtual ~TransactionFrameBase() = default;
+};
+
+#ifdef BUILD_TESTS
+// Diagnostic per-thread accumulators (ms) breaking down the sequential soroban
+// preParallelApply work, summed across preParallelApply calls on the calling
+// thread. Reset and read by the parallel-apply setup to split setup_seq_check.
+// Cross-thread CPU-time accumulators for the pre-apply sub-phases; see the
+// definitions in TransactionFrame.cpp.
+extern std::atomic<double> gSeqPreApplyCommonValidMs;
+extern std::atomic<double> gSeqPreApplyProcessSigsMs;
+extern std::atomic<double> gSeqPreApplyCheckValidMs;
+extern std::atomic<double> gSeqPreApplyWriteMs;
+#endif
+}
+
+namespace std
+{
+template <> class hash<stellar::ParallelApplyLedgerKey>
+{
+  public:
+    size_t
+    operator()(stellar::ParallelApplyLedgerKey const& key) const
+    {
+        return key.hash();
+    }
 };
 }

@@ -6,33 +6,82 @@
 #include "crypto/ByteSlice.h"
 #include "crypto/CryptoError.h"
 #include "crypto/Curve25519.h"
+#include "rust/RustBridge.h"
 #include "util/NonCopyable.h"
 #include <Tracy.hpp>
-#include <sodium.h>
+#include <openssl/sha.h>
+#include <vector>
+
+// Verify that the aligned storage in SHA.h matches the real SHA256_CTX.
+static_assert(sizeof(SHA256_CTX) == 112,
+              "SHA256_CTX size mismatch with aligned storage in SHA.h");
+static_assert(alignof(SHA256_CTX) <= 4,
+              "SHA256_CTX alignment exceeds aligned storage in SHA.h");
 
 namespace stellar
 {
 
-// Plain SHA256
+// Helper to access the OpenSSL SHA256_CTX stored in the aligned byte array.
+static inline SHA256_CTX*
+ctx(std::byte* s)
+{
+    return reinterpret_cast<SHA256_CTX*>(s);
+}
+
+// Plain SHA256. Routed through the Rust sha2 bridge rather than OpenSSL 3.x's
+// one-shot ::SHA256(): the latter implicitly fetches the algorithm (taking a
+// global lock) on every call and therefore does not scale across threads, which
+// throttled the parallel Soroban apply (sha256 is called per-entry/per-tx). The
+// Rust impl is stateless/lock-free, uses SHA-NI, and is byte-identical.
 uint256
 sha256(ByteSlice const& bin)
 {
     ZoneScoped;
     uint256 out;
-    if (crypto_hash_sha256(out.data(), bin.data(), bin.size()) != 0)
-    {
-        throw CryptoError("error from crypto_hash_sha256");
-    }
+    rust_bridge::sha256_rust(bin.data(), bin.size(), out.data());
+    return out;
+}
+
+// Incremental SHA256 backed by the Rust sha2 bridge. The rust::Box handle is
+// kept behind a pimpl so RustBridge.h stays out of the widely-included SHA.h.
+struct StreamingSha256::Impl
+{
+    rust::Box<rust_bridge::RustSha256> box;
+};
+
+StreamingSha256::StreamingSha256()
+    : mImpl(new Impl{rust_bridge::new_rust_sha256()})
+{
+}
+
+StreamingSha256::~StreamingSha256() = default;
+
+void
+StreamingSha256::update(unsigned char const* data, size_t size)
+{
+    mImpl->box->update(data, size);
+}
+
+uint256
+StreamingSha256::finish()
+{
+    uint256 out;
+    mImpl->box->finalize(out.data());
     return out;
 }
 
 Hash
 subSha256(ByteSlice const& seed, uint64_t counter)
 {
-    SHA256 sha;
-    sha.add(seed);
-    sha.add(xdr::xdr_to_opaque(counter));
-    return sha.finish();
+    // Equivalent to sha256(seed || xdr(counter)); built as one buffer so it goes
+    // through the thread-scalable bridged sha256() above. Called per-tx during
+    // parallel apply, so avoiding the non-scaling path matters here.
+    auto counterBytes = xdr::xdr_to_opaque(counter);
+    std::vector<uint8_t> buf;
+    buf.reserve(seed.size() + counterBytes.size());
+    buf.insert(buf.end(), seed.begin(), seed.end());
+    buf.insert(buf.end(), counterBytes.begin(), counterBytes.end());
+    return sha256(buf);
 }
 
 SHA256::SHA256()
@@ -43,10 +92,7 @@ SHA256::SHA256()
 void
 SHA256::reset()
 {
-    if (crypto_hash_sha256_init(&mState) != 0)
-    {
-        throw CryptoError("error from crypto_hash_sha256_init");
-    }
+    SHA256_Init(ctx(mState));
     mFinished = false;
 }
 
@@ -58,26 +104,20 @@ SHA256::add(ByteSlice const& bin)
     {
         throw std::runtime_error("adding bytes to finished SHA256");
     }
-    if (crypto_hash_sha256_update(&mState, bin.data(), bin.size()) != 0)
-    {
-        throw CryptoError("error from crypto_hash_sha256_update");
-    }
+    SHA256_Update(ctx(mState), bin.data(), bin.size());
 }
 
 uint256
 SHA256::finish()
 {
     uint256 out;
-    static_assert(sizeof(out) == crypto_hash_sha256_BYTES,
-                  "unexpected crypto_hash_sha256_BYTES");
+    static_assert(sizeof(out) == SHA256_DIGEST_LENGTH,
+                  "unexpected SHA256_DIGEST_LENGTH");
     if (mFinished)
     {
         throw std::runtime_error("finishing already-finished SHA256");
     }
-    if (crypto_hash_sha256_final(&mState, out.data()) != 0)
-    {
-        throw CryptoError("error from crypto_hash_sha256_final");
-    }
+    SHA256_Final(out.data(), ctx(mState));
     mFinished = true;
     return out;
 }

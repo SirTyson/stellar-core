@@ -159,7 +159,13 @@ class TransactionFrame : public TransactionFrameBase
     bool validateSorobanOpsConsistency() const;
     int64_t refundSorobanFee(AbstractLedgerTxn& ltx, AccountID const& feeSource,
                              MutableTransactionResultBase& txResult) const;
+
+  public:
+    // Public: also invoked by the staged (parallel) pre-apply write commit
+    // in ParallelApplyUtils for txs that skip preParallelApplyWrite.
     void updateSorobanMetrics(AppConnector& app) const;
+
+  protected:
     bool accessesFrozenKey(SorobanNetworkConfig const& cfg) const;
 
 #ifdef BUILD_TESTS
@@ -309,17 +315,51 @@ class TransactionFrame : public TransactionFrameBase
                    SorobanNetworkConfig const* sorobanConfig,
                    Hash const& envelopeContentsHash) const;
 
+    std::unique_ptr<SignatureChecker> commonParallelPreApplyReadOnly(
+        bool chargeFee, AppConnector& app, CheckValidLedgerViewWrapper const& ls,
+        TransactionMetaBuilder& meta,
+        MutableTransactionResultBase& txResult,
+        SorobanNetworkConfig const* sorobanConfig,
+        Hash const& envelopeContentsHash,
+        ParallelPreApplyInfo& info) const;
+
+    bool processSignaturesReadOnly(ValidationType cv,
+                                   SignatureChecker& signatureChecker,
+                                   CheckValidLedgerViewWrapper const& ls,
+                                   MutableTransactionResultBase& txResult,
+                                   ParallelPreApplyInfo& info) const;
+
     void preParallelApply(bool chargeFee, AppConnector& app,
                           AbstractLedgerTxn& ltx, TransactionMetaBuilder& meta,
                           MutableTransactionResultBase& txResult,
                           SorobanNetworkConfig const& sorobanConfig,
                           Hash const& envelopeContentsHash) const;
 
+    void preParallelApplyReadOnly(bool chargeFee, AppConnector& app,
+                                  CheckValidLedgerViewWrapper const& ls,
+                                  TransactionMetaBuilder& meta,
+                                  MutableTransactionResultBase& txResult,
+                                  SorobanNetworkConfig const& sorobanConfig,
+                                  Hash const& envelopeContentsHash,
+                                  ParallelPreApplyInfo& info) const;
+
     void
     preParallelApply(AppConnector& app, AbstractLedgerTxn& ltx,
                      TransactionMetaBuilder& meta,
                      MutableTransactionResultBase& txResult,
                      SorobanNetworkConfig const& sorobanConfig) const override;
+
+    void
+    preParallelApplyReadOnly(AppConnector& app, CheckValidLedgerViewWrapper const& ls,
+                             TransactionMetaBuilder& meta,
+                             MutableTransactionResultBase& txResult,
+                             SorobanNetworkConfig const& sorobanConfig,
+                             ParallelPreApplyInfo& info) const override;
+
+    void
+    preParallelApplyWrite(AppConnector& app, AbstractLedgerTxn& ltx,
+                          TransactionMetaBuilder& meta,
+                          ParallelPreApplyInfo const& info) const override;
 
     std::optional<ParallelTxSuccessVal> parallelApply(
         AppConnector& app, ThreadParallelApplyLedgerState const& threadState,

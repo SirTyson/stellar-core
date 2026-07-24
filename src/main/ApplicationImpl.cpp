@@ -59,6 +59,7 @@
 #include "util/ProtocolVersion.h"
 #include "util/StatusManager.h"
 #include "util/Thread.h"
+#include "util/ThreadPool.h"
 #include "util/TmpDir.h"
 #include "work/BasicWork.h"
 #include "work/WorkScheduler.h"
@@ -142,6 +143,13 @@ ApplicationImpl::ApplicationImpl(VirtualClock& clock, Config const& cfg)
     std::srand(static_cast<uint32>(clock.now().time_since_epoch().count()));
 
     mNetworkID = sha256(mConfig.NETWORK_PASSPHRASE);
+
+    if (mConfig.DISABLE_SOROBAN_METRICS_FOR_TESTING)
+    {
+        // Simple timers include the bucket point-load timers that are updated
+        // from the parallel apply threads, where they are a contention point.
+        mMetrics->setSimpleTimersEnabled(false);
+    }
 
     TracyAppInfo(STELLAR_CORE_VERSION.c_str(), STELLAR_CORE_VERSION.size());
     TracyAppInfo(mConfig.NETWORK_PASSPHRASE.c_str(),
@@ -234,6 +242,14 @@ ApplicationImpl::ApplicationImpl(VirtualClock& clock, Config const& cfg)
             [this]() { mLedgerCloseIOContext->run(); });
         mThreadTypes[mLedgerCloseThread->get_id()] = ThreadType::APPLY;
     }
+
+    // Starts with no workers; the parallel apply path grows it to the
+    // cluster count it needs. Workers are pinned one-per-physical-core: the
+    // parallel apply joins on all the workers, so a single pair of workers
+    // left on hyperthread siblings of one core by the kernel's wake-up
+    // placement degrades every ledger's apply tail.
+    mApplyThreadPool = std::make_unique<ThreadPool>();
+    mApplyThreadPool->pinWorkersToDistinctPhysicalCores();
 }
 
 static void
@@ -977,6 +993,12 @@ ApplicationImpl::joinAllThreads()
 
     joined += shutdownThread(mOverlayThread, mOverlayWork, "overlay");
     joined += shutdownThread(mEvictionThread, mEvictionWork, "eviction");
+    if (mApplyThreadPool)
+    {
+        joined += static_cast<uint32_t>(mApplyThreadPool->workerCount());
+        mApplyThreadPool->shutdown();
+        mApplyThreadPool.reset();
+    }
     if (joined)
     {
         LOG_INFO(DEFAULT_LOG, "Joined all {} threads", joined);
@@ -1559,6 +1581,13 @@ ApplicationImpl::getLedgerCloseIOContext()
 {
     releaseAssert(mLedgerCloseIOContext);
     return *mLedgerCloseIOContext;
+}
+
+ThreadPool&
+ApplicationImpl::getApplyThreadPool()
+{
+    releaseAssert(mApplyThreadPool);
+    return *mApplyThreadPool;
 }
 
 void

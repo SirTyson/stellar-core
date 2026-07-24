@@ -15,7 +15,7 @@ noinst_HEADERS = $(SRC_H_FILES)
 # is done by setting the CXXSTDLIB flag, which Rust's C++-building machinery is
 # sensitive to. Rust passes-on, but does not look inside, CXXFLAGS itself to
 # realize that it needs this setting.
-CXXSTDLIB := $(if $(findstring -stdlib=libc++,$(CXXFLAGS)),c++,$(if $(findstring -stdlib=libstdc++,$(CXXFLAGS)),stdc++,))
+CXXSTDLIB := $(if $(findstring -stdlib=libc++,$(CXXFLAGS)),c++,$(if $(findstring -stdlib=libstdc++,$(CXXFLAGS)),stdc++,stdc++))
 
 if USE_TRACY
 # NB: this unfortunately long list has to be provided here and kept in sync with
@@ -71,7 +71,7 @@ stellar_core_SOURCES = $(MAIN_FILES) $(SRC_CXX_FILES)
 CARGO_FEATURE_TESTUTILS =
 endif # !BUILD_TESTS
 
-if ENABLE_CAP_0071
+if ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
 CARGO_FEATURE_NEXT = --features next
 else
 CARGO_FEATURE_NEXT =
@@ -83,7 +83,7 @@ main/XDRFilesSha256.cpp: $(SRC_X_FILES) Makefile $(top_srcdir)/hash-xdrs.sh
 # tcmalloc must be linked early to properly override malloc/free
 stellar_core_LDADD = $(libtcmalloc_LIBS) $(soci_LIBS) $(libmedida_LIBS)		\
 	$(top_builddir)/lib/lib3rdparty.a $(sqlite3_LIBS)	\
-	$(libpq_LIBS) $(xdrpp_LIBS) $(libsodium_LIBS)
+	$(libpq_LIBS) $(xdrpp_LIBS) $(libsodium_LIBS) -lcrypto
 
 TESTDATA_DIR = testdata
 TEST_FILES = $(TESTDATA_DIR)/stellar-core_example.cfg $(TESTDATA_DIR)/stellar-core_standalone.cfg \
@@ -97,7 +97,7 @@ BUILT_SOURCES = $(SRC_X_FILES:.x=.h) $(GENERATED_VERSION_SOURCES) $(TEST_FILES)
 
 $(SRC_X_FILES:.x=.h): $(XDRC)
 XDR_FEATURE_FLAGS =
-if ENABLE_CAP_0071
+if CAP_0071
 XDR_FEATURE_FLAGS += -DCAP_0071
 endif
 # Empty-tx-set recovery (docs/direct-leader-flooding.md) is enabled
@@ -212,11 +212,8 @@ ALL_SOROBAN_PROTOCOLS=p21 p22 p23 p24 p25 p26
 WIP_SOROBAN_PROTOCOL=p27
 
 CARGO_XDR_FEATURE_FLAGS =
-if ENABLE_CAP_0071
-CARGO_XDR_FEATURE_FLAGS += --features cap_0071
-endif
 
-if ENABLE_CAP_0071
+if ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
 ALL_SOROBAN_PROTOCOLS+=$(WIP_SOROBAN_PROTOCOL)
 # This means "only pass --features=next if there's no WIP submodule"
 SOROBAN_FEATURE_NEXT=$(if $(WIP_SOROBAN_PROTOCOL),,$(CARGO_FEATURE_NEXT))

@@ -22,10 +22,14 @@
 #include <memory>
 #include <spdlog/spdlog.h>
 
+// NB: the logger is bound by const reference (with lifetime extension when
+// the expression yields a temporary) rather than copied: copying a LogPtr
+// bumps the logger's shared_ptr refcount, which is an atomic RMW on a control
+// block shared by every thread logging to that partition.
 #define LOG_CHECK(logger, level, action) \
     do \
     { \
-        auto lg = (logger); \
+        auto const& lg = (logger); \
         if (lg->should_log(level) || lg->should_backtrace()) \
         { \
             action; \
@@ -157,6 +161,19 @@ class CoutLogger
     }
 };
 
+// Logging uses one *permanent* spdlog logger per partition (plus "default"):
+// the logger objects are created on first use and are never destroyed or
+// replaced for the lifetime of the process. Each logger's single sink is a
+// dist_sink_mt whose child sinks (console/file) are swapped in place, under
+// that sink's own mutex, whenever logging is (re)configured. Log levels are
+// atomics inside spdlog.
+//
+// This makes the per-partition getters below (and thus every CLOG_* call
+// site) lock-free and write-free: checking whether a disabled level is
+// enabled costs two loads and touches no shared mutable state, so it can be
+// done freely from concurrently-running threads (e.g. the parallel apply
+// workers). It is also safe to cache the returned LogPtr: reconfiguration
+// changes what the permanent loggers write to, not the logger identities.
 class Logging
 {
     static LogLevel mGlobalLogLevel;
@@ -168,10 +185,6 @@ class Logging
     static std::string mLastPattern;
     static std::string mLastFilenamePattern;
     static bool mLogToConsole;
-    static LogPtr defaultLogPtr;
-#define LOG_PARTITION(name) static LogPtr name##LogPtr;
-#include "util/LogPartitions.def"
-#undef LOG_PARTITION
 #endif
 
   public:
@@ -196,8 +209,8 @@ class Logging
     static std::array<std::string const, 15> const kPartitionNames;
 
 #if defined(USE_SPDLOG)
-    static LogPtr getDefaultLogPtr();
-#define LOG_PARTITION(name) static LogPtr get##name##LogPtr();
+    static LogPtr const& getDefaultLogPtr();
+#define LOG_PARTITION(name) static LogPtr const& get##name##LogPtr();
 #include "util/LogPartitions.def"
 #undef LOG_PARTITION
 #endif

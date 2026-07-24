@@ -90,6 +90,8 @@ class ApplicationImpl : public Application
     virtual asio::io_context& getOverlayIOContext() override;
     virtual asio::io_context& getLedgerCloseIOContext() override;
 
+    virtual ThreadPool& getApplyThreadPool() override;
+
     virtual void postOnMainThread(std::function<void()>&& f, std::string&& name,
                                   Scheduler::ActionType type) override;
     virtual void postOnBackgroundThread(std::function<void()>&& f,
@@ -241,6 +243,12 @@ class ApplicationImpl : public Application
     // Medium-priority pool for parallel transaction validation (see
     // Config::TX_VALIDATION_THREADS).
     std::vector<std::unique_ptr<std::thread>> mTxValidationThreads;
+
+    // Persistent workers for the parallel transaction apply path. Created
+    // empty and grown on demand (the demanded parallelism is a network
+    // setting that can change at runtime), so unlike the threads above its
+    // workers are not registered in mThreadTypes.
+    std::unique_ptr<ThreadPool> mApplyThreadPool;
 
     // Unlike mWorkerThreads (which are low priority), eviction scans require a
     // medium priority thread. In the future, this may become a more general

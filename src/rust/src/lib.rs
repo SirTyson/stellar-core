@@ -5,6 +5,11 @@
 #![crate_type = "staticlib"]
 #![allow(non_snake_case)]
 
+use tcmalloc::TCMalloc;
+
+#[global_allocator]
+pub(crate) static GLOBAL_ALLOCATOR: TCMalloc = TCMalloc;
+
 #[cfg(feature = "tracy")]
 macro_rules! tracy_span {
     () => {
@@ -33,6 +38,7 @@ mod ed25519_verify;
 mod i128;
 mod log;
 mod quorum_checker;
+mod sha256;
 mod soroban_invoke;
 mod soroban_module_cache;
 mod soroban_test_wasm;

@@ -53,10 +53,22 @@
 #include "medida/meter.h"
 
 #include <algorithm>
+#include <chrono>
 #include <xdrpp/types.h>
 
 namespace stellar
 {
+#ifdef BUILD_TESTS
+// NB: these are atomics (not thread_local) because the pre-apply work that
+// updates the first three runs on the parallel apply worker threads; the
+// aggregation site in ParallelApplyUtils.cpp reads them from the main thread
+// after the workers are joined. As cross-thread accumulators, they measure
+// CPU time summed over all the workers (which can exceed phase wall time).
+std::atomic<double> gSeqPreApplyCommonValidMs{0};
+std::atomic<double> gSeqPreApplyProcessSigsMs{0};
+std::atomic<double> gSeqPreApplyCheckValidMs{0};
+std::atomic<double> gSeqPreApplyWriteMs{0};
+#endif
 namespace
 {
 // Limit to the maximum resource fee allowed for transaction,
@@ -511,8 +523,7 @@ TransactionFrame::checkSignature(SignatureChecker& signatureChecker,
     }
     signers.insert(signers.end(), acc.signers.begin(), acc.signers.end());
 
-    return signatureChecker.checkSignature(
-        signers, neededWeight, !signatureChecker.isOverlayValidation());
+    return signatureChecker.checkSignature(signers, neededWeight);
 }
 
 bool
@@ -547,7 +558,7 @@ TransactionFrame::checkExtraSigners(SignatureChecker& signatureChecker) const
         // we assign a weight of 1 to each key, and set the neededWeight to the
         // number of extraSigners
         return signatureChecker.checkSignature(
-            signers, static_cast<int32_t>(signers.size()), true);
+            signers, static_cast<int32_t>(signers.size()));
     }
     return true;
 }
@@ -2162,6 +2173,129 @@ TransactionFrame::commonPreApply(bool chargeFee, AppConnector& app,
     }
 }
 
+std::unique_ptr<SignatureChecker>
+TransactionFrame::commonParallelPreApplyReadOnly(
+    bool chargeFee, AppConnector& app, CheckValidLedgerViewWrapper const& ls,
+    TransactionMetaBuilder& meta, MutableTransactionResultBase& txResult,
+    SorobanNetworkConfig const* sorobanConfig,
+    Hash const& envelopeContentsHash, ParallelPreApplyInfo& info) const
+{
+    mCachedAccountPreProtocol8.reset();
+    uint32_t ledgerVersion = ls.getLedgerHeader().current().ledgerVersion;
+    std::unique_ptr<SignatureChecker> signatureChecker;
+#ifdef BUILD_TESTS
+    if (txResult.hasReplayTransactionResult())
+    {
+        signatureChecker = std::make_unique<AlwaysValidSignatureChecker>(
+            ledgerVersion, getContentsHash(), getSignatures(mEnvelope));
+    }
+    else
+    {
+#endif // BUILD_TESTS
+        signatureChecker = std::make_unique<SignatureChecker>(
+            ledgerVersion, getContentsHash(), getSignatures(mEnvelope));
+#ifdef BUILD_TESTS
+    }
+#endif // BUILD_TESTS
+
+    std::optional<FeePair> sorobanResourceFee;
+    if (protocolVersionStartsFrom(ledgerVersion, SOROBAN_PROTOCOL_VERSION) &&
+        isSoroban())
+    {
+        sorobanResourceFee = computePreApplySorobanResourceFee(
+            ledgerVersion, *sorobanConfig, app.getConfig());
+
+        meta.setNonRefundableResourceFee(
+            sorobanResourceFee->non_refundable_fee);
+        int64_t initialFeeRefund = declaredSorobanResourceFee() -
+                                   sorobanResourceFee->non_refundable_fee;
+        txResult.initializeRefundableFeeTracker(initialFeeRefund);
+    }
+
+#ifdef BUILD_TESTS
+    auto _cvStart = std::chrono::steady_clock::now();
+#endif
+    auto cv = commonValid(app, sorobanConfig, *signatureChecker, ls, 0, true,
+                          chargeFee, 0, 0, envelopeContentsHash,
+                          sorobanResourceFee, txResult,
+                          meta.getDiagnosticEventManager(), std::nullopt);
+#ifdef BUILD_TESTS
+    gSeqPreApplyCommonValidMs += std::chrono::duration<double, std::milli>(
+                                     std::chrono::steady_clock::now() - _cvStart)
+                                     .count();
+#endif
+    info.mUpdateSeqNum = cv >= ValidationType::kInvalidUpdateSeqNum;
+
+#ifdef BUILD_TESTS
+    auto _sigStart = std::chrono::steady_clock::now();
+#endif
+    bool signaturesValid =
+        processSignaturesReadOnly(cv, *signatureChecker, ls, txResult, info);
+#ifdef BUILD_TESTS
+    gSeqPreApplyProcessSigsMs +=
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - _sigStart)
+            .count();
+#endif
+
+    if (signaturesValid && cv == ValidationType::kMaybeValid)
+    {
+        return signatureChecker;
+    }
+    return nullptr;
+}
+
+bool
+TransactionFrame::processSignaturesReadOnly(ValidationType cv,
+                                            SignatureChecker& signatureChecker,
+                                            CheckValidLedgerViewWrapper const& ls,
+                                            MutableTransactionResultBase& txResult,
+                                            ParallelPreApplyInfo& info) const
+{
+    ZoneScoped;
+    bool maybeValid = (cv == ValidationType::kMaybeValid);
+    uint32_t ledgerVersion = ls.getLedgerHeader().current().ledgerVersion;
+    if (protocolVersionIsBefore(ledgerVersion, ProtocolVersion::V_10))
+    {
+        return maybeValid;
+    }
+
+    if (protocolVersionStartsFrom(ledgerVersion, ProtocolVersion::V_13) &&
+        !maybeValid)
+    {
+        info.mRemoveOneTimeSigners = true;
+        return false;
+    }
+    if (protocolVersionIsBefore(ledgerVersion, ProtocolVersion::V_13) &&
+        cv < ValidationType::kInvalidPostAuth)
+    {
+        return false;
+    }
+
+    bool allOpsValid = true;
+    if (auto code = txResult.getInnermostResultCode();
+        code == txSUCCESS || code == txFAILED)
+    {
+        allOpsValid = checkOperationSignatures(signatureChecker, ls, &txResult);
+    }
+
+    info.mRemoveOneTimeSigners = true;
+
+    if (!allOpsValid)
+    {
+        txResult.setInnermostError(txFAILED);
+        return false;
+    }
+
+    if (!signatureChecker.checkAllSignaturesUsed())
+    {
+        txResult.setInnermostError(txBAD_AUTH_EXTRA);
+        return false;
+    }
+
+    return maybeValid;
+}
+
 void
 TransactionFrame::preParallelApply(
     AppConnector& app, AbstractLedgerTxn& ltx, TransactionMetaBuilder& meta,
@@ -2170,6 +2304,135 @@ TransactionFrame::preParallelApply(
 {
     preParallelApply(true, app, ltx, meta, resPayload, sorobanConfig,
                      getContentsHash());
+}
+
+void
+TransactionFrame::preParallelApplyReadOnly(
+    AppConnector& app, CheckValidLedgerViewWrapper const& ls, TransactionMetaBuilder& meta,
+    MutableTransactionResultBase& txResult,
+    SorobanNetworkConfig const& sorobanConfig,
+    ParallelPreApplyInfo& info) const
+{
+    preParallelApplyReadOnly(true, app, ls, meta, txResult, sorobanConfig,
+                             getContentsHash(), info);
+}
+
+void
+TransactionFrame::preParallelApplyReadOnly(
+    bool chargeFee, AppConnector& app, CheckValidLedgerViewWrapper const& ls,
+    TransactionMetaBuilder& meta, MutableTransactionResultBase& txResult,
+    SorobanNetworkConfig const& sorobanConfig,
+    Hash const& envelopeContentsHash, ParallelPreApplyInfo& info) const
+{
+    ZoneScoped;
+    try
+    {
+        releaseAssertOrThrow(isSoroban());
+
+        auto signatureChecker = commonParallelPreApplyReadOnly(
+            chargeFee, app, ls, meta, txResult, &sorobanConfig,
+            envelopeContentsHash, info);
+        bool ok = signatureChecker != nullptr;
+        if (ok)
+        {
+            info.mUpdateSorobanMetrics = true;
+
+            auto& opResult = txResult.getOpResultAt(0);
+#ifdef BUILD_TESTS
+            auto _checkValidStart = std::chrono::steady_clock::now();
+#endif
+            ok = mOperations.front()->checkValid(
+                app, *signatureChecker, &sorobanConfig, ls, true, opResult,
+                meta.getDiagnosticEventManager());
+#ifdef BUILD_TESTS
+            gSeqPreApplyCheckValidMs +=
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - _checkValidStart)
+                    .count();
+#endif
+            if (!ok)
+            {
+                txResult.setInnermostError(txFAILED);
+            }
+        }
+
+        releaseAssertOrThrow(ok == txResult.isSuccess());
+    }
+    catch (std::exception& e)
+    {
+        printErrorAndAbort("Exception during read-only preParallelApply: ",
+                           e.what());
+    }
+    catch (...)
+    {
+        printErrorAndAbort(
+            "Unknown exception during read-only preParallelApply");
+    }
+}
+
+void
+TransactionFrame::preParallelApplyWrite(AppConnector& app,
+                                        AbstractLedgerTxn& ltx,
+                                        TransactionMetaBuilder& meta,
+                                        ParallelPreApplyInfo const& info) const
+{
+    ZoneScoped;
+#ifdef BUILD_TESTS
+    auto _writeStart = std::chrono::steady_clock::now();
+#endif
+    try
+    {
+        if (meta.isEnabled())
+        {
+            // Meta needs this tx's changes isolated in their own nested
+            // LedgerTxn so they can be recorded as this tx's changesBefore.
+            LedgerTxn ltxTx(ltx);
+            if (info.mUpdateSeqNum)
+            {
+                processSeqNum(ltxTx);
+            }
+            if (info.mRemoveOneTimeSigners)
+            {
+                removeOneTimeSignerFromAllSourceAccounts(ltxTx);
+            }
+            meta.pushTxChangesBefore(ltxTx);
+            ltxTx.commit();
+        }
+        else
+        {
+            // With meta disabled there is nothing to record per tx, so write
+            // directly into the outer ltx: this runs sequentially for every
+            // tx in the ledger, and the per-tx nested-LedgerTxn
+            // construct/commit cycle dominates the phase.
+            if (info.mUpdateSeqNum)
+            {
+                processSeqNum(ltx);
+            }
+            if (info.mRemoveOneTimeSigners)
+            {
+                removeOneTimeSignerFromAllSourceAccounts(ltx);
+            }
+        }
+
+        if (info.mUpdateSorobanMetrics)
+        {
+            updateSorobanMetrics(app);
+        }
+    }
+    catch (std::exception& e)
+    {
+        printErrorAndAbort("Exception during preParallelApply writes: ",
+                           e.what());
+    }
+    catch (...)
+    {
+        printErrorAndAbort("Unknown exception during preParallelApply writes");
+    }
+#ifdef BUILD_TESTS
+    gSeqPreApplyWriteMs += std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - _writeStart)
+                               .count();
+#endif
 }
 
 void
@@ -2187,32 +2450,12 @@ TransactionFrame::preParallelApply(bool chargeFee, AppConnector& app,
     {
         releaseAssertOrThrow(isSoroban());
 
-        auto signatureChecker =
-            commonPreApply(chargeFee, app, ltx, meta, txResult, &sorobanConfig,
-                           envelopeContentsHash);
-        bool ok = signatureChecker != nullptr;
-        if (ok)
-        {
-            updateSorobanMetrics(app);
+        ParallelPreApplyInfo info;
+        CheckValidLedgerViewWrapper ls(ltx);
+        preParallelApplyReadOnly(chargeFee, app, ls, meta, txResult,
+                                 sorobanConfig, envelopeContentsHash, info);
+        preParallelApplyWrite(app, ltx, meta, info);
 
-            auto& opResult = txResult.getOpResultAt(0);
-
-            // Pre parallel soroban, OperationFrame::checkValid is called
-            // right before OperationFrame::doApply, but we do it here
-            // instead to avoid making OperationFrame::checkValid thread
-            // safe.
-            ok = mOperations.front()->checkValid(
-                app, *signatureChecker, &sorobanConfig, ltx, true, opResult,
-                meta.getDiagnosticEventManager());
-            if (!ok)
-            {
-                txResult.setInnermostError(txFAILED);
-            }
-        }
-
-        // If validation fails, we check the result code in the parallel
-        // step to make sure we don't apply the transaction.
-        releaseAssertOrThrow(ok == txResult.isSuccess());
     }
     catch (std::exception& e)
     {
@@ -2280,8 +2523,14 @@ TransactionFrame::parallelApply(
 
         if (res)
         {
-            threadState.setEffectsDeltaFromSuccessfulTx(*res, ledgerInfo,
-                                                        effects);
+            // Only build the LedgerTxnDelta when invariant checks are
+            // enabled — the delta is consumed exclusively by
+            // checkOnOperationApply which is a no-op otherwise.
+            if (!config.INVARIANT_CHECKS.empty())
+            {
+                threadState.setEffectsDeltaFromSuccessfulTx(*res, ledgerInfo,
+                                                            effects);
+            }
             opMeta.setLedgerChangesFromSuccessfulOp(threadState, *res,
                                                     ledgerInfo.getLedgerSeq());
         }

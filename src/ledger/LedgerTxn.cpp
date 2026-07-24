@@ -24,6 +24,7 @@
 #include <soci.h>
 
 #include <algorithm>
+#include <future>
 #include <stdexcept>
 
 namespace stellar
@@ -409,6 +410,22 @@ AbstractLedgerTxn::~AbstractLedgerTxn()
 {
 }
 
+void
+AbstractLedgerTxn::createWithoutLoading(InternalLedgerEntry&& entry)
+{
+    // Default: forward to const-ref version (copies).
+    // LedgerTxn overrides this to move directly into make_shared.
+    createWithoutLoading(static_cast<InternalLedgerEntry const&>(entry));
+}
+
+void
+AbstractLedgerTxn::updateWithoutLoading(InternalLedgerEntry&& entry)
+{
+    // Default: forward to const-ref version (copies).
+    // LedgerTxn overrides this to move directly into make_shared.
+    updateWithoutLoading(static_cast<InternalLedgerEntry const&>(entry));
+}
+
 // Implementation of LedgerTxn ----------------------------------------------
 LedgerTxn::LedgerTxn(AbstractLedgerTxnParent& parent,
                      bool shouldUpdateLastModified, TransactionMode mode)
@@ -771,6 +788,33 @@ LedgerTxn::Impl::createWithoutLoading(InternalLedgerEntry const& entry)
 }
 
 void
+LedgerTxn::createWithoutLoading(InternalLedgerEntry&& entry)
+{
+    getImpl()->createWithoutLoading(std::move(entry));
+}
+
+void
+LedgerTxn::Impl::createWithoutLoading(InternalLedgerEntry&& entry)
+{
+    abortIfWrongThread("createWithoutLoading");
+    throwIfSealed();
+    throwIfChild();
+
+    auto key = entry.toKey();
+    auto iter = mActive.find(key);
+    if (iter != mActive.end())
+    {
+        throw std::runtime_error("Key is already active");
+    }
+
+    updateEntry(
+        key, /* keyHint */ nullptr,
+        LedgerEntryPtr::Init(
+            std::make_shared<InternalLedgerEntry>(std::move(entry))),
+        /* effectiveActive */ false);
+}
+
+void
 LedgerTxn::updateWithoutLoading(InternalLedgerEntry const& entry)
 {
     getImpl()->updateWithoutLoading(entry);
@@ -793,6 +837,33 @@ LedgerTxn::Impl::updateWithoutLoading(InternalLedgerEntry const& entry)
     updateEntry(
         key, /* keyHint */ nullptr,
         LedgerEntryPtr::Live(std::make_shared<InternalLedgerEntry>(entry)),
+        /* effectiveActive */ false);
+}
+
+void
+LedgerTxn::updateWithoutLoading(InternalLedgerEntry&& entry)
+{
+    getImpl()->updateWithoutLoading(std::move(entry));
+}
+
+void
+LedgerTxn::Impl::updateWithoutLoading(InternalLedgerEntry&& entry)
+{
+    abortIfWrongThread("updateWithoutLoading");
+    throwIfSealed();
+    throwIfChild();
+
+    auto key = entry.toKey();
+    auto iter = mActive.find(key);
+    if (iter != mActive.end())
+    {
+        throw std::runtime_error("Key is already active");
+    }
+
+    updateEntry(
+        key, /* keyHint */ nullptr,
+        LedgerEntryPtr::Live(
+            std::make_shared<InternalLedgerEntry>(std::move(entry))),
         /* effectiveActive */ false);
 }
 
@@ -1623,18 +1694,61 @@ LedgerTxn::getAllEntries(std::vector<LedgerEntry>& initEntries,
     getImpl()->getAllEntries(initEntries, liveEntries, deadEntries);
 }
 
+namespace
+{
+// Copies the pointed-to values into a new vector, fanning the (potentially
+// large XDR) copies out to parallel threads for large inputs.
+template <typename T>
+std::vector<T>
+copyFromPtrsParallel(std::vector<T const*> const& ptrs)
+{
+    std::vector<T> res(ptrs.size());
+    auto copyRange = [&ptrs, &res](size_t b, size_t e) {
+        for (size_t i = b; i < e; ++i)
+        {
+            res[i] = *ptrs[i];
+        }
+    };
+    size_t n = ptrs.size();
+    constexpr size_t PARALLEL_COPY_THRESHOLD = 4096;
+    if (n >= PARALLEL_COPY_THRESHOLD)
+    {
+        size_t q = n / 4;
+        auto f1 = std::async(std::launch::async, [&] { copyRange(0, q); });
+        auto f2 = std::async(std::launch::async, [&] { copyRange(q, 2 * q); });
+        auto f3 =
+            std::async(std::launch::async, [&] { copyRange(2 * q, 3 * q); });
+        copyRange(3 * q, n);
+        f1.get();
+        f2.get();
+        f3.get();
+    }
+    else
+    {
+        copyRange(0, n);
+    }
+    return res;
+}
+}
+
 void
 LedgerTxn::Impl::getAllEntries(std::vector<LedgerEntry>& initEntries,
                                std::vector<LedgerEntry>& liveEntries,
                                std::vector<LedgerKey>& deadEntries)
 {
+    ZoneScoped;
     abortIfWrongThread("getAllEntries");
     std::vector<LedgerEntry> resInit, resLive;
     std::vector<LedgerKey> resDead;
-    resInit.reserve(mEntry.size());
-    resLive.reserve(mEntry.size());
-    resDead.reserve(mEntry.size());
     maybeUpdateLastModifiedThenInvokeThenSeal([&](EntryMap const& entries) {
+        // Phase 1: walk the map once, classifying pointers to the entries
+        // (cheap). Phase 2 below copies the actual XDR payloads, in parallel
+        // for large ledgers.
+        std::vector<LedgerEntry const*> initPtrs, livePtrs;
+        std::vector<LedgerKey const*> deadPtrs;
+        initPtrs.reserve(entries.size());
+        livePtrs.reserve(entries.size());
+        deadPtrs.reserve(entries.size());
         for (auto const& kv : entries)
         {
             auto const& key = kv.first;
@@ -1649,18 +1763,21 @@ LedgerTxn::Impl::getAllEntries(std::vector<LedgerEntry>& initEntries,
             {
                 if (entry.isInit())
                 {
-                    resInit.emplace_back(entry->ledgerEntry());
+                    initPtrs.push_back(&entry->ledgerEntry());
                 }
                 else
                 {
-                    resLive.emplace_back(entry->ledgerEntry());
+                    livePtrs.push_back(&entry->ledgerEntry());
                 }
             }
             else
             {
-                resDead.emplace_back(key.ledgerKey());
+                deadPtrs.push_back(&key.ledgerKey());
             }
         }
+        resInit = copyFromPtrsParallel(initPtrs);
+        resLive = copyFromPtrsParallel(livePtrs);
+        resDead = copyFromPtrsParallel(deadPtrs);
     });
     initEntries.swap(resInit);
     liveEntries.swap(resLive);
@@ -1695,30 +1812,17 @@ LedgerTxn::Impl::getRestoredLiveBucketListKeys() const
     return mRestoredEntries.liveBucketList;
 }
 
-LedgerKeySet
-LedgerTxn::getAllKeysWithoutSealing() const
+bool
+LedgerTxn::isModifiedKey(LedgerKey const& key) const
 {
-    return getImpl()->getAllKeysWithoutSealing();
+    return getImpl()->isModifiedKey(key);
 }
 
-LedgerKeySet
-LedgerTxn::Impl::getAllKeysWithoutSealing() const
+bool
+LedgerTxn::Impl::isModifiedKey(LedgerKey const& key) const
 {
-    abortIfWrongThread("getAllKeysWithoutSealing");
-    throwIfNotExactConsistency();
-    LedgerKeySet result;
-    // Subtle: mEntry contains only *modified* entries in this LedgerTxn.
-    // Callers rely on this — for example, to enforce that expired entries
-    // (which cannot be modified) are never present here.
-    for (auto const& [k, v] : mEntry)
-    {
-        if (k.type() == InternalLedgerEntryType::LEDGER_ENTRY)
-        {
-            result.emplace(k.ledgerKey());
-        }
-    }
-
-    return result;
+    abortIfWrongThread("isModifiedKey");
+    return mEntry.find(InternalLedgerKey(key)) != mEntry.end();
 }
 
 std::shared_ptr<InternalLedgerEntry const>

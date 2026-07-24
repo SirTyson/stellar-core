@@ -8,6 +8,7 @@
 #include "ledger/LedgerTypeUtils.h"
 #include "ledger/SorobanMetrics.h"
 #include "util/GlobalChecks.h"
+#include <Tracy.hpp>
 #include <cstdint>
 #include <medida/counter.h>
 
@@ -57,9 +58,11 @@ InMemorySorobanState::updateContractDataTTL(
 {
     // Since entries are immutable, we must erase and re-insert
     auto ledgerEntryPtr = dataIt->get().ledgerEntry;
+    auto sizeBytes = dataIt->get().sizeBytes;
+    auto ttlKeyHash = dataIt->ttlKeyHash();
     mContractDataEntries.erase(dataIt);
-    mContractDataEntries.emplace(
-        InternalContractDataMapEntry(std::move(ledgerEntryPtr), newTtlData));
+    mContractDataEntries.emplace(InternalContractDataMapEntry(
+        std::move(ledgerEntryPtr), newTtlData, sizeBytes, ttlKeyHash));
 }
 
 void
@@ -95,19 +98,20 @@ InMemorySorobanState::updateContractData(LedgerEntry const& ledgerEntry)
 
     // Entry must already exist since this is an update
     auto lk = LedgerEntryKey(ledgerEntry);
-    auto dataIt = mContractDataEntries.find(InternalContractDataMapEntry(lk));
+    auto query = InternalContractDataMapEntry(lk);
+    auto dataIt = mContractDataEntries.find(query);
     releaseAssertOrThrow(dataIt != mContractDataEntries.end());
     releaseAssertOrThrow(dataIt->get().ledgerEntry != nullptr);
 
-    uint32_t oldSize = xdr::xdr_size(*dataIt->get().ledgerEntry);
+    uint32_t oldSize = dataIt->get().sizeBytes;
     uint32_t newSize = xdr::xdr_size(ledgerEntry);
     updateStateSizeOnEntryUpdate(oldSize, newSize, /*isContractCode=*/false);
 
     // Preserve the existing TTL while updating the data
     auto preservedTTL = dataIt->get().ttlData;
     mContractDataEntries.erase(dataIt);
-    mContractDataEntries.emplace(
-        InternalContractDataMapEntry(ledgerEntry, preservedTTL));
+    mContractDataEntries.emplace(InternalContractDataMapEntry(
+        ledgerEntry, preservedTTL, newSize, query.ttlKeyHash()));
 }
 
 void
@@ -115,14 +119,17 @@ InMemorySorobanState::createContractDataEntry(LedgerEntry const& ledgerEntry)
 {
     releaseAssertOrThrow(ledgerEntry.data.type() == CONTRACT_DATA);
 
+    // Compute the TTL key (SHA256 of the entry key) once and reuse it for
+    // the lookups and insertion below.
+    auto ttlKey = getTTLKey(LedgerEntryKey(ledgerEntry));
+
     // Verify entry doesn't already exist
-    auto dataIt = mContractDataEntries.find(
-        InternalContractDataMapEntry(LedgerEntryKey(ledgerEntry)));
+    auto dataIt =
+        mContractDataEntries.find(InternalContractDataMapEntry(ttlKey));
     releaseAssertOrThrow(dataIt == mContractDataEntries.end());
 
     // Check if we've already seen this entry's TTL (can happen during
     // initialization when TTL is written before the data)
-    auto ttlKey = getTTLKey(LedgerEntryKey(ledgerEntry));
     auto ttlData = TTLData();
 
     auto ttlIt = mPendingTTLs.find(ttlKey);
@@ -135,10 +142,10 @@ InMemorySorobanState::createContractDataEntry(LedgerEntry const& ledgerEntry)
     }
     // else: TTL hasn't arrived yet, initialize to 0 (will be updated later)
 
-    updateStateSizeOnEntryUpdate(0, xdr::xdr_size(ledgerEntry),
-                                 /*isContractCode=*/false);
-    mContractDataEntries.emplace(
-        InternalContractDataMapEntry(ledgerEntry, ttlData));
+    uint32_t sizeBytes = xdr::xdr_size(ledgerEntry);
+    updateStateSizeOnEntryUpdate(0, sizeBytes, /*isContractCode=*/false);
+    mContractDataEntries.emplace(InternalContractDataMapEntry(
+        ledgerEntry, ttlData, sizeBytes, ttlKey.ttl().keyHash));
 }
 
 bool
@@ -196,7 +203,7 @@ InMemorySorobanState::deleteContractData(LedgerKey const& ledgerKey)
         mContractDataEntries.find(InternalContractDataMapEntry(ledgerKey));
     releaseAssertOrThrow(it != mContractDataEntries.end());
     releaseAssertOrThrow(it->get().ledgerEntry != nullptr);
-    updateStateSizeOnEntryUpdate(xdr::xdr_size(*it->get().ledgerEntry), 0,
+    updateStateSizeOnEntryUpdate(it->get().sizeBytes, 0,
                                  /*isContractCode=*/false);
     mContractDataEntries.erase(it);
 }
@@ -374,8 +381,8 @@ InMemorySorobanState::InMemorySorobanState(InMemorySorobanState const& other)
     , mContractCodeStateSize(other.mContractCodeStateSize)
     , mContractDataStateSize(other.mContractDataStateSize)
 {
-    // InternalContractDataMapEntry has an explicit copy constructor that
-    // deep-copies via clone(), so we can just use emplace.
+    // InternalContractDataMapEntry copies share the (immutable) LedgerEntry
+    // payloads via shared_ptr, so we can just use emplace.
     for (auto const& entry : other.mContractDataEntries)
     {
         mContractDataEntries.emplace(entry);
@@ -539,6 +546,7 @@ InMemorySorobanState::updateState(
     std::optional<SorobanNetworkConfig const> const& sorobanConfig,
     SorobanMetrics& metrics)
 {
+    ZoneScoped;
     // After initialization, we must apply every ledger in order to the
     // in-memory state with no gaps.
     releaseAssertOrThrow(mLastClosedLedgerSeq + 1 == lh.ledgerSeq);
@@ -582,6 +590,105 @@ InMemorySorobanState::updateState(
         }
 
         for (auto const& key : deadEntries)
+        {
+            if (key.type() == CONTRACT_DATA)
+            {
+                deleteContractData(key);
+            }
+            else if (key.type() == CONTRACT_CODE)
+            {
+                deleteContractCode(key);
+            }
+            // No need to evict TTLs, they are stored with their associated
+            // entry
+        }
+    }
+
+    checkUpdateInvariants();
+    reportMetrics(metrics);
+}
+
+void
+InMemorySorobanState::applyShardEntries(
+    std::vector<BucketEntry> const& entries,
+    SorobanNetworkConfig const& sorobanConfig, uint32_t ledgerVersion)
+{
+    ZoneScoped;
+    for (auto const& be : entries)
+    {
+        switch (be.type())
+        {
+        case INITENTRY:
+        {
+            auto const& entry = be.liveEntry();
+            if (entry.data.type() == CONTRACT_DATA)
+            {
+                createContractDataEntry(entry);
+            }
+            else if (entry.data.type() == CONTRACT_CODE)
+            {
+                createContractCodeEntry(entry, sorobanConfig, ledgerVersion);
+            }
+            else if (entry.data.type() == TTL)
+            {
+                createTTL(entry);
+            }
+            break;
+        }
+        case LIVEENTRY:
+        {
+            auto const& entry = be.liveEntry();
+            if (entry.data.type() == CONTRACT_DATA)
+            {
+                updateContractData(entry);
+            }
+            else if (entry.data.type() == CONTRACT_CODE)
+            {
+                updateContractCode(entry, sorobanConfig, ledgerVersion);
+            }
+            else if (entry.data.type() == TTL)
+            {
+                updateTTL(entry);
+            }
+            break;
+        }
+        case DEADENTRY:
+        {
+            auto const& key = be.deadEntry();
+            if (key.type() == CONTRACT_DATA)
+            {
+                deleteContractData(key);
+            }
+            else if (key.type() == CONTRACT_CODE)
+            {
+                deleteContractCode(key);
+            }
+            // No need to evict TTLs, they are stored with their associated
+            // entry
+            break;
+        }
+        default:
+            throw std::runtime_error("Unexpected entry type in level-0 shard");
+        }
+    }
+}
+
+void
+InMemorySorobanState::finalizeUpdate(
+    LedgerHeader const& lh,
+    std::optional<SorobanNetworkConfig const> const& sorobanConfig,
+    SorobanMetrics& metrics, UnorderedSet<LedgerKey> const& evictionDeletedKeys)
+{
+    ZoneScoped;
+    // After initialization, we must apply every ledger in order to the
+    // in-memory state with no gaps.
+    releaseAssertOrThrow(mLastClosedLedgerSeq + 1 == lh.ledgerSeq);
+    mLastClosedLedgerSeq = lh.ledgerSeq;
+
+    if (protocolVersionStartsFrom(lh.ledgerVersion, SOROBAN_PROTOCOL_VERSION))
+    {
+        releaseAssertOrThrow(sorobanConfig.has_value());
+        for (auto const& key : evictionDeletedKeys)
         {
             if (key.type() == CONTRACT_DATA)
             {

@@ -81,9 +81,10 @@ LiveBucketIndex::LiveBucketIndex(BucketManager const& bm, Archive& ar,
     releaseAssertOrThrow(pageSize != 0);
 }
 
-LiveBucketIndex::LiveBucketIndex(BucketManager& bm,
-                                 std::vector<BucketEntry> const& inMemoryState,
-                                 BucketMetadata const& metadata)
+LiveBucketIndex::LiveBucketIndex(
+    BucketManager& bm,
+    std::shared_ptr<std::vector<BucketEntry> const> const& inMemoryState,
+    BucketMetadata const& metadata)
     : mInMemoryIndex(
           std::make_unique<InMemoryIndex>(bm, inMemoryState, metadata))
     , mCacheHitMeter(bm.getCacheHitMeter())
@@ -237,6 +238,18 @@ LiveBucketIndex::lookup(LedgerKey const& k) const
         releaseAssertOrThrow(mInMemoryIndex);
         return mInMemoryIndex->scan(mInMemoryIndex->begin(), k).first;
     }
+}
+
+IndexReturnT
+LiveBucketIndex::lookup(LedgerKey const& k, size_t identityHash) const
+{
+    if (mDiskIndex)
+    {
+        return lookup(k);
+    }
+    releaseAssertOrThrow(mInMemoryIndex);
+    return mInMemoryIndex->scan(mInMemoryIndex->begin(), k, identityHash)
+        .first;
 }
 
 std::pair<IndexReturnT, LiveBucketIndex::IterT>

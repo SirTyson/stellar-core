@@ -169,7 +169,8 @@ SearchableBucketListSnapshot<BucketT>::getEntryAtOffset(
 template <class BucketT>
 std::pair<std::shared_ptr<typename BucketT::EntryT const>, bool>
 SearchableBucketListSnapshot<BucketT>::getBucketEntry(
-    std::shared_ptr<BucketT const> const& bucket, LedgerKey const& k) const
+    std::shared_ptr<BucketT const> const& bucket, LedgerKey const& k,
+    size_t keyIdentityHash) const
 {
     ZoneScoped;
     if (bucket->isEmpty())
@@ -177,7 +178,17 @@ SearchableBucketListSnapshot<BucketT>::getBucketEntry(
         return {nullptr, false};
     }
 
-    auto indexRes = bucket->getIndex().lookup(k);
+    IndexReturnT indexRes;
+    if constexpr (std::is_same_v<BucketT, LiveBucket>)
+    {
+        // Hash the key identity once per multi-bucket lookup (the walk
+        // probes every level's index, including all level-0 shards).
+        indexRes = bucket->getIndex().lookup(k, keyIdentityHash);
+    }
+    else
+    {
+        indexRes = bucket->getIndex().lookup(k);
+    }
     switch (indexRes.getState())
     {
     // Index had entry in cache
@@ -284,16 +295,35 @@ SearchableBucketListSnapshot<BucketT>::loopAllBuckets(
 {
     for (auto const& level : snapshot.levels)
     {
-        if (level.curr && !level.curr->isEmpty())
+        for (auto const& bucket : {level.curr, level.snap})
         {
-            if (f(level.curr) == Loop::COMPLETE)
+            if (!bucket || bucket->isEmpty())
             {
-                return;
+                continue;
             }
-        }
-        if (level.snap && !level.snap->isEmpty())
-        {
-            if (f(level.snap) == Loop::COMPLETE)
+            if constexpr (std::is_same_v<BucketT, LiveBucket>)
+            {
+                // Composite (sharded) level-0 buckets are searched shard by
+                // shard, newest shard first (newer shards shadow older ones,
+                // and this loop's contract is newest-to-oldest).
+                if (bucket->isSharded())
+                {
+                    auto const& shards = bucket->getShards();
+                    bool complete = false;
+                    for (auto it = shards.rbegin();
+                         !complete && it != shards.rend(); ++it)
+                    {
+                        complete = f(std::shared_ptr<BucketT const>(*it)) ==
+                                   Loop::COMPLETE;
+                    }
+                    if (complete)
+                    {
+                        return;
+                    }
+                    continue;
+                }
+            }
+            if (f(bucket) == Loop::COMPLETE)
             {
                 return;
             }
@@ -324,8 +354,9 @@ SearchableBucketListSnapshot<BucketT>::load(LedgerKey const& k) const
     std::shared_ptr<typename BucketT::LoadT const> result{};
 
     // Search function called on each Bucket in BucketList until we find the key
+    size_t const keyIdentityHash = hashLedgerIdentity(k);
     auto loadKeyBucketLoop = [&](std::shared_ptr<BucketT const> const& bucket) {
-        auto [be, bloomMiss] = getBucketEntry(bucket, k);
+        auto [be, bloomMiss] = getBucketEntry(bucket, k, keyIdentityHash);
         if (bloomMiss)
         {
             // Reset timer on bloom miss to avoid outlier metrics, since we

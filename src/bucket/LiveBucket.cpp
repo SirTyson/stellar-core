@@ -6,10 +6,14 @@
 #include "bucket/BucketApplicator.h"
 #include "bucket/BucketBase.h"
 #include "bucket/BucketInputIterator.h"
+#include "bucket/BucketManager.h"
 #include "bucket/BucketMergeAdapter.h"
 #include "bucket/BucketOutputIterator.h"
 #include "bucket/BucketUtils.h"
 #include "bucket/LedgerCmp.h"
+#include "bucket/MergeKey.h"
+#include "crypto/SHA.h"
+#include <future>
 #include <medida/counter.h>
 
 namespace stellar
@@ -314,6 +318,13 @@ LiveBucket::mergeCasesWithEqualKeys(
 bool
 LiveBucket::containsBucketIdentity(BucketEntry const& id) const
 {
+    if (isSharded())
+    {
+        return std::any_of(mShards.begin(), mShards.end(),
+                           [&](std::shared_ptr<LiveBucket> const& shard) {
+                               return shard->containsBucketIdentity(id);
+                           });
+    }
     BucketEntryIdCmp<LiveBucket> cmp;
     LiveBucketInputIterator iter(shared_from_this());
     while (iter)
@@ -342,14 +353,31 @@ void
 LiveBucket::apply(Application& app) const
 {
     ZoneScoped;
-    std::unordered_set<LedgerKey> emptySet;
+    std::unordered_set<LedgerKey> seenKeys;
+    if (isSharded())
+    {
+        // Apply shards newest-first; seenKeys is shared so entries in newer
+        // shards shadow keywise-equal entries in older shards.
+        for (auto it = mShards.rbegin(); it != mShards.rend(); ++it)
+        {
+            (*it)->applyInternal(app, seenKeys);
+        }
+        return;
+    }
+    applyInternal(app, seenKeys);
+}
+
+void
+LiveBucket::applyInternal(Application& app,
+                          std::unordered_set<LedgerKey>& seenKeys) const
+{
     BucketApplicator applicator(
         app, app.getConfig().LEDGER_PROTOCOL_VERSION,
         0 /*set to 0 so we always load from the parent to check state*/,
         0 /*set to a level that's not the bottom so we don't treat live entries
              as init*/
         ,
-        shared_from_this(), emptySet);
+        shared_from_this(), seenKeys);
     BucketApplicator::Counters counters(app.getClock().now());
     while (applicator)
     {
@@ -361,6 +389,15 @@ LiveBucket::apply(Application& app) const
 size_t
 LiveBucket::getMaxCacheSize() const
 {
+    if (isSharded())
+    {
+        size_t sum = 0;
+        for (auto const& shard : mShards)
+        {
+            sum += shard->getMaxCacheSize();
+        }
+        return sum;
+    }
     if (!isEmpty())
     {
         return getIndex().getMaxCacheSize();
@@ -373,6 +410,9 @@ LiveBucket::getMaxCacheSize() const
 std::optional<std::pair<std::streamoff, std::streamoff>>
 LiveBucket::getRangeForType(LedgerEntryType type) const
 {
+    // File offsets are meaningless for composites; callers must expand to
+    // shards first.
+    releaseAssertOrThrow(!isSharded());
     return getIndex().getRangeForType(type);
 }
 
@@ -383,39 +423,154 @@ LiveBucket::convertToBucketEntry(bool useInit,
                                  std::vector<LedgerKey> const& deadEntries)
 {
     ZoneScoped;
-    std::vector<BucketEntry> bucket;
-    bucket.reserve(initEntries.size() + liveEntries.size() +
-                   deadEntries.size());
 
+    // Lightweight reference for indirect sorting: avoids copying and
+    // swapping full BucketEntry objects (which contain large XDR
+    // LedgerEntry payloads).  Instead we sort small 24-byte ref structs
+    // and materialise the final BucketEntry vector in one pass.
+    struct EntryRef
+    {
+        BucketEntryType type;
+        // Exactly one of these is non-null.
+        LedgerEntry const* livePtr; // for INITENTRY / LIVEENTRY
+        LedgerKey const* deadPtr;   // for DEADENTRY
+    };
+
+    size_t totalSize =
+        initEntries.size() + liveEntries.size() + deadEntries.size();
+
+    std::vector<EntryRef> refs;
+    refs.reserve(totalSize);
+
+    BucketEntryType initType = useInit ? INITENTRY : LIVEENTRY;
     for (auto const& e : initEntries)
     {
-        BucketEntry ce;
-        ce.type(useInit ? INITENTRY : LIVEENTRY);
-        ce.liveEntry() = e;
-        bucket.push_back(ce);
+        refs.push_back({initType, &e, nullptr});
     }
     for (auto const& e : liveEntries)
     {
-        BucketEntry ce;
-        ce.type(LIVEENTRY);
-        ce.liveEntry() = e;
-        bucket.push_back(ce);
+        refs.push_back({LIVEENTRY, &e, nullptr});
     }
     for (auto const& e : deadEntries)
     {
-        BucketEntry ce;
-        ce.type(DEADENTRY);
-        ce.deadEntry() = e;
-        bucket.push_back(ce);
+        refs.push_back({DEADENTRY, nullptr, &e});
     }
 
+    // Sort using the same LedgerEntryIdCmp logic but through pointers.
+    LedgerEntryIdCmp idCmp;
+    auto refCmp = [&idCmp](EntryRef const& a, EntryRef const& b) {
+        // METAENTRY sorts below all others; not expected here but
+        // handled for safety.
+        if (a.type == METAENTRY || b.type == METAENTRY)
+        {
+            return a.type < b.type;
+        }
+
+        // Compare by ledger-entry identity, same as
+        // BucketEntryIdCmp<LiveBucket>::compareLive but using
+        // pointers into the source vectors.
+        bool aIsLive = (a.type == LIVEENTRY || a.type == INITENTRY);
+        bool bIsLive = (b.type == LIVEENTRY || b.type == INITENTRY);
+
+        if (aIsLive && bIsLive)
+        {
+            return idCmp(a.livePtr->data, b.livePtr->data);
+        }
+        else if (aIsLive && !bIsLive)
+        {
+            return idCmp(a.livePtr->data, *b.deadPtr);
+        }
+        else if (!aIsLive && bIsLive)
+        {
+            return idCmp(*a.deadPtr, b.livePtr->data);
+        }
+        else
+        {
+            return idCmp(*a.deadPtr, *b.deadPtr);
+        }
+    };
+
+    // For large batches (the ledger-close hot path), sort 4 chunks on
+    // parallel threads and merge; entry identities are unique, so the
+    // (unstable) parallel sort produces the same total order as a single
+    // std::sort.
+    constexpr size_t PARALLEL_SORT_THRESHOLD = 8192;
+    if (totalSize >= PARALLEL_SORT_THRESHOLD)
+    {
+        auto b = refs.begin();
+        auto q1 = b + totalSize / 4;
+        auto q2 = b + totalSize / 2;
+        auto q3 = b + (3 * totalSize) / 4;
+        auto e = refs.end();
+        auto f1 = std::async(std::launch::async,
+                             [&] { std::sort(b, q1, refCmp); });
+        auto f2 = std::async(std::launch::async,
+                             [&] { std::sort(q1, q2, refCmp); });
+        auto f3 = std::async(std::launch::async,
+                             [&] { std::sort(q2, q3, refCmp); });
+        std::sort(q3, e, refCmp);
+        f1.get();
+        f2.get();
+        f3.get();
+        auto fm = std::async(std::launch::async,
+                             [&] { std::inplace_merge(b, q1, q2, refCmp); });
+        std::inplace_merge(q2, q3, e, refCmp);
+        fm.get();
+        std::inplace_merge(b, q2, e, refCmp);
+    }
+    else
+    {
+        std::sort(refs.begin(), refs.end(), refCmp);
+    }
+
+    // Materialise sorted BucketEntry vector, copying the (large) XDR
+    // payloads on parallel threads for large batches.
+    std::vector<BucketEntry> bucket(totalSize);
+    auto materializeRange = [&refs, &bucket](size_t begin, size_t end) {
+        for (size_t i = begin; i < end; ++i)
+        {
+            auto const& r = refs[i];
+            auto& ce = bucket[i];
+            if (r.type == DEADENTRY)
+            {
+                ce.type(DEADENTRY);
+                ce.deadEntry() = *r.deadPtr;
+            }
+            else
+            {
+                ce.type(r.type);
+                ce.liveEntry() = *r.livePtr;
+            }
+        }
+    };
+    if (totalSize >= PARALLEL_SORT_THRESHOLD)
+    {
+        size_t quarter = totalSize / 4;
+        auto m1 = std::async(std::launch::async,
+                             [&] { materializeRange(0, quarter); });
+        auto m2 = std::async(std::launch::async,
+                             [&] { materializeRange(quarter, 2 * quarter); });
+        auto m3 = std::async(std::launch::async, [&] {
+            materializeRange(2 * quarter, 3 * quarter);
+        });
+        materializeRange(3 * quarter, totalSize);
+        m1.get();
+        m2.get();
+        m3.get();
+    }
+    else
+    {
+        materializeRange(0, totalSize);
+    }
+
+#ifndef NDEBUG
     BucketEntryIdCmp<LiveBucket> cmp;
-    std::sort(bucket.begin(), bucket.end(), cmp);
     releaseAssert(std::adjacent_find(
                       bucket.begin(), bucket.end(),
                       [&cmp](BucketEntry const& lhs, BucketEntry const& rhs) {
                           return !cmp(lhs, rhs);
                       }) == bucket.end());
+#endif
     return bucket;
 }
 
@@ -463,40 +618,6 @@ LiveBucket::fresh(BucketManager& bucketManager, uint32_t protocolVersion,
     return out.getBucket(bucketManager);
 }
 
-std::shared_ptr<LiveBucket>
-LiveBucket::freshInMemoryOnly(BucketManager& bucketManager,
-                              uint32_t protocolVersion,
-                              std::vector<LedgerEntry> const& initEntries,
-                              std::vector<LedgerEntry> const& liveEntries,
-                              std::vector<LedgerKey> const& deadEntries,
-                              bool countMergeEvents)
-{
-    ZoneScoped;
-    // When building fresh buckets after protocol version 10 (i.e. version
-    // 11-or-after) we differentiate INITENTRY from LIVEENTRY. In older
-    // protocols, for compatibility sake, we mark both cases as LIVEENTRY.
-    bool useInit = protocolVersionStartsFrom(
-        protocolVersion, FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY);
-
-    auto entries =
-        convertToBucketEntry(useInit, initEntries, liveEntries, deadEntries);
-    if (countMergeEvents)
-    {
-        MergeCounters mc;
-        for (auto const& e : entries)
-        {
-            countNewEntryType(mc, e);
-        }
-        bucketManager.incrMergeCounters<LiveBucket>(mc);
-    }
-
-    // This is just a "shell" bucket for in-memory merges, so we'll forgo the
-    // expensive BucketOutputIterator construction and just directly populate
-    // the in-memory state only.
-    return std::make_shared<LiveBucket>(
-        std::make_unique<std::vector<BucketEntry>>(std::move(entries)));
-}
-
 void
 LiveBucket::checkProtocolLegality(BucketEntry const& entry,
                                   uint32_t protocolVersion)
@@ -512,9 +633,10 @@ LiveBucket::checkProtocolLegality(BucketEntry const& entry,
     }
 }
 
-LiveBucket::LiveBucket(std::string const& filename, Hash const& hash,
-                       std::shared_ptr<LiveBucket::IndexT const>&& index,
-                       std::unique_ptr<std::vector<BucketEntry>> inMemoryState)
+LiveBucket::LiveBucket(
+    std::string const& filename, Hash const& hash,
+    std::shared_ptr<LiveBucket::IndexT const>&& index,
+    std::shared_ptr<std::vector<BucketEntry> const> inMemoryState)
     : BucketBase(filename, hash, std::move(index))
     , mEntries(std::move(inMemoryState))
 {
@@ -523,17 +645,235 @@ LiveBucket::LiveBucket(std::string const& filename, Hash const& hash,
 LiveBucket::LiveBucket() : BucketBase()
 {
     // Empty bucket is trivially stored in memory
-    mEntries = std::make_unique<std::vector<BucketEntry>>();
+    mEntries = std::make_shared<std::vector<BucketEntry> const>();
 }
 
-LiveBucket::LiveBucket(std::unique_ptr<std::vector<BucketEntry>> entries)
+LiveBucket::LiveBucket(std::shared_ptr<std::vector<BucketEntry> const> entries)
     : BucketBase(), mEntries(std::move(entries))
 {
+}
+
+LiveBucket::LiveBucket(std::vector<std::shared_ptr<LiveBucket>>&& shards,
+                       Hash const& combinedHash, uint32_t maxShardVersion,
+                       BucketEntryCounters&& counters, size_t totalSize)
+    : BucketBase(combinedHash, totalSize)
+    , mShards(std::move(shards))
+    , mCachedBucketVersion(maxShardVersion)
+    , mCompositeEntryCounters(std::move(counters))
+{
+}
+
+Hash
+LiveBucket::computeShardSetHash(
+    std::vector<std::shared_ptr<LiveBucket>> const& shards)
+{
+    SHA256 hsh;
+    for (auto const& shard : shards)
+    {
+        hsh.add(shard->getHash());
+    }
+    return hsh.finish();
+}
+
+std::shared_ptr<LiveBucket>
+LiveBucket::makeSharded(std::vector<std::shared_ptr<LiveBucket>> shards)
+{
+    ZoneScoped;
+    releaseAssertOrThrow(!shards.empty());
+
+    uint32_t maxVersion = 0;
+    BucketEntryCounters counters;
+    size_t totalSize = 0;
+    for (auto const& shard : shards)
+    {
+        releaseAssertOrThrow(shard && !shard->isSharded() &&
+                             !shard->isEmpty());
+        maxVersion = std::max(maxVersion, shard->getBucketVersion());
+        counters += shard->getBucketEntryCounters();
+        totalSize += shard->getSize();
+    }
+    auto hash = computeShardSetHash(shards);
+    return std::make_shared<LiveBucket>(std::move(shards), hash, maxVersion,
+                                        std::move(counters), totalSize);
+}
+
+std::shared_ptr<LiveBucket>
+LiveBucket::freshShard(BucketManager& bucketManager, uint32_t protocolVersion,
+                       std::vector<BucketEntry>&& sortedEntries,
+                       asio::io_context& ctx, bool doFsync)
+{
+    ZoneScoped;
+    // Note: an empty entry vector produces a meta-only shard (for protocols
+    // that write METAENTRY), used for ledgers whose batch is empty so that
+    // level-0 curr still carries the current protocol version.
+
+    BucketMetadata meta;
+    meta.ledgerVersion = protocolVersion;
+    if (protocolVersionStartsFrom(
+            protocolVersion,
+            LiveBucket::FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION))
+    {
+        meta.ext.v(1);
+        meta.ext.bucketListType() = BucketListType::LIVE;
+    }
+
+    // Shared so that the index and the resulting bucket alias the entries in
+    // this vector instead of copying them; it is complete before either reads
+    // it and immutable afterwards.
+    auto entriesPtr = std::make_shared<std::vector<BucketEntry> const>(
+        std::move(sortedEntries));
+
+    MergeCounters mc;
+    LiveBucketOutputIterator out(bucketManager.getTmpDir(),
+                                 /*keepTombstoneEntries=*/true, meta, mc, ctx,
+                                 doFsync);
+    for (auto const& e : *entriesPtr)
+    {
+        // Entries are sorted with unique identities (convertToBucketEntry
+        // output or sorted dirty-entry extraction), so skip put()'s dedup
+        // buffering.
+        out.putPresorted(e);
+    }
+
+    auto index =
+        std::make_shared<LiveBucketIndex>(bucketManager, entriesPtr, meta);
+
+    auto bucket =
+        out.getBucket(bucketManager, nullptr, entriesPtr, std::move(index));
+    bucket->mCachedBucketVersion = protocolVersion;
+    return bucket;
+}
+
+std::shared_ptr<LiveBucket>
+LiveBucket::mergeWithShardedInput(
+    BucketManager& bucketManager, uint32_t maxProtocolVersion,
+    std::shared_ptr<LiveBucket> const& oldBucket,
+    std::shared_ptr<LiveBucket> const& newShardedBucket,
+    std::vector<std::shared_ptr<LiveBucket>> const& shadows,
+    bool keepTombstoneEntries, bool countMergeEvents, asio::io_context& ctx,
+    bool doFsync)
+{
+    ZoneScoped;
+    releaseAssert(oldBucket);
+    releaseAssert(newShardedBucket && newShardedBucket->isSharded());
+    releaseAssert(!oldBucket->isSharded());
+
+    MergeCounters mc;
+    LiveBucketInputIterator oi(oldBucket);
+    for (auto const& s : shadows)
+    {
+        // Composite shadows must be expanded into shards by the caller.
+        releaseAssert(!s->isSharded());
+    }
+    std::vector<LiveBucketInputIterator> shadowIterators(shadows.begin(),
+                                                         shadows.end());
+
+    // Mirrors calculateMergeProtocolVersion, with the new-side version taken
+    // from the composite (max over its shards).
+    uint32_t protocolVersion = std::max(
+        oi.getMetadata().ledgerVersion, newShardedBucket->getBucketVersion());
+    for (auto const& si : shadowIterators)
+    {
+        auto version = si.getMetadata().ledgerVersion;
+        if (protocolVersionIsBefore(version,
+                                    LiveBucket::FIRST_PROTOCOL_SHADOWS_REMOVED))
+        {
+            protocolVersion = std::max(version, protocolVersion);
+        }
+    }
+    if (protocolVersion > maxProtocolVersion)
+    {
+        throw std::runtime_error(fmt::format(
+            FMT_STRING(
+                "bucket protocol version {:d} exceeds maxProtocolVersion {:d}"),
+            protocolVersion, maxProtocolVersion));
+    }
+    bool keepShadowedLifecycleEntries = updateMergeCountersForProtocolVersion(
+        mc, protocolVersion, shadowIterators);
+
+    auto timer = bucketManager.getMergeTimer().TimeScope();
+    BucketMetadata meta;
+    meta.ledgerVersion = protocolVersion;
+    if (protocolVersionStartsFrom(
+            protocolVersion,
+            LiveBucket::FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION))
+    {
+        meta.ext.v(1);
+        meta.ext.bucketListType() = BucketListType::LIVE;
+    }
+    else if (oi.getMetadata().ext.v() == 1)
+    {
+        meta.ext = oi.getMetadata().ext;
+    }
+
+    LiveBucketOutputIterator out(bucketManager.getTmpDir(),
+                                 keepTombstoneEntries, meta, mc, ctx, doFsync);
+    ShardedLiveMergeInput inputSource(oi, newShardedBucket->getShards(), mc);
+    std::function<void(BucketEntry const&)> putFunc =
+        [&out](BucketEntry const& entry) { out.put(entry); };
+    mergeInternal(bucketManager, inputSource, putFunc, protocolVersion, mc,
+                  shadowIterators, keepShadowedLifecycleEntries);
+
+    if (countMergeEvents)
+    {
+        bucketManager.incrMergeCounters<LiveBucket>(mc);
+    }
+
+    std::vector<Hash> shadowHashes;
+    shadowHashes.reserve(shadows.size());
+    for (auto const& s : shadows)
+    {
+        shadowHashes.push_back(s->getHash());
+    }
+    MergeKey mk{keepTombstoneEntries, oldBucket->getHash(),
+                newShardedBucket->getHash(), shadowHashes};
+    return out.getBucket(bucketManager, &mk);
+}
+
+std::optional<BucketEntry>
+LiveBucket::mergeSameKeyEntries(MergeCounters& mc, BucketEntry const& oldEntry,
+                                BucketEntry const& newEntry)
+{
+    // Mirrors the lifecycle rules in mergeCasesWithEqualKeys (see the table
+    // and invariants documented there).
+    if (newEntry.type() == INITENTRY)
+    {
+        if (oldEntry.type() != DEADENTRY)
+        {
+            throw std::runtime_error(
+                "Malformed sharded bucket: old non-DEAD + new INIT.");
+        }
+        BucketEntry newLive;
+        newLive.type(LIVEENTRY);
+        newLive.liveEntry() = newEntry.liveEntry();
+        ++mc.mNewInitEntriesMergedWithOldDead;
+        return newLive;
+    }
+    else if (oldEntry.type() == INITENTRY)
+    {
+        if (newEntry.type() == LIVEENTRY)
+        {
+            BucketEntry newInit;
+            newInit.type(INITENTRY);
+            newInit.liveEntry() = newEntry.liveEntry();
+            ++mc.mOldInitEntriesMergedWithNewLive;
+            return newInit;
+        }
+        // INIT + DEAD annihilate.
+        ++mc.mOldInitEntriesMergedWithNewDead;
+        return std::nullopt;
+    }
+    ++mc.mNewEntriesMergedWithOldNeitherInit;
+    return newEntry;
 }
 
 uint32_t
 LiveBucket::getBucketVersion() const
 {
+    if (mCachedBucketVersion)
+    {
+        return *mCachedBucketVersion;
+    }
     LiveBucketInputIterator it(shared_from_this());
     return it.getMetadata().ledgerVersion;
 }
@@ -542,79 +882,26 @@ void
 LiveBucket::maybeInitializeCache(size_t totalBucketListAccountsSizeBytes,
                                  Config const& cfg) const
 {
+    if (isSharded())
+    {
+        for (auto const& shard : mShards)
+        {
+            shard->maybeInitializeCache(totalBucketListAccountsSizeBytes, cfg);
+        }
+        return;
+    }
     releaseAssert(mIndex);
     mIndex->maybeInitializeCache(totalBucketListAccountsSizeBytes, cfg);
 }
 
-std::shared_ptr<LiveBucket>
-LiveBucket::mergeInMemory(BucketManager& bucketManager,
-                          uint32_t maxProtocolVersion,
-                          std::shared_ptr<LiveBucket> const& oldBucket,
-                          std::shared_ptr<LiveBucket> const& newBucket,
-                          bool countMergeEvents, asio::io_context& ctx,
-                          bool doFsync)
-{
-    ZoneScoped;
-    releaseAssertOrThrow(oldBucket->hasInMemoryEntries());
-    releaseAssertOrThrow(newBucket->hasInMemoryEntries());
-
-    auto const& oldEntries = oldBucket->getInMemoryEntries();
-    auto const& newEntries = newBucket->getInMemoryEntries();
-
-    std::vector<BucketEntry> mergedEntries;
-    mergedEntries.reserve(oldEntries.size() + newEntries.size());
-
-    // Prepare metadata for the merged bucket
-    BucketMetadata meta;
-    meta.ledgerVersion = maxProtocolVersion;
-    if (protocolVersionStartsFrom(
-            maxProtocolVersion,
-            LiveBucket::FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION))
-    {
-        meta.ext.v(1);
-        meta.ext.bucketListType() = BucketListType::LIVE;
-    }
-
-    // First level never has shadows
-    std::vector<LiveBucketInputIterator> shadowIterators{};
-    MergeCounters mc;
-    bool keepShadowedLifecycleEntries = updateMergeCountersForProtocolVersion(
-        mc, maxProtocolVersion, shadowIterators);
-
-    MemoryMergeInput<LiveBucket> inputSource(oldEntries, newEntries);
-    std::function<void(BucketEntry const&)> putFunc =
-        [&mergedEntries](BucketEntry const& entry) {
-            mergedEntries.emplace_back(entry);
-        };
-
-    mergeInternal(bucketManager, inputSource, putFunc, maxProtocolVersion, mc,
-                  shadowIterators, keepShadowedLifecycleEntries);
-
-    if (countMergeEvents)
-    {
-        bucketManager.incrMergeCounters<LiveBucket>(mc);
-    }
-
-    // Write merge output to a bucket and save to disk
-    LiveBucketOutputIterator out(bucketManager.getTmpDir(),
-                                 /*keepTombstoneEntries=*/true, meta, mc, ctx,
-                                 doFsync);
-
-    for (auto const& e : mergedEntries)
-    {
-        out.put(e);
-    }
-
-    // Store the merged entries in memory in the new bucket in case this
-    // bucket sees another incoming merge as level 0 curr.
-    return out.getBucket(
-        bucketManager, nullptr,
-        std::make_unique<std::vector<BucketEntry>>(std::move(mergedEntries)));
-}
 
 BucketEntryCounters const&
 LiveBucket::getBucketEntryCounters() const
 {
+    if (isSharded())
+    {
+        return *mCompositeEntryCounters;
+    }
     releaseAssert(mIndex);
     return mIndex->getBucketEntryCounters();
 }
@@ -641,6 +928,12 @@ template void LiveBucket::mergeCasesWithEqualKeys<FileMergeInput<LiveBucket>>(
 
 template void LiveBucket::mergeCasesWithEqualKeys<MemoryMergeInput<LiveBucket>>(
     MergeCounters& mc, MemoryMergeInput<LiveBucket>& inputSource,
+    std::function<void(BucketEntry const&)> putFunc, uint32_t protocolVersion,
+    std::vector<LiveBucketInputIterator>& shadowIterators,
+    bool keepShadowedLifecycleEntries);
+
+template void LiveBucket::mergeCasesWithEqualKeys<ShardedLiveMergeInput>(
+    MergeCounters& mc, ShardedLiveMergeInput& inputSource,
     std::function<void(BucketEntry const&)> putFunc, uint32_t protocolVersion,
     std::vector<LiveBucketInputIterator>& shadowIterators,
     bool keepShadowedLifecycleEntries);

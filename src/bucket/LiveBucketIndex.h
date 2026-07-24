@@ -108,9 +108,12 @@ class LiveBucketIndex : public NonMovableOrCopyable
     LiveBucketIndex(BucketManager const& bm, Archive& ar,
                     std::streamoff pageSize);
 
-    // Constructor for creating new index from in-memory state
+    // Constructor for creating new index from in-memory state. The index
+    // aliases the entries in the backing vector (sharing ownership of the
+    // vector), so the vector must not be mutated after this call.
     LiveBucketIndex(BucketManager& bm,
-                    std::vector<BucketEntry> const& inMemoryState,
+                    std::shared_ptr<std::vector<BucketEntry> const> const&
+                        inMemoryState,
                     BucketMetadata const& metadata);
 
     // Initializes the random eviction cache if it has not already been
@@ -133,6 +136,11 @@ class LiveBucketIndex : public NonMovableOrCopyable
     static std::streamoff getPageSize(Config const& cfg, size_t bucketSize);
 
     IndexReturnT lookup(LedgerKey const& k) const;
+
+    // Lookup with a precomputed identity hash (hashLedgerIdentity(k)); lets
+    // multi-bucket walks hash the key once. Only the in-memory index uses
+    // the hash; disk-backed indexes fall back to the plain lookup.
+    IndexReturnT lookup(LedgerKey const& k, size_t identityHash) const;
 
     std::pair<IndexReturnT, IterT> scan(IterT start, LedgerKey const& k) const;
 

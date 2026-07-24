@@ -31,8 +31,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Optional, Sequence
 
-# Instance type to use. Matches SDF validator instance type.
-INSTANCE_TYPE = "c5d.2xlarge"
+# Default instance type to use. Matches SDF validator instance type.
+DEFAULT_INSTANCE_TYPE = "c5d.2xlarge"
 
 # Directory containing helper files for this script.
 APPLY_LOAD_SCRIPT_DIR = Path(__file__).resolve().parent
@@ -61,6 +61,14 @@ REMOTE_FILE_CHUNK_SIZE_BYTES = 12 * 1024
 
 # Preserve the legacy tag value required by the existing EC2 IAM policy.
 INSTANCE_TEST_TAG_VALUE = "max-sac-tps"
+
+# Override for tcmalloc's total thread-cache budget (bytes), passed to the
+# stellar-core container via TCMALLOC_MAX_TOTAL_THREAD_CACHE_BYTES. tcmalloc
+# divides this fixed budget across all threads (capped at 4 MB/thread), so the
+# default (32 MB) starves per-thread caches as the apply thread count grows,
+# increasing central-free-list/pageheap lock contention. Giving every thread its
+# full 4 MB cache removes that contention. Set to 0 to leave the env var unset.
+DEFAULT_TCMALLOC_MAX_TOTAL_THREAD_CACHE_BYTES = 1 << 30  # 1 GiB
 
 
 @dataclass(frozen=True)
@@ -323,6 +331,16 @@ def add_run_arguments(parser: argparse.ArgumentParser) -> None:
         type=int,
         help="Optional disk IOPS limit for the NVMe device.",
     )
+    parser.add_argument(
+        "--tcmalloc-max-total-thread-cache-bytes",
+        type=int,
+        default=DEFAULT_TCMALLOC_MAX_TOTAL_THREAD_CACHE_BYTES,
+        help=(
+            "Value for TCMALLOC_MAX_TOTAL_THREAD_CACHE_BYTES passed to the "
+            "stellar-core container. Set to 0 to leave it unset (tcmalloc "
+            "default) for baseline comparisons."
+        ),
+    )
 
 
 def add_aws_run_arguments(parser: argparse.ArgumentParser) -> None:
@@ -352,7 +370,8 @@ def add_aws_run_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def build_docker_command(config_path: str, image: str,
-                         iops: Optional[int]) -> list[str]:
+                         iops: Optional[int],
+                         tcmalloc_max_total_thread_cache_bytes: int) -> list[str]:
     command = [
         "docker",
         "run",
@@ -363,6 +382,12 @@ def build_docker_command(config_path: str, image: str,
         "-v",
         f"{APPLY_LOAD_LOG_DIR}:{APPLY_LOAD_LOG_DIR}",
     ]
+    if tcmalloc_max_total_thread_cache_bytes > 0:
+        command.extend([
+            "-e",
+            "TCMALLOC_MAX_TOTAL_THREAD_CACHE_BYTES="
+            f"{tcmalloc_max_total_thread_cache_bytes}",
+        ])
     if iops is not None:
         command.extend([
             "--device-write-iops",
@@ -400,6 +425,12 @@ def build_apply_load_command(mode_name: str, values: Mapping[str, Any],
     ]
     if iops is not None:
         command.extend(["--iops", str(iops)])
+    tcmalloc_bytes = values.get("tcmalloc_max_total_thread_cache_bytes")
+    if tcmalloc_bytes is not None:
+        command.extend([
+            "--tcmalloc-max-total-thread-cache-bytes",
+            str(tcmalloc_bytes),
+        ])
     for parameter in get_mode_cli_parameters(mode_name):
         command.extend([
             f"--{parameter.replace('_', '-')}",
@@ -430,7 +461,8 @@ def build_remote_apply_load_command(mode_name: str, values: Mapping[str, Any],
 
 
 def start_ec2_instance(ami: str, region: str, security_group: str,
-                       iam_instance_profile: str) -> str:
+                       iam_instance_profile: str,
+                       instance_type: str) -> str:
     """Start an EC2 instance and return its instance id."""
     print("Starting EC2 instance...")
     command = [
@@ -440,7 +472,7 @@ def start_ec2_instance(ami: str, region: str, security_group: str,
         "--image-id",
         ami,
         "--instance-type",
-        INSTANCE_TYPE,
+        instance_type,
         "--security-groups",
         security_group,
         "--iam-instance-profile",
@@ -706,10 +738,11 @@ def local_aws_init() -> None:
 
 
 def aws_init(ami: str, region: str, security_group: str,
-             iam_instance_profile: str, s3_bucket: str) -> None:
+             iam_instance_profile: str, s3_bucket: str,
+             instance_type: str) -> None:
     """Create and initialize an AWS instance for running apply-load."""
     instance_id = start_ec2_instance(
-        ami, region, security_group, iam_instance_profile
+        ami, region, security_group, iam_instance_profile, instance_type
     )
     install_script_on_instance(instance_id, region, s3_bucket)
     run_ssm_command(
@@ -720,7 +753,8 @@ def aws_init(ami: str, region: str, security_group: str,
     print(instance_id)
 
 
-def run_apply_load(config: str, image: str, iops: Optional[int]) -> None:
+def run_apply_load(config: str, image: str, iops: Optional[int],
+                   tcmalloc_max_total_thread_cache_bytes: int) -> None:
     """Run apply-load with the given configuration."""
     with tempfile.NamedTemporaryFile(
         mode="w", encoding="utf-8", delete=False
@@ -734,7 +768,10 @@ def run_apply_load(config: str, image: str, iops: Optional[int]) -> None:
 
     try:
         result = run(
-            build_docker_command(config_path, image, iops),
+            build_docker_command(
+                config_path, image, iops,
+                tcmalloc_max_total_thread_cache_bytes,
+            ),
             capture_output=True,
             check=False,
         )
@@ -851,6 +888,7 @@ def handle_aws_init(args: argparse.Namespace) -> None:
         args.security_group,
         args.iam_instance_profile,
         args.s3_bucket,
+        args.instance_type,
     )
 
 
@@ -860,7 +898,10 @@ def handle_local_aws_init(_: argparse.Namespace) -> None:
 
 def handle_run_mode(args: argparse.Namespace) -> None:
     config = render_config(args.apply_load_mode, vars(args))
-    run_apply_load(config, args.image, args.iops)
+    run_apply_load(
+        config, args.image, args.iops,
+        args.tcmalloc_max_total_thread_cache_bytes,
+    )
 
 
 def handle_aws_run_mode(args: argparse.Namespace) -> None:
@@ -911,6 +952,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--s3-bucket",
         required=True,
         help="S3 bucket to use for file transfer.",
+    )
+    aws_init_parser.add_argument(
+        "--instance-type",
+        default=DEFAULT_INSTANCE_TYPE,
+        help=(
+            f"EC2 instance type to use. Defaults to {DEFAULT_INSTANCE_TYPE}."
+        ),
     )
     aws_init_parser.set_defaults(handler=handle_aws_init)
 

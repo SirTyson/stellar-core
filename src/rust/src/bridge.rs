@@ -188,6 +188,16 @@ pub(crate) mod rust_bridge {
     extern "Rust" {
         fn to_base64(b: &CxxVector<u8>, mut s: Pin<&mut CxxString>);
         fn from_base64(s: &CxxString, mut b: Pin<&mut CxxVector<u8>>);
+        // SHA-256 via RustCrypto's sha2 (lock-free + SHA-NI), writing the
+        // 32-byte digest to `out`. A thread-scalable replacement for OpenSSL
+        // 3.x's one-shot SHA256(), which serializes on a global fetch lock.
+        unsafe fn sha256_rust(data: *const u8, data_len: usize, out: *mut u8);
+        // Incremental SHA-256 (same sha2 backend), for streaming hashing
+        // without materializing a contiguous input buffer.
+        type RustSha256;
+        fn new_rust_sha256() -> Box<RustSha256>;
+        unsafe fn update(self: &mut RustSha256, data: *const u8, len: usize);
+        unsafe fn finalize(self: &mut RustSha256, out: *mut u8);
         fn check_sensible_soroban_config_for_protocol(core_max_proto: u32);
 
         // Ed25519 signature verification using dalek library.
@@ -208,13 +218,22 @@ pub(crate) mod rust_bridge {
             restored_rw_entry_indices: &Vec<u32>,
             source_account: &CxxBuf,
             auth_entries: &Vec<CxxBuf>,
-            ledger_info: CxxLedgerInfo,
+            ledger_info: &CxxLedgerInfo,
             ledger_entries: &Vec<CxxBuf>,
             ttl_entries: &Vec<CxxBuf>,
             base_prng_seed: &CxxBuf,
             rent_fee_configuration: CxxRentFeeConfiguration,
             module_cache: &SorobanModuleCache,
         ) -> Result<InvokeHostFunctionOutput>;
+
+        // Returns the buffers backing `output` to the Rust output-buffer pool
+        // for reuse by a later invocation. Must be called once C++ is done
+        // consuming the output.
+        fn recycle_invoke_host_function_output(
+            config_max_protocol: u32,
+            protocol_version: u32,
+            output: InvokeHostFunctionOutput,
+        );
 
         fn init_logging(maxLevel: LogLevel) -> Result<()>;
 
@@ -236,6 +255,7 @@ pub(crate) mod rust_bridge {
         fn get_hostile_large_val_wasm() -> Result<RustBuf>;
 
         fn get_auth_wasm() -> Result<RustBuf>;
+        fn get_delegated_auth_wasm() -> Result<RustBuf>;
 
         fn get_no_arg_constructor_wasm() -> Result<RustBuf>;
         fn get_constructor_with_args_p21_wasm() -> Result<RustBuf>;
@@ -335,7 +355,7 @@ pub(crate) mod rust_bridge {
         fn evict_contract_code(self: &SorobanModuleCache, key: &[u8]) -> Result<()>;
         fn clear(self: &SorobanModuleCache) -> Result<()>;
         fn contains_module(self: &SorobanModuleCache, protocol: u32, key: &[u8]) -> Result<bool>;
-        fn get_mem_bytes_consumed(self: &SorobanModuleCache, protocol: u32) -> Result<u64>;
+        fn get_wasm_bytes_input(self: &SorobanModuleCache, protocol: u32) -> Result<u64>;
 
         // Given a quorum set configuration, checks if quorum intersection is
         // enjoyed among all possible quorums. Returns `Ok(status)` where
@@ -352,20 +372,14 @@ pub(crate) mod rust_bridge {
         //
         // The quorum checker accepts two limits (passed via `resource_limit`),
         // time (ms) and memory (bytes). The time limit is enforced internally
-        // via code logic, once exceeds, returns a solver error. The memory
-        // limit is enforced by a global memory allocator, and if exceeded, will
-        // abort the program. In other words, memory limit is a hard, system
-        // enforced limit.
+        // via solver callbacks. The memory limit parameter is currently
+        // accepted for compatibility but ignored.
         //
         // Errors:
-        //  - if resource limits (not including memory) have been exceeded.
+        //  - if the time limit has been exceeded.
         //  - any other solver error In either sucess or error case, the
         // `resource_usage` will be updated with the actual resource
         // consumption.
-        //
-        // Aborts:
-        // - if the memory limit has been exceeded
-        // Abort is non-recoverable (it cannot be caught by catch_unwind)
         fn network_enjoys_quorum_intersection(
             nodes: &Vec<CxxBuf>,
             quorum_set: &Vec<CxxBuf>,
@@ -374,11 +388,8 @@ pub(crate) mod rust_bridge {
             resource_usage: &mut QuorumCheckerResource,
         ) -> Result<QuorumCheckerStatus>;
 
-        // The QI checker actually manages the memory limit using a global
-        // allocator, which winds up controlling _all_ memory allocation by
-        // rust code in the process. So we want to ensure that limit is unlimited
-        // when the process starts up -- the QI check call will limit it later,
-        // if and only if it's running as a QI-checking subprocess.
+        // The QI checker no longer manages a Rust-side memory limit, so this is
+        // retained as a no-op compatibility hook for existing startup code.
         fn set_rust_global_memory_limit_to_unlimited();
 
         // Soroban fuzzing support - always declared but only functional with --features fuzz.
@@ -403,6 +414,7 @@ pub(crate) mod rust_bridge {
             level: LogLevel,
             msg: &CxxString,
         ) -> Result<()>;
+        unsafe fn shim_copyU8Vector(data: *const u8, len: usize) -> UniquePtr<CxxVector<u8>>;
     }
 }
 
@@ -416,6 +428,7 @@ use crate::ed25519_verify::*;
 use crate::i128::*;
 use crate::log::*;
 use crate::quorum_checker::*;
+use crate::sha256::*;
 use crate::soroban_fuzz::*;
 use crate::soroban_invoke::*;
 use crate::soroban_module_cache::*;

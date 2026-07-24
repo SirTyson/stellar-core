@@ -447,7 +447,7 @@ std::shared_ptr<LiveBucket>
 BucketManager::adoptFileAsBucket(
     std::string const& filename, uint256 const& hash, MergeKey* mergeKey,
     std::shared_ptr<LiveBucket::IndexT const> index,
-    std::unique_ptr<std::vector<BucketEntry>> inMemoryState)
+    std::shared_ptr<std::vector<BucketEntry> const> inMemoryState)
 {
     // Delay bucket adoption 100us to 2s to expose race conditions
     JITTER_INJECT_DELAY_CUSTOM(100, 100, 500'000);
@@ -462,7 +462,7 @@ std::shared_ptr<HotArchiveBucket>
 BucketManager::adoptFileAsBucket(
     std::string const& filename, uint256 const& hash, MergeKey* mergeKey,
     std::shared_ptr<HotArchiveBucket::IndexT const> index,
-    std::unique_ptr<std::vector<BucketEntry>> inMemoryState)
+    std::shared_ptr<std::vector<BucketEntry> const> inMemoryState)
 {
     // Delay bucket adoption 100us to 2s to expose race conditions
     JITTER_INJECT_DELAY_CUSTOM(100, 100, 2'000'000);
@@ -478,7 +478,7 @@ BucketManager::adoptFileAsBucketInternal(
     std::string const& filename, uint256 const& hash, MergeKey* mergeKey,
     std::shared_ptr<typename BucketT::IndexT const> index,
     BucketMapT<BucketT>& bucketMap, FutureMapT<BucketT>& futureMap,
-    std::unique_ptr<std::vector<BucketEntry>> inMemoryState)
+    std::shared_ptr<std::vector<BucketEntry> const> inMemoryState)
 {
     BUCKET_TYPE_ASSERT(BucketT);
     ZoneScoped;
@@ -801,26 +801,44 @@ BucketManager::getBucketListReferencedBuckets() const
     ZoneScoped;
     std::set<Hash> referenced;
 
+    auto addBucketHash = [&](auto const& bucket) {
+        // Composite (sharded) level-0 buckets: the combined hash names no
+        // file; reference the shard files instead, which must be retained
+        // as long as the composite is.
+        if constexpr (std::is_same_v<
+                          std::decay_t<decltype(*bucket)>, LiveBucket>)
+        {
+            if (bucket->isSharded())
+            {
+                for (auto const& shard : bucket->getShards())
+                {
+                    auto srit = referenced.emplace(shard->getHash());
+                    if (srit.second)
+                    {
+                        CLOG_TRACE(Bucket, "{} referenced by bucket list",
+                                   binToHex(*srit.first));
+                    }
+                }
+                return;
+            }
+        }
+        auto rit = referenced.emplace(bucket->getHash());
+        if (rit.second)
+        {
+            CLOG_TRACE(Bucket, "{} referenced by bucket list",
+                       binToHex(*rit.first));
+        }
+    };
     auto processBucketList = [&](auto const& bl, uint32_t levels) {
         // retain current bucket list
         for (uint32_t i = 0; i < levels; ++i)
         {
             auto const& level = bl->getLevel(i);
-            auto rit = referenced.emplace(level.getCurr()->getHash());
-            if (rit.second)
-            {
-                CLOG_TRACE(Bucket, "{} referenced by bucket list",
-                           binToHex(*rit.first));
-            }
-            rit = referenced.emplace(level.getSnap()->getHash());
-            if (rit.second)
-            {
-                CLOG_TRACE(Bucket, "{} referenced by bucket list",
-                           binToHex(*rit.first));
-            }
+            addBucketHash(level.getCurr());
+            addBucketHash(level.getSnap());
             for (auto const& h : level.getNext().getHashes())
             {
-                rit = referenced.emplace(hexToBin256(h));
+                auto rit = referenced.emplace(hexToBin256(h));
                 if (rit.second)
                 {
                     CLOG_TRACE(Bucket, "{} referenced by bucket list", h);
@@ -1046,6 +1064,27 @@ BucketManager::addLiveBatch(Application& app, LedgerHeader header,
 }
 
 void
+BucketManager::addLiveBatchShards(
+    Application& app, LedgerHeader header,
+    std::vector<std::shared_ptr<LiveBucket>>&& newShards)
+{
+    ZoneScoped;
+#ifdef BUILD_TESTS
+    if (mUseFakeTestValuesForNextClose)
+    {
+        header.ledgerVersion = mFakeTestProtocolVersion;
+    }
+#endif
+    auto timer = mBucketAddLiveBatch.TimeScope();
+    mLiveBucketList->addBatchShards(app, header.ledgerSeq,
+                                    header.ledgerVersion,
+                                    std::move(newShards));
+    mLiveBucketListSizeCounter.set_count(mLiveBucketList->getSize());
+    reportBucketEntryCountMetrics();
+    reportLiveBucketIndexCacheMetrics();
+}
+
+void
 BucketManager::addHotArchiveBatch(
     Application& app, LedgerHeader header,
     std::vector<LedgerEntry> const& archivedEntries,
@@ -1179,9 +1218,217 @@ BucketManager::startBackgroundEvictionScan(ApplyLedgerView lclApplyView,
 
 EvictedStateVectors
 BucketManager::resolveBackgroundEvictionScan(
+    ApplyLedgerView const& lclApplyView, AbstractLedgerTxn& ltx)
+{
+    // Production path: uses direct O(1) lookups in the LedgerTxn's EntryMap
+    // via isModifiedKey(), avoiding building a full UnorderedSet of all ~128K
+    // modified keys (~20ms saved per ledger).
+    auto isModifiedKey = [&ltx](LedgerKey const& k) {
+        return ltx.isModifiedKey(k);
+    };
+
+    ZoneScoped;
+    releaseAssert(mEvictionStatistics);
+    auto timer = mBucketListEvictionMetrics.blockingTime.TimeScope();
+    auto ledgerSeq = ltx.loadHeader().current().ledgerSeq;
+    auto ledgerVers = ltx.loadHeader().current().ledgerVersion;
+    auto networkConfig = SorobanNetworkConfig::loadFromLedger(ltx);
+    releaseAssert(ledgerSeq == lclApplyView.getLedgerSeq() + 1);
+
+    if (!mEvictionFuture.valid())
+    {
+        startBackgroundEvictionScan(lclApplyView, networkConfig);
+    }
+
+    auto evictionCandidates = mEvictionFuture.get();
+
+    if (!evictionCandidates->isValid(ledgerSeq, ledgerVers,
+                                     networkConfig.stateArchivalSettings()))
+    {
+        startBackgroundEvictionScan(lclApplyView, networkConfig);
+        evictionCandidates = mEvictionFuture.get();
+    }
+
+    auto& eligibleEntries = evictionCandidates->eligibleEntries;
+
+    for (auto iter = eligibleEntries.begin(); iter != eligibleEntries.end();)
+    {
+        if (!isModifiedKey(getTTLKey(iter->entry)))
+        {
+            if (isModifiedKey(LedgerEntryKey(iter->entry)))
+            {
+                auto msg = fmt::format(
+                    "Eviction attempted on modified entry: {}",
+                    xdr::xdr_to_string(LedgerEntryKey(iter->entry)));
+                CLOG_ERROR(Bucket, "{}", msg);
+                CLOG_FATAL(Bucket, "{}", REPORT_INTERNAL_BUG);
+                if (getConfig().INVARIANT_EXTRA_CHECKS)
+                {
+                    throw std::runtime_error(msg);
+                }
+            }
+
+            ++iter;
+        }
+        else
+        {
+            iter = eligibleEntries.erase(iter);
+        }
+    }
+
+    auto remainingEntriesToEvict =
+        networkConfig.stateArchivalSettings().maxEntriesToArchive;
+    auto entryToEvictIter = eligibleEntries.begin();
+    auto newEvictionIterator = evictionCandidates->endOfRegionIterator;
+
+    std::vector<LedgerKey> deletedKeys;
+    std::vector<LedgerEntry> archivedEntries;
+
+    while (remainingEntriesToEvict > 0 &&
+           entryToEvictIter != eligibleEntries.end())
+    {
+        ltx.erase(LedgerEntryKey(entryToEvictIter->entry));
+        ltx.erase(getTTLKey(entryToEvictIter->entry));
+        --remainingEntriesToEvict;
+
+        if (isTemporaryEntry(entryToEvictIter->entry.data))
+        {
+            deletedKeys.emplace_back(LedgerEntryKey(entryToEvictIter->entry));
+        }
+        else
+        {
+            archivedEntries.emplace_back(entryToEvictIter->entry);
+        }
+
+        deletedKeys.emplace_back(getTTLKey(entryToEvictIter->entry));
+
+        auto age = ledgerSeq - entryToEvictIter->liveUntilLedger;
+        mEvictionStatistics->recordEvictedEntry(age);
+        mBucketListEvictionMetrics.entriesEvicted.inc();
+
+        newEvictionIterator = entryToEvictIter->iter;
+        entryToEvictIter = eligibleEntries.erase(entryToEvictIter);
+    }
+
+    if (remainingEntriesToEvict != 0)
+    {
+        newEvictionIterator = evictionCandidates->endOfRegionIterator;
+    }
+
+    networkConfig.updateEvictionIterator(ltx, newEvictionIterator);
+    return EvictedStateVectors{deletedKeys, archivedEntries};
+}
+
+EvictedStateVectors
+BucketManager::resolveBackgroundEvictionScan(
+    ApplyLedgerView const& lclApplyView, AbstractLedgerTxn& ltx,
+    UnorderedSet<LedgerKey> const& modifiedSorobanKeys)
+{
+    // Bypass path: soroban entries were not written through the LedgerTxn
+    // (see bypassLtxForSorobanEntries), so modified-key checks are answered
+    // from the shard-derived key set. Eviction candidates are always
+    // soroban-typed, so the set is complete for this purpose.
+    ZoneScoped;
+    releaseAssert(mEvictionStatistics);
+    auto timer = mBucketListEvictionMetrics.blockingTime.TimeScope();
+    auto ledgerSeq = ltx.loadHeader().current().ledgerSeq;
+    auto ledgerVers = ltx.loadHeader().current().ledgerVersion;
+    auto networkConfig = SorobanNetworkConfig::loadFromLedger(ltx);
+    releaseAssert(ledgerSeq == lclApplyView.getLedgerSeq() + 1);
+
+    if (!mEvictionFuture.valid())
+    {
+        startBackgroundEvictionScan(lclApplyView, networkConfig);
+    }
+
+    auto evictionCandidates = mEvictionFuture.get();
+
+    if (!evictionCandidates->isValid(ledgerSeq, ledgerVers,
+                                     networkConfig.stateArchivalSettings()))
+    {
+        startBackgroundEvictionScan(lclApplyView, networkConfig);
+        evictionCandidates = mEvictionFuture.get();
+    }
+
+    auto& eligibleEntries = evictionCandidates->eligibleEntries;
+
+    for (auto iter = eligibleEntries.begin(); iter != eligibleEntries.end();)
+    {
+        if (modifiedSorobanKeys.find(getTTLKey(iter->entry)) ==
+            modifiedSorobanKeys.end())
+        {
+            if (modifiedSorobanKeys.find(LedgerEntryKey(iter->entry)) !=
+                modifiedSorobanKeys.end())
+            {
+                auto msg = fmt::format(
+                    "Eviction attempted on modified entry: {}",
+                    xdr::xdr_to_string(LedgerEntryKey(iter->entry)));
+                CLOG_ERROR(Bucket, "{}", msg);
+                CLOG_FATAL(Bucket, "{}", REPORT_INTERNAL_BUG);
+                if (getConfig().INVARIANT_EXTRA_CHECKS)
+                {
+                    throw std::runtime_error(msg);
+                }
+            }
+
+            ++iter;
+        }
+        else
+        {
+            iter = eligibleEntries.erase(iter);
+        }
+    }
+
+    auto remainingEntriesToEvict =
+        networkConfig.stateArchivalSettings().maxEntriesToArchive;
+    auto entryToEvictIter = eligibleEntries.begin();
+    auto newEvictionIterator = evictionCandidates->endOfRegionIterator;
+
+    std::vector<LedgerKey> deletedKeys;
+    std::vector<LedgerEntry> archivedEntries;
+
+    while (remainingEntriesToEvict > 0 &&
+           entryToEvictIter != eligibleEntries.end())
+    {
+        ltx.erase(LedgerEntryKey(entryToEvictIter->entry));
+        ltx.erase(getTTLKey(entryToEvictIter->entry));
+        --remainingEntriesToEvict;
+
+        if (isTemporaryEntry(entryToEvictIter->entry.data))
+        {
+            deletedKeys.emplace_back(LedgerEntryKey(entryToEvictIter->entry));
+        }
+        else
+        {
+            archivedEntries.emplace_back(entryToEvictIter->entry);
+        }
+
+        deletedKeys.emplace_back(getTTLKey(entryToEvictIter->entry));
+
+        auto age = ledgerSeq - entryToEvictIter->liveUntilLedger;
+        mEvictionStatistics->recordEvictedEntry(age);
+        mBucketListEvictionMetrics.entriesEvicted.inc();
+
+        newEvictionIterator = entryToEvictIter->iter;
+        entryToEvictIter = eligibleEntries.erase(entryToEvictIter);
+    }
+
+    if (remainingEntriesToEvict != 0)
+    {
+        newEvictionIterator = evictionCandidates->endOfRegionIterator;
+    }
+
+    networkConfig.updateEvictionIterator(ltx, newEvictionIterator);
+    return EvictedStateVectors{deletedKeys, archivedEntries};
+}
+
+EvictedStateVectors
+BucketManager::resolveBackgroundEvictionScan(
     ApplyLedgerView const& lclApplyView, AbstractLedgerTxn& ltx,
     LedgerKeySet const& modifiedKeys)
 {
+    // Test path: uses an explicitly provided key set (for test helpers that
+    // don't write entries through the LedgerTxn subsystem).
     ZoneScoped;
     releaseAssert(mEvictionStatistics);
     auto timer = mBucketListEvictionMetrics.blockingTime.TimeScope();
@@ -1203,8 +1450,6 @@ BucketManager::resolveBackgroundEvictionScan(
 
     auto evictionCandidates = mEvictionFuture.get();
 
-    // If eviction related settings changed during the ledger, we have to
-    // restart the scan
     if (!evictionCandidates->isValid(ledgerSeq, ledgerVers,
                                      networkConfig.stateArchivalSettings()))
     {
@@ -1216,7 +1461,6 @@ BucketManager::resolveBackgroundEvictionScan(
 
     for (auto iter = eligibleEntries.begin(); iter != eligibleEntries.end();)
     {
-        // If the TTL has not been modified this ledger, we can evict the entry
         if (modifiedKeys.find(getTTLKey(iter->entry)) == modifiedKeys.end())
         {
             auto maybeEntryIt = modifiedKeys.find(LedgerEntryKey(iter->entry));
@@ -1246,11 +1490,9 @@ BucketManager::resolveBackgroundEvictionScan(
     auto entryToEvictIter = eligibleEntries.begin();
     auto newEvictionIterator = evictionCandidates->endOfRegionIterator;
 
-    // Return vectors include both evicted entry and associated TTL
     std::vector<LedgerKey> deletedKeys;
     std::vector<LedgerEntry> archivedEntries;
 
-    // Only actually evict up to maxEntriesToArchive of the eligible entries
     while (remainingEntriesToEvict > 0 &&
            entryToEvictIter != eligibleEntries.end())
     {
@@ -1267,7 +1509,6 @@ BucketManager::resolveBackgroundEvictionScan(
             archivedEntries.emplace_back(entryToEvictIter->entry);
         }
 
-        // Delete TTL for both types
         deletedKeys.emplace_back(getTTLKey(entryToEvictIter->entry));
 
         auto age = ledgerSeq - entryToEvictIter->liveUntilLedger;
@@ -1278,10 +1519,6 @@ BucketManager::resolveBackgroundEvictionScan(
         entryToEvictIter = eligibleEntries.erase(entryToEvictIter);
     }
 
-    // If remainingEntriesToEvict == 0, that means we could not evict the entire
-    // scan region, so the new eviction iterator should be after the last entry
-    // evicted. Otherwise, eviction iterator should be at the end of the scan
-    // region
     if (remainingEntriesToEvict != 0)
     {
         newEvictionIterator = evictionCandidates->endOfRegionIterator;
@@ -1345,10 +1582,45 @@ BucketManager::assumeState(Application& app, HistoryArchiveState const& has,
             typename std::remove_reference<decltype(bl)>::type::bucket_type;
         for (uint32_t i = 0; i < kNumLevels; ++i)
         {
-            auto curr =
-                getBucketByHash<BucketT>(hexToBin256(hasBuckets.at(i).curr));
-            auto snap =
-                getBucketByHash<BucketT>(hexToBin256(hasBuckets.at(i).snap));
+            // Composite (sharded) level-0 buckets are reconstructed from
+            // their shard files; the combined hash in curr/snap names no
+            // file of its own.
+            auto getBucketOrComposite =
+                [&](std::string const& hash,
+                    std::vector<std::string> const& shardHashes)
+                -> std::shared_ptr<BucketT> {
+                if constexpr (std::is_same_v<BucketT, LiveBucket>)
+                {
+                    if (!shardHashes.empty())
+                    {
+                        std::vector<std::shared_ptr<LiveBucket>> shards;
+                        shards.reserve(shardHashes.size());
+                        for (auto const& h : shardHashes)
+                        {
+                            auto shard =
+                                getBucketByHash<LiveBucket>(hexToBin256(h));
+                            if (!shard || shard->isEmpty())
+                            {
+                                throw std::runtime_error(
+                                    "Missing shard bucket files while "
+                                    "assuming saved live BucketList state");
+                            }
+                            releaseAssert(shard->isIndexed());
+                            shards.push_back(shard);
+                        }
+                        auto composite =
+                            LiveBucket::makeSharded(std::move(shards));
+                        releaseAssert(composite->getHash() ==
+                                      hexToBin256(hash));
+                        return composite;
+                    }
+                }
+                return getBucketByHash<BucketT>(hexToBin256(hash));
+            };
+            auto curr = getBucketOrComposite(hasBuckets.at(i).curr,
+                                             hasBuckets.at(i).currShards);
+            auto snap = getBucketOrComposite(hasBuckets.at(i).snap,
+                                             hasBuckets.at(i).snapShards);
             if (!(curr && snap))
             {
                 throw std::runtime_error("Missing bucket files while assuming "
@@ -1369,9 +1641,12 @@ BucketManager::assumeState(Application& app, HistoryArchiveState const& has,
                 }
             }
 
-            // Buckets on the BucketList should always be indexed
-            releaseAssert(curr->isEmpty() || curr->isIndexed());
-            releaseAssert(snap->isEmpty() || snap->isIndexed());
+            // Buckets on the BucketList should always be indexed (composites
+            // have per-shard indexes, asserted above)
+            releaseAssert(curr->isEmpty() || curr->isComposite() ||
+                          curr->isIndexed());
+            releaseAssert(snap->isEmpty() || snap->isComposite() ||
+                          snap->isIndexed());
             if (nextBucket)
             {
                 releaseAssert(nextBucket->isEmpty() || nextBucket->isIndexed());
@@ -1408,12 +1683,50 @@ void
 BucketManager::shutdown()
 {
     mIsShutdown = true;
+    // Release any background threads blocked on the apply-window gate.
+    {
+        std::lock_guard<std::mutex> lock(mApplyWindowMutex);
+        mApplyWindowActive.store(false, std::memory_order_release);
+    }
+    mApplyWindowCv.notify_all();
 }
 
 bool
 BucketManager::isShutdown() const
 {
     return mIsShutdown;
+}
+
+void
+BucketManager::beginApplyWindow()
+{
+    std::lock_guard<std::mutex> lock(mApplyWindowMutex);
+    mApplyWindowActive.store(true, std::memory_order_release);
+}
+
+void
+BucketManager::endApplyWindow()
+{
+    {
+        std::lock_guard<std::mutex> lock(mApplyWindowMutex);
+        mApplyWindowActive.store(false, std::memory_order_release);
+    }
+    mApplyWindowCv.notify_all();
+}
+
+void
+BucketManager::pauseForApplyWindow() const
+{
+    if (!mApplyWindowActive.load(std::memory_order_acquire))
+    {
+        return;
+    }
+    ZoneScopedN("pause for apply window");
+    std::unique_lock<std::mutex> lock(mApplyWindowMutex);
+    mApplyWindowCv.wait(lock, [this]() {
+        return !mApplyWindowActive.load(std::memory_order_acquire) ||
+               isShutdown();
+    });
 }
 
 // Loads a single bucket worth of entries into `map`, deleting dead entries and
@@ -1525,10 +1838,29 @@ BucketManager::loadCompleteBucketListStateHelper(
     for (uint32_t i = BucketListBase<BucketT>::kNumLevels; i > 0; --i)
     {
         HistoryStateBucket<BucketT> const& hsb = buckets.at(i - 1);
-        hashes.emplace_back(hexToBin256(hsb.snap),
-                            fmt::format(FMT_STRING("snap {:d}"), i - 1));
-        hashes.emplace_back(hexToBin256(hsb.curr),
-                            fmt::format(FMT_STRING("curr {:d}"), i - 1));
+        // For composite (sharded) buckets, enumerate the shard files oldest
+        // to newest; the combined hash names no file.
+        auto addHashes = [&](std::string const& hash,
+                             std::vector<std::string> const& shardHashes,
+                             std::string const& name) {
+            if (!shardHashes.empty())
+            {
+                for (size_t s = 0; s < shardHashes.size(); ++s)
+                {
+                    hashes.emplace_back(
+                        hexToBin256(shardHashes[s]),
+                        fmt::format(FMT_STRING("{} shard {:d}"), name, s));
+                }
+            }
+            else
+            {
+                hashes.emplace_back(hexToBin256(hash), name);
+            }
+        };
+        addHashes(hsb.snap, hsb.snapShards,
+                  fmt::format(FMT_STRING("snap {:d}"), i - 1));
+        addHashes(hsb.curr, hsb.currShards,
+                  fmt::format(FMT_STRING("curr {:d}"), i - 1));
     }
     for (auto const& pair : hashes)
     {

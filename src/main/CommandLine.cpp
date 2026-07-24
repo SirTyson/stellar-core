@@ -47,6 +47,7 @@
 
 #ifdef BUILD_TESTS
 #include "simulation/ApplyLoad.h"
+#include "simulation/ThreadScalingBench.h"
 #include "test/TestUtils.h"
 #include "test/fuzz/FuzzTargetRegistry.h"
 #include "test/test.h"
@@ -1870,6 +1871,12 @@ runApplyLoad(CommandLineArgs const& args)
     return runWithHelp(args, {configurationParser(configOption)}, [&] {
         auto config = configOption.getConfig();
         auto mode = config.APPLY_LOAD_MODE;
+        
+        // if (mode == ApplyLoadMode::BENCHMARK_MODEL_TX)
+        // {
+        //     runThreadScalingBench(config);
+        // }
+
         // Common boilerplate configuration for apply load benchmarking.
         // The goal of this config is to set up all the common parameters
         // that don't affect benchmarking at once.

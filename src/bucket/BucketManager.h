@@ -17,9 +17,11 @@
 #include "xdr/Stellar-ledger.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 
@@ -150,6 +152,20 @@ class BucketManager : NonMovableOrCopyable
 
     std::atomic<bool> mIsShutdown{false};
 
+    // "Apply window" gate: while the parallel tx-apply phase runs, all
+    // physical cores belong to the apply workers, and any other CPU-heavy
+    // background loop (bucket merges, streaming index builds) running
+    // concurrently degrades the slowest apply cluster via SMT-sibling
+    // contention -- and the apply join waits for exactly that slowest
+    // cluster. Long background loops periodically call
+    // pauseForApplyWindow(), which blocks them while the window is active;
+    // the deferred work resumes in the (much longer) non-apply part of the
+    // ledger. Nothing the apply phase waits on may call
+    // pauseForApplyWindow() (deadlock).
+    mutable std::mutex mApplyWindowMutex;
+    mutable std::condition_variable mApplyWindowCv;
+    std::atomic<bool> mApplyWindowActive{false};
+
     void cleanupStaleFiles(HistoryArchiveState const& has);
     void deleteTmpDirAndUnlockBucketDir();
     void deleteEntireBucketDir();
@@ -161,7 +177,7 @@ class BucketManager : NonMovableOrCopyable
         std::string const& filename, uint256 const& hash, MergeKey* mergeKey,
         std::shared_ptr<typename BucketT::IndexT const> index,
         BucketMapT<BucketT>& bucketMap, FutureMapT<BucketT>& futureMap,
-        std::unique_ptr<std::vector<BucketEntry>> inMemoryState)
+        std::shared_ptr<std::vector<BucketEntry> const> inMemoryState)
         REQUIRES(mBucketMutex);
 
     template <class BucketT>
@@ -261,7 +277,8 @@ class BucketManager : NonMovableOrCopyable
     std::shared_ptr<BucketT> adoptFileAsBucket(
         std::string const& filename, uint256 const& hash, MergeKey* mergeKey,
         std::shared_ptr<typename BucketT::IndexT const> index,
-        std::unique_ptr<std::vector<BucketEntry>> inMemoryState = nullptr);
+        std::shared_ptr<std::vector<BucketEntry> const> inMemoryState =
+            nullptr);
 
     // Companion method to `adoptFileAsLiveBucket` also called from the
     // `BucketOutputIterator::getBucket` merge-completion path. This method
@@ -314,6 +331,13 @@ class BucketManager : NonMovableOrCopyable
     // be given separate init (created) and live (updated) entry vectors. The
     // `header` value should be taken from the ledger at which this batch is
     // being added.
+    // Shard-aware form of addLiveBatch: adds the batch for the ledger
+    // described by `header` as a list of pre-built shard buckets, ordered
+    // oldest to newest. See LiveBucketList::addBatchShards.
+    void
+    addLiveBatchShards(Application& app, LedgerHeader header,
+                       std::vector<std::shared_ptr<LiveBucket>>&& newShards);
+
     void addLiveBatch(Application& app, LedgerHeader header,
                       std::vector<LedgerEntry> const& initEntries,
                       std::vector<LedgerEntry> const& liveEntries,
@@ -346,10 +370,26 @@ class BucketManager : NonMovableOrCopyable
     // second vector contains all archived entries (persistent and
     // ContractCode). Note that when an entry is archived, its TTL key will be
     // included in the deleted keys vector.
+    // Production path: checks modified keys via direct O(1) lookups in the
+    // LedgerTxn's EntryMap, avoiding building a full UnorderedSet.
+    EvictedStateVectors
+    resolveBackgroundEvictionScan(ApplyLedgerView const& lclApplyView,
+                                  AbstractLedgerTxn& ltx);
+
+    // Test path: uses an explicitly provided set of modified keys (for test
+    // helpers that don't write entries through the LedgerTxn subsystem).
     EvictedStateVectors
     resolveBackgroundEvictionScan(ApplyLedgerView const& lclApplyView,
                                   AbstractLedgerTxn& ltx,
                                   LedgerKeySet const& modifiedKeys);
+
+    // Bypass path: soroban entries were not written through the LedgerTxn
+    // (see bypassLtxForSorobanEntries); modified-key checks are answered
+    // from the shard-derived key set built by the early in-memory state
+    // updater.
+    EvictedStateVectors resolveBackgroundEvictionScan(
+        ApplyLedgerView const& lclApplyView, AbstractLedgerTxn& ltx,
+        UnorderedSet<LedgerKey> const& modifiedSorobanKeys);
 
     medida::Meter& getBloomMissMeter() const;
     medida::Meter& getBloomLookupMeter() const;
@@ -401,6 +441,16 @@ class BucketManager : NonMovableOrCopyable
     void shutdown();
 
     bool isShutdown() const;
+
+    // Open/close the apply-window gate (see mApplyWindowActive). Called by
+    // the ledger manager around the parallel tx-apply phase.
+    void beginApplyWindow();
+    void endApplyWindow();
+
+    // Block the calling background thread while the apply window is active.
+    // Cheap (one relaxed atomic load) when the window is inactive. Returns
+    // immediately on shutdown.
+    void pauseForApplyWindow() const;
 
     // Load the complete state of the ledger from the provided HAS. Throws if
     // any of the buckets referenced in the HAS do not exist.

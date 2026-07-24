@@ -90,10 +90,10 @@ FeeBumpTransactionFrame::preParallelApply(
 {
     try
     {
-        LedgerTxn ltxTx(ltx);
-        removeOneTimeSignerKeyFromFeeSource(ltxTx);
-        meta.pushTxChangesBefore(ltxTx);
-        ltxTx.commit();
+        ParallelPreApplyInfo info;
+        CheckValidLedgerViewWrapper ls(ltx);
+        preParallelApplyReadOnly(app, ls, meta, txResult, sorobanConfig, info);
+        preParallelApplyWrite(app, ltx, meta, info);
     }
     catch (std::exception& e)
     {
@@ -103,19 +103,66 @@ FeeBumpTransactionFrame::preParallelApply(
     {
         printErrorAndAbort("Unknown exception in preParallelApply");
     }
+}
 
+void
+FeeBumpTransactionFrame::preParallelApplyReadOnly(
+    AppConnector& app, CheckValidLedgerViewWrapper const& ls, TransactionMetaBuilder& meta,
+    MutableTransactionResultBase& txResult,
+    SorobanNetworkConfig const& sorobanConfig, ParallelPreApplyInfo& info) const
+{
     try
     {
-        mInnerTx->preParallelApply(/*chargeFee=*/false, app, ltx, meta,
-                                   txResult, sorobanConfig, getContentsHash());
+        mInnerTx->preParallelApplyReadOnly(/*chargeFee=*/false, app, ls, meta,
+                                           txResult, sorobanConfig,
+                                           getContentsHash(), info);
     }
     catch (std::exception& e)
     {
-        printErrorAndAbort("Exception during preParallelApply: ", e.what());
+        printErrorAndAbort("Exception during read-only preParallelApply: ",
+                           e.what());
     }
     catch (...)
     {
-        printErrorAndAbort("Unknown exception during preParallelApply");
+        printErrorAndAbort(
+            "Unknown exception during read-only preParallelApply");
+    }
+}
+
+void
+FeeBumpTransactionFrame::preParallelApplyWrite(
+    AppConnector& app, AbstractLedgerTxn& ltx, TransactionMetaBuilder& meta,
+    ParallelPreApplyInfo const& info) const
+{
+    try
+    {
+        if (meta.isEnabled())
+        {
+            // Meta needs the fee-source changes isolated in their own nested
+            // LedgerTxn so they can be recorded as changesBefore.
+            LedgerTxn ltxTx(ltx);
+            removeOneTimeSignerKeyFromFeeSource(ltxTx);
+            meta.pushTxChangesBefore(ltxTx);
+            ltxTx.commit();
+        }
+        else
+        {
+            // With meta disabled, skip the per-tx nested-LedgerTxn
+            // construct/commit cycle (see
+            // TransactionFrame::preParallelApplyWrite).
+            removeOneTimeSignerKeyFromFeeSource(ltx);
+        }
+
+        mInnerTx->preParallelApplyWrite(app, ltx, meta, info);
+    }
+    catch (std::exception& e)
+    {
+        printErrorAndAbort("Exception during preParallelApply writes: ",
+                           e.what());
+    }
+    catch (...)
+    {
+        printErrorAndAbort("Unknown exception during preParallelApply writes");
     }
 }
 
@@ -240,8 +287,7 @@ FeeBumpTransactionFrame::checkSignature(SignatureChecker& signatureChecker,
     }
     signers.insert(signers.end(), acc.signers.begin(), acc.signers.end());
 
-    return signatureChecker.checkSignature(
-        signers, neededWeight, !signatureChecker.isOverlayValidation());
+    return signatureChecker.checkSignature(signers, neededWeight);
 }
 
 bool

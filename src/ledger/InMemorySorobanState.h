@@ -11,8 +11,10 @@
 #include <unordered_set>
 
 #include "ledger/LedgerTypeUtils.h"
+#include "util/UnorderedSet.h"
 #include "util/types.h"
 #include "xdr/Stellar-ledger-entries.h"
+#include "xdr/Stellar-ledger.h"
 #include "xdr/Stellar-types.h"
 
 namespace stellar
@@ -45,14 +47,20 @@ struct TTLData
 
 // ContractDataMapEntryT stores a ContractData LedgerEntry and its TTL. TTL is
 // stored directly with the data to avoid an additional lookup and save memory.
+// We also cache the XDR size to avoid repeated xdr_size() calls during updates.
 struct ContractDataMapEntryT
 {
     std::shared_ptr<LedgerEntry const> const ledgerEntry;
     TTLData const ttlData;
+    // Cached XDR serialized size to avoid repeated xdr_size() calls
+    uint32_t const sizeBytes;
 
     explicit ContractDataMapEntryT(
-        std::shared_ptr<LedgerEntry const>&& ledgerEntry, TTLData ttlData)
-        : ledgerEntry(std::move(ledgerEntry)), ttlData(ttlData)
+        std::shared_ptr<LedgerEntry const>&& ledgerEntry, TTLData ttlData,
+        uint32_t sizeBytes)
+        : ledgerEntry(std::move(ledgerEntry))
+        , ttlData(ttlData)
+        , sizeBytes(sizeBytes)
     {
     }
 };
@@ -101,154 +109,69 @@ struct ContractCodeMapEntryT
 class InternalContractDataMapEntry
 {
   private:
-    // Abstract base class for polymorphic entry handling.
-    // This allows QueryKey and ValueEntry to be used interchangeably in the
-    // set.
-    struct AbstractEntry
-    {
-        virtual ~AbstractEntry() = default;
-
-        // Returns the TTL key (SHA256 hash) that indexes this entry.
-        // For ContractData entries, this is getTTLKey(ledgerKey).ttl().keyHash
-        // For TTL queries, this is directly the keyHash from the TTL key
-        virtual uint256 copyKey() const = 0;
-
-        // Computes hash for unordered_set storage.
-        // Note: This returns size_t for STL compatibility, not the uint256 key
-        virtual size_t hash() const = 0;
-
-        // Returns the stored data. Only valid for ValueEntry instances.
-        virtual ContractDataMapEntryT const& get() const = 0;
-
-        // Creates a deep copy of this entry. Required for copy constructor.
-        virtual std::unique_ptr<AbstractEntry> clone() const = 0;
-
-        // Equality comparison based on TTL keys
-        virtual bool
-        operator==(AbstractEntry const& other) const
-        {
-            return copyKey() == other.copyKey();
-        }
-    };
-
-    // ValueEntry stores actual ContractData entries in the map.
-    // Contains both the LedgerEntry and its TTL information.
-    struct ValueEntry : public AbstractEntry
-    {
-      private:
-        ContractDataMapEntryT entry;
-
-      public:
-        ValueEntry(std::shared_ptr<LedgerEntry const>&& ledgerEntry,
-                   TTLData ttlData)
-            : entry(std::move(ledgerEntry), ttlData)
-        {
-        }
-
-        uint256
-        copyKey() const override
-        {
-            auto ttlKey = getTTLKey(LedgerEntryKey(*entry.ledgerEntry));
-            return ttlKey.ttl().keyHash;
-        }
-
-        size_t
-        hash() const override
-        {
-            return std::hash<uint256>{}(copyKey());
-        }
-
-        ContractDataMapEntryT const&
-        get() const override
-        {
-            return entry;
-        }
-
-        std::unique_ptr<AbstractEntry>
-        clone() const override
-        {
-            return std::make_unique<ValueEntry>(
-                std::make_shared<LedgerEntry const>(*entry.ledgerEntry),
-                entry.ttlData);
-        }
-    };
-
-    // QueryKey is a lightweight key-only entry used for map lookups.
-    struct QueryKey : public AbstractEntry
-    {
-      private:
-        uint256 const ledgerKeyHash;
-
-      public:
-        explicit QueryKey(uint256 const& ledgerKeyHash)
-            : ledgerKeyHash(ledgerKeyHash)
-        {
-        }
-
-        uint256
-        copyKey() const override
-        {
-            return ledgerKeyHash;
-        }
-
-        size_t
-        hash() const override
-        {
-            return std::hash<uint256>{}(ledgerKeyHash);
-        }
-
-        // Should never be called - QueryKey is only for lookups
-        ContractDataMapEntryT const&
-        get() const override
-        {
-            throw std::runtime_error(
-                "QueryKey::get() called - this is a logic error");
-        }
-
-        std::unique_ptr<AbstractEntry>
-        clone() const override
-        {
-            return std::make_unique<QueryKey>(ledgerKeyHash);
-        }
-    };
-
-    std::unique_ptr<AbstractEntry> impl;
+    // Disengaged for query-only objects, which are never stored in the set.
+    std::optional<ContractDataMapEntryT> mEntry;
+    // The TTL key (SHA256 hash of the ContractData key) that indexes this
+    // entry. Computed once at construction and cached so that set operations
+    // (hashing and equality) never recompute SHA256 hashes or materialize
+    // LedgerKey copies.
+    uint256 mTtlKeyHash;
 
   public:
-    // Copy constructor - required for InMemorySorobanState copy constructor.
-    InternalContractDataMapEntry(InternalContractDataMapEntry const& other)
-        : impl(other.impl->clone())
-    {
-    }
-
-    // Creates a ValueEntry from a LedgerEntry (copies the entry)
+    // Creates a value entry from a LedgerEntry (copies the entry)
     InternalContractDataMapEntry(LedgerEntry const& ledgerEntry,
-                                 TTLData ttlData)
-        : impl(std::make_unique<ValueEntry>(
-              std::make_shared<LedgerEntry const>(ledgerEntry), ttlData))
+                                 TTLData ttlData, uint32_t sizeBytes)
+        : mEntry(std::in_place,
+                 std::make_shared<LedgerEntry const>(ledgerEntry), ttlData,
+                 sizeBytes)
+        , mTtlKeyHash(
+              getTTLKey(LedgerEntryKey(*mEntry->ledgerEntry)).ttl().keyHash)
     {
     }
 
-    // Creates a ValueEntry from a shared_ptr (avoids copying)
+    // Same as above, but with a pre-computed TTL key hash (e.g. taken from
+    // the entry being replaced), avoiding the SHA256 computation.
+    InternalContractDataMapEntry(LedgerEntry const& ledgerEntry,
+                                 TTLData ttlData, uint32_t sizeBytes,
+                                 uint256 const& ttlKeyHash)
+        : mEntry(std::in_place,
+                 std::make_shared<LedgerEntry const>(ledgerEntry), ttlData,
+                 sizeBytes)
+        , mTtlKeyHash(ttlKeyHash)
+    {
+    }
+
+    // Creates a value entry from a shared_ptr (avoids copying)
     InternalContractDataMapEntry(
-        std::shared_ptr<LedgerEntry const>&& ledgerEntry, TTLData ttlData)
-        : impl(std::make_unique<ValueEntry>(std::move(ledgerEntry), ttlData))
+        std::shared_ptr<LedgerEntry const>&& ledgerEntry, TTLData ttlData,
+        uint32_t sizeBytes)
+        : mEntry(std::in_place, std::move(ledgerEntry), ttlData, sizeBytes)
+        , mTtlKeyHash(
+              getTTLKey(LedgerEntryKey(*mEntry->ledgerEntry)).ttl().keyHash)
     {
     }
 
-    // Creates a QueryKey for lookups. Accepts both CONTRACT_DATA and TTL keys.
-    // For CONTRACT_DATA keys, converts to TTL key hash.
+    // Same as above, but with a pre-computed TTL key hash.
+    InternalContractDataMapEntry(
+        std::shared_ptr<LedgerEntry const>&& ledgerEntry, TTLData ttlData,
+        uint32_t sizeBytes, uint256 const& ttlKeyHash)
+        : mEntry(std::in_place, std::move(ledgerEntry), ttlData, sizeBytes)
+        , mTtlKeyHash(ttlKeyHash)
+    {
+    }
+
+    // Creates a query-only object for lookups. Accepts both CONTRACT_DATA and
+    // TTL keys. For CONTRACT_DATA keys, converts to TTL key hash.
     // For TTL keys, uses the hash directly.
     explicit InternalContractDataMapEntry(LedgerKey const& ledgerKey)
     {
         if (ledgerKey.type() == CONTRACT_DATA)
         {
-            auto ttlKey = getTTLKey(ledgerKey);
-            impl = std::make_unique<QueryKey>(ttlKey.ttl().keyHash);
+            mTtlKeyHash = getTTLKey(ledgerKey).ttl().keyHash;
         }
         else if (ledgerKey.type() == TTL)
         {
-            impl = std::make_unique<QueryKey>(ledgerKey.ttl().keyHash);
+            mTtlKeyHash = ledgerKey.ttl().keyHash;
         }
         else
         {
@@ -260,19 +183,30 @@ class InternalContractDataMapEntry
     size_t
     hash() const
     {
-        return impl->hash();
+        return std::hash<uint256>{}(mTtlKeyHash);
     }
 
     bool
     operator==(InternalContractDataMapEntry const& other) const
     {
-        return impl->operator==(*other.impl);
+        return mTtlKeyHash == other.mTtlKeyHash;
     }
 
     ContractDataMapEntryT const&
     get() const
     {
-        return impl->get();
+        if (!mEntry)
+        {
+            throw std::runtime_error(
+                "get() called on query-only entry - this is a logic error");
+        }
+        return *mEntry;
+    }
+
+    uint256 const&
+    ttlKeyHash() const
+    {
+        return mTtlKeyHash;
     }
 };
 
@@ -450,6 +384,27 @@ class InMemorySorobanState
                 LedgerHeader const& lh,
                 std::optional<SorobanNetworkConfig const> const& sorobanConfig,
                 SorobanMetrics& metrics);
+
+    // Early-update path for the ledger currently being closed, fed from the
+    // level-0 shard buckets written by the parallel apply phase (which
+    // retain their entries in memory). Shards must be applied in shard
+    // order, strictly after all apply threads have joined (no concurrent
+    // readers) and before finalizeUpdate. INIT/LIVE/DEAD bucket entries map
+    // to create/update/delete; DEAD TTL keys are skipped (TTL state lives
+    // with its data entry), matching updateState.
+    void applyShardEntries(std::vector<BucketEntry> const& entries,
+                           SorobanNetworkConfig const& sorobanConfig,
+                           uint32_t ledgerVersion);
+
+    // Completes an early update started with applyShardEntries: applies the
+    // seal-time eviction deletions (data/code keys; TTL keys skipped),
+    // advances the ledger seq (must be exactly mLastClosedLedgerSeq + 1),
+    // checks invariants and reports metrics.
+    void finalizeUpdate(LedgerHeader const& lh,
+                        std::optional<SorobanNetworkConfig const> const&
+                            sorobanConfig,
+                        SorobanMetrics& metrics,
+                        UnorderedSet<LedgerKey> const& evictionDeletedKeys);
 
     // Should only be called in manual ledger close paths.
     void manuallyAdvanceLedgerHeader(LedgerHeader const& lh);
