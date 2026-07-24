@@ -36,6 +36,8 @@
 #include <Tracy.hpp>
 #include <crypto/SHA.h>
 
+namespace stellar
+{
 #ifdef BUILD_TESTS
 // Defined in LedgerManagerImpl.cpp; sums the rust host's self-reported
 // invocation time across all apply workers, for the phase-timing table.
@@ -45,6 +47,7 @@ extern std::atomic<int64_t> gParApplyInvokeNs;
 extern std::atomic<int64_t> gParApplyStoreNs;
 extern std::atomic<int64_t> gParApplyEvtNs;
 #endif
+}
 
 namespace stellar
 {
