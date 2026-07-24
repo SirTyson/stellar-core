@@ -1255,8 +1255,11 @@ impl App {
                 let overlay_handle = self.overlay_handle.clone();
 
                 tokio::spawn(async move {
+                    // Keep this below Core's getTopTransactions timeout
+                    // (5000ms) so an empty response still reaches the caller
+                    // before it gives up waiting.
                     let txs = match tokio::time::timeout(
-                        std::time::Duration::from_millis(100),
+                        std::time::Duration::from_millis(4000),
                         overlay_handle.get_top_txs(count),
                     )
                     .await

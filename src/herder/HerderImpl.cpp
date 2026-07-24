@@ -1665,10 +1665,20 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
     // The Rust overlay maintains the mempool via TX flooding
     PerPhaseTransactionList txPhases;
 
-    // Get TXs from Rust overlay
+    // Get TXs from Rust overlay. Size the pull from both phases' capacity:
+    // the classic ops limit alone (previously the only term) caps the pull
+    // far below the Soroban ledgerMaxTxCount, starving nomination at high
+    // Soroban TPS. The 2x buffer leaves headroom for txs trimmed as invalid.
     auto& overlayMgr = mApp.getOverlayManager();
-    auto txEnvelopes = overlayMgr.getTopTransactions(
-        mApp.getLedgerManager().getLastMaxTxSetSizeOps() * 2, 5000);
+    size_t pullCount = mApp.getLedgerManager().getLastMaxTxSetSizeOps() * 2;
+    if (mApp.getLedgerManager().hasLastClosedSorobanNetworkConfig())
+    {
+        pullCount += 2 * static_cast<size_t>(
+                             mApp.getLedgerManager()
+                                 .getLastClosedSorobanNetworkConfig()
+                                 .ledgerMaxTxCount());
+    }
+    auto txEnvelopes = overlayMgr.getTopTransactions(pullCount, 5000);
 
     CLOG_INFO(Herder, "Got {} transactions from Rust overlay mempool",
               txEnvelopes.size());
