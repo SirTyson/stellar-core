@@ -124,11 +124,13 @@ receiveMessage(int socket)
     std::memcpy(&type, &header[0], 4);
     std::memcpy(&payloadLen, &header[4], 4);
 
-    // Sanity check payload length (256MB max). Must stay in sync with
-    // MAX_PAYLOAD_SIZE in the Rust overlay's ipc/messages.rs: a
-    // TopTxsResponse sized from the Soroban ledgerMaxTxCount can carry tens
-    // of thousands of envelopes.
-    if (payloadLen > 256u * 1024 * 1024)
+    // Sanity check payload length to guard against a corrupt length field.
+    // Must stay in sync with MAX_PAYLOAD_SIZE in the Rust overlay's
+    // ipc/messages.rs, and must exceed the largest legitimate frame: a
+    // TopTxsResponse sized from the Soroban ledgerMaxTxCount (e.g. 2 x 27k
+    // envelopes at ~1-2KB each is 54-108MB). Tripping this cap desyncs the
+    // channel, so keep real headroom.
+    if (payloadLen > 128u * 1024 * 1024)
     {
         return std::nullopt;
     }

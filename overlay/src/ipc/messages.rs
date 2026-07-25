@@ -160,10 +160,12 @@ impl Message {
     }
 }
 
-/// Maximum payload size (256 MB) - sanity check to prevent OOM. Must stay in
-/// sync with the reader cap in Core's IPC.cpp: a TopTxsResponse sized from
-/// the Soroban ledgerMaxTxCount can carry tens of thousands of envelopes.
-const MAX_PAYLOAD_SIZE: usize = 256 * 1024 * 1024;
+/// Maximum payload size - sanity check to prevent OOM on a corrupt length
+/// field. Must stay in sync with the reader cap in Core's IPC.cpp, and must
+/// exceed the largest legitimate frame: a TopTxsResponse sized from the
+/// Soroban ledgerMaxTxCount (e.g. 2 x 27k envelopes at ~1-2KB each is
+/// 54-108MB). Tripping this cap desyncs the channel, so keep real headroom.
+const MAX_PAYLOAD_SIZE: usize = 128 * 1024 * 1024;
 
 /// Header size: 4 bytes type + 4 bytes length
 const HEADER_SIZE: usize = 8;
@@ -263,7 +265,7 @@ mod tests {
         // Create a message with payload size > MAX_PAYLOAD_SIZE
         let mut buf = Vec::new();
         buf.extend_from_slice(&1u32.to_ne_bytes()); // BroadcastScp
-        buf.extend_from_slice(&(300 * 1024 * 1024u32).to_ne_bytes()); // 300MB > 256MB limit
+        buf.extend_from_slice(&(300 * 1024 * 1024u32).to_ne_bytes()); // 300MB > 128MB limit
 
         let mut cursor = Cursor::new(buf);
         let result = MessageCodec::read(&mut cursor);

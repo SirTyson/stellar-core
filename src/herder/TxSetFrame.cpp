@@ -582,7 +582,7 @@ addWireTxsToList(Hash const& networkID,
         for (auto const& env : xdrTxs)
         {
             auto tx = prebuiltFrames->next();
-            if (!tx->XDRProvidesValidFee())
+            if (!tx->XDRProvidesValidFee() || tx->getInclusionFee() <= 0)
             {
                 return false;
             }
@@ -1869,7 +1869,8 @@ TxSetPhaseFrame::makeFromWire(TxSetPhase phase, Hash const& networkID,
                             ? prebuiltFrames->next()
                             : TransactionFrameBase::makeTransactionFromWire(
                                   networkID, env);
-                    if (!tx->XDRProvidesValidFee())
+                    if (!tx->XDRProvidesValidFee() ||
+                        tx->getInclusionFee() <= 0)
                     {
                         CLOG_DEBUG(Herder, "Got bad generalized txSet: "
                                            "transaction has invalid XDR");
