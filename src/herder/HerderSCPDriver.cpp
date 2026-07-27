@@ -1696,6 +1696,7 @@ HerderSCPDriver::onTxSetReceived(Hash const& hash, TxSetXDRFrameConstPtr txSet)
         mPendingTxSetWrappers.erase(vit);
     }
 
+    std::set<uint64_t> slotsToRevalidate;
     auto eit = mPendingTxSetEnvelopeWrappers.find(hash);
     if (eit != mPendingTxSetEnvelopeWrappers.end())
     {
@@ -1704,9 +1705,21 @@ HerderSCPDriver::onTxSetReceived(Hash const& hash, TxSetXDRFrameConstPtr txSet)
             if (auto sp = wp.lock())
             {
                 sp->addTxSet(txSet);
+                slotsToRevalidate.emplace(sp->getStatement().slotIndex);
             }
         }
         mPendingTxSetEnvelopeWrappers.erase(eit);
+    }
+
+    // Early-delivered PREPARE envelopes are already in SCP's processed set, so
+    // replaying them through PendingEnvelopes only classifies them as
+    // duplicates. Re-drive SCP explicitly now that validateValue can upgrade
+    // their value from structurally-valid to fully-valid. Without this, a node
+    // that has already heard all useful PREPARE statements can remain stuck
+    // until its ballot timer happens to fire.
+    for (auto slotIndex : slotsToRevalidate)
+    {
+        mSCP.revalidateValue(slotIndex);
     }
 }
 

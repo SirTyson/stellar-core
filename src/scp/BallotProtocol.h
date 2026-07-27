@@ -105,6 +105,10 @@ class BallotProtocol
     SCP::EnvelopeState processEnvelope(SCPEnvelopeWrapperPtr envelope,
                                        bool self);
 
+    // Re-run transition rules against already-recorded statements whose values
+    // are now fully valid.
+    void revalidateValue();
+
     void ballotProtocolTimerExpired();
     // abandon's current ballot, move to a new ballot
     // at counter `n` (or, if n == 0, increment current counter)

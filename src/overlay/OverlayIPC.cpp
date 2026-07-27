@@ -71,6 +71,7 @@ OverlayIPC::OverlayIPC(std::optional<std::string> socketPath,
     : mSocketPath(socketPath && !socketPath->empty()
                       ? std::move(*socketPath)
                       : defaultSocketPath(peerPort))
+    , mSCPSocketPath(mSocketPath + ".scp")
     , mOverlayBinaryPath(std::move(overlayBinaryPath))
     , mPeerPort(peerPort)
     , mNodeSeedHex(std::move(nodeSeedHex))
@@ -150,8 +151,9 @@ OverlayIPC::start()
         return false;
     }
 
-    // Remove old socket file if exists
+    // Remove old socket files if they exist.
     unlink(mSocketPath.c_str());
+    unlink(mSCPSocketPath.c_str());
 
     // Spawn overlay process
     if (!spawnOverlay())
@@ -168,15 +170,30 @@ OverlayIPC::start()
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(RETRY_DELAY_MS));
 
-        mChannel = IPCChannel::connect(mSocketPath);
-        if (mChannel && mChannel->isConnected())
+        if (!mChannel || !mChannel->isConnected())
         {
-            CLOG_INFO(Overlay, "Connected to overlay IPC at {} (attempt {})",
-                      mSocketPath, attempt + 1);
+            mChannel = IPCChannel::connect(mSocketPath);
+        }
+        if (mChannel && mChannel->isConnected() &&
+            (!mSCPChannel || !mSCPChannel->isConnected()))
+        {
+            mSCPChannel = IPCChannel::connect(mSCPSocketPath);
+        }
+        if (mChannel && mChannel->isConnected() && mSCPChannel &&
+            mSCPChannel->isConnected())
+        {
+            CLOG_INFO(Overlay,
+                      "Connected to overlay IPC at {} and SCP IPC at {} "
+                      "(attempt {})",
+                      mSocketPath, mSCPSocketPath, attempt + 1);
 
-            // Start reader thread
+            // Use independent readers so TxSet payload transfer and decoding
+            // on the bulk channel cannot delay received SCP envelopes.
             mRunning = true;
-            mReaderThread = std::thread(&OverlayIPC::readerLoop, this);
+            mReaderThread = std::thread(&OverlayIPC::readerLoop, this,
+                                        mChannel.get(), "bulk");
+            mSCPReaderThread = std::thread(&OverlayIPC::readerLoop, this,
+                                           mSCPChannel.get(), "scp");
             if (mStartupConfigPath)
             {
                 unlink(mStartupConfigPath->c_str());
@@ -189,8 +206,10 @@ OverlayIPC::start()
                    attempt + 1);
     }
 
-    CLOG_ERROR(Overlay, "Failed to connect to overlay at {} after {} attempts",
-               mSocketPath, MAX_RETRIES);
+    CLOG_ERROR(Overlay,
+               "Failed to connect to overlay at {} and SCP IPC at {} after {} "
+               "attempts",
+               mSocketPath, mSCPSocketPath, MAX_RETRIES);
     if (mStartupConfigPath)
     {
         unlink(mStartupConfigPath->c_str());
@@ -203,7 +222,10 @@ OverlayIPC::start()
 void
 OverlayIPC::shutdown()
 {
-    if (!mRunning)
+    // A failed start can leave one channel connected and the child blocked
+    // waiting for the other connection. Clean up that partial state too.
+    if (!mRunning && !mChannel && !mSCPChannel && mOverlayPid <= 0 &&
+        !mStartupConfigPath)
     {
         return;
     }
@@ -227,14 +249,23 @@ OverlayIPC::shutdown()
     {
         mChannel->shutdown();
     }
+    if (mSCPChannel)
+    {
+        mSCPChannel->shutdown();
+    }
 
-    // Wait for reader thread
+    // Wait for both reader threads.
     if (mReaderThread.joinable())
     {
         mReaderThread.join();
     }
+    if (mSCPReaderThread.joinable())
+    {
+        mSCPReaderThread.join();
+    }
 
     mChannel.reset();
+    mSCPChannel.reset();
 
     // Wait for overlay process
     if (mOverlayPid > 0)
@@ -360,18 +391,19 @@ OverlayIPC::resolveOverlayBinaryPath() const
 }
 
 void
-OverlayIPC::readerLoop()
+OverlayIPC::readerLoop(IPCChannel* channel, char const* channelName)
 {
-    CLOG_DEBUG(Overlay, "OverlayIPC reader thread started");
+    CLOG_DEBUG(Overlay, "OverlayIPC {} reader thread started", channelName);
 
-    while (mRunning && mChannel && mChannel->isConnected())
+    while (mRunning && channel && channel->isConnected())
     {
-        auto msg = mChannel->receive();
+        auto msg = channel->receive();
         if (!msg)
         {
             if (mRunning)
             {
-                CLOG_WARNING(Overlay, "Overlay IPC connection closed");
+                CLOG_WARNING(Overlay, "Overlay {} IPC connection closed",
+                             channelName);
             }
             break;
         }
@@ -379,7 +411,7 @@ OverlayIPC::readerLoop()
         handleMessage(*msg);
     }
 
-    CLOG_DEBUG(Overlay, "OverlayIPC reader thread exiting");
+    CLOG_DEBUG(Overlay, "OverlayIPC {} reader thread exiting", channelName);
 }
 
 void
@@ -598,9 +630,10 @@ OverlayIPC::handleMessage(IPCMessage const& msg)
 bool
 OverlayIPC::broadcastSCP(SCPEnvelope const& envelope)
 {
-    if (!mChannel || !mChannel->isConnected())
+    if (!mSCPChannel || !mSCPChannel->isConnected())
     {
-        CLOG_WARNING(Overlay, "Cannot broadcast SCP: not connected to overlay");
+        CLOG_WARNING(Overlay,
+                     "Cannot broadcast SCP: priority IPC not connected");
         return false;
     }
 
@@ -608,8 +641,8 @@ OverlayIPC::broadcastSCP(SCPEnvelope const& envelope)
     msg.type = IPCMessageType::BROADCAST_SCP;
     msg.payload = xdr::xdr_to_opaque(envelope);
 
-    std::lock_guard<std::mutex> lock(mSendMutex);
-    return mChannel->send(msg);
+    std::lock_guard<std::mutex> lock(mSCPSendMutex);
+    return mSCPChannel->send(msg);
 }
 
 void
@@ -1081,7 +1114,8 @@ OverlayIPC::requestMetrics(int timeoutMs)
 bool
 OverlayIPC::isConnected() const
 {
-    return mChannel && mChannel->isConnected();
+    return mChannel && mChannel->isConnected() && mSCPChannel &&
+           mSCPChannel->isConnected();
 }
 
 } // namespace stellar

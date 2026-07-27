@@ -264,6 +264,38 @@ BallotProtocol::processEnvelope(SCPEnvelopeWrapperPtr envelope, bool self)
     return SCP::EnvelopeState::INVALID;
 }
 
+void
+BallotProtocol::revalidateValue()
+{
+    if (mPhase == SCP_PHASE_EXTERNALIZE)
+    {
+        return;
+    }
+
+    // advanceSlot can emit a local statement and recursively update
+    // mLatestEnvelopes, so copy the hints before starting the re-drive.
+    std::vector<SCPStatement> fullyValidatedHints;
+    fullyValidatedHints.reserve(mLatestEnvelopes.size());
+    for (auto const& entry : mLatestEnvelopes)
+    {
+        auto const& envelope = entry.second;
+        auto const& statement = envelope->getStatement();
+        if (validateValues(statement) == SCPDriver::kFullyValidatedValue)
+        {
+            fullyValidatedHints.emplace_back(statement);
+        }
+    }
+
+    for (auto const& hint : fullyValidatedHints)
+    {
+        if (mPhase == SCP_PHASE_EXTERNALIZE)
+        {
+            break;
+        }
+        advanceSlot(hint);
+    }
+}
+
 bool
 BallotProtocol::isStatementSane(SCPStatement const& st, bool self)
 {
@@ -1175,54 +1207,48 @@ BallotProtocol::setConfirmPrepared(SCPBallot const& newC, SCPBallot const& newH)
     // remember newH's value
     mValueOverride = mSlot.getSCPDriver().wrapValue(newH.value);
 
-    // we don't set c/h if we're not on a compatible ballot
+    bool canSetCommit = true;
+    if (newC.counter != 0)
+    {
+        // Parallel tx set download (docs/direct-leader-flooding.md): only
+        // vote-to-commit a value we can positively validate. Re-validate now
+        // and set c/h only for a fully-validated LCL+1 value or a value for a
+        // non-current slot we are finalizing (kMaybeValidValue, e.g. during
+        // catch-up). In particular, do not set h while withholding c: PREPARE
+        // statement ordering does not include c, so the later c-bearing
+        // statement would be stale and the node would wait for a higher ballot.
+        auto vl = mSlot.getSCPDriver().validateValue(mSlot.getSlotIndex(),
+                                                     newC.value, false);
+        canSetCommit = vl == SCPDriver::kFullyValidatedValue ||
+                       vl == SCPDriver::kMaybeValidValue;
+        if (!canSetCommit)
+        {
+            CLOG_DEBUG(SCP,
+                       "BallotProtocol::setConfirmPrepared i: {} NOT "
+                       "voting-to-commit (validation level {}): value not "
+                       "fully validated (tx set downloading or invalid)",
+                       mSlot.getSlotIndex(), static_cast<int>(vl));
+        }
+    }
+
+    // We don't set c/h if we're not on a compatible ballot, or if c is gated
+    // on validation (h must be deferred with it; see above).
     if (!mCurrentBallot ||
         areBallotsCompatible(mCurrentBallot->getBallot(), newH))
     {
-        if (!mHighBallot || compareBallots(newH, mHighBallot->getBallot()) > 0)
+        if (canSetCommit &&
+            (!mHighBallot ||
+             compareBallots(newH, mHighBallot->getBallot()) > 0))
         {
             didWork = true;
             mHighBallot = makeBallot(newH);
         }
 
-        if (newC.counter != 0)
+        if (canSetCommit && newC.counter != 0)
         {
             dbgAssert(!mCommit);
-            // Parallel tx set download (docs/direct-leader-flooding.md): only
-            // vote-to-commit a value we can positively validate. Re-validate
-            // now and set mCommit ONLY for a fully-validated LCL+1 value or a
-            // value for a non-current slot we are finalizing (kMaybeValidValue,
-            // e.g. during catch-up) -- matching the values SCP is allowed to
-            // externalize. Every other level leaves mCommit unset so the node
-            // stays in PREPARE:
-            //   - kStructurallyValidValue: the tx set is still downloading;
-            //     commit once the pushed set arrives and a later SCP re-drive
-            //     upgrades the value to fully validated.
-            //   - kInvalidValue: the tx set arrived and failed checkValid (or a
-            //     Byzantine/faulty leader proposed an invalid-but-parseable
-            //     set). We must NOT vote-to-commit it -- doing so would emit a
-            //     spec-violating vote and pin mCommit to a value that can never
-            //     externalize (peers' CONFIRM/EXTERNALIZE for it are rejected),
-            //     wedging this node. Leaving mCommit unset lets the node move
-            //     to a valid value at a higher ballot.
-            // This is the core safety gate: a value whose transactions we have
-            // not validated (or consider invalid) cannot be committed.
-            auto vl = mSlot.getSCPDriver().validateValue(mSlot.getSlotIndex(),
-                                                         newC.value, false);
-            if (vl == SCPDriver::kFullyValidatedValue ||
-                vl == SCPDriver::kMaybeValidValue)
-            {
-                mCommit = makeBallot(newC);
-                didWork = true;
-            }
-            else
-            {
-                CLOG_DEBUG(SCP,
-                           "BallotProtocol::setConfirmPrepared i: {} NOT "
-                           "voting-to-commit (validation level {}): value not "
-                           "fully validated (tx set downloading or invalid)",
-                           mSlot.getSlotIndex(), static_cast<int>(vl));
-            }
+            mCommit = makeBallot(newC);
+            didWork = true;
         }
 
         if (didWork)

@@ -33,6 +33,16 @@ SCP::receiveEnvelope(SCPEnvelopeWrapperPtr envelope)
     return getSlot(slotIndex, true)->processEnvelope(envelope, false);
 }
 
+void
+SCP::revalidateValue(uint64 slotIndex)
+{
+    auto slot = getSlot(slotIndex, false);
+    if (slot)
+    {
+        slot->revalidateValue();
+    }
+}
+
 bool
 SCP::nominate(uint64 slotIndex, ValueWrapperPtr value,
               Value const& previousValue, Value const& leaderElectionSeed)

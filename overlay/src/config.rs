@@ -43,6 +43,14 @@ impl Default for Config {
 }
 
 impl Config {
+    /// SCP uses a separate Unix socket so consensus traffic cannot be queued
+    /// behind bulk transaction-set IPC messages.
+    pub fn scp_socket(&self) -> PathBuf {
+        let mut path = self.core_socket.as_os_str().to_os_string();
+        path.push(".scp");
+        PathBuf::from(path)
+    }
+
     /// Load config from TOML file
     pub fn from_file(path: &std::path::Path) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path).map_err(|e| ConfigError::Io(e))?;
@@ -82,6 +90,10 @@ mod tests {
         assert_eq!(
             config.core_socket,
             PathBuf::from("/tmp/stellar-overlay.sock")
+        );
+        assert_eq!(
+            config.scp_socket(),
+            PathBuf::from("/tmp/stellar-overlay.sock.scp")
         );
         assert_eq!(config.peer_port, 11625);
         assert_eq!(config.log_level, "info");

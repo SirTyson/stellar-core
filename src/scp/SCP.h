@@ -51,6 +51,11 @@ class SCP
     // invokes the appropriate methods
     EnvelopeState receiveEnvelope(SCPEnvelopeWrapperPtr envelope);
 
+    // Re-evaluate the latest ballot statements for a slot after external
+    // validation context changes (for example, after a referenced transaction
+    // set finishes downloading). This does not record a new envelope.
+    void revalidateValue(uint64 slotIndex);
+
     // Submit a value to consider for slotIndex
     // previousValue is the value from slotIndex-1
     // leaderElectionSeed seeds leader election for this slot (see

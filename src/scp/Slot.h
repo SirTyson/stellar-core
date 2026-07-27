@@ -115,6 +115,10 @@ class Slot : public std::enable_shared_from_this<Slot>
     SCP::EnvelopeState processEnvelope(SCPEnvelopeWrapperPtr envelope,
                                        bool self);
 
+    // Re-evaluate already-recorded ballot statements after a value's
+    // validation level changes without requiring a new network envelope.
+    void revalidateValue();
+
     bool abandonBallot();
 
     // bumps the ballot based on the local state and the value passed in:

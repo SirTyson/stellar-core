@@ -325,6 +325,59 @@ mod tests {
         assert_eq!(received.payload, vec![4, 5, 6]);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_scp_channel_is_independent_from_blocked_bulk_channel() {
+        let (bulk_overlay, bulk_core) = StdUnixStream::pair().unwrap();
+        let (scp_overlay, mut scp_core) = StdUnixStream::pair().unwrap();
+        let (bulk_tx, bulk_rx) = mpsc::unbounded_channel();
+        let (scp_tx, scp_rx) = mpsc::unbounded_channel();
+        let bulk_writer = tokio::spawn(CoreIpc::writer_loop(Arc::new(bulk_overlay), bulk_rx));
+        let scp_writer = tokio::spawn(CoreIpc::writer_loop(Arc::new(scp_overlay), scp_rx));
+        let bulk_sender = CoreSender { tx: bulk_tx };
+        let scp_sender = CoreSender { tx: scp_tx };
+
+        let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let _ = received_tx.send(MessageCodec::read(&mut scp_core));
+        });
+
+        // Do not read the bulk peer. This payload is much larger than a Unix
+        // socket buffer, so the bulk writer remains blocked in write_all.
+        bulk_sender
+            .send_tx_set_available([0xAA; 32], vec![0xBB; 16 * 1024 * 1024])
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // A physically separate SCP channel must remain usable while that bulk
+        // write is in flight.
+        let envelope = vec![1, 2, 3, 4, 5];
+        scp_sender.send_scp_received(envelope.clone()).unwrap();
+        let received =
+            tokio::time::timeout(std::time::Duration::from_millis(500), received_rx).await;
+
+        // Unblock both writers before checking the result, so a failing
+        // assertion cannot strand a blocking task during runtime teardown.
+        drop(bulk_core);
+        drop(bulk_sender);
+        drop(scp_sender);
+        let received = received
+            .expect("SCP IPC was blocked by bulk IPC")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(received.msg_type, MessageType::ScpReceived);
+        assert_eq!(received.payload, envelope);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), bulk_writer)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), scp_writer)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     // ═══ SCP State Sync Tests (Mocking C++ Response) ═══
 
     #[tokio::test]

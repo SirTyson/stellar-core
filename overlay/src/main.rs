@@ -479,7 +479,11 @@ fn missing_quorum_members(
 
 /// Application state
 struct App {
+    /// Bulk control/data IPC channel.
     core_ipc: CoreIpc,
+    /// Dedicated SCP IPC channel. Keeping this physically separate prevents a
+    /// TxSet frame or decode on the bulk channel from delaying consensus.
+    scp_ipc: CoreIpc,
     overlay_handle: OverlayHandle,
     /// Cache for built TX sets
     tx_set_cache: TxSetCache,
@@ -614,11 +618,18 @@ struct ConfiguredPeers {
 
 impl App {
     async fn new(config: Config, listen_mode: bool) -> Result<Self, Box<dyn std::error::Error>> {
-        // Connect to Core (or listen for connection)
+        // Connect to Core (or listen for connections). SCP has a physically
+        // separate channel so bulk TxSet traffic cannot head-of-line block it.
+        let scp_socket = config.scp_socket();
         let core_ipc = if listen_mode {
             CoreIpc::listen(&config.core_socket).await?
         } else {
             CoreIpc::connect(&config.core_socket).await?
+        };
+        let scp_ipc = if listen_mode {
+            CoreIpc::listen(&scp_socket).await?
+        } else {
+            CoreIpc::connect(&scp_socket).await?
         };
 
         // Create channels for mempool manager communication
@@ -661,6 +672,7 @@ impl App {
 
         Ok(Self {
             core_ipc,
+            scp_ipc,
             overlay_handle,
             tx_set_cache: TxSetCache::new(100),
             current_ledger_seq: 0,
@@ -717,6 +729,22 @@ impl App {
                         }
                         None => {
                             info!("Core IPC connection closed");
+                            break;
+                        }
+                    }
+                }
+
+                // SCP commands arrive on a separate IPC socket and therefore
+                // cannot sit behind bulk transaction-set messages.
+                msg = self.scp_ipc.receiver.recv() => {
+                    match msg {
+                        Some(msg) => {
+                            if !self.handle_core_message(msg).await {
+                                break;
+                            }
+                        }
+                        None => {
+                            info!("Core SCP IPC connection closed");
                             break;
                         }
                     }
@@ -887,7 +915,7 @@ impl App {
                 let _ = &txset_hashes;
 
                 // Forward to Core
-                if let Err(e) = self.core_ipc.sender.send_scp_received(envelope) {
+                if let Err(e) = self.scp_ipc.sender.send_scp_received(envelope) {
                     error!(
                         "SCP_TO_CORE_FAIL: Failed to send SCP (id={:02x?}) to Core: {}",
                         &id_bytes[..id_len],
@@ -1922,6 +1950,7 @@ async fn main() {
 
     info!("Stellar Overlay starting");
     info!("Core socket: {}", config.core_socket.display());
+    info!("SCP socket: {}", config.scp_socket().display());
     info!("Peer port: {}", config.peer_port);
     info!(
         "Mode: {}",

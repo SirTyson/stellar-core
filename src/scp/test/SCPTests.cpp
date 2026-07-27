@@ -753,6 +753,66 @@ TEST_CASE("parallel tx set download: structurally valid value not externalized",
     REQUIRE(scp.mExternalizedValues[0] == xValue);
 }
 
+TEST_CASE("parallel tx set download: tx set arrival re-drives ballot",
+          "[scp][ballotprotocol]")
+{
+    setupValues();
+    SIMULATION_CREATE_NODE(0);
+    SIMULATION_CREATE_NODE(1);
+    SIMULATION_CREATE_NODE(2);
+    SIMULATION_CREATE_NODE(3);
+    SIMULATION_CREATE_NODE(4);
+
+    SCPQuorumSet qSet;
+    qSet.threshold = 4;
+    qSet.validators.push_back(v0NodeID);
+    qSet.validators.push_back(v1NodeID);
+    qSet.validators.push_back(v2NodeID);
+    qSet.validators.push_back(v3NodeID);
+    qSet.validators.push_back(v4NodeID);
+    auto const qSetHash = sha256(xdr::xdr_to_opaque(qSet));
+
+    TestSCP scp(v0SecretKey.getPublicKey(), qSet);
+    auto const localQSetHash = scp.mSCP.getLocalNode()->getQuorumSetHash();
+    scp.storeQuorumSet(std::make_shared<SCPQuorumSet>(qSet));
+
+    SCPBallot ballot(1, xValue);
+    scp.mValidationLevel = SCPDriver::kStructurallyValidValue;
+    REQUIRE(scp.bumpState(0, xValue));
+
+    // Reach prepared and then receive a quorum that pledges commit while the
+    // value is only structurally valid. The safety gate must keep us in
+    // PREPARE, but all statements needed to advance are now recorded.
+    for (auto const& sk : {v1SecretKey, v2SecretKey, v3SecretKey})
+    {
+        scp.receiveEnvelope(makePrepare(sk, qSetHash, 0, ballot));
+    }
+    for (auto const& sk : {v1SecretKey, v2SecretKey, v3SecretKey})
+    {
+        scp.receiveEnvelope(
+            makePrepare(sk, qSetHash, 0, ballot, &ballot));
+    }
+    for (auto const& sk : {v1SecretKey, v2SecretKey, v3SecretKey})
+    {
+        scp.receiveEnvelope(makePrepare(sk, qSetHash, 0, ballot, &ballot,
+                                        ballot.counter, ballot.counter));
+    }
+
+    auto const envelopesBeforeArrival = scp.mEnvs.size();
+    REQUIRE(envelopesBeforeArrival > 0);
+    REQUIRE(scp.mEnvs.back().statement.pledges.type() == SCP_ST_PREPARE);
+
+    // Model the TxSet arrival: validation upgrades without any newer network
+    // envelope. Re-driving the recorded statements must immediately emit the
+    // CONFIRM that was previously blocked, rather than waiting for a timeout.
+    scp.mValidationLevel = SCPDriver::kFullyValidatedValue;
+    scp.mSCP.revalidateValue(0);
+
+    REQUIRE(scp.mEnvs.size() == envelopesBeforeArrival + 1);
+    verifyConfirm(scp.mEnvs.back(), v0SecretKey, localQSetHash, 0,
+                  ballot.counter, ballot, ballot.counter, ballot.counter);
+}
+
 TEST_CASE("parallel tx set download: structurally valid value drives nomination"
           " to ballot",
           "[scp][nominationprotocol]")

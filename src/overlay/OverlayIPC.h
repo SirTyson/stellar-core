@@ -255,8 +255,8 @@ class OverlayIPC
 
     std::optional<std::string> resolveOverlayBinaryPath() const;
 
-    /// Reader thread function
-    void readerLoop();
+    /// Reader thread function for one IPC channel.
+    void readerLoop(IPCChannel* channel, char const* channelName);
 
     /// Handle a received IPC message
     void handleMessage(IPCMessage const& msg);
@@ -266,6 +266,9 @@ class OverlayIPC
                               std::vector<SCPEnvelope> const& envelopes);
 
     std::string mSocketPath;
+    // SCP uses a physically separate socket so consensus messages cannot be
+    // queued behind or decoded after bulk transaction-set payloads.
+    std::string mSCPSocketPath;
     std::optional<std::string> mOverlayBinaryPath;
     uint16_t mPeerPort;
     std::optional<std::string> mNodeSeedHex;
@@ -273,7 +276,9 @@ class OverlayIPC
     std::optional<std::string> mStartupConfigPath;
 
     std::unique_ptr<IPCChannel> mChannel;
+    std::unique_ptr<IPCChannel> mSCPChannel;
     std::thread mReaderThread;
+    std::thread mSCPReaderThread;
     std::atomic<bool> mRunning{false};
 
     pid_t mOverlayPid{-1};
@@ -296,6 +301,8 @@ class OverlayIPC
 
     // Protects mChannel->send() - channel is not thread-safe
     mutable std::mutex mSendMutex;
+    // Protects mSCPChannel->send() independently from bulk IPC writes.
+    mutable std::mutex mSCPSendMutex;
 };
 
 } // namespace stellar
