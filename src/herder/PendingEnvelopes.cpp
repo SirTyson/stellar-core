@@ -102,22 +102,33 @@ PendingEnvelopes::recvSCPQuorumSet(Hash const& hash, SCPQuorumSet const& q)
     CLOG_TRACE(Herder, "Got SCPQSet {}", hexAbbrev(hash));
 
     // Only accept if we were actually fetching this
-    if (mPendingQSetFetches.find(hash) == mPendingQSetFetches.end())
+    auto it = mPendingQSetFetches.find(hash);
+    if (it == mPendingQSetFetches.end())
     {
         return false;
     }
+
+    // Move the waiter list out before re-processing envelopes: SCP can
+    // externalize a slot and purge pending state recursively.
+    auto waitingEnvelopes = std::move(it->second);
+    mPendingQSetFetches.erase(it);
 
     char const* errString = nullptr;
     bool res = isQuorumSetSane(q, false, errString);
     if (res)
     {
         addSCPQuorumSet(hash, q);
+        for (auto const& envelope : waitingEnvelopes)
+        {
+            CLOG_INFO(Herder, "Re-processing envelope after SCPQSet {} fetch",
+                      hexAbbrev(hash));
+            mApp.getHerder().recvSCPEnvelope(envelope);
+        }
     }
     else
     {
         discardSCPEnvelopesWithQSet(hash);
     }
-    mPendingQSetFetches.erase(hash);
     return res;
 }
 
@@ -138,8 +149,12 @@ PendingEnvelopes::discardSCPEnvelopesWithQSet(Hash const& hash)
                 it->first.statement);
             if (qsetHash == hash)
             {
-                discardSCPEnvelope(it->first);
-                it = slotEnvs.second.mFetchingEnvelopes.erase(it);
+                // discardSCPEnvelope erases this entry. Copy it first so
+                // stopFetch does not observe a dangling map-key reference,
+                // and advance before erasing to keep the iterator valid.
+                auto envelope = it->first;
+                ++it;
+                discardSCPEnvelope(envelope);
             }
             else
             {
@@ -245,14 +260,20 @@ PendingEnvelopes::recvTxSet(Hash const& hash, TxSetXDRFrameConstPtr txset)
         return false;
     }
 
+    // Move the waiter list out before re-driving SCP: TxSet arrival can
+    // externalize a slot and purge pending state recursively.
+    auto waitingEnvelopes = std::move(it->second);
+    mPendingTxSetFetches.erase(it);
+
     addTxSet(hash, 0, txset);
-    for (auto& env : it->second)
+    mHerder.getHerderSCPDriver().onTxSetReceived(hash, txset);
+
+    for (auto const& env : waitingEnvelopes)
     {
         CLOG_INFO(Herder, "Re-processing envelope after TxSet {} fetch",
                   hexAbbrev(hash));
         mApp.getHerder().recvSCPEnvelope(env);
     }
-    mPendingTxSetFetches.erase(hash);
     return true;
 }
 
@@ -339,32 +360,7 @@ PendingEnvelopes::recvSCPEnvelope(SCPEnvelope const& envelope)
         auto& processed = envs.mProcessedEnvelopes;
 
         auto fetchIt = fetching.find(envelope);
-
-        if (fetchIt == fetching.end())
-        { // we aren't fetching this envelope
-            if (processed.find(envelope) == processed.end())
-            { // we haven't seen this envelope before
-                // insert it into the fetching set
-                fetchIt =
-                    fetching.emplace(envelope, mApp.getClock().now()).first;
-                startFetch(envelope);
-                updateMetrics();
-            }
-            else
-            {
-                // we already have this one
-                CLOG_INFO(Herder,
-                          "Ignoring duplicate SCPEnvelope from {} for slot {}",
-                          mApp.getConfig().toShortString(nodeID),
-                          envelope.statement.slotIndex);
-                return Herder::ENVELOPE_STATUS_PROCESSED;
-            }
-        }
-
-        // we are fetching this envelope
-        // check if we are done fetching it
-        if (isFullyFetched(envelope))
-        {
+        auto retireFromFetching = [&]() {
             std::chrono::nanoseconds durationNano =
                 mApp.getClock().now() - fetchIt->second;
             mFetchDuration.Update(durationNano);
@@ -376,12 +372,36 @@ PendingEnvelopes::recvSCPEnvelope(SCPEnvelope const& envelope)
                        hexAbbrev(xdrSha256(envelope)), txSetsToStr(envelope),
                        hexAbbrev(h),
                        std::chrono::duration<double>(durationNano).count());
-
-            // move the item from fetching to processed
-            processed.emplace(envelope);
             fetching.erase(fetchIt);
+        };
 
+        if (processed.find(envelope) != processed.end())
+        {
+            if (fetchIt != fetching.end() && isFullyFetched(envelope))
+            {
+                retireFromFetching();
+                updateMetrics();
+            }
+            return Herder::ENVELOPE_STATUS_PROCESSED;
+        }
+
+        if (fetchIt == fetching.end())
+        {
+            fetchIt = fetching.emplace(envelope, mApp.getClock().now()).first;
+            startFetch(envelope);
+            updateMetrics();
+        }
+
+        if (mHerder.getHerderSCPDriver().isEnvelopeReady(envelope))
+        {
+            processed.emplace(envelope);
             envelopeReady(envelope);
+
+            if (isFullyFetched(envelope))
+            {
+                retireFromFetching();
+            }
+
             updateMetrics();
             return Herder::ENVELOPE_STATUS_READY;
         }
@@ -576,17 +596,24 @@ PendingEnvelopes::envelopeReady(SCPEnvelope const& envelope)
 bool
 PendingEnvelopes::isFullyFetched(SCPEnvelope const& envelope)
 {
-    if (!getKnownQSet(
-            Slot::getCompanionQuorumSetHashFromStatement(envelope.statement),
-            false))
-    {
-        return false;
-    }
+    return isQsetFetched(envelope) && areTxSetsFetched(envelope);
+}
 
+bool
+PendingEnvelopes::isQsetFetched(SCPEnvelope const& envelope)
+{
+    return getKnownQSet(
+               Slot::getCompanionQuorumSetHashFromStatement(envelope.statement),
+               false) != nullptr;
+}
+
+bool
+PendingEnvelopes::areTxSetsFetched(SCPEnvelope const& envelope)
+{
     auto txSetHashes = getValidatedTxSetHashes(envelope);
     return std::all_of(std::begin(txSetHashes), std::end(txSetHashes),
                        [&](Hash const& txSetHash) {
-                           return getKnownTxSet(txSetHash, 0, false);
+                           return getKnownTxSet(txSetHash, 0, false) != nullptr;
                        });
 }
 
@@ -596,12 +623,19 @@ PendingEnvelopes::startFetch(SCPEnvelope const& envelope)
     ZoneScoped;
     Hash h = Slot::getCompanionQuorumSetHashFromStatement(envelope.statement);
 
+    auto addWaiter = [&](std::vector<SCPEnvelope>& waiters) {
+        if (std::find(waiters.begin(), waiters.end(), envelope) ==
+            waiters.end())
+        {
+            waiters.emplace_back(envelope);
+        }
+    };
+
     bool needSomething = false;
     if (!getKnownQSet(h, false))
     {
         // Track that we need this qset - will be requested via IPC
-        auto& vec = mPendingQSetFetches[h];
-        vec.push_back(envelope);
+        addWaiter(mPendingQSetFetches[h]);
         needSomething = true;
     }
 
@@ -611,13 +645,13 @@ PendingEnvelopes::startFetch(SCPEnvelope const& envelope)
         if (it != mPendingTxSetFetches.end())
         {
             // Already fetching - just add envelope to waiting list
-            it->second.push_back(envelope);
+            addWaiter(it->second);
         }
         else if (!getKnownTxSet(h2, 0, false))
         {
             // Not fetching yet - start fetch
             auto& vec = mPendingTxSetFetches[h2];
-            vec.push_back(envelope);
+            addWaiter(vec);
             mApp.getOverlayManager().requestTxSet(h2); // Only once!
         }
     }
@@ -748,6 +782,36 @@ PendingEnvelopes::eraseOutsideRange(std::optional<uint64> minSlot,
             maybeEraseEnvelope(iter);
         }
     }
+
+    auto const slotPurged = [&](uint64 slot) {
+        if (slot == slotToKeep)
+        {
+            return false;
+        }
+        return (minSlot && slot < *minSlot) || (maxSlot && slot > *maxSlot);
+    };
+    auto purgeWaiters = [&](auto& pendingFetches) {
+        for (auto it = pendingFetches.begin(); it != pendingFetches.end();)
+        {
+            auto& waiters = it->second;
+            waiters.erase(std::remove_if(waiters.begin(), waiters.end(),
+                                         [&](SCPEnvelope const& envelope) {
+                                             return slotPurged(
+                                                 envelope.statement.slotIndex);
+                                         }),
+                          waiters.end());
+            if (waiters.empty())
+            {
+                it = pendingFetches.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+    };
+    purgeWaiters(mPendingTxSetFetches);
+    purgeWaiters(mPendingQSetFetches);
 
     // 0 is special mark for data that we do not know the slot index
     // it is used for state loaded from database

@@ -12,7 +12,9 @@
 #include "util/ProtocolVersion.h"
 #include "util/RandomEvictionCache.h"
 #include "xdr/Stellar-ledger.h"
+#include <map>
 #include <optional>
+#include <vector>
 
 namespace medida
 {
@@ -64,6 +66,11 @@ class HerderSCPDriver : public SCPDriver
     SCPEnvelopeWrapperPtr wrapEnvelope(SCPEnvelope const& envelope) override;
     void signEnvelope(SCPEnvelope& envelope) override;
     void emitEnvelope(SCPEnvelope const& envelope) override;
+    bool isEnvelopeReady(SCPEnvelope const& envelope);
+
+    // Back-fill and pin a newly received transaction set into wrappers that
+    // were created while it was still downloading.
+    void onTxSetReceived(Hash const& hash, TxSetXDRFrameConstPtr txSet);
 
     // value validation
     SCPDriver::ValidationLevel validateValue(uint64_t slotIndex,
@@ -128,7 +135,7 @@ class HerderSCPDriver : public SCPDriver
     bool checkCloseTime(uint64_t slotIndex, uint64_t lastCloseTime,
                         StellarValue const& b) const;
 
-    // wraps a *valid* StellarValue (throws if it can't find txSet/qSet)
+    // Wraps a valid StellarValue. The transaction set may still be downloading.
     ValueWrapperPtr wrapStellarValue(StellarValue const& sv);
 
     ValueWrapperPtr wrapValue(Value const& sv) override;
@@ -189,6 +196,11 @@ class HerderSCPDriver : public SCPDriver
     Upgrades const& mUpgrades;
     PendingEnvelopes& mPendingEnvelopes;
     SCP mSCP;
+
+    std::map<Hash, std::vector<std::weak_ptr<ValueWrapper>>>
+        mPendingTxSetWrappers;
+    std::map<Hash, std::vector<std::weak_ptr<SCPEnvelopeWrapper>>>
+        mPendingTxSetEnvelopeWrappers;
 
     struct SCPMetrics
     {

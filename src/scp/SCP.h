@@ -51,6 +51,10 @@ class SCP
     // invokes the appropriate methods
     EnvelopeState receiveEnvelope(SCPEnvelopeWrapperPtr envelope);
 
+    // Re-evaluate a slot after external validation context changes, such as a
+    // referenced transaction set finishing download.
+    void revalidateValue(uint64 slotIndex);
+
     // Submit a value to consider for slotIndex
     // previousValue is the value from slotIndex-1
     bool nominate(uint64 slotIndex, ValueWrapperPtr value,

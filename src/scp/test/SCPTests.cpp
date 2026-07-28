@@ -63,11 +63,14 @@ class TestSCP : public SCPDriver
         mQuorumSets[qSetHash] = qSet;
     }
 
+    SCPDriver::ValidationLevel mValidationLevel =
+        SCPDriver::kFullyValidatedValue;
+
     SCPDriver::ValidationLevel
     validateValue(uint64 slotIndex, Value const& value,
                   bool nomination) override
     {
-        return SCPDriver::kFullyValidatedValue;
+        return mValidationLevel;
     }
 
     void
@@ -651,6 +654,145 @@ makeExternalizeGen(Hash const& qSetHash, SCPBallot const& commitBallot,
 {
     return std::bind(makeExternalize, _1, std::cref(qSetHash), 0,
                      std::cref(commitBallot), nH);
+}
+
+TEST_CASE("parallel tx set download: structurally valid value not externalized",
+          "[scp][ballotprotocol]")
+{
+    setupValues();
+    SIMULATION_CREATE_NODE(0);
+    SIMULATION_CREATE_NODE(1);
+    SIMULATION_CREATE_NODE(2);
+    SIMULATION_CREATE_NODE(3);
+    SIMULATION_CREATE_NODE(4);
+
+    SCPQuorumSet qSet;
+    qSet.threshold = 4;
+    qSet.validators = {v0NodeID, v1NodeID, v2NodeID, v3NodeID, v4NodeID};
+    auto const qSetHash = sha256(xdr::xdr_to_opaque(qSet));
+
+    TestSCP scp(v0SecretKey.getPublicKey(), qSet);
+    scp.storeQuorumSet(std::make_shared<SCPQuorumSet>(qSet));
+
+    SCPBallot ballot(1, xValue);
+    scp.mValidationLevel = SCPDriver::kStructurallyValidValue;
+
+    for (auto const& key : {v1SecretKey, v2SecretKey, v3SecretKey, v4SecretKey})
+    {
+        scp.receiveEnvelope(makeConfirm(key, qSetHash, 0, 1, ballot, 1, 1));
+        scp.receiveEnvelope(makeExternalize(key, qSetHash, 0, ballot, 1));
+    }
+    REQUIRE(scp.mExternalizedValues.find(0) == scp.mExternalizedValues.end());
+
+    scp.mValidationLevel = SCPDriver::kFullyValidatedValue;
+    for (auto const& key : {v1SecretKey, v2SecretKey, v3SecretKey, v4SecretKey})
+    {
+        scp.receiveEnvelope(makeExternalize(key, qSetHash, 0, ballot, 1));
+    }
+    REQUIRE(scp.mExternalizedValues.at(0) == xValue);
+}
+
+TEST_CASE("parallel tx set download: tx set arrival re-drives ballot",
+          "[scp][ballotprotocol]")
+{
+    setupValues();
+    SIMULATION_CREATE_NODE(0);
+    SIMULATION_CREATE_NODE(1);
+    SIMULATION_CREATE_NODE(2);
+    SIMULATION_CREATE_NODE(3);
+    SIMULATION_CREATE_NODE(4);
+
+    SCPQuorumSet qSet;
+    qSet.threshold = 4;
+    qSet.validators = {v0NodeID, v1NodeID, v2NodeID, v3NodeID, v4NodeID};
+    auto const qSetHash = sha256(xdr::xdr_to_opaque(qSet));
+
+    TestSCP scp(v0SecretKey.getPublicKey(), qSet);
+    auto const localQSetHash = scp.mSCP.getLocalNode()->getQuorumSetHash();
+    scp.storeQuorumSet(std::make_shared<SCPQuorumSet>(qSet));
+
+    SCPBallot ballot(1, xValue);
+    scp.mValidationLevel = SCPDriver::kStructurallyValidValue;
+    REQUIRE(scp.bumpState(0, xValue));
+
+    for (auto const& key : {v1SecretKey, v2SecretKey, v3SecretKey})
+    {
+        scp.receiveEnvelope(makePrepare(key, qSetHash, 0, ballot));
+    }
+    for (auto const& key : {v1SecretKey, v2SecretKey, v3SecretKey})
+    {
+        scp.receiveEnvelope(makePrepare(key, qSetHash, 0, ballot, &ballot));
+    }
+    for (auto const& key : {v1SecretKey, v2SecretKey, v3SecretKey})
+    {
+        scp.receiveEnvelope(makePrepare(key, qSetHash, 0, ballot, &ballot,
+                                        ballot.counter, ballot.counter));
+    }
+
+    auto const envelopesBeforeArrival = scp.mEnvs.size();
+    REQUIRE(envelopesBeforeArrival > 0);
+    REQUIRE(scp.mEnvs.back().statement.pledges.type() == SCP_ST_PREPARE);
+
+    scp.mValidationLevel = SCPDriver::kFullyValidatedValue;
+    scp.mSCP.revalidateValue(0);
+
+    REQUIRE(scp.mEnvs.size() == envelopesBeforeArrival + 1);
+    verifyConfirm(scp.mEnvs.back(), v0SecretKey, localQSetHash, 0,
+                  ballot.counter, ballot, ballot.counter, ballot.counter);
+}
+
+TEST_CASE("parallel tx set download: structurally valid nomination reaches "
+          "ballot",
+          "[scp][nominationprotocol]")
+{
+    setupValues();
+    SIMULATION_CREATE_NODE(0);
+    SIMULATION_CREATE_NODE(1);
+    SIMULATION_CREATE_NODE(2);
+    SIMULATION_CREATE_NODE(3);
+    SIMULATION_CREATE_NODE(4);
+
+    SCPQuorumSet qSet;
+    qSet.threshold = 4;
+    qSet.validators = {v0NodeID, v1NodeID, v2NodeID, v3NodeID, v4NodeID};
+    auto const qSetHash = sha256(xdr::xdr_to_opaque(qSet));
+
+    TestSCP scp(v0SecretKey.getPublicKey(), qSet);
+    auto const localQSetHash = scp.mSCP.getLocalNode()->getQuorumSetHash();
+    scp.storeQuorumSet(std::make_shared<SCPQuorumSet>(qSet));
+    scp.mValidationLevel = SCPDriver::kStructurallyValidValue;
+
+    REQUIRE(scp.nominate(0, xValue, false));
+    std::vector<Value> votes{xValue};
+    std::vector<Value> accepted;
+    verifyNominate(scp.mEnvs[0], v0SecretKey, localQSetHash, 0, votes,
+                   accepted);
+
+    scp.receiveEnvelope(
+        makeNominate(v1SecretKey, qSetHash, 0, votes, accepted));
+    scp.receiveEnvelope(
+        makeNominate(v2SecretKey, qSetHash, 0, votes, accepted));
+    REQUIRE(scp.mEnvs.size() == 1);
+
+    scp.receiveEnvelope(
+        makeNominate(v3SecretKey, qSetHash, 0, votes, accepted));
+    REQUIRE(scp.mEnvs.size() == 2);
+    accepted.emplace_back(xValue);
+    verifyNominate(scp.mEnvs[1], v0SecretKey, localQSetHash, 0, votes,
+                   accepted);
+
+    scp.mExpectedCandidates.emplace(xValue);
+    scp.mCompositeValue = xValue;
+    scp.receiveEnvelope(
+        makeNominate(v1SecretKey, qSetHash, 0, votes, accepted));
+    scp.receiveEnvelope(
+        makeNominate(v2SecretKey, qSetHash, 0, votes, accepted));
+    scp.receiveEnvelope(
+        makeNominate(v3SecretKey, qSetHash, 0, votes, accepted));
+
+    REQUIRE(scp.mEnvs.size() == 3);
+    verifyPrepare(scp.mEnvs[2], v0SecretKey, localQSetHash, 0,
+                  SCPBallot(1, xValue));
 }
 
 // Testing matrix that covers interesting min/max values for each timeout

@@ -211,6 +211,12 @@ Slot::processEnvelope(SCPEnvelopeWrapperPtr envelope, bool self)
     return res;
 }
 
+void
+Slot::revalidateValue()
+{
+    mBallotProtocol.revalidateValue();
+}
+
 bool
 Slot::abandonBallot()
 {

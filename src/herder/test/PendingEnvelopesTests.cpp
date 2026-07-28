@@ -4,6 +4,7 @@
 
 #include "crypto/SHA.h"
 #include "herder/HerderImpl.h"
+#include "herder/HerderSCPDriver.h"
 #include "herder/PendingEnvelopes.h"
 #include "herder/test/TestTxSetUtils.h"
 #include "main/Application.h"
@@ -128,25 +129,33 @@ TEST_CASE("PendingEnvelopes recvSCPEnvelope", "[herder]")
 
         SECTION("process when all data comes (quorum set first)")
         {
+            // Qset arrival replays the waiting envelope. Current-ledger
+            // PREPARE enters SCP while its transaction set continues
+            // downloading.
             REQUIRE(pendingEnvelopes.recvSCPQuorumSet(saneQSetHash, saneQSet));
-            // still waiting for txset
-            REQUIRE(pendingEnvelopes.recvSCPEnvelope(saneEnvelope) ==
-                    Herder::ENVELOPE_STATUS_FETCHING);
-
             REQUIRE(!pendingEnvelopes.recvSCPQuorumSet(saneQSetHash, saneQSet));
-            REQUIRE(pendingEnvelopes.recvSCPEnvelope(saneEnvelope) ==
-                    Herder::ENVELOPE_STATUS_FETCHING);
+            REQUIRE(herder.recvSCPEnvelope(saneEnvelope) ==
+                    Herder::ENVELOPE_STATUS_PROCESSED);
 
-            REQUIRE(herder.getSCP().getLatestMessage(pk) == nullptr);
-            // -> processes saneEnvelope
+            auto m = herder.getSCP().getLatestMessage(pk);
+            REQUIRE(m);
+            REQUIRE(*m == saneEnvelope);
+            REQUIRE(herder.getHerderSCPDriver().validateValue(
+                        saneEnvelope.statement.slotIndex, p.first, false) ==
+                    SCPDriver::kStructurallyValidValue);
+
+            // Arrival upgrades validation and re-drives the recorded slot.
             REQUIRE(pendingEnvelopes.recvTxSet(p.second->getContentsHash(),
                                                p.second));
             REQUIRE(!pendingEnvelopes.recvTxSet(p.second->getContentsHash(),
                                                 p.second));
 
-            auto m = herder.getSCP().getLatestMessage(pk);
+            m = herder.getSCP().getLatestMessage(pk);
             REQUIRE(m);
             REQUIRE(*m == saneEnvelope);
+            REQUIRE(herder.getHerderSCPDriver().validateValue(
+                        saneEnvelope.statement.slotIndex, p.first, false) ==
+                    SCPDriver::kFullyValidatedValue);
 
             REQUIRE(pendingEnvelopes.recvSCPEnvelope(saneEnvelope) ==
                     Herder::ENVELOPE_STATUS_PROCESSED);
@@ -172,8 +181,9 @@ TEST_CASE("PendingEnvelopes recvSCPEnvelope", "[herder]")
 
             REQUIRE(herder.getSCP().getLatestMessage(pk) == nullptr);
 
-            // this triggers process
             REQUIRE(pendingEnvelopes.recvSCPQuorumSet(saneQSetHash, saneQSet));
+            REQUIRE(herder.recvSCPEnvelope(saneEnvelope) ==
+                    Herder::ENVELOPE_STATUS_PROCESSED);
             auto m = herder.getSCP().getLatestMessage(pk);
             REQUIRE(m);
             REQUIRE(*m == saneEnvelope);
@@ -410,8 +420,37 @@ TEST_CASE("PendingEnvelopes recvSCPEnvelope", "[herder]")
         REQUIRE(pendingEnvelopes.recvSCPEnvelope(malformedEnvelope) ==
                 Herder::ENVELOPE_STATUS_FETCHING);
         REQUIRE(pendingEnvelopes.recvSCPQuorumSet(saneQSetHash, saneQSet));
-        REQUIRE(herder.getSCP().getLatestMessage(pk) == nullptr);
+        auto m = herder.getSCP().getLatestMessage(pk);
+        REQUIRE(m);
+        REQUIRE(*m == malformedEnvelope);
+        REQUIRE(herder.getHerderSCPDriver().validateValue(
+                    malformedEnvelope.statement.slotIndex, p2.first, false) ==
+                SCPDriver::kStructurallyValidValue);
         REQUIRE(pendingEnvelopes.recvTxSet(p2.second->getContentsHash(),
                                            p2.second));
+        REQUIRE(herder.getHerderSCPDriver().validateValue(
+                    malformedEnvelope.statement.slotIndex, p2.first, false) ==
+                SCPDriver::kInvalidValue);
+    }
+
+    SECTION("wrappers accept and pin a transaction set that arrives later")
+    {
+        auto& driver = herder.getHerderSCPDriver();
+        auto const txSetHash = txSet->getContentsHash();
+        auto const slotIndex = lcl.header.ledgerSeq + 1;
+
+        // Validation does not depend on volatile fetch bookkeeping: a missing
+        // LCL+1 set remains structurally valid.
+        REQUIRE(driver.validateValue(slotIndex, p.first, false) ==
+                SCPDriver::kStructurallyValidValue);
+
+        auto valueWrapper = driver.wrapValue(p.first);
+        REQUIRE(txSet.use_count() == 2);
+
+        driver.onTxSetReceived(txSetHash, txSet);
+        REQUIRE(txSet.use_count() == 3);
+
+        valueWrapper.reset();
+        REQUIRE(txSet.use_count() == 2);
     }
 }

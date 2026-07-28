@@ -132,6 +132,11 @@ class PendingEnvelopes
     PendingEnvelopes(Application& app, HerderImpl& herder);
     ~PendingEnvelopes();
 
+    // An envelope can enter SCP once its quorum set is present and, for
+    // current-ledger nomination/PREPARE, before its transaction sets arrive.
+    bool isQsetFetched(SCPEnvelope const& envelope);
+    bool areTxSetsFetched(SCPEnvelope const& envelope);
+
 #ifdef BUILD_TESTS
     void clearQSetCache();
 #endif

@@ -203,6 +203,30 @@ BallotProtocol::processEnvelope(SCPEnvelopeWrapperPtr envelope, bool self)
         return SCP::EnvelopeState::INVALID;
     }
 
+    // A PREPARE may advance while its transaction set is downloading. A
+    // peer's CONFIRM or any EXTERNALIZE must wait for full validation. A
+    // self-generated CONFIRM is allowed because a v-blocking set can make the
+    // local node accept commit before it has the set; it still cannot
+    // externalize until validation completes.
+    if (validationRes == SCPDriver::kStructurallyValidValue)
+    {
+        switch (statement.pledges.type())
+        {
+        case SCP_ST_PREPARE:
+            break;
+        case SCP_ST_CONFIRM:
+            if (!self)
+            {
+                return SCP::EnvelopeState::INVALID;
+            }
+            break;
+        case SCP_ST_EXTERNALIZE:
+            return SCP::EnvelopeState::INVALID;
+        default:
+            break;
+        }
+    }
+
     if (mPhase != SCP_PHASE_EXTERNALIZE)
     {
         if (validationRes == SCPDriver::kMaybeValidValue)
@@ -233,6 +257,37 @@ BallotProtocol::processEnvelope(SCPEnvelopeWrapperPtr envelope, bool self)
     }
 
     return SCP::EnvelopeState::INVALID;
+}
+
+void
+BallotProtocol::revalidateValue()
+{
+    if (mPhase == SCP_PHASE_EXTERNALIZE)
+    {
+        return;
+    }
+
+    // advanceSlot can recursively replace entries in mLatestEnvelopes, so
+    // collect stable statement copies before re-driving transitions.
+    std::vector<SCPStatement> fullyValidatedHints;
+    fullyValidatedHints.reserve(mLatestEnvelopes.size());
+    for (auto const& entry : mLatestEnvelopes)
+    {
+        auto const& statement = entry.second->getStatement();
+        if (validateValues(statement) == SCPDriver::kFullyValidatedValue)
+        {
+            fullyValidatedHints.emplace_back(statement);
+        }
+    }
+
+    for (auto const& hint : fullyValidatedHints)
+    {
+        if (mPhase == SCP_PHASE_EXTERNALIZE)
+        {
+            break;
+        }
+        advanceSlot(hint);
+    }
 }
 
 bool
@@ -1055,17 +1110,39 @@ BallotProtocol::setConfirmPrepared(SCPBallot const& newC, SCPBallot const& newH)
     // remember newH's value
     mValueOverride = mSlot.getSCPDriver().wrapValue(newH.value);
 
-    // we don't set c/h if we're not on a compatible ballot
+    bool canSetCommit = true;
+    if (newC.counter != 0)
+    {
+        // Do not vote to commit until the value is fully validated. Defer h
+        // together with c: PREPARE statement ordering does not include c, so
+        // publishing h alone could make the later c-bearing statement stale.
+        auto validationLevel = mSlot.getSCPDriver().validateValue(
+            mSlot.getSlotIndex(), newC.value, false);
+        canSetCommit = validationLevel == SCPDriver::kFullyValidatedValue ||
+                       validationLevel == SCPDriver::kMaybeValidValue;
+        if (!canSetCommit)
+        {
+            CLOG_DEBUG(SCP,
+                       "BallotProtocol::setConfirmPrepared i: {} not voting "
+                       "to commit at validation level {}",
+                       mSlot.getSlotIndex(), static_cast<int>(validationLevel));
+        }
+    }
+
+    // We do not set c/h if the ballot is incompatible, or while commit is
+    // gated on transaction-set validation.
     if (!mCurrentBallot ||
         areBallotsCompatible(mCurrentBallot->getBallot(), newH))
     {
-        if (!mHighBallot || compareBallots(newH, mHighBallot->getBallot()) > 0)
+        if (canSetCommit &&
+            (!mHighBallot ||
+             compareBallots(newH, mHighBallot->getBallot()) > 0))
         {
             didWork = true;
             mHighBallot = makeBallot(newH);
         }
 
-        if (newC.counter != 0)
+        if (canSetCommit && newC.counter != 0)
         {
             dbgAssert(!mCommit);
             mCommit = makeBallot(newC);

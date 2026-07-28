@@ -15,6 +15,9 @@
 
 namespace stellar
 {
+class TxSetXDRFrame;
+using TxSetXDRFrameConstPtr = std::shared_ptr<TxSetXDRFrame const>;
+
 class ValueWrapper : public NonMovableOrCopyable
 {
     Value const mValue;
@@ -27,6 +30,13 @@ class ValueWrapper : public NonMovableOrCopyable
     getValue() const
     {
         return mValue;
+    }
+
+    // Called when a transaction set becomes available after this wrapper was
+    // created without it. Herder wrappers override this to pin the set.
+    virtual void
+    setTxSet(TxSetXDRFrameConstPtr)
+    {
     }
 };
 
@@ -58,6 +68,13 @@ class SCPEnvelopeWrapper : public NonMovableOrCopyable
     getStatement() const
     {
         return mEnvelope.statement;
+    }
+
+    // Called when a transaction set becomes available after this wrapper was
+    // created without it. Herder wrappers override this to pin the set.
+    virtual void
+    addTxSet(TxSetXDRFrameConstPtr)
+    {
     }
 };
 
@@ -115,9 +132,13 @@ class SCPDriver
     // NB: validation levels are ordered
     enum ValidationLevel
     {
-        kInvalidValue = 0,       // value is invalid for sure
-        kMaybeValidValue = 1,    // value may be valid
-        kFullyValidatedValue = 2 // value is valid for sure
+        kInvalidValue = 0,    // value is invalid for sure
+        kMaybeValidValue = 1, // value may be valid for a non-current ledger
+        // Value is structurally valid for LCL+1, but its transaction set is
+        // not available yet. It may drive nomination and PREPARE, but must not
+        // be committed or externalized.
+        kStructurallyValidValue = 2,
+        kFullyValidatedValue = 3 // value is valid for sure
     };
     virtual ValidationLevel
     validateValue(uint64 slotIndex, Value const& value, bool nomination)
