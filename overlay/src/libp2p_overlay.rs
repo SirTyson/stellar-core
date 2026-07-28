@@ -48,6 +48,24 @@ const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 /// TXs that can't be queued are dropped - they'll be re-requested if needed.
 const TX_EVENT_CHANNEL_CAPACITY: usize = 10_000;
 
+// Core retries unanswered TxSet requests once per second. Treat the existing
+// request as stale slightly before then so its retry can select another peer.
+const TXSET_FETCH_REQUEST_STALE_AFTER: Duration = Duration::from_millis(900);
+
+fn next_peer_in_ring(mut peers: Vec<PeerId>, current: &PeerId) -> Option<PeerId> {
+    peers.sort_by_key(|peer| peer.to_bytes());
+    if peers.is_empty() {
+        return None;
+    }
+
+    let next = peers
+        .iter()
+        .position(|peer| peer == current)
+        .map(|index| (index + 1) % peers.len())
+        .unwrap_or(0);
+    peers.get(next).cloned()
+}
+
 /// Events from the overlay to the application
 #[derive(Debug, Clone)]
 pub enum OverlayEvent {
@@ -887,22 +905,29 @@ impl StellarOverlay {
 
     /// Fetch TX set from a peer - preferring the peer who sent us the SCP message referencing it
     async fn fetch_txset(&mut self, hash: [u8; 32]) {
-        // Check if we're already fetching this TxSet from a connected peer (dedup)
-        {
+        // Deduplicate fresh requests. Once a connected peer has failed to
+        // answer for long enough, avoid it on the next attempt so a peer that
+        // evicted the body cannot strand consensus forever.
+        let pending_request = {
             let pending = self.state.pending_txset_requests.read().await;
-            if let Some((pending_peer, _)) = pending.get(&hash) {
-                // Check if that peer is still connected
+            pending.get(&hash).cloned()
+        };
+        let stale_peer = if let Some((pending_peer, requested_at)) = pending_request {
+            let connected = {
                 let streams = self.state.peer_streams.read().await;
-                if streams.contains_key(pending_peer) {
-                    debug!(
-                        "TXSET_FETCH_SKIP: TxSet {:02x?}... already being fetched from {}, skipping duplicate",
-                        &hash[..4], pending_peer
-                    );
-                    return;
-                }
-                // Otherwise, peer disconnected - we'll re-request below
+                streams.contains_key(&pending_peer)
+            };
+            if connected && requested_at.elapsed() < TXSET_FETCH_REQUEST_STALE_AFTER {
+                debug!(
+                    "TXSET_FETCH_SKIP: TxSet {:02x?}... already being fetched from {}, skipping duplicate",
+                    &hash[..4], pending_peer
+                );
+                return;
             }
-        }
+            connected.then_some(pending_peer)
+        } else {
+            None
+        };
 
         // First check if we know which peer has this TX set (from SCP message)
         let known_source = {
@@ -910,45 +935,22 @@ impl StellarOverlay {
             sources.peek(&hash).cloned()
         };
 
-        let peer = if let Some(source_peer) = known_source {
-            // Verify this peer is still connected
+        let peer = {
             let streams = self.state.peer_streams.read().await;
-            if streams.contains_key(&source_peer) {
-                info!(
-                    "TXSET_FETCH: Fetching TX set {:02x?}... from known source {}",
-                    &hash[..4],
-                    source_peer
-                );
-                source_peer
+            let connected: Vec<_> = streams.keys().cloned().collect();
+            let selected = if let Some(previous_peer) = stale_peer.as_ref() {
+                // Walk a stable ring on retries. Unlike repeatedly choosing
+                // the known source plus one fallback, this eventually asks
+                // every connected peer.
+                next_peer_in_ring(connected, previous_peer)
             } else {
-                // Source peer disconnected, fall back to any peer
-                match streams.keys().next().cloned() {
-                    Some(p) => {
-                        info!("TXSET_FETCH: Fetching TX set {:02x?}... from fallback peer {} (source {} disconnected)",
-                              &hash[..4], p, source_peer);
-                        p
-                    }
-                    None => {
-                        warn!(
-                            "TXSET_FETCH_FAIL: No peers to fetch TX set {:02x?}... from",
-                            &hash[..4]
-                        );
-                        return;
-                    }
-                }
-            }
-        } else {
-            // No known source, pick any connected peer
-            let streams = self.state.peer_streams.read().await;
-            match streams.keys().next().cloned() {
-                Some(p) => {
-                    info!(
-                        "TXSET_FETCH: Fetching TX set {:02x?}... from random peer {} (no known source)",
-                        &hash[..4],
-                        p
-                    );
-                    p
-                }
+                known_source
+                    .filter(|source| streams.contains_key(source))
+                    .or_else(|| connected.into_iter().next())
+            };
+
+            match selected {
+                Some(peer) => peer,
                 None => {
                     warn!(
                         "TXSET_FETCH_FAIL: No peers to fetch TX set {:02x?}... from",
@@ -958,6 +960,21 @@ impl StellarOverlay {
                 }
             }
         };
+
+        if let Some(previous_peer) = stale_peer {
+            info!(
+                "TXSET_FETCH_RETRY: Retrying stale TxSet {:02x?}... from {} via {}",
+                &hash[..4],
+                previous_peer,
+                peer
+            );
+        } else {
+            info!(
+                "TXSET_FETCH: Fetching TX set {:02x?}... from {}",
+                &hash[..4],
+                peer
+            );
+        }
 
         // Record this pending request with timestamp for latency tracking
         self.state
@@ -2101,6 +2118,23 @@ fn test_txset_xdr(seed: u8) -> ([u8; 32], Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_txset_retry_ring_visits_every_peer() {
+        let peers = vec![PeerId::random(), PeerId::random(), PeerId::random()];
+        let mut visited = HashSet::new();
+        let mut current = peers[0];
+        visited.insert(current);
+
+        for _ in 1..peers.len() {
+            current = next_peer_in_ring(peers.clone(), &current).unwrap();
+            assert!(visited.insert(current), "retry ring repeated a peer early");
+        }
+
+        assert_eq!(visited.len(), peers.len());
+        assert_eq!(next_peer_in_ring(vec![peers[0]], &peers[0]), Some(peers[0]));
+        assert_eq!(next_peer_in_ring(Vec::new(), &peers[0]), None);
+    }
 
     #[tokio::test]
     async fn test_overlay_creation() {
@@ -3958,6 +3992,106 @@ async fn test_pending_txset_cleanup_on_disconnect() {
 
     handle1.shutdown().await;
     handle2.shutdown().await;
+}
+
+/// A connected peer can accept a GetTxSet request but never answer because it
+/// has already evicted the body. Retrying the same hash must eventually select
+/// another connected peer rather than being deduplicated forever.
+#[tokio::test]
+async fn test_stale_txset_request_retries_another_peer() {
+    let requester_key = Keypair::generate_ed25519();
+    let first_peer_key = Keypair::generate_ed25519();
+    let second_peer_key = Keypair::generate_ed25519();
+    let first_peer_id = PeerId::from_public_key(&first_peer_key.public());
+
+    let (requester, _requester_events, _requester_tx_events, requester_overlay) =
+        create_overlay(requester_key, Arc::new(OverlayMetrics::new())).unwrap();
+    let (first_peer, mut first_events, _first_tx_events, first_overlay) =
+        create_overlay(first_peer_key, Arc::new(OverlayMetrics::new())).unwrap();
+    let (second_peer, mut second_events, _second_tx_events, second_overlay) =
+        create_overlay(second_peer_key, Arc::new(OverlayMetrics::new())).unwrap();
+
+    let requester_port = 22511;
+    let first_peer_port = 22512;
+    let second_peer_port = 22513;
+    tokio::spawn(async move { requester_overlay.run("127.0.0.1", requester_port).await });
+    tokio::spawn(async move { first_overlay.run("127.0.0.1", first_peer_port).await });
+    tokio::spawn(async move { second_overlay.run("127.0.0.1", second_peer_port).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    for port in [first_peer_port, second_peer_port] {
+        let addr: Multiaddr = format!("/ip4/127.0.0.1/udp/{port}/quic-v1")
+            .parse()
+            .unwrap();
+        requester.dial(addr).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let (txset_hash, _txset_data) = test_txset_xdr(0x93);
+    requester
+        .record_txset_source(txset_hash, first_peer_id)
+        .await;
+    requester.fetch_txset(txset_hash).await;
+
+    let first_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut first_received = false;
+    while tokio::time::Instant::now() < first_deadline && !first_received {
+        tokio::select! {
+            Some(event) = first_events.recv() => {
+                if let OverlayEvent::TxSetRequested { hash, .. } = event {
+                    first_received = hash == txset_hash;
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+    }
+    assert!(
+        first_received,
+        "known source should receive the first request"
+    );
+
+    // A fresh duplicate must still be suppressed rather than flooding every
+    // connected peer.
+    requester.fetch_txset(txset_hash).await;
+    let fresh_deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+    while tokio::time::Instant::now() < fresh_deadline {
+        tokio::select! {
+            Some(event) = second_events.recv() => {
+                if let OverlayEvent::TxSetRequested { hash, .. } = event {
+                    assert_ne!(
+                        hash, txset_hash,
+                        "fresh duplicate should not be sent to another peer"
+                    );
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+    }
+
+    // Leave the first request unanswered, then retry after it is stale.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    requester.fetch_txset(txset_hash).await;
+
+    let retry_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut retry_received = false;
+    while tokio::time::Instant::now() < retry_deadline && !retry_received {
+        tokio::select! {
+            Some(event) = second_events.recv() => {
+                if let OverlayEvent::TxSetRequested { hash, .. } = event {
+                    retry_received = hash == txset_hash;
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+    }
+    assert!(
+        retry_received,
+        "stale request should retry a different connected peer"
+    );
+
+    requester.shutdown().await;
+    first_peer.shutdown().await;
+    second_peer.shutdown().await;
 }
 
 /// Test INV/GETDATA protocol: TX propagation via INV→GETDATA→TX flow

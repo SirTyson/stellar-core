@@ -65,6 +65,15 @@ class PendingEnvelopes
     std::map<Hash, std::vector<SCPEnvelope>> mPendingTxSetFetches;
     std::map<Hash, std::vector<SCPEnvelope>> mPendingQSetFetches;
 
+    // Nomination can advance before a TxSet body arrives, so a lost request
+    // must not leave the referenced value permanently unusable.
+    VirtualTimer mTxSetFetchRetryTimer;
+    bool mTxSetFetchRetryArmed{false};
+    std::map<Hash, VirtualClock::time_point> mTxSetFetchRequested;
+#ifdef BUILD_TESTS
+    std::map<Hash, size_t> mTxSetFetchRequestCounts;
+#endif
+
     using TxSetFramCacheItem = std::pair<uint64, TxSetXDRFrameConstPtr>;
     // recent txsets
     // Note on thread-safety: the cache must be maintained strictly by the main
@@ -102,6 +111,9 @@ class PendingEnvelopes
     bool isFullyFetched(SCPEnvelope const& envelope);
     void startFetch(SCPEnvelope const& envelope);
     void stopFetch(SCPEnvelope const& envelope);
+    void requestTxSet(Hash const& hash);
+    void maybeArmTxSetFetchRetryTimer();
+    void txSetFetchRetryTick();
     void touchFetchCache(SCPEnvelope const& envelope);
     bool isDiscarded(SCPEnvelope const& envelope) const;
 
@@ -139,6 +151,7 @@ class PendingEnvelopes
 
 #ifdef BUILD_TESTS
     void clearQSetCache();
+    size_t getTxSetFetchRequestCount(Hash const& hash) const;
 #endif
 
     /**

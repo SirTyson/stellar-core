@@ -26,10 +26,14 @@ using namespace std;
 namespace stellar
 {
 
+static constexpr std::chrono::milliseconds TXSET_FETCH_RETRY_DELAY{1000};
+static constexpr std::chrono::milliseconds TXSET_FETCH_RETRY_TICK{250};
+
 PendingEnvelopes::PendingEnvelopes(Application& app, HerderImpl& herder)
     : mApp(app)
     , mHerder(herder)
     , mQsetCache(QSET_CACHE_SIZE)
+    , mTxSetFetchRetryTimer(app)
     , mTxSetCache(TXSET_CACHE_SIZE)
     , mValueSizeCache(TXSET_CACHE_SIZE + QSET_CACHE_SIZE)
     , mRebuildQuorum(true)
@@ -264,6 +268,7 @@ PendingEnvelopes::recvTxSet(Hash const& hash, TxSetXDRFrameConstPtr txset)
     // externalize a slot and purge pending state recursively.
     auto waitingEnvelopes = std::move(it->second);
     mPendingTxSetFetches.erase(it);
+    mTxSetFetchRequested.erase(hash);
 
     addTxSet(hash, 0, txset);
     mHerder.getHerderSCPDriver().onTxSetReceived(hash, txset);
@@ -618,6 +623,70 @@ PendingEnvelopes::areTxSetsFetched(SCPEnvelope const& envelope)
 }
 
 void
+PendingEnvelopes::requestTxSet(Hash const& hash)
+{
+#ifdef BUILD_TESTS
+    ++mTxSetFetchRequestCounts[hash];
+#endif
+    mApp.getOverlayManager().requestTxSet(hash);
+    mTxSetFetchRequested[hash] = mApp.getClock().now();
+}
+
+void
+PendingEnvelopes::maybeArmTxSetFetchRetryTimer()
+{
+    if (mTxSetFetchRetryArmed || mPendingTxSetFetches.empty())
+    {
+        return;
+    }
+
+    mTxSetFetchRetryArmed = true;
+    mTxSetFetchRetryTimer.expires_from_now(TXSET_FETCH_RETRY_TICK);
+    mTxSetFetchRetryTimer.async_wait(
+        [this]() { txSetFetchRetryTick(); }, &VirtualTimer::onFailureNoop);
+}
+
+void
+PendingEnvelopes::txSetFetchRetryTick()
+{
+    ZoneScoped;
+    mTxSetFetchRetryArmed = false;
+    auto const now = mApp.getClock().now();
+
+    for (auto const& [hash, waiters] : mPendingTxSetFetches)
+    {
+        if (waiters.empty() || getKnownTxSet(hash, 0, false))
+        {
+            continue;
+        }
+
+        auto const requested = mTxSetFetchRequested.find(hash);
+        if (requested == mTxSetFetchRequested.end() ||
+            now - requested->second >= TXSET_FETCH_RETRY_DELAY)
+        {
+            CLOG_DEBUG(Herder, "Retrying TxSet {} fetch", hexAbbrev(hash));
+            requestTxSet(hash);
+        }
+    }
+
+    for (auto it = mTxSetFetchRequested.begin();
+         it != mTxSetFetchRequested.end();)
+    {
+        if (mPendingTxSetFetches.find(it->first) ==
+            mPendingTxSetFetches.end())
+        {
+            it = mTxSetFetchRequested.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+
+    maybeArmTxSetFetchRetryTimer();
+}
+
+void
 PendingEnvelopes::startFetch(SCPEnvelope const& envelope)
 {
     ZoneScoped;
@@ -652,9 +721,11 @@ PendingEnvelopes::startFetch(SCPEnvelope const& envelope)
             // Not fetching yet - start fetch
             auto& vec = mPendingTxSetFetches[h2];
             addWaiter(vec);
-            mApp.getOverlayManager().requestTxSet(h2); // Only once!
+            requestTxSet(h2);
         }
     }
+
+    maybeArmTxSetFetchRetryTimer();
 
     if (needSomething)
     {
@@ -663,6 +734,15 @@ PendingEnvelopes::startFetch(SCPEnvelope const& envelope)
                    envelope.statement.pledges.type());
     }
 }
+
+#ifdef BUILD_TESTS
+size_t
+PendingEnvelopes::getTxSetFetchRequestCount(Hash const& hash) const
+{
+    auto const it = mTxSetFetchRequestCounts.find(hash);
+    return it == mTxSetFetchRequestCounts.end() ? 0 : it->second;
+}
+#endif
 
 void
 PendingEnvelopes::stopFetch(SCPEnvelope const& envelope)
@@ -681,6 +761,7 @@ PendingEnvelopes::stopFetch(SCPEnvelope const& envelope)
             if (vec.empty())
             {
                 mPendingTxSetFetches.erase(it);
+                mTxSetFetchRequested.erase(h2);
             }
         }
     }
@@ -812,6 +893,19 @@ PendingEnvelopes::eraseOutsideRange(std::optional<uint64> minSlot,
     };
     purgeWaiters(mPendingTxSetFetches);
     purgeWaiters(mPendingQSetFetches);
+    for (auto it = mTxSetFetchRequested.begin();
+         it != mTxSetFetchRequested.end();)
+    {
+        if (mPendingTxSetFetches.find(it->first) ==
+            mPendingTxSetFetches.end())
+        {
+            it = mTxSetFetchRequested.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
 
     // 0 is special mark for data that we do not know the slot index
     // it is used for state loaded from database

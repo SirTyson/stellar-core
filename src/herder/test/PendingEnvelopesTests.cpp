@@ -19,6 +19,83 @@
 using namespace stellar;
 using namespace stellar::txtest;
 
+TEST_CASE("PendingEnvelopes retries missing transaction sets",
+          "[herder][txset-retry]")
+{
+    Config cfg(getTestConfig());
+    cfg.MANUAL_CLOSE = true;
+
+    VirtualClock clock;
+    auto peerKey = SecretKey::pseudoRandomForTesting();
+    cfg.QUORUM_SET.validators.emplace_back(peerKey.getPublicKey());
+    auto app = createTestApplication(clock, cfg);
+    auto& herder = static_cast<HerderImpl&>(app->getHerder());
+    auto& pending = herder.getPendingEnvelopes();
+    auto const& lcl = app->getLedgerManager().getLastClosedLedgerHeader();
+
+    SCPQuorumSet qset;
+    qset.threshold = 1;
+    qset.validators.emplace_back(peerKey.getPublicKey());
+    auto const qsetHash = xdrSha256(qset);
+    pending.addSCPQuorumSet(qsetHash, qset);
+
+    auto txSet = TxSetXDRFrame::makeEmpty(lcl);
+    auto const txSetHash = txSet->getContentsHash();
+    auto value = herder.makeStellarValue(
+        txSetHash, lcl.header.scpValue.closeTime + 1, emptyUpgradeSteps,
+        peerKey);
+
+    SCPEnvelope envelope;
+    envelope.statement.nodeID = peerKey.getPublicKey();
+    envelope.statement.slotIndex = lcl.header.ledgerSeq + 1;
+    envelope.statement.pledges.type(SCP_ST_PREPARE);
+    auto& prepare = envelope.statement.pledges.prepare();
+    prepare.quorumSetHash = qsetHash;
+    prepare.ballot = SCPBallot(1, xdr::xdr_to_opaque(value));
+    herder.signEnvelope(peerKey, envelope);
+
+    // If the selected peer is connected but does not have the set, a one-shot
+    // request would leave this value permanently unusable.
+    REQUIRE(pending.recvSCPEnvelope(envelope) ==
+            Herder::ENVELOPE_STATUS_READY);
+    REQUIRE(pending.getTxSetFetchRequestCount(txSetHash) == 1);
+
+    testutil::crankFor(clock, std::chrono::milliseconds(750));
+    REQUIRE(pending.getTxSetFetchRequestCount(txSetHash) == 1);
+
+    testutil::crankFor(clock, std::chrono::milliseconds(1750));
+
+    // Liveness requirement: an unanswered request is retried on a bounded
+    // cadence so another peer can serve it.
+    REQUIRE(pending.getTxSetFetchRequestCount(txSetHash) >= 2);
+
+    SECTION("delivery stops retries")
+    {
+        REQUIRE(pending.recvTxSet(txSetHash, txSet));
+        auto const requestsAfterDelivery =
+            pending.getTxSetFetchRequestCount(txSetHash);
+
+        testutil::crankFor(clock, std::chrono::milliseconds(2500));
+
+        // Delivery must cancel retry bookkeeping.
+        REQUIRE(pending.getTxSetFetchRequestCount(txSetHash) ==
+                requestsAfterDelivery);
+    }
+
+    SECTION("purging the waiting slot stops retries")
+    {
+        auto const requestsBeforePurge =
+            pending.getTxSetFetchRequestCount(txSetHash);
+        auto const nextSlot = envelope.statement.slotIndex + 1;
+        pending.eraseOutsideRange(nextSlot, std::nullopt, nextSlot);
+
+        testutil::crankFor(clock, std::chrono::milliseconds(2500));
+
+        REQUIRE(pending.getTxSetFetchRequestCount(txSetHash) ==
+                requestsBeforePurge);
+    }
+}
+
 TEST_CASE("PendingEnvelopes recvSCPEnvelope", "[herder]")
 {
     Config cfg(getTestConfig());
