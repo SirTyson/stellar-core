@@ -148,6 +148,21 @@ overlay.flood.broadcast                   | meter     | message sent as broadcas
 overlay.flood.duplicate_recv              | meter     | number of bytes of flooded messages that have already been received
 overlay.flood.unique_recv                 | meter     | number of bytes of flooded messages that have not yet been received
 overlay.flood.tx-batch-size               | histogram | number of transactions in a batch
+overlay.flood.txset-push                  | meter     | eager TX-set shreds successfully assigned by a nominator
+overlay.flood.txset-push-bytes            | meter     | eager TX-set shred bytes sent by a nominator
+overlay.flood.txset-push-dropped          | meter     | unsent TX-set shreds canceled by a newer nomination or ledger close
+overlay.txset-shard.broadcast             | meter     | TX sets erasure-coded for eager dissemination
+overlay.txset-shard.original-sent         | meter     | original shreds sent by a nominator
+overlay.txset-shard.recovery-sent         | meter     | Reed-Solomon recovery shreds sent by a nominator
+overlay.txset-shard.recv-unique           | meter     | unique TX-set shreds received
+overlay.txset-shard.recv-duplicate        | meter     | duplicate TX-set shreds received
+overlay.txset-shard.forwarded             | meter     | TX-set shreds forwarded for their single dense-mesh hop
+overlay.txset-shard.reconstruct-original  | meter     | TX sets reconstructed without recovery shreds
+overlay.txset-shard.reconstruct-recovery  | meter     | TX sets reconstructed using recovery shreds
+overlay.txset-shard.invalid               | meter     | malformed, conflicting, undecodable, or hash-invalid shreds/sets
+overlay.txset-shard.accumulator-evicted   | meter     | incomplete TX-set accumulators evicted by capacity or age
+overlay.txset-shard.encode                | timer     | Reed-Solomon encoding time per TX set
+overlay.txset-shard.reconstruct           | timer     | TX-set reconstruction time after the threshold shred arrives
 overlay.inbound.attempt                   | meter     | inbound connection attempted (accepted on socket)
 overlay.inbound.drop                      | meter     | inbound connection dropped
 overlay.inbound.establish                 | meter     | inbound connection established (added to pending)

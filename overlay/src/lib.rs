@@ -8,5 +8,6 @@ pub mod integrated;
 pub mod ipc;
 pub mod libp2p_overlay;
 pub mod metrics;
+pub mod txset_shards;
 pub mod wire;
 pub mod xdr;

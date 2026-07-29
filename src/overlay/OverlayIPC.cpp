@@ -646,7 +646,8 @@ OverlayIPC::broadcastSCP(SCPEnvelope const& envelope)
 }
 
 void
-OverlayIPC::notifyLedgerClosed(uint32_t ledgerSeq, Hash const& ledgerHash)
+OverlayIPC::notifyLedgerClosed(uint32_t ledgerSeq, Hash const& ledgerHash,
+                               uint32_t numClusters)
 {
     if (!mChannel || !mChannel->isConnected())
     {
@@ -656,10 +657,11 @@ OverlayIPC::notifyLedgerClosed(uint32_t ledgerSeq, Hash const& ledgerHash)
     IPCMessage msg;
     msg.type = IPCMessageType::LEDGER_CLOSED;
 
-    // Payload: [ledgerSeq:4][ledgerHash:32]
-    msg.payload.resize(4 + 32);
+    // Payload: [ledgerSeq:4][ledgerHash:32][numClusters:4]
+    msg.payload.resize(4 + 32 + 4);
     std::memcpy(msg.payload.data(), &ledgerSeq, 4);
     std::memcpy(msg.payload.data() + 4, ledgerHash.data(), 32);
+    std::memcpy(msg.payload.data() + 36, &numClusters, 4);
 
     std::lock_guard<std::mutex> lock(mSendMutex);
     mChannel->send(msg);
@@ -902,7 +904,7 @@ OverlayIPC::broadcastTxSet(Hash const& hash, std::vector<uint8_t> const& xdr)
     std::memcpy(msg.payload.data(), hash.data(), 32);
     std::memcpy(msg.payload.data() + 32, xdr.data(), xdr.size());
 
-    CLOG_DEBUG(Overlay, "Broadcasting TX set {} ({} bytes) to all peers",
+    CLOG_DEBUG(Overlay, "Requesting coded TX set dissemination for {} ({} bytes)",
                hexAbbrev(hash), xdr.size());
     std::lock_guard<std::mutex> lock(mSendMutex);
     mChannel->send(msg);
@@ -913,7 +915,8 @@ OverlayIPC::setPeerConfig(std::vector<std::string> const& knownPeers,
                           std::vector<std::string> const& preferredPeers,
                           uint16_t listenPort,
                           std::vector<std::string> const& quorumMembers,
-                          size_t txBatchMaxSize, bool suppressTxBroadcast)
+                          size_t txBatchMaxSize, uint32_t numClusters,
+                          bool suppressTxBroadcast)
 {
     if (!mChannel || !mChannel->isConnected())
     {
@@ -945,6 +948,7 @@ OverlayIPC::setPeerConfig(std::vector<std::string> const& knownPeers,
     json += "]";
     json += ",\"listen_port\":" + std::to_string(listenPort);
     json += ",\"tx_batch_max_size\":" + std::to_string(txBatchMaxSize);
+    json += ",\"num_clusters\":" + std::to_string(numClusters);
     json += std::string(",\"suppress_tx_broadcast\":") +
             (suppressTxBroadcast ? "true" : "false") + "}";
 

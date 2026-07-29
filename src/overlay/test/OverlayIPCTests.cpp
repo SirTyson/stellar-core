@@ -1258,17 +1258,15 @@ TEST_CASE("TX routed directly to leader", "[overlay-ipc][herder][.]")
 }
 
 /**
- * End-to-end test of eager TX set dissemination (direct leader flooding, TxSet
- * push; see docs/direct-leader-flooding.md). The round-1 leader pushes its
- * nominated TX set body to all peers, and the GetTxSet request path is removed
- * from live nomination.
+ * End-to-end test of eager coded TX set dissemination (see
+ * docs/txset-shred-dissemination.md). The round-1 leader assigns
+ * Reed-Solomon shreds to its peers, which forward once across the dense Tier-1
+ * mesh, and the GetTxSet request path is removed from live nomination.
  *
  * On a real 3-validator network, a TX submitted to one node must still be
- * included and applied on ALL nodes. With no request fallback, a non-leader can
- * only validate (and thus vote for) the nominated value if it obtained the TX
- * set via the eager push -- so inclusion-on-all-nodes exercises the push path
- * end-to-end. The network must also report at least one eager TX set push
- * (flood_txset_push) on the node(s) that led a round.
+ * included and applied on ALL nodes. The reconstruction metrics below prove
+ * the eager path delivered TX sets; the legacy fetch path remains available as
+ * a safety net.
  */
 TEST_CASE("TX set eagerly pushed to peers", "[overlay-ipc][herder][.]")
 {
@@ -1336,10 +1334,14 @@ TEST_CASE("TX set eagerly pushed to peers", "[overlay-ipc][herder][.]")
         REQUIRE(stellar::loadAccount(ltx, destKey.getPublicKey()));
     }
 
-    // At least one node acted as a round-1 leader and eagerly pushed its TX set
-    // body to peers. Sum across the network so the assertion is independent of
-    // which node happened to lead the closed slots.
+    // At least one node acted as a round-1 leader and eagerly assigned coded
+    // shreds. Sum across the network so the assertion is independent of which
+    // node happened to lead the closed slots.
     uint64_t totalTxSetPush = 0;
+    uint64_t totalShardBroadcast = 0;
+    uint64_t totalOriginalSent = 0;
+    uint64_t totalRecoverySent = 0;
+    uint64_t totalReconstructed = 0;
     for (auto const& node : nodes)
     {
         auto metricsJson =
@@ -1349,14 +1351,30 @@ TEST_CASE("TX set eagerly pushed to peers", "[overlay-ipc][herder][.]")
         Json::Reader reader;
         REQUIRE(reader.parse(metricsJson, root));
         REQUIRE(root.isMember("flood_txset_push"));
+        REQUIRE(root.isMember("txset_shard_broadcast"));
+        REQUIRE(root.isMember("txset_shard_original_sent"));
+        REQUIRE(root.isMember("txset_shard_recovery_sent"));
+        REQUIRE(root.isMember("txset_shard_reconstruct_original"));
+        REQUIRE(root.isMember("txset_shard_reconstruct_recovery"));
         totalTxSetPush += root["flood_txset_push"].asUInt64();
+        totalShardBroadcast += root["txset_shard_broadcast"].asUInt64();
+        totalOriginalSent += root["txset_shard_original_sent"].asUInt64();
+        totalRecoverySent += root["txset_shard_recovery_sent"].asUInt64();
+        totalReconstructed +=
+            root["txset_shard_reconstruct_original"].asUInt64() +
+            root["txset_shard_reconstruct_recovery"].asUInt64();
     }
     REQUIRE(totalTxSetPush >= 1);
+    REQUIRE(totalShardBroadcast >= 1);
+    REQUIRE(totalOriginalSent >= 1);
+    REQUIRE(totalRecoverySent >= 1);
+    REQUIRE(totalReconstructed >= 1);
 
     LOG_INFO(DEFAULT_LOG,
-             "TX set eagerly pushed to peers test passed (total txset pushes: "
-             "{})",
-             totalTxSetPush);
+             "coded TX set dissemination passed (broadcasts: {}, assigned "
+             "shreds: {}, reconstructions: {})",
+             totalShardBroadcast, totalOriginalSent + totalRecoverySent,
+             totalReconstructed);
 }
 
 /**

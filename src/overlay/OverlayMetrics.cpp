@@ -54,6 +54,34 @@ OverlayMetrics::OverlayMetrics(Application& app)
           {"overlay", "flood", "txset-push"}, "message"))
     , mFloodTxSetPushBytesMeter(app.getMetrics().NewMeter(
           {"overlay", "flood", "txset-push-bytes"}, "byte"))
+    , mFloodTxSetPushDroppedMeter(app.getMetrics().NewMeter(
+          {"overlay", "flood", "txset-push-dropped"}, "shred"))
+    , mTxSetShardBroadcast(app.getMetrics().NewMeter(
+          {"overlay", "txset-shard", "broadcast"}, "txset"))
+    , mTxSetShardOriginalSent(app.getMetrics().NewMeter(
+          {"overlay", "txset-shard", "original-sent"}, "shred"))
+    , mTxSetShardRecoverySent(app.getMetrics().NewMeter(
+          {"overlay", "txset-shard", "recovery-sent"}, "shred"))
+    , mTxSetShardRecvUnique(app.getMetrics().NewMeter(
+          {"overlay", "txset-shard", "recv-unique"}, "shred"))
+    , mTxSetShardRecvDuplicate(app.getMetrics().NewMeter(
+          {"overlay", "txset-shard", "recv-duplicate"}, "shred"))
+    , mTxSetShardForwarded(app.getMetrics().NewMeter(
+          {"overlay", "txset-shard", "forwarded"}, "shred"))
+    , mTxSetShardReconstructOriginal(app.getMetrics().NewMeter(
+          {"overlay", "txset-shard", "reconstruct-original"},
+          "reconstruction"))
+    , mTxSetShardReconstructRecovery(app.getMetrics().NewMeter(
+          {"overlay", "txset-shard", "reconstruct-recovery"},
+          "reconstruction"))
+    , mTxSetShardInvalid(app.getMetrics().NewMeter(
+          {"overlay", "txset-shard", "invalid"}, "shred"))
+    , mTxSetShardAccumulatorEvicted(app.getMetrics().NewMeter(
+          {"overlay", "txset-shard", "accumulator-evicted"}, "txset"))
+    , mTxSetShardEncodeTimer(
+          app.getMetrics().NewTimer({"overlay", "txset-shard", "encode"}))
+    , mTxSetShardReconstructTimer(
+          app.getMetrics().NewTimer({"overlay", "txset-shard", "reconstruct"}))
     , mMessagesBroadcast(app.getMetrics().NewMeter(
           {"overlay", "message", "broadcast"}, "message"))
     , mUniqueFloodBytesRecv(app.getMetrics().NewMeter(

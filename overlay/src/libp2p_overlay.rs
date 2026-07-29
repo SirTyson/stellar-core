@@ -7,6 +7,7 @@
 //! - SCP stream: consensus messages (priority, ~500B)
 //! - TX stream: transaction flooding (~1KB) - uses INV/GETDATA protocol
 //! - TxSet stream: TX set request/response (~10MB)
+//! - TxSet-shred stream: eager erasure-coded dissemination
 //!
 //! Each stream is opened once per peer and kept alive.
 //! QUIC provides independent loss recovery per stream.
@@ -16,6 +17,13 @@ use crate::flood::{
     TxStreamMessage,
 };
 use crate::metrics::OverlayMetrics;
+#[cfg(test)]
+use crate::txset_shards::make_txset_shards;
+use crate::txset_shards::{
+    assign_shard_branches_to_peer_offsets, make_txset_shards_parallel, relay_target_peer_offsets,
+    TxSetCodingExecutor, TxSetShardAccumulator, TxSetShardConfig, TxSetShardMessage,
+    TXSET_MAX_SHARD_BRANCHING_FACTOR, TXSET_SHARD_BRANCHING_FACTOR,
+};
 use crate::wire::ValidatedTx;
 use futures::{AsyncReadExt, AsyncWriteExt, StreamExt};
 use libp2p::{
@@ -40,6 +48,7 @@ use tracing::{debug, error, info, trace, warn};
 pub const SCP_PROTOCOL: StreamProtocol = StreamProtocol::new("/stellar/scp/1.0.0");
 pub const TX_PROTOCOL: StreamProtocol = StreamProtocol::new("/stellar/tx/1.0.0");
 pub const TXSET_PROTOCOL: StreamProtocol = StreamProtocol::new("/stellar/txset/1.0.0");
+pub const TXSET_SHARD_PROTOCOL: StreamProtocol = StreamProtocol::new("/stellar/txset-shard/2.0.0");
 
 /// Message frame: 4-byte length prefix + payload
 /// Max message size: 16MB (for large TX sets)
@@ -55,6 +64,13 @@ const TX_EVENT_CHANNEL_CAPACITY: usize = 10_000;
 /// actually goes through instead of being deduplicated against the stuck
 /// request (docs/direct-leader-flooding.md).
 const TXSET_FETCH_RETRY_STALE: Duration = Duration::from_millis(900);
+
+/// A peer can make us allocate at most this many incomplete TX sets. At the
+/// 16 MiB TX-set wire limit plus 50% recovery data this bounds worst-case
+/// accumulator payloads below 400 MiB, while normal consensus keeps only one
+/// or two sets in flight.
+const TXSET_MAX_ACTIVE_ACCUMULATORS: usize = 16;
+const TXSET_SHARD_ACCUMULATOR_TTL: Duration = Duration::from_secs(60);
 
 /// Events from the overlay to the application
 #[derive(Debug, Clone)]
@@ -99,8 +115,8 @@ pub enum OverlayCommand {
         data: Vec<u8>,
         to: PeerId,
     },
-    /// Eagerly broadcast a TX set body to all connected peers (round-1 leader
-    /// pushes its nominated set so receivers skip the GetTxSet round-trip)
+    /// Eagerly code and assign a nominated TX set across connected Tier-1
+    /// peers so receivers skip the GetTxSet round-trip.
     BroadcastTxSet { hash: [u8; 32], data: Vec<u8> },
     /// Relay a network-received TX that Core has validated (see the
     /// validation gate in main.rs): store it for GETDATA service, then push
@@ -131,6 +147,7 @@ struct PeerOutboundStreams {
     scp: Mutex<Option<Stream>>,
     tx: Mutex<Option<Stream>>,
     txset: Mutex<Option<Stream>>,
+    txset_shard: Mutex<Option<Stream>>,
 }
 
 impl PeerOutboundStreams {
@@ -139,6 +156,29 @@ impl PeerOutboundStreams {
             scp: Mutex::new(None),
             tx: Mutex::new(None),
             txset: Mutex::new(None),
+            txset_shard: Mutex::new(None),
+        }
+    }
+}
+
+struct TxSetShardStore {
+    partial: HashMap<[u8; 32], TxSetShardAccumulator>,
+    /// Shred indexes received while a threshold set is being decoded off the
+    /// async runtime. This closes the race between removing a ready
+    /// accumulator and publishing its completed marker.
+    reconstructing: HashMap<[u8; 32], HashSet<usize>>,
+    /// Completed TX sets and the direct shreds already seen for each. Keeping
+    /// the indexes lets a late, previously unseen TTL=1 shred fulfill its
+    /// forwarding duty exactly once without permitting replay amplification.
+    completed: lru::LruCache<[u8; 32], HashSet<usize>>,
+}
+
+impl TxSetShardStore {
+    fn new() -> Self {
+        Self {
+            partial: HashMap::new(),
+            reconstructing: HashMap::new(),
+            completed: lru::LruCache::new(std::num::NonZeroUsize::new(1000).unwrap()),
         }
     }
 }
@@ -182,6 +222,9 @@ pub struct OverlayHandle {
     tx_batch_max_size: Arc<AtomicUsize>,
     /// Shared with SharedState; written directly (see flood_leaders).
     current_ledger_seq: Arc<AtomicU64>,
+    /// Private coding pool, replaced when Core reports a new network
+    /// transaction-cluster limit.
+    txset_coding_executor: Arc<RwLock<Arc<TxSetCodingExecutor>>>,
 }
 
 impl OverlayHandle {
@@ -195,6 +238,25 @@ impl OverlayHandle {
     pub fn set_tx_batch_max_size(&self, max: usize) {
         debug!("TX batch max size set to {}", max);
         self.tx_batch_max_size.store(max, Ordering::Relaxed);
+    }
+
+    /// Bound Reed–Solomon encode/decode workers by
+    /// ledgerMaxDependentTxClusters (`num_clusters` in the IPC contract).
+    pub async fn set_txset_coding_parallelism(&self, num_clusters: usize) -> Result<(), String> {
+        if self.txset_coding_executor.read().await.max_parallelism() == num_clusters {
+            return Ok(());
+        }
+        let executor = tokio::task::spawn_blocking(move || {
+            TxSetCodingExecutor::new(num_clusters).map(Arc::new)
+        })
+        .await
+        .map_err(|e| format!("TX-set coding pool task failed: {e}"))??;
+        *self.txset_coding_executor.write().await = executor;
+        info!(
+            "TX-set coding parallelism set to {} cluster(s)",
+            num_clusters
+        );
+        Ok(())
     }
 
     pub async fn broadcast_scp(&self, envelope: Vec<u8>) {
@@ -262,7 +324,7 @@ impl OverlayHandle {
         }
     }
 
-    /// Eagerly broadcast a TX set body to all connected peers.
+    /// Eagerly disseminate a TX set as Reed–Solomon shreds.
     pub async fn broadcast_txset(&self, hash: [u8; 32], data: Vec<u8>) {
         if let Err(e) = self
             .cmd_tx
@@ -362,16 +424,8 @@ impl OverlayHandle {
     }
 }
 
-/// Shared state for stream handlers
-#[derive(Default)]
-struct TxSetPushState {
-    /// peer -> (slot the set was nominated for, hash, framed message)
-    pending: HashMap<PeerId, (u64, [u8; 32], Arc<Vec<u8>>)>,
-    /// peers with a live drainer task
-    draining: HashSet<PeerId>,
-}
-
 struct SharedState {
+    local_peer_id: PeerId,
     /// Outbound streams per peer - each peer has three independently-locked streams
     peer_streams: RwLock<HashMap<PeerId, Arc<PeerOutboundStreams>>>,
     /// SCP messages seen (for dedup)
@@ -384,6 +438,13 @@ struct SharedState {
     txset_sources: RwLock<lru::LruCache<[u8; 32], PeerId>>,
     /// Pending TX set requests: hash -> (peer, request_time) to avoid duplicate fetches and track latency
     pending_txset_requests: RwLock<HashMap<[u8; 32], (PeerId, Instant)>>,
+    /// Partial, reconstructing, and completed erasure-coded TX sets. A single
+    /// lock makes completion publication atomic with respect to new shreds.
+    txset_shard_store: Mutex<TxSetShardStore>,
+    /// Reed–Solomon and forwarding parameters. TTL=1 targets a fully-connected
+    /// Tier-1 validator topology.
+    txset_shard_config: TxSetShardConfig,
+    txset_coding_executor: Arc<RwLock<Arc<TxSetCodingExecutor>>>,
     /// Event sender for non-TX events (SCP, TxSet - critical path, unbounded)
     event_tx: mpsc::UnboundedSender<OverlayEvent>,
     /// Bounded TX event sender (backpressure - drops allowed)
@@ -416,21 +477,19 @@ struct SharedState {
     /// SetPeerConfig). 0 or 1 disables batching (send-per-TX). Shared with
     /// OverlayHandle, which writes it directly.
     tx_batch_max_size: Arc<AtomicUsize>,
-    /// Last closed ledger as reported by Core (0 until first close). Shared
-    /// with OverlayHandle. Used to drop queued tx set pushes whose consensus
-    /// round has already completed.
+    /// Last closed ledger as reported by Core (0 until first close). Used to
+    /// avoid sending shreds whose consensus round closed while coding.
     current_ledger_seq: Arc<AtomicU64>,
-    /// Latest-wins tx set push mailbox: at most ONE queued push per peer
-    /// (newest replaces older undelivered ones), drained by a per-peer task.
-    /// Prevents a slow peer from accumulating an unbounded FIFO of dead
-    /// multi-MB sets that starve the current slot's delivery.
-    txset_push: Mutex<TxSetPushState>,
+    /// Monotonic latest-wins generation for locally nominated TX sets. A newer
+    /// broadcast cancels unsent shreds from older coding/sending tasks.
+    txset_shard_generation: AtomicU64,
     /// Overlay metrics (shared with App for IPC reporting)
     metrics: Arc<OverlayMetrics>,
 }
 
 impl SharedState {
     fn new(
+        local_peer_id: PeerId,
         event_tx: mpsc::UnboundedSender<OverlayEvent>,
         tx_event_tx: mpsc::Sender<OverlayEvent>,
         control: Control,
@@ -438,8 +497,10 @@ impl SharedState {
         flood_leaders: Arc<RwLock<Vec<PeerId>>>,
         tx_batch_max_size: Arc<AtomicUsize>,
         current_ledger_seq: Arc<AtomicU64>,
+        txset_coding_executor: Arc<RwLock<Arc<TxSetCodingExecutor>>>,
     ) -> Self {
         Self {
+            local_peer_id,
             peer_streams: RwLock::new(HashMap::new()),
             scp_seen: RwLock::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(10000).unwrap(),
@@ -454,6 +515,9 @@ impl SharedState {
                 std::num::NonZeroUsize::new(1000).unwrap(),
             )),
             pending_txset_requests: RwLock::new(HashMap::new()),
+            txset_shard_store: Mutex::new(TxSetShardStore::new()),
+            txset_shard_config: TxSetShardConfig::default(),
+            txset_coding_executor,
             event_tx,
             tx_event_tx,
             tx_dropped_count: AtomicU64::new(0),
@@ -467,7 +531,7 @@ impl SharedState {
             tx_batcher: RwLock::new(TxBatcher::new()),
             tx_batch_max_size,
             current_ledger_seq,
-            txset_push: Mutex::new(TxSetPushState::default()),
+            txset_shard_generation: AtomicU64::new(0),
             metrics,
         }
     }
@@ -491,6 +555,22 @@ pub struct StellarOverlay {
 pub fn create_overlay(
     keypair: Keypair,
     metrics: Arc<OverlayMetrics>,
+) -> Result<
+    (
+        OverlayHandle,
+        mpsc::UnboundedReceiver<OverlayEvent>,
+        mpsc::Receiver<OverlayEvent>,
+        StellarOverlay,
+    ),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    create_overlay_with_txset_shard_config(keypair, metrics, TxSetShardConfig::default())
+}
+
+pub(crate) fn create_overlay_with_txset_shard_config(
+    keypair: Keypair,
+    metrics: Arc<OverlayMetrics>,
+    txset_shard_config: TxSetShardConfig,
 ) -> Result<
     (
         OverlayHandle,
@@ -539,7 +619,11 @@ pub fn create_overlay(
     let flood_leaders = Arc::new(RwLock::new(Vec::new()));
     let tx_batch_max_size = Arc::new(AtomicUsize::new(0));
     let current_ledger_seq = Arc::new(AtomicU64::new(0));
-    let state = Arc::new(SharedState::new(
+    let txset_coding_executor = Arc::new(RwLock::new(Arc::new(
+        TxSetCodingExecutor::new(1).expect("serial TX-set coding executor is valid"),
+    )));
+    let mut state = SharedState::new(
+        peer_id,
         event_tx,
         tx_event_tx,
         control.clone(),
@@ -547,7 +631,10 @@ pub fn create_overlay(
         Arc::clone(&flood_leaders),
         Arc::clone(&tx_batch_max_size),
         Arc::clone(&current_ledger_seq),
-    ));
+        Arc::clone(&txset_coding_executor),
+    );
+    state.txset_shard_config = txset_shard_config;
+    let state = Arc::new(state);
 
     let overlay = StellarOverlay {
         swarm,
@@ -561,6 +648,7 @@ pub fn create_overlay(
         flood_leaders,
         tx_batch_max_size,
         current_ledger_seq,
+        txset_coding_executor,
     };
 
     Ok((handle, event_rx, tx_event_rx, overlay))
@@ -615,15 +703,30 @@ impl StellarOverlay {
                 return;
             }
         };
+        let txset_shard_incoming = match self.control.accept(TXSET_SHARD_PROTOCOL) {
+            Ok(incoming) => incoming,
+            Err(e) => {
+                error!(
+                    "Failed to accept TxSet shred protocol streams: {:?}. Overlay cannot function.",
+                    e
+                );
+                return;
+            }
+        };
 
         // Spawn inbound stream handlers
         let state = self.state.clone();
         tokio::spawn(handle_inbound_scp_streams(scp_incoming, state.clone()));
         tokio::spawn(handle_inbound_tx_streams(tx_incoming, state.clone()));
         tokio::spawn(handle_inbound_txset_streams(txset_incoming, state.clone()));
+        tokio::spawn(handle_inbound_txset_shard_streams(
+            txset_shard_incoming,
+            state.clone(),
+        ));
 
         // Spawn INV/GETDATA housekeeping task
         tokio::spawn(inv_getdata_housekeeping_task(state.clone()));
+        tokio::spawn(txset_shard_housekeeping_task(state.clone()));
 
         loop {
             tokio::select! {
@@ -649,7 +752,17 @@ impl StellarOverlay {
                             self.send_txset_response(to, hash, data).await;
                         }
                         OverlayCommand::BroadcastTxSet { hash, data } => {
-                            self.broadcast_txset(hash, data).await;
+                            // Reed–Solomon coding can take milliseconds for a
+                            // maximum-size set. Keep it off the swarm task so
+                            // SCP and connection polling remain responsive.
+                            let state = Arc::clone(&self.state);
+                            let generation = state
+                                .txset_shard_generation
+                                .fetch_add(1, Ordering::Relaxed)
+                                .wrapping_add(1);
+                            tokio::spawn(async move {
+                                broadcast_txset_shards(state, hash, data, generation).await;
+                            });
                         }
                         OverlayCommand::RecordTxSetSource { hash, peer } => {
                             let mut sources = self.state.txset_sources.write().await;
@@ -821,11 +934,6 @@ impl StellarOverlay {
                     {
                         let mut batcher = self.state.tx_batcher.write().await;
                         batcher.remove_peer(&peer_id);
-                    }
-                    // Drop any queued tx set push for this peer
-                    {
-                        let mut st = self.state.txset_push.lock().await;
-                        st.pending.remove(&peer_id);
                     }
                     // Notify main loop to clean up any pending requests for this peer
                     if let Err(e) = self.state.event_tx.send(OverlayEvent::PeerDisconnected {
@@ -1258,73 +1366,6 @@ impl StellarOverlay {
         });
     }
 
-    /// Eagerly broadcast a TX set body to every connected peer.
-    ///
-    /// Direct leader flooding (docs/direct-leader-flooding.md): the round-1
-    /// leader pushes its nominated set to all peers so they hold it before the
-    /// nomination referencing it arrives, removing the GetTxSet round-trip from
-    /// the nomination critical path. Unlike `send_txset_response`, this is
-    /// unsolicited; receivers accept it (the inbound TxSet handler forwards a
-    /// `GeneralizedTxSet` frame to Core whether or not it was requested).
-    async fn broadcast_txset(&mut self, hash: [u8; 32], data: Vec<u8>) {
-        // `data` is our trusted local core's nominated set; skip the redundant
-        // decode/re-encode (perf fix #5357) but still guard against a
-        // hash/bytes mismatch that would make the set unfetchable network-wide,
-        // then frame by concatenation (mirrors send_txset_response).
-        if !crate::xdr::tx_set_hash_matches(&hash, &data) {
-            warn!(
-                "TXSET_BROADCAST_DROP: Dropping TxSet {:02x?}...: hash/bytes mismatch",
-                &hash[..4]
-            );
-            return;
-        }
-        let message = crate::xdr::frame_tx_set(&data);
-
-        let streams = self.state.peer_streams.read().await;
-        let peers: Vec<PeerId> = streams.keys().cloned().collect();
-        drop(streams);
-
-        if peers.is_empty() {
-            debug!(
-                "TXSET_BROADCAST_SKIP: no peers to push TX set {:02x?}...",
-                &hash[..4]
-            );
-            return;
-        }
-
-        info!(
-            "TXSET_BROADCAST: Pushing TX set {:02x?}... ({} bytes) to {} peers",
-            &hash[..4],
-            data.len(),
-            peers.len()
-        );
-
-        // Latest-wins enqueue: at most ONE queued push per peer. A slow peer
-        // must never accumulate a FIFO of dead multi-MB sets -- for consensus
-        // data only the NEWEST set matters, so a newer set replaces an
-        // undelivered older one, and the drainer skips sets whose round has
-        // already completed. One shared buffer (no per-peer clones).
-        let message = Arc::new(message);
-        // The set being broadcast is for the slot currently being voted.
-        let slot = self.state.current_ledger_seq.load(Ordering::Relaxed) + 1;
-        let mut st = self.state.txset_push.lock().await;
-        for peer_id in peers {
-            if st
-                .pending
-                .insert(peer_id, (slot, hash, Arc::clone(&message)))
-                .is_some()
-            {
-                self.state
-                    .metrics
-                    .flood_txset_push_dropped
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            if st.draining.insert(peer_id) {
-                tokio::spawn(drain_txset_pushes(Arc::clone(&self.state), peer_id));
-            }
-        }
-    }
-
     /// Request SCP state from all connected peers
     pub async fn request_scp_state_from_all_peers(&mut self, ledger_seq: u32) {
         let streams = self.state.peer_streams.read().await;
@@ -1354,7 +1395,215 @@ impl StellarOverlay {
     }
 }
 
-/// Open SCP, TX, and TxSet streams to a peer.
+/// Erasure-code a locally nominated TX set and eagerly distribute each shred
+/// to two branch roots. In the fully-connected Tier-1 topology, those roots
+/// partition the other validators, balancing outgoing bandwidth without
+/// duplicating relay edges.
+async fn broadcast_txset_shards(
+    state: Arc<SharedState>,
+    hash: [u8; 32],
+    data: Vec<u8>,
+    generation: u64,
+) {
+    broadcast_txset_shards_with_branching_factor(
+        state,
+        hash,
+        data,
+        generation,
+        TXSET_SHARD_BRANCHING_FACTOR,
+    )
+    .await;
+}
+
+async fn broadcast_txset_shards_with_branching_factor(
+    state: Arc<SharedState>,
+    hash: [u8; 32],
+    data: Vec<u8>,
+    generation: u64,
+    requested_branch_count: usize,
+) {
+    if !(1..=TXSET_MAX_SHARD_BRANCHING_FACTOR).contains(&requested_branch_count) {
+        warn!(
+            "TXSET_SHARD_BROADCAST_DROP: invalid branch factor {}",
+            requested_branch_count
+        );
+        return;
+    }
+    if !crate::xdr::tx_set_hash_matches(&hash, &data) {
+        warn!(
+            "TXSET_SHARD_BROADCAST_DROP: TX set {:02x?}... has a content-hash mismatch",
+            &hash[..4]
+        );
+        return;
+    }
+
+    let streams = state.peer_streams.read().await;
+    let mut peers: Vec<PeerId> = streams.keys().cloned().collect();
+    drop(streams);
+    peers.sort_by_key(|peer| peer.to_bytes());
+    if peers.is_empty() {
+        debug!(
+            "TXSET_SHARD_BROADCAST_SKIP: no peers for TX set {:02x?}...",
+            &hash[..4]
+        );
+        return;
+    }
+
+    let data_len = data.len();
+    let peer_count = peers.len();
+    let branch_count = requested_branch_count.min(peer_count);
+    let slot = state
+        .current_ledger_seq
+        .load(Ordering::Relaxed)
+        .saturating_add(1);
+    let config = state.txset_shard_config;
+    let coding_executor = state.txset_coding_executor.read().await.clone();
+    let encode_start = Instant::now();
+    let encoded = tokio::task::spawn_blocking(move || {
+        let shards = make_txset_shards_parallel(hash, &data, peer_count, config, &coding_executor)?;
+        shards
+            .into_iter()
+            .map(|shard| {
+                let is_original = shard.is_original();
+                (0..branch_count)
+                    .map(|branch_index| {
+                        shard
+                            .with_branch(branch_index, branch_count)
+                            .encode()
+                            .map(|message| (is_original, Arc::new(message)))
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+            })
+            .collect::<Result<Vec<_>, String>>()
+    })
+    .await;
+    let encoded = match encoded {
+        Ok(Ok(encoded)) => encoded,
+        Ok(Err(e)) => {
+            warn!(
+                "TXSET_SHARD_BROADCAST_DROP: failed to code TX set {:02x?}...: {}",
+                &hash[..4],
+                e
+            );
+            return;
+        }
+        Err(e) => {
+            warn!(
+                "TXSET_SHARD_BROADCAST_DROP: coding task for {:02x?}... failed: {}",
+                &hash[..4],
+                e
+            );
+            return;
+        }
+    };
+    if state.current_ledger_seq.load(Ordering::Relaxed) >= slot
+        || state.txset_shard_generation.load(Ordering::Relaxed) != generation
+    {
+        let message_count: usize = encoded.iter().map(Vec::len).sum();
+        state
+            .metrics
+            .flood_txset_push_dropped
+            .fetch_add(message_count as u64, Ordering::Relaxed);
+        debug!(
+            "TXSET_SHARD_BROADCAST_STALE: dropping {} coded shreds for closed or superseded slot {}",
+            message_count,
+            slot
+        );
+        return;
+    }
+    state
+        .metrics
+        .txset_shard_encode_sum_us
+        .fetch_add(encode_start.elapsed().as_micros() as u64, Ordering::Relaxed);
+    state
+        .metrics
+        .txset_shard_encode_count
+        .fetch_add(1, Ordering::Relaxed);
+    state
+        .metrics
+        .txset_shard_broadcast
+        .fetch_add(1, Ordering::Relaxed);
+    state
+        .metrics
+        .message_broadcast
+        .fetch_add(1, Ordering::Relaxed);
+
+    let original_shards = encoded
+        .iter()
+        .filter(|branches| branches.first().is_some_and(|(original, _)| *original))
+        .count();
+    let recovery_shards = encoded.len() - original_shards;
+    info!(
+        "TXSET_SHARD_BROADCAST: TX set {:02x?}... ({} bytes) -> {} original + {} recovery shreds, branch factor {}, across {} peers",
+        &hash[..4],
+        data_len,
+        original_shards,
+        recovery_shards,
+        branch_count,
+        peer_count
+    );
+
+    for (peer, offsets) in peers.into_iter().zip(assign_shard_branches_to_peer_offsets(
+        encoded.len(),
+        peer_count,
+        branch_count,
+    )) {
+        let state = Arc::clone(&state);
+        let messages: Vec<_> = offsets
+            .into_iter()
+            .map(|(offset, branch_index)| encoded[offset][branch_index].clone())
+            .collect();
+        tokio::spawn(async move {
+            let message_count = messages.len();
+            for (offset, (is_original, message)) in messages.into_iter().enumerate() {
+                if state.current_ledger_seq.load(Ordering::Relaxed) >= slot
+                    || state.txset_shard_generation.load(Ordering::Relaxed) != generation
+                {
+                    state
+                        .metrics
+                        .flood_txset_push_dropped
+                        .fetch_add((message_count - offset) as u64, Ordering::Relaxed);
+                    break;
+                }
+                match send_to_peer_stream(&state, peer, StreamType::TxSetShard, &message).await {
+                    Ok(()) => {
+                        state.metrics.message_write.fetch_add(1, Ordering::Relaxed);
+                        state.metrics.send_txset.fetch_add(1, Ordering::Relaxed);
+                        state
+                            .metrics
+                            .flood_txset_push
+                            .fetch_add(1, Ordering::Relaxed);
+                        state
+                            .metrics
+                            .byte_write
+                            .fetch_add(message.len() as u64, Ordering::Relaxed);
+                        state
+                            .metrics
+                            .flood_txset_push_bytes
+                            .fetch_add(message.len() as u64, Ordering::Relaxed);
+                        let counter = if is_original {
+                            &state.metrics.txset_shard_original_sent
+                        } else {
+                            &state.metrics.txset_shard_recovery_sent
+                        };
+                        counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        state.metrics.error_write.fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            "TXSET_SHARD_SEND_FAIL: failed sending {:02x?}... shred to {}: {}",
+                            &hash[..4],
+                            peer,
+                            e
+                        );
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Open SCP, TX, TxSet-fetch, and TxSet-shred streams to a peer.
 /// Spawned as a background task so the swarm event loop stays unblocked —
 /// `control.open_stream()` needs the swarm to be polled to complete.
 async fn open_streams_to_peer(mut control: Control, state: Arc<SharedState>, peer_id: PeerId) {
@@ -1362,12 +1611,15 @@ async fn open_streams_to_peer(mut control: Control, state: Arc<SharedState>, pee
 
     let mut control2 = control.clone();
     let mut control3 = control.clone();
+    let mut control4 = control.clone();
 
     let scp_fut = async { control.open_stream(peer_id, SCP_PROTOCOL).await };
     let tx_fut = async { control2.open_stream(peer_id, TX_PROTOCOL).await };
     let txset_fut = async { control3.open_stream(peer_id, TXSET_PROTOCOL).await };
+    let txset_shard_fut = async { control4.open_stream(peer_id, TXSET_SHARD_PROTOCOL).await };
 
-    let (scp_result, tx_result, txset_result) = tokio::join!(scp_fut, tx_fut, txset_fut);
+    let (scp_result, tx_result, txset_result, txset_shard_result) =
+        tokio::join!(scp_fut, tx_fut, txset_fut, txset_shard_fut);
 
     let scp_stream = match scp_result {
         Ok(s) => {
@@ -1401,6 +1653,16 @@ async fn open_streams_to_peer(mut control: Control, state: Arc<SharedState>, pee
             None
         }
     };
+    let txset_shard_stream = match txset_shard_result {
+        Ok(s) => {
+            debug!("Opened TxSet shred stream to {}", peer_id);
+            Some(s)
+        }
+        Err(e) => {
+            warn!("Failed to open TxSet shred stream to {}: {:?}", peer_id, e);
+            None
+        }
+    };
 
     // Store streams
     {
@@ -1414,6 +1676,9 @@ async fn open_streams_to_peer(mut control: Control, state: Arc<SharedState>, pee
             }
             if let Some(stream) = txset_stream {
                 *peer_streams.txset.lock().await = Some(stream);
+            }
+            if let Some(stream) = txset_shard_stream {
+                *peer_streams.txset_shard.lock().await = Some(stream);
             }
         }
     }
@@ -1435,6 +1700,7 @@ enum StreamType {
     Scp,
     Tx,
     TxSet,
+    TxSetShard,
 }
 
 impl StreamType {
@@ -1443,6 +1709,7 @@ impl StreamType {
             StreamType::Scp => SCP_PROTOCOL,
             StreamType::Tx => TX_PROTOCOL,
             StreamType::TxSet => TXSET_PROTOCOL,
+            StreamType::TxSetShard => TXSET_SHARD_PROTOCOL,
         }
     }
 }
@@ -1467,6 +1734,7 @@ async fn try_send_to_existing_stream(
         StreamType::Scp => &peer_streams.scp,
         StreamType::Tx => &peer_streams.tx,
         StreamType::TxSet => &peer_streams.txset,
+        StreamType::TxSetShard => &peer_streams.txset_shard,
     };
 
     let mut stream_guard = stream_mutex.lock().await;
@@ -1529,6 +1797,7 @@ async fn send_to_peer_stream_inner(
             StreamType::Scp => &peer_streams.scp,
             StreamType::Tx => &peer_streams.tx,
             StreamType::TxSet => &peer_streams.txset,
+            StreamType::TxSetShard => &peer_streams.txset_shard,
         };
 
         let mut stream_guard = stream_mutex.lock().await;
@@ -2137,67 +2406,6 @@ async fn push_tx_to_peers(
     }
 }
 
-/// Drain the latest-wins tx set push mailbox for `peer`: repeatedly take the
-/// newest queued set, drop it if its consensus round already completed, else
-/// send it. Exits (and clears the draining flag) when the mailbox is empty.
-async fn drain_txset_pushes(state: Arc<SharedState>, peer: PeerId) {
-    loop {
-        let (slot, hash, message) = {
-            let mut st = state.txset_push.lock().await;
-            match st.pending.remove(&peer) {
-                Some(entry) => entry,
-                None => {
-                    st.draining.remove(&peer);
-                    return;
-                }
-            }
-        };
-
-        let lcl = state.current_ledger_seq.load(Ordering::Relaxed);
-        if lcl >= slot {
-            // The round this set was nominated for has closed; pushing it now
-            // is pure waste and delays whatever is queued next.
-            debug!(
-                "TXSET_PUSH_STALE: dropping TX set {:02x?}... for closed slot {} (lcl {}) to {}",
-                &hash[..4],
-                slot,
-                lcl,
-                peer
-            );
-            state
-                .metrics
-                .flood_txset_push_dropped
-                .fetch_add(1, Ordering::Relaxed);
-            continue;
-        }
-
-        match send_to_peer_stream(&state, peer, StreamType::TxSet, &message).await {
-            Ok(_) => {
-                // Count under both the generic TxSet-send meter and the
-                // dedicated eager-push meters (successful sends only).
-                state.metrics.send_txset.fetch_add(1, Ordering::Relaxed);
-                state
-                    .metrics
-                    .flood_txset_push
-                    .fetch_add(1, Ordering::Relaxed);
-                state
-                    .metrics
-                    .flood_txset_push_bytes
-                    .fetch_add(message.len() as u64, Ordering::Relaxed);
-                state.metrics.message_write.fetch_add(1, Ordering::Relaxed);
-                state
-                    .metrics
-                    .byte_write
-                    .fetch_add(message.len() as u64, Ordering::Relaxed);
-            }
-            Err(e) => {
-                state.metrics.error_write.fetch_add(1, Ordering::Relaxed);
-                warn!("TXSET_BROADCAST_FAIL: push to {} failed: {}", peer, e);
-            }
-        }
-    }
-}
-
 /// Send a batch of TXs to `peer` as ONE stream write of concatenated
 /// length-prefixed Transaction frames (the receiver's framed-read loop splits
 /// them; wire format unchanged). On failure every TX in the batch is rescued
@@ -2476,6 +2684,24 @@ async fn handle_inbound_txset_streams(mut incoming: IncomingStreams, state: Arc<
                                 // rather than re-encoding.
                                 let txset_data = data[4..].to_vec();
                                 let hash = crate::xdr::sha256_hash(&txset_data);
+                                let already_completed = {
+                                    let mut store = state.txset_shard_store.lock().await;
+                                    store.partial.remove(&hash);
+                                    store.reconstructing.remove(&hash);
+                                    let already_completed = store.completed.peek(&hash).is_some();
+                                    if !already_completed {
+                                        store.completed.put(hash, HashSet::new());
+                                    }
+                                    already_completed
+                                };
+                                if already_completed {
+                                    trace!(
+                                        "TXSET_RECV_DUP: ignoring redundant full TX set {:02x?}... from {}",
+                                        &hash[..4],
+                                        peer_id
+                                    );
+                                    continue;
+                                }
 
                                 // Clear pending request flag and measure fetch latency
                                 let was_pending = {
@@ -2532,6 +2758,430 @@ async fn handle_inbound_txset_streams(mut incoming: IncomingStreams, state: Arc<
                 }
             }
         });
+    }
+}
+
+async fn handle_inbound_txset_shard_streams(
+    mut incoming: IncomingStreams,
+    state: Arc<SharedState>,
+) {
+    while let Some((peer_id, mut stream)) = incoming.next().await {
+        debug!("Accepted inbound TxSet shred stream from {}", peer_id);
+        state.metrics.inbound_live.fetch_add(1, Ordering::Relaxed);
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            loop {
+                match read_framed(&mut stream).await {
+                    Ok(data) => {
+                        state.metrics.message_read.fetch_add(1, Ordering::Relaxed);
+                        state
+                            .metrics
+                            .byte_read
+                            .fetch_add(data.len() as u64, Ordering::Relaxed);
+                        handle_txset_shard_message(&state, peer_id, data).await;
+                    }
+                    Err(e) => {
+                        state.metrics.error_read.fetch_add(1, Ordering::Relaxed);
+                        state.metrics.inbound_live.fetch_sub(1, Ordering::Relaxed);
+                        info!("TxSet shred stream from {} closed: {}", peer_id, e);
+                        break;
+                    }
+                }
+            }
+        });
+    }
+}
+
+async fn handle_txset_shard_message(state: &Arc<SharedState>, from: PeerId, data: Vec<u8>) {
+    let shard = match TxSetShardMessage::decode(&data) {
+        Ok(shard) => shard,
+        Err(e) => {
+            state
+                .metrics
+                .txset_shard_invalid
+                .fetch_add(1, Ordering::Relaxed);
+            warn!(
+                "TXSET_SHARD_PARSE_ERR: dropping malformed shred from {}: {}",
+                from, e
+            );
+            return;
+        }
+    };
+
+    enum ShardAction {
+        Accepted {
+            unique: bool,
+            ready: Option<(TxSetShardAccumulator, usize, Duration)>,
+        },
+        Invalid(String),
+    }
+
+    let action = {
+        let mut store = state.txset_shard_store.lock().await;
+
+        if let Some(seen) = store.completed.get_mut(&shard.hash) {
+            ShardAction::Accepted {
+                unique: seen.insert(shard.shard_index),
+                ready: None,
+            }
+        } else if let Some(seen) = store.reconstructing.get_mut(&shard.hash) {
+            ShardAction::Accepted {
+                unique: seen.insert(shard.shard_index),
+                ready: None,
+            }
+        } else {
+            if !store.partial.contains_key(&shard.hash)
+                && store.partial.len() >= TXSET_MAX_ACTIVE_ACCUMULATORS
+            {
+                if let Some(oldest) = store
+                    .partial
+                    .iter()
+                    .min_by_key(|(_, accumulator)| accumulator.created_at)
+                    .map(|(hash, _)| *hash)
+                {
+                    store.partial.remove(&oldest);
+                    state
+                        .metrics
+                        .txset_shard_accumulator_evicted
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+
+            let insert_result = store
+                .partial
+                .entry(shard.hash)
+                .or_insert_with(|| TxSetShardAccumulator::new(&shard))
+                .insert(&shard);
+            match insert_result {
+                Ok(unique) => {
+                    let ready = unique
+                        && store
+                            .partial
+                            .get(&shard.hash)
+                            .is_some_and(TxSetShardAccumulator::is_ready);
+                    if ready {
+                        let accumulator = store
+                            .partial
+                            .remove(&shard.hash)
+                            .expect("ready TX-set accumulator must exist");
+                        let received_shards = accumulator.shard_count();
+                        let elapsed = accumulator.created_at.elapsed();
+                        store
+                            .reconstructing
+                            .insert(shard.hash, accumulator.shard_indexes());
+                        ShardAction::Accepted {
+                            unique,
+                            ready: Some((accumulator, received_shards, elapsed)),
+                        }
+                    } else {
+                        ShardAction::Accepted {
+                            unique,
+                            ready: None,
+                        }
+                    }
+                }
+                Err(e) => {
+                    // A conflicting or parameter-incompatible shred must not
+                    // poison this content hash until the 60-second expiry.
+                    store.partial.remove(&shard.hash);
+                    ShardAction::Invalid(e)
+                }
+            }
+        }
+    };
+
+    let (unique, ready) = match action {
+        ShardAction::Accepted { unique, ready } => (unique, ready),
+        ShardAction::Invalid(e) => {
+            state
+                .metrics
+                .txset_shard_invalid
+                .fetch_add(1, Ordering::Relaxed);
+            warn!(
+                "TXSET_SHARD_CONFLICT: shred {} for {:02x?}... from {}: {}",
+                shard.shard_index,
+                &shard.hash[..4],
+                from,
+                e
+            );
+            return;
+        }
+    };
+
+    if unique {
+        state
+            .metrics
+            .txset_shard_recv_unique
+            .fetch_add(1, Ordering::Relaxed);
+    } else {
+        state
+            .metrics
+            .txset_shard_recv_duplicate
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    if shard.ttl > 0 && unique {
+        rebroadcast_txset_shard(state, &shard, from).await;
+    }
+
+    let Some((accumulator, received_shards, elapsed)) = ready else {
+        return;
+    };
+
+    // Reed–Solomon decoding and strict XDR validation are CPU work. Run both
+    // away from Tokio's async workers, just as the nominator does for coding.
+    let reconstruct_start = Instant::now();
+    let hash = shard.hash;
+    let coding_executor = state.txset_coding_executor.read().await.clone();
+    let decoded = tokio::task::spawn_blocking(move || {
+        let result = accumulator
+            .reconstruct_parallel(&coding_executor)?
+            .ok_or_else(|| "ready accumulator did not reconstruct".to_string())?;
+        if !crate::xdr::tx_set_hash_matches(&hash, &result.data) {
+            return Err("reconstructed TX set has the wrong content hash".to_string());
+        }
+        crate::xdr::validate_tx_set(&result.data)
+            .map_err(|e| format!("reconstructed TX set is not strict XDR: {e}"))?;
+        Ok::<_, String>(result)
+    })
+    .await;
+    let reconstruct_us = reconstruct_start.elapsed().as_micros() as u64;
+    state
+        .metrics
+        .txset_shard_reconstruct_sum_us
+        .fetch_add(reconstruct_us, Ordering::Relaxed);
+    state
+        .metrics
+        .txset_shard_reconstruct_count
+        .fetch_add(1, Ordering::Relaxed);
+
+    let result = match decoded {
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => {
+            state
+                .metrics
+                .txset_shard_invalid
+                .fetch_add(1, Ordering::Relaxed);
+            state
+                .txset_shard_store
+                .lock()
+                .await
+                .reconstructing
+                .remove(&shard.hash);
+            warn!(
+                "TXSET_SHARD_VALIDATE_FAIL: reconstructed TX set {:02x?}...: {}",
+                &shard.hash[..4],
+                e
+            );
+            return;
+        }
+        Err(e) => {
+            state
+                .metrics
+                .txset_shard_invalid
+                .fetch_add(1, Ordering::Relaxed);
+            state
+                .txset_shard_store
+                .lock()
+                .await
+                .reconstructing
+                .remove(&shard.hash);
+            warn!(
+                "TXSET_SHARD_DECODE_TASK_FAIL: TX set {:02x?}...: {}",
+                &shard.hash[..4],
+                e
+            );
+            return;
+        }
+    };
+
+    let already_completed = {
+        let mut store = state.txset_shard_store.lock().await;
+        let seen = store.reconstructing.remove(&shard.hash).unwrap_or_default();
+        if let Some(existing) = store.completed.get_mut(&shard.hash) {
+            existing.extend(seen);
+            true
+        } else {
+            store.completed.put(shard.hash, seen);
+            false
+        }
+    };
+    if already_completed {
+        trace!(
+            "TXSET_SHARD_RECONSTRUCT_DUP: full TX-set response won race for {:02x?}...",
+            &shard.hash[..4]
+        );
+        return;
+    }
+
+    let reconstruction_counter = if result.used_recovery {
+        &state.metrics.txset_shard_reconstruct_recovery
+    } else {
+        &state.metrics.txset_shard_reconstruct_original
+    };
+    reconstruction_counter.fetch_add(1, Ordering::Relaxed);
+
+    // Eager reconstruction may win a race with the legacy safety-net fetch.
+    // Clearing it here prevents a later full-body response from doing duplicate
+    // work and records eager-path latency in the existing fetch timer.
+    let was_pending = {
+        let mut pending = state.pending_txset_requests.write().await;
+        if let Some((_, request_time)) = pending.remove(&shard.hash) {
+            state
+                .metrics
+                .fetch_txset_sum_us
+                .fetch_add(request_time.elapsed().as_micros() as u64, Ordering::Relaxed);
+            state
+                .metrics
+                .fetch_txset_count
+                .fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    };
+
+    info!(
+        "TXSET_SHARD_RECONSTRUCTED: {:02x?}... ({} bytes) from {} shreds in {:?}, recovery={}, fetch_preempted={}",
+        &shard.hash[..4],
+        result.data.len(),
+        received_shards,
+        elapsed,
+        result.used_recovery,
+        was_pending
+    );
+    if let Err(e) = state.event_tx.send(OverlayEvent::TxSetReceived {
+        hash: shard.hash,
+        data: result.data,
+        from,
+    }) {
+        warn!(
+            "TXSET_SHARD_TO_APP_FAIL: failed forwarding {:02x?}...: {}",
+            &shard.hash[..4],
+            e
+        );
+    }
+}
+
+async fn rebroadcast_txset_shard(
+    state: &Arc<SharedState>,
+    shard: &TxSetShardMessage,
+    from: PeerId,
+) {
+    let Some(next_ttl) = shard.ttl.checked_sub(1) else {
+        return;
+    };
+    let message = match shard.with_ttl(next_ttl).encode() {
+        Ok(message) => Arc::new(message),
+        Err(e) => {
+            warn!(
+                "TXSET_SHARD_FORWARD_DROP: failed encoding shred {} for {:02x?}...: {}",
+                shard.shard_index,
+                &shard.hash[..4],
+                e
+            );
+            return;
+        }
+    };
+    // The leader and every root derive the same sorted receiver list in the
+    // fully-connected Tier-1 mesh. Verify this node really is the designated
+    // root, then relay only to its disjoint branch partition.
+    let streams = state.peer_streams.read().await;
+    let mut leader_peers: Vec<_> = streams
+        .keys()
+        .filter(|peer| **peer != from)
+        .cloned()
+        .collect();
+    leader_peers.push(state.local_peer_id);
+    leader_peers.sort_by_key(|peer| peer.to_bytes());
+    leader_peers.dedup();
+    let peer_count = leader_peers.len();
+    let expected_root = (shard.shard_index * shard.branch_count + shard.branch_index) % peer_count;
+    if leader_peers[expected_root] != state.local_peer_id {
+        warn!(
+            "TXSET_SHARD_FORWARD_DROP: local node is not branch {} root for shred {} of {:02x?}...",
+            shard.branch_index,
+            shard.shard_index,
+            &shard.hash[..4]
+        );
+        return;
+    }
+    let target_offsets = match relay_target_peer_offsets(
+        peer_count,
+        shard.shard_index,
+        shard.branch_index,
+        shard.branch_count,
+    ) {
+        Ok(offsets) => offsets,
+        Err(e) => {
+            warn!(
+                "TXSET_SHARD_FORWARD_DROP: invalid branch for shred {} of {:02x?}...: {}",
+                shard.shard_index,
+                &shard.hash[..4],
+                e
+            );
+            return;
+        }
+    };
+    let peers: Vec<_> = target_offsets
+        .into_iter()
+        .filter_map(|offset| {
+            let peer = leader_peers[offset];
+            (peer != state.local_peer_id && streams.contains_key(&peer)).then_some(peer)
+        })
+        .collect();
+    drop(streams);
+
+    for peer in peers {
+        let state = Arc::clone(state);
+        let message = Arc::clone(&message);
+        let hash = shard.hash;
+        let shard_index = shard.shard_index;
+        tokio::spawn(async move {
+            match send_to_peer_stream(&state, peer, StreamType::TxSetShard, &message).await {
+                Ok(()) => {
+                    state.metrics.message_write.fetch_add(1, Ordering::Relaxed);
+                    state
+                        .metrics
+                        .byte_write
+                        .fetch_add(message.len() as u64, Ordering::Relaxed);
+                    state
+                        .metrics
+                        .txset_shard_forwarded
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    state.metrics.error_write.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        "TXSET_SHARD_FORWARD_FAIL: shred {} for {:02x?}... to {}: {}",
+                        shard_index,
+                        &hash[..4],
+                        peer,
+                        e
+                    );
+                }
+            }
+        });
+    }
+}
+
+async fn txset_shard_housekeeping_task(state: Arc<SharedState>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(10));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        let mut store = state.txset_shard_store.lock().await;
+        let before = store.partial.len();
+        store.partial.retain(|_, accumulator| {
+            accumulator.created_at.elapsed() <= TXSET_SHARD_ACCUMULATOR_TTL
+        });
+        let evicted = before - store.partial.len();
+        if evicted > 0 {
+            state
+                .metrics
+                .txset_shard_accumulator_evicted
+                .fetch_add(evicted as u64, Ordering::Relaxed);
+        }
     }
 }
 
@@ -2686,8 +3336,269 @@ fn test_txset_xdr(seed: u8) -> ([u8; 32], Vec<u8>) {
 }
 
 #[cfg(test)]
+fn test_large_txset_xdr(seed: u8, target_bytes: usize) -> ([u8; 32], Vec<u8>) {
+    use stellar_xdr::curr::{
+        GeneralizedTransactionSet, Hash, Limits, ReadXdr, TransactionEnvelope, TransactionPhase,
+        TxSetComponent, TxSetComponentTxsMaybeDiscountedFee, VecM, WriteXdr,
+    };
+
+    let envelope =
+        TransactionEnvelope::from_xdr(test_tx_xdr(seed as i64 + 1), Limits::none()).unwrap();
+    let envelope_len = envelope.to_xdr(Limits::none()).unwrap().len();
+    let tx_count = target_bytes.div_ceil(envelope_len).max(1);
+    let component =
+        TxSetComponent::TxsetCompTxsMaybeDiscountedFee(TxSetComponentTxsMaybeDiscountedFee {
+            base_fee: None,
+            txs: VecM::try_from(vec![envelope; tx_count]).unwrap(),
+        });
+    let mut tx_set = GeneralizedTransactionSet::default();
+    let GeneralizedTransactionSet::V1(v1) = &mut tx_set;
+    v1.previous_ledger_hash = Hash([seed; 32]);
+    v1.phases = VecM::try_from(vec![TransactionPhase::V0(
+        VecM::try_from(vec![component]).unwrap(),
+    )])
+    .unwrap();
+    let bytes = tx_set.to_xdr(Limits::none()).unwrap();
+    let hash = crate::xdr::sha256_hash(&bytes);
+    (hash, bytes)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_txset_shred_handler_reconstructs_with_and_without_recovery() {
+        for use_recovery in [false, true] {
+            let metrics = Arc::new(OverlayMetrics::new());
+            let keypair = Keypair::generate_ed25519();
+            let (_handle, mut events, _tx_events, overlay) =
+                create_overlay(keypair, Arc::clone(&metrics)).unwrap();
+            let state = Arc::clone(&overlay.state);
+            let (hash, expected) = test_txset_xdr(if use_recovery { 0x62 } else { 0x61 });
+            let config = TxSetShardConfig {
+                target_shard_size: 8,
+                recovery_factor_percent: 50,
+                initial_ttl: 0,
+            };
+            let shreds = make_txset_shards(hash, &expected, 2, config).unwrap();
+            let original_count = shreds[0].original_shards;
+            state
+                .pending_txset_requests
+                .write()
+                .await
+                .insert(hash, (PeerId::random(), Instant::now()));
+            let selected: Vec<_> = if use_recovery {
+                shreds
+                    .iter()
+                    .filter(|shred| shred.shard_index != 0)
+                    .take(original_count)
+                    .collect()
+            } else {
+                shreds.iter().filter(|shred| shred.is_original()).collect()
+            };
+            for shred in selected {
+                handle_txset_shard_message(&state, PeerId::random(), shred.encode().unwrap()).await;
+            }
+
+            let event = tokio::time::timeout(Duration::from_millis(100), events.recv())
+                .await
+                .expect("reconstruction event timed out")
+                .expect("event channel closed");
+            match event {
+                OverlayEvent::TxSetReceived {
+                    hash: received_hash,
+                    data,
+                    ..
+                } => {
+                    assert_eq!(received_hash, hash);
+                    assert_eq!(data, expected);
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+            assert_eq!(
+                metrics
+                    .txset_shard_reconstruct_original
+                    .load(Ordering::Relaxed),
+                (!use_recovery) as u64
+            );
+            assert_eq!(
+                metrics
+                    .txset_shard_reconstruct_recovery
+                    .load(Ordering::Relaxed),
+                use_recovery as u64
+            );
+            assert_eq!(metrics.fetch_txset_count.load(Ordering::Relaxed), 1);
+            assert!(!state
+                .pending_txset_requests
+                .read()
+                .await
+                .contains_key(&hash));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_txset_shred_handler_rejects_wrong_content_hash() {
+        let metrics = Arc::new(OverlayMetrics::new());
+        let keypair = Keypair::generate_ed25519();
+        let (_handle, mut events, _tx_events, overlay) =
+            create_overlay(keypair, Arc::clone(&metrics)).unwrap();
+        let state = Arc::clone(&overlay.state);
+        let (_, expected) = test_txset_xdr(0x63);
+        let wrong_hash = [0xff; 32];
+        let shreds =
+            make_txset_shards(wrong_hash, &expected, 2, TxSetShardConfig::default()).unwrap();
+        for shred in shreds.iter().filter(|shred| shred.is_original()) {
+            handle_txset_shard_message(&state, PeerId::random(), shred.encode().unwrap()).await;
+        }
+
+        assert!(events.try_recv().is_err());
+        assert_eq!(metrics.txset_shard_invalid.load(Ordering::Relaxed), 1);
+        assert!(state
+            .txset_shard_store
+            .lock()
+            .await
+            .completed
+            .peek(&wrong_hash)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_txset_shred_completion_is_atomic_and_replays_are_deduplicated() {
+        let metrics = Arc::new(OverlayMetrics::new());
+        let keypair = Keypair::generate_ed25519();
+        let (_handle, mut events, _tx_events, overlay) =
+            create_overlay(keypair, Arc::clone(&metrics)).unwrap();
+        let state = Arc::clone(&overlay.state);
+        let (hash, expected) = test_txset_xdr(0x65);
+        let config = TxSetShardConfig {
+            target_shard_size: 8,
+            recovery_factor_percent: 50,
+            initial_ttl: 0,
+        };
+        let shreds = make_txset_shards(hash, &expected, 2, config).unwrap();
+        assert_eq!(shreds.len(), 3);
+
+        // The recovery shred arrives while threshold reconstruction is on the
+        // blocking pool. It must not create a second accumulator or event.
+        tokio::join!(
+            handle_txset_shard_message(&state, PeerId::random(), shreds[0].encode().unwrap()),
+            handle_txset_shard_message(&state, PeerId::random(), shreds[1].encode().unwrap()),
+            handle_txset_shard_message(&state, PeerId::random(), shreds[2].encode().unwrap()),
+        );
+
+        let event = events.recv().await.expect("missing reconstruction event");
+        assert!(matches!(
+            event,
+            OverlayEvent::TxSetReceived { hash: h, data, .. }
+                if h == hash && data == expected
+        ));
+        assert!(events.try_recv().is_err(), "duplicate reconstruction event");
+        assert_eq!(
+            metrics
+                .txset_shard_reconstruct_count
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(state.txset_shard_store.lock().await.partial.is_empty());
+
+        let unique_before = metrics.txset_shard_recv_unique.load(Ordering::Relaxed);
+        let duplicate_before = metrics.txset_shard_recv_duplicate.load(Ordering::Relaxed);
+        for _ in 0..2 {
+            handle_txset_shard_message(&state, PeerId::random(), shreds[0].encode().unwrap()).await;
+        }
+        assert_eq!(
+            metrics.txset_shard_recv_unique.load(Ordering::Relaxed),
+            unique_before
+        );
+        assert_eq!(
+            metrics.txset_shard_recv_duplicate.load(Ordering::Relaxed),
+            duplicate_before + 2
+        );
+    }
+
+    #[tokio::test]
+    async fn test_conflicting_shred_does_not_poison_content_hash() {
+        let metrics = Arc::new(OverlayMetrics::new());
+        let keypair = Keypair::generate_ed25519();
+        let (_handle, mut events, _tx_events, overlay) =
+            create_overlay(keypair, Arc::clone(&metrics)).unwrap();
+        let state = Arc::clone(&overlay.state);
+        let (hash, expected) = test_txset_xdr(0x66);
+        let config = TxSetShardConfig {
+            target_shard_size: 8,
+            recovery_factor_percent: 50,
+            initial_ttl: 0,
+        };
+        let shreds = make_txset_shards(hash, &expected, 2, config).unwrap();
+        handle_txset_shard_message(&state, PeerId::random(), shreds[0].encode().unwrap()).await;
+        let mut conflicting = shreds[0].clone();
+        conflicting.payload[0] ^= 1;
+        handle_txset_shard_message(&state, PeerId::random(), conflicting.encode().unwrap()).await;
+
+        // The valid stream can restart immediately after the conflict.
+        for shred in shreds.iter().filter(|shred| shred.is_original()) {
+            handle_txset_shard_message(&state, PeerId::random(), shred.encode().unwrap()).await;
+        }
+        let event = events.recv().await.expect("missing reconstruction event");
+        assert!(matches!(
+            event,
+            OverlayEvent::TxSetReceived { hash: h, data, .. }
+                if h == hash && data == expected
+        ));
+        assert_eq!(metrics.txset_shard_invalid.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_txset_shred_accumulators_are_capacity_bounded() {
+        let metrics = Arc::new(OverlayMetrics::new());
+        let keypair = Keypair::generate_ed25519();
+        let (_handle, _events, _tx_events, overlay) =
+            create_overlay(keypair, Arc::clone(&metrics)).unwrap();
+        let state = Arc::clone(&overlay.state);
+        let (_, data) = test_txset_xdr(0x64);
+        let config = TxSetShardConfig {
+            initial_ttl: 0,
+            ..TxSetShardConfig::default()
+        };
+        for i in 0..=TXSET_MAX_ACTIVE_ACCUMULATORS {
+            let shreds = make_txset_shards([i as u8; 32], &data, 15, config).unwrap();
+            handle_txset_shard_message(&state, PeerId::random(), shreds[0].encode().unwrap()).await;
+        }
+
+        assert_eq!(
+            state.txset_shard_store.lock().await.partial.len(),
+            TXSET_MAX_ACTIVE_ACCUMULATORS
+        );
+        assert_eq!(
+            metrics
+                .txset_shard_accumulator_evicted
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_superseded_txset_broadcast_drops_coded_shreds() {
+        let metrics = Arc::new(OverlayMetrics::new());
+        let keypair = Keypair::generate_ed25519();
+        let (_handle, _events, _tx_events, overlay) =
+            create_overlay(keypair, Arc::clone(&metrics)).unwrap();
+        let state = Arc::clone(&overlay.state);
+        state
+            .peer_streams
+            .write()
+            .await
+            .insert(PeerId::random(), Arc::new(PeerOutboundStreams::new()));
+        state.txset_shard_generation.store(2, Ordering::Relaxed);
+        let (hash, data) = test_txset_xdr(0x67);
+
+        broadcast_txset_shards(state, hash, data, 1).await;
+
+        assert_eq!(metrics.txset_shard_broadcast.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.flood_txset_push_dropped.load(Ordering::Relaxed), 3);
+        assert_eq!(metrics.flood_txset_push.load(Ordering::Relaxed), 0);
+    }
 
     #[tokio::test]
     async fn test_overlay_creation() {
@@ -2706,6 +3617,44 @@ mod tests {
             .await
             .expect("Overlay should shutdown")
             .expect("Overlay task should complete");
+    }
+
+    #[tokio::test]
+    async fn test_txset_coding_parallelism_is_cluster_bounded() {
+        let keypair = Keypair::generate_ed25519();
+        let (handle, _events, _tx_events, overlay) =
+            create_overlay(keypair, Arc::new(OverlayMetrics::new())).unwrap();
+
+        assert_eq!(
+            overlay
+                .state
+                .txset_coding_executor
+                .read()
+                .await
+                .max_parallelism(),
+            1
+        );
+        handle.set_txset_coding_parallelism(4).await.unwrap();
+        assert_eq!(
+            overlay
+                .state
+                .txset_coding_executor
+                .read()
+                .await
+                .max_parallelism(),
+            4
+        );
+        assert!(handle.set_txset_coding_parallelism(0).await.is_err());
+        assert_eq!(
+            overlay
+                .state
+                .txset_coding_executor
+                .read()
+                .await
+                .max_parallelism(),
+            4,
+            "an invalid update must preserve the previous pool"
+        );
     }
 
     #[tokio::test]
@@ -3400,12 +4349,9 @@ mod tests {
         handle2.shutdown().await;
     }
 
-    /// Direct leader flooding (TxSet dissemination, docs/direct-leader-flooding.md):
-    /// the round-1 leader's eager `broadcast_txset` pushes the full body to
-    /// EVERY connected peer, unsolicited. Each peer receives a `TxSetReceived`
-    /// event from a single broadcast call, with no request round-trip -- which
-    /// is the latency win. Uses a 3-node star (leader + 2 peers) to exercise the
-    /// "to all peers" fan-out.
+    /// Eager TX-set shreds on the fully-connected Tier-1 topology: the leader
+    /// sends each Reed–Solomon shred to two roots. The roots partition the
+    /// remaining recipients; in this three-node case both receivers are roots.
     #[tokio::test]
     async fn test_broadcast_txset_to_all_peers() {
         let keypair1 = Keypair::generate_ed25519();
@@ -3415,10 +4361,12 @@ mod tests {
         let metrics1 = Arc::new(OverlayMetrics::new());
         let (handle1, mut events1, _tx_events1, overlay1) =
             create_overlay(keypair1, Arc::clone(&metrics1)).unwrap();
+        let metrics2 = Arc::new(OverlayMetrics::new());
+        let metrics3 = Arc::new(OverlayMetrics::new());
         let (handle2, mut events2, _tx_events2, overlay2) =
-            create_overlay(keypair2, Arc::new(OverlayMetrics::new())).unwrap();
+            create_overlay(keypair2, Arc::clone(&metrics2)).unwrap();
         let (handle3, mut events3, _tx_events3, overlay3) =
-            create_overlay(keypair3, Arc::new(OverlayMetrics::new())).unwrap();
+            create_overlay(keypair3, Arc::clone(&metrics3)).unwrap();
 
         let listen_port = 24201;
         tokio::spawn(async move { overlay1.run("127.0.0.1", listen_port).await });
@@ -3427,24 +4375,39 @@ mod tests {
         tokio::spawn(async move { overlay3.run("127.0.0.1", 24203).await });
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // Both peers connect to the leader (node1).
-        let addr: Multiaddr = format!("/ip4/127.0.0.1/udp/{}/quic-v1", listen_port)
+        // Fully connect all three validators.
+        let leader_addr: Multiaddr = format!("/ip4/127.0.0.1/udp/{}/quic-v1", listen_port)
             .parse()
             .unwrap();
-        handle2.dial(addr.clone()).await;
-        handle3.dial(addr).await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        let peer2_addr: Multiaddr = "/ip4/127.0.0.1/udp/24202/quic-v1".parse().unwrap();
+        handle2.dial(leader_addr.clone()).await;
+        handle3.dial(leader_addr).await;
+        handle3.dial(peer2_addr).await;
+
+        let connect_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < connect_deadline
+            && (handle1.connected_peer_count().await != 2
+                || handle2.connected_peer_count().await != 2
+                || handle3.connected_peer_count().await != 2)
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(handle1.connected_peer_count().await, 2);
+        assert_eq!(handle2.connected_peer_count().await, 2);
+        assert_eq!(handle3.connected_peer_count().await, 2);
+        // Connection establishment precedes the four protocol stream opens.
+        tokio::time::sleep(Duration::from_millis(300)).await;
 
         // Drain connection-setup events.
         while events1.try_recv().is_ok() {}
         while events2.try_recv().is_ok() {}
         while events3.try_recv().is_ok() {}
 
-        // Leader eagerly pushes a TxSet to all peers. No one requested it.
+        // Leader eagerly assigns shreds. No one requested the full body.
         let (want_hash, want_data) = test_txset_xdr(0x37);
         handle1.broadcast_txset(want_hash, want_data.clone()).await;
 
-        // Both peers must receive the unsolicited body from the single push.
+        // Both peers reconstruct the unsolicited body from the eager shreds.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let mut got2 = false;
         let mut got3 = false;
@@ -3470,20 +4433,269 @@ mod tests {
         assert!(got2, "peer2 should receive the eagerly pushed TxSet");
         assert!(got3, "peer3 should receive the eagerly pushed TxSet");
 
-        // The leader must not have been asked for it: this is a pure push, so
-        // no peer emits a request and the fan-out is exactly one send per peer.
+        // The leader must not have been asked for it: this is a pure push.
         assert!(
             !matches!(events1.try_recv(), Ok(OverlayEvent::TxSetRequested { .. })),
             "leader should not receive a TxSet request on the push path"
         );
-        // Exactly one successful push per connected peer.
-        assert_eq!(metrics1.flood_txset_push.load(Ordering::Relaxed), 2);
-        assert_eq!(metrics1.send_txset.load(Ordering::Relaxed), 2);
+        // Two originals + 50% recovery are sent to both branch roots.
+        let send_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while tokio::time::Instant::now() < send_deadline
+            && metrics1.flood_txset_push.load(Ordering::Relaxed) < 6
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(metrics1.flood_txset_push.load(Ordering::Relaxed), 6);
+        assert_eq!(metrics1.send_txset.load(Ordering::Relaxed), 6);
+        assert_eq!(
+            metrics1.txset_shard_original_sent.load(Ordering::Relaxed),
+            4
+        );
+        assert_eq!(
+            metrics1.txset_shard_recovery_sent.load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            metrics2.txset_shard_forwarded.load(Ordering::Relaxed)
+                + metrics3.txset_shard_forwarded.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            metrics2
+                .txset_shard_reconstruct_original
+                .load(Ordering::Relaxed)
+                + metrics2
+                    .txset_shard_reconstruct_recovery
+                    .load(Ordering::Relaxed)
+                + metrics3
+                    .txset_shard_reconstruct_original
+                    .load(Ordering::Relaxed)
+                + metrics3
+                    .txset_shard_reconstruct_recovery
+                    .load(Ordering::Relaxed),
+            2
+        );
         assert!(metrics1.flood_txset_push_bytes.load(Ordering::Relaxed) > 0);
 
         handle1.shutdown().await;
         handle2.shutdown().await;
         handle3.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "manual 15-validator TX-set latency and throughput baseline"]
+    async fn benchmark_txset_full_mesh_latency_and_bandwidth() {
+        const NODE_COUNT: usize = 15;
+        const BASE_PORT: u16 = 26201;
+        const TARGET_TXSET_BYTES: usize = 5 * 1024 * 1024;
+
+        let mut handles = Vec::with_capacity(NODE_COUNT);
+        let mut events = Vec::with_capacity(NODE_COUNT);
+        let mut peer_ids = Vec::with_capacity(NODE_COUNT);
+        let mut metrics = Vec::with_capacity(NODE_COUNT);
+        let mut states = Vec::with_capacity(NODE_COUNT);
+        for offset in 0..NODE_COUNT {
+            let keypair = Keypair::generate_ed25519();
+            peer_ids.push(keypair.public().to_peer_id());
+            let node_metrics = Arc::new(OverlayMetrics::new());
+            let (handle, node_events, _tx_events, overlay) =
+                create_overlay(keypair, Arc::clone(&node_metrics)).unwrap();
+            states.push(Arc::clone(&overlay.state));
+            handles.push(handle);
+            events.push(node_events);
+            metrics.push(node_metrics);
+            tokio::spawn(async move {
+                overlay.run("127.0.0.1", BASE_PORT + offset as u16).await;
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // Dial each undirected edge once to form the fully-connected Tier-1
+        // topology used by the reference experiment.
+        for (node, handle) in handles.iter().enumerate().skip(1) {
+            for prior in 0..node {
+                let address: Multiaddr =
+                    format!("/ip4/127.0.0.1/udp/{}/quic-v1", BASE_PORT + prior as u16)
+                        .parse()
+                        .unwrap();
+                handle.dial(address).await;
+            }
+        }
+        let connect_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let mut ready = true;
+            for handle in &handles {
+                ready &= handle.connected_peer_count().await == NODE_COUNT - 1;
+            }
+            if ready {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < connect_deadline,
+                "15-node mesh did not fully connect"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        for receiver in &mut events {
+            while receiver.try_recv().is_ok() {}
+        }
+
+        // Baseline: reproduce the previous eager-full strategy by sending one
+        // complete body from the leader to every other validator.
+        let (full_hash, full_data) = test_large_txset_xdr(0x71, TARGET_TXSET_BYTES);
+        let full_message = Arc::new(crate::xdr::frame_tx_set(&full_data));
+        let full_source_bytes = (full_message.len() * (NODE_COUNT - 1)) as u64;
+        let full_start = Instant::now();
+        let full_sends = peer_ids.iter().copied().skip(1).map(|peer_id| {
+            let state = Arc::clone(&states[0]);
+            let message = Arc::clone(&full_message);
+            async move { send_to_peer_stream(&state, peer_id, StreamType::TxSet, &message).await }
+        });
+        for result in futures::future::join_all(full_sends).await {
+            result.expect("eager-full baseline send failed");
+        }
+        let mut full_received = [false; NODE_COUNT];
+        let full_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while full_received.iter().skip(1).any(|received| !received) {
+            for node in 1..NODE_COUNT {
+                while let Ok(event) = events[node].try_recv() {
+                    if let OverlayEvent::TxSetReceived { hash, data, .. } = event {
+                        if hash == full_hash {
+                            assert_eq!(data, full_data);
+                            full_received[node] = true;
+                        }
+                    }
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < full_deadline,
+                "eager-full baseline timed out"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let full_latency = full_start.elapsed();
+
+        // Compare branch factors on the same warm mesh. Alternate their order
+        // to avoid systematically favoring the first or last run.
+        let mut factor_latencies = [Vec::new(), Vec::new()];
+        let mut factor_source_bytes = [0u64; 2];
+        let mut factor_aggregate_bytes = [0u64; 2];
+        for (sample, branch_count) in [1usize, 2, 2, 1, 1, 2].into_iter().enumerate() {
+            let (coded_hash, coded_data) =
+                test_large_txset_xdr(0x72 + sample as u8, TARGET_TXSET_BYTES);
+            assert_eq!(coded_data.len(), full_data.len());
+            let coded_bytes_before: Vec<_> = metrics
+                .iter()
+                .map(|node| node.byte_write.load(Ordering::Relaxed))
+                .collect();
+            let coded_source_before = metrics[0].flood_txset_push_bytes.load(Ordering::Relaxed);
+            let source_shreds_before = metrics[0].txset_shard_original_sent.load(Ordering::Relaxed)
+                + metrics[0].txset_shard_recovery_sent.load(Ordering::Relaxed);
+            let forwarded_before: u64 = metrics
+                .iter()
+                .map(|node| node.txset_shard_forwarded.load(Ordering::Relaxed))
+                .sum();
+
+            let coded_start = Instant::now();
+            let generation = states[0]
+                .txset_shard_generation
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(1);
+            broadcast_txset_shards_with_branching_factor(
+                Arc::clone(&states[0]),
+                coded_hash,
+                coded_data.clone(),
+                generation,
+                branch_count,
+            )
+            .await;
+            let mut coded_received = [false; NODE_COUNT];
+            let coded_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            while coded_received.iter().skip(1).any(|received| !received) {
+                for node in 1..NODE_COUNT {
+                    while let Ok(event) = events[node].try_recv() {
+                        if let OverlayEvent::TxSetReceived { hash, data, .. } = event {
+                            if hash == coded_hash {
+                                assert_eq!(data, coded_data);
+                                coded_received[node] = true;
+                            }
+                        }
+                    }
+                }
+                assert!(
+                    tokio::time::Instant::now() < coded_deadline,
+                    "coded dissemination timed out"
+                );
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            let coded_latency = coded_start.elapsed();
+
+            let plan = crate::txset_shards::plan_txset_shards(
+                coded_data.len(),
+                NODE_COUNT - 1,
+                TxSetShardConfig::default(),
+            )
+            .unwrap();
+            let branches = branch_count.min(NODE_COUNT - 1) as u64;
+            let expected_source_shreds = plan.total_shards() as u64 * branches;
+            let expected_forwarded =
+                plan.total_shards() as u64 * (NODE_COUNT as u64 - 1 - branches);
+            let flush_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let source_shreds = metrics[0].txset_shard_original_sent.load(Ordering::Relaxed)
+                    + metrics[0].txset_shard_recovery_sent.load(Ordering::Relaxed)
+                    - source_shreds_before;
+                let forwarded: u64 = metrics
+                    .iter()
+                    .map(|node| node.txset_shard_forwarded.load(Ordering::Relaxed))
+                    .sum::<u64>()
+                    - forwarded_before;
+                if source_shreds >= expected_source_shreds && forwarded >= expected_forwarded {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < flush_deadline,
+                    "coded sends did not flush"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let coded_source_bytes =
+                metrics[0].flood_txset_push_bytes.load(Ordering::Relaxed) - coded_source_before;
+            let coded_aggregate_bytes: u64 = metrics
+                .iter()
+                .zip(coded_bytes_before)
+                .map(|(node, before)| node.byte_write.load(Ordering::Relaxed) - before)
+                .sum();
+            let index = branch_count - 1;
+            factor_latencies[index].push(coded_latency);
+            factor_source_bytes[index] = coded_source_bytes;
+            factor_aggregate_bytes[index] = coded_aggregate_bytes;
+            eprintln!(
+                "txset-full-mesh-sample: branches={branch_count}, latency={coded_latency:?}, source={coded_source_bytes} bytes, aggregate={coded_aggregate_bytes} bytes"
+            );
+        }
+
+        for latencies in &mut factor_latencies {
+            latencies.sort_unstable();
+        }
+        eprintln!(
+            "txset-full-mesh: nodes={NODE_COUNT}, txset={} bytes, eager-full latency={full_latency:?} source={full_source_bytes} bytes; branches=1 median={:?} source={} aggregate={}; branches=2 median={:?} source={} aggregate={}",
+            full_data.len(),
+            factor_latencies[0][1],
+            factor_source_bytes[0],
+            factor_aggregate_bytes[0],
+            factor_latencies[1][1],
+            factor_source_bytes[1],
+            factor_aggregate_bytes[1],
+        );
+        assert!(factor_source_bytes[0] < full_source_bytes / 5);
+        assert!(factor_source_bytes[1] < full_source_bytes / 4);
+        assert_eq!(factor_aggregate_bytes[0], factor_aggregate_bytes[1]);
+
+        for handle in handles {
+            handle.shutdown().await;
+        }
     }
 
     /// Test multiple TXs flood with correct ordering (by fee)

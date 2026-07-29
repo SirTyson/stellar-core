@@ -83,15 +83,30 @@ pub struct OverlayMetrics {
     /// overlay.flood.leader-fallback — TXs INV-flooded because no configured
     /// leader was connected
     pub flood_leader_fallback: AtomicU64,
-    /// overlay.flood.txset-push — TX set bodies eagerly pushed to a peer by the
-    /// round-1 leader (successful sends only; one per peer per broadcast)
+    /// overlay.flood.txset-push — coded TX-set shreds initially assigned by the
+    /// round-1 leader (successful sends only)
     pub flood_txset_push: AtomicU64,
-    /// overlay.flood.txset-push-bytes — bytes of eagerly pushed TX set bodies
+    /// overlay.flood.txset-push-bytes — bytes of initially assigned TX-set shreds
     pub flood_txset_push_bytes: AtomicU64,
-    /// overlay.flood.txset-push-dropped — queued TX set pushes dropped without
-    /// sending: superseded by a newer slot's set for the same peer, or stale
-    /// (their consensus round completed) by drain time. Latest-wins queueing.
+    /// overlay.flood.txset-push-dropped — coded shreds skipped because a newer
+    /// TX set superseded them or their consensus round completed.
     pub flood_txset_push_dropped: AtomicU64,
+
+    // Eager erasure-coded TX-set dissemination.
+    pub txset_shard_broadcast: AtomicU64,
+    pub txset_shard_original_sent: AtomicU64,
+    pub txset_shard_recovery_sent: AtomicU64,
+    pub txset_shard_recv_unique: AtomicU64,
+    pub txset_shard_recv_duplicate: AtomicU64,
+    pub txset_shard_forwarded: AtomicU64,
+    pub txset_shard_reconstruct_original: AtomicU64,
+    pub txset_shard_reconstruct_recovery: AtomicU64,
+    pub txset_shard_invalid: AtomicU64,
+    pub txset_shard_accumulator_evicted: AtomicU64,
+    pub txset_shard_encode_sum_us: AtomicU64,
+    pub txset_shard_encode_count: AtomicU64,
+    pub txset_shard_reconstruct_sum_us: AtomicU64,
+    pub txset_shard_reconstruct_count: AtomicU64,
 
     // Connection lifecycle
     /// overlay.inbound.attempt — inbound connection attempts
@@ -167,6 +182,20 @@ impl Default for OverlayMetrics {
             flood_txset_push: AtomicU64::new(0),
             flood_txset_push_dropped: AtomicU64::new(0),
             flood_txset_push_bytes: AtomicU64::new(0),
+            txset_shard_broadcast: AtomicU64::new(0),
+            txset_shard_original_sent: AtomicU64::new(0),
+            txset_shard_recovery_sent: AtomicU64::new(0),
+            txset_shard_recv_unique: AtomicU64::new(0),
+            txset_shard_recv_duplicate: AtomicU64::new(0),
+            txset_shard_forwarded: AtomicU64::new(0),
+            txset_shard_reconstruct_original: AtomicU64::new(0),
+            txset_shard_reconstruct_recovery: AtomicU64::new(0),
+            txset_shard_invalid: AtomicU64::new(0),
+            txset_shard_accumulator_evicted: AtomicU64::new(0),
+            txset_shard_encode_sum_us: AtomicU64::new(0),
+            txset_shard_encode_count: AtomicU64::new(0),
+            txset_shard_reconstruct_sum_us: AtomicU64::new(0),
+            txset_shard_reconstruct_count: AtomicU64::new(0),
             inbound_attempt: AtomicU64::new(0),
             inbound_establish: AtomicU64::new(0),
             inbound_drop: AtomicU64::new(0),
@@ -234,6 +263,20 @@ impl OverlayMetrics {
             flood_txset_push: self.flood_txset_push.load(ORD),
             flood_txset_push_dropped: self.flood_txset_push_dropped.load(ORD),
             flood_txset_push_bytes: self.flood_txset_push_bytes.load(ORD),
+            txset_shard_broadcast: self.txset_shard_broadcast.load(ORD),
+            txset_shard_original_sent: self.txset_shard_original_sent.load(ORD),
+            txset_shard_recovery_sent: self.txset_shard_recovery_sent.load(ORD),
+            txset_shard_recv_unique: self.txset_shard_recv_unique.load(ORD),
+            txset_shard_recv_duplicate: self.txset_shard_recv_duplicate.load(ORD),
+            txset_shard_forwarded: self.txset_shard_forwarded.load(ORD),
+            txset_shard_reconstruct_original: self.txset_shard_reconstruct_original.load(ORD),
+            txset_shard_reconstruct_recovery: self.txset_shard_reconstruct_recovery.load(ORD),
+            txset_shard_invalid: self.txset_shard_invalid.load(ORD),
+            txset_shard_accumulator_evicted: self.txset_shard_accumulator_evicted.load(ORD),
+            txset_shard_encode_sum_us: self.txset_shard_encode_sum_us.load(ORD),
+            txset_shard_encode_count: self.txset_shard_encode_count.load(ORD),
+            txset_shard_reconstruct_sum_us: self.txset_shard_reconstruct_sum_us.load(ORD),
+            txset_shard_reconstruct_count: self.txset_shard_reconstruct_count.load(ORD),
             inbound_attempt: self.inbound_attempt.load(ORD),
             inbound_establish: self.inbound_establish.load(ORD),
             inbound_drop: self.inbound_drop.load(ORD),
@@ -309,6 +352,20 @@ pub struct MetricsSnapshot {
     pub flood_txset_push: u64,
     pub flood_txset_push_dropped: u64,
     pub flood_txset_push_bytes: u64,
+    pub txset_shard_broadcast: u64,
+    pub txset_shard_original_sent: u64,
+    pub txset_shard_recovery_sent: u64,
+    pub txset_shard_recv_unique: u64,
+    pub txset_shard_recv_duplicate: u64,
+    pub txset_shard_forwarded: u64,
+    pub txset_shard_reconstruct_original: u64,
+    pub txset_shard_reconstruct_recovery: u64,
+    pub txset_shard_invalid: u64,
+    pub txset_shard_accumulator_evicted: u64,
+    pub txset_shard_encode_sum_us: u64,
+    pub txset_shard_encode_count: u64,
+    pub txset_shard_reconstruct_sum_us: u64,
+    pub txset_shard_reconstruct_count: u64,
     pub inbound_attempt: u64,
     pub inbound_establish: u64,
     pub inbound_drop: u64,
@@ -338,6 +395,8 @@ mod tests {
         assert_eq!(m.connection_authenticated.load(ORD), 0);
         assert_eq!(m.byte_read.load(ORD), 0);
         assert_eq!(m.flood_advertised.load(ORD), 0);
+        assert_eq!(m.txset_shard_broadcast.load(ORD), 0);
+        assert_eq!(m.txset_shard_reconstruct_recovery.load(ORD), 0);
     }
 
     #[test]
@@ -346,11 +405,15 @@ mod tests {
         m.byte_read.fetch_add(1000, ORD);
         m.connection_authenticated.store(3, ORD);
         m.flood_advertised.fetch_add(42, ORD);
+        m.txset_shard_original_sent.fetch_add(20, ORD);
+        m.txset_shard_encode_sum_us.fetch_add(1234, ORD);
 
         let snap = m.snapshot();
         assert_eq!(snap.byte_read, 1000);
         assert_eq!(snap.connection_authenticated, 3);
         assert_eq!(snap.flood_advertised, 42);
+        assert_eq!(snap.txset_shard_original_sent, 20);
+        assert_eq!(snap.txset_shard_encode_sum_us, 1234);
     }
 
     #[test]
@@ -378,5 +441,6 @@ mod tests {
         let json = serde_json::to_string(&snap).unwrap();
         assert!(json.contains("\"connection_authenticated\":5"));
         assert!(json.contains("\"byte_read\":2048"));
+        assert!(json.contains("\"txset_shard_broadcast\":0"));
     }
 }

@@ -103,8 +103,10 @@ class OverlayIPC
      *
      * @param ledgerSeq The closed ledger sequence number
      * @param ledgerHash The closed ledger hash
+     * @param numClusters Maximum Reed-Solomon coding workers
      */
-    void notifyLedgerClosed(uint32_t ledgerSeq, Hash const& ledgerHash);
+    void notifyLedgerClosed(uint32_t ledgerSeq, Hash const& ledgerHash,
+                            uint32_t numClusters = 1);
 
     /**
      * Notify overlay that a TX set was externalized.
@@ -155,12 +157,14 @@ class OverlayIPC
      * @param knownPeers List of known peer addresses (host:port)
      * @param preferredPeers List of preferred peer addresses (host:port)
      * @param listenPort Local port to listen on
+     * @param numClusters Maximum Reed-Solomon coding workers
      */
     void setPeerConfig(std::vector<std::string> const& knownPeers,
                        std::vector<std::string> const& preferredPeers,
                        uint16_t listenPort,
                        std::vector<std::string> const& quorumMembers = {},
                        size_t txBatchMaxSize = 0,
+                       uint32_t numClusters = 1,
                        bool suppressTxBroadcast = false);
 
     /**
@@ -195,11 +199,11 @@ class OverlayIPC
     void cacheTxSet(Hash const& hash, std::vector<uint8_t> const& xdr);
 
     /**
-     * Eagerly push a locally-built TX set to all connected peers.
+     * Eagerly disseminate a locally-built TX set as erasure-coded shreds.
      *
      * Like cacheTxSet, but in addition to caching the set the overlay
-     * broadcasts the full body to every connected peer immediately, so
-     * receivers have it before/when they process the nomination that
+     * codes and assigns shreds immediately, so receivers have it before/when
+     * they process the nomination that
      * references it -- removing the GetTxSet request round-trip from the
      * nomination critical path. Intended for the round-1 leader only.
      *

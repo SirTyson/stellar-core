@@ -63,9 +63,8 @@ pub enum MessageType {
     /// election priority
     SetLeaders = 14,
 
-    /// Eagerly push a locally-built TX set to ALL connected peers (round-1
-    /// leader only): cache it locally AND broadcast the full body, skipping the
-    /// request/response round-trip. See docs/direct-leader-flooding.md.
+    /// Eagerly disseminate a locally-built TX set as erasure-coded shreds
+    /// (round-1 leader only), skipping the request/response round-trip.
     /// Payload: [hash:32][txSetXDR...]
     BroadcastTxSet = 15,
 

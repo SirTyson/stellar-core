@@ -14,6 +14,7 @@ pub mod integrated;
 mod ipc;
 pub mod libp2p_overlay;
 mod metrics;
+mod txset_shards;
 mod wire;
 mod xdr;
 
@@ -646,7 +647,8 @@ impl App {
             }
         });
 
-        // Create libp2p QUIC overlay for SCP + TX + TxSet (unified, independent streams)
+        // Create the unified libp2p QUIC overlay with independent SCP, TX,
+        // TxSet-fetch, and TxSet-shred streams.
         let libp2p_keypair = libp2p_keypair_from_config(&config)?;
         let metrics = Arc::new(OverlayMetrics::new());
         let (libp2p_handle, libp2p_event_rx, tx_event_rx, libp2p_overlay) =
@@ -666,7 +668,7 @@ impl App {
         });
 
         info!(
-            "Started libp2p QUIC overlay on {}:{} (SCP + TX + TxSet streams)",
+            "Started libp2p QUIC overlay on {}:{} (SCP + TX + TxSet + TxSet-shred streams)",
             config.libp2p_listen_ip, libp2p_port
         );
 
@@ -901,7 +903,7 @@ impl App {
 
                 // Leader-push-only tx set dissemination
                 // (docs/direct-leader-flooding.md): the nominating leader
-                // eagerly pushes the full tx set body to every peer, so on a
+                // eagerly pushes coded TX-set shreds to peers, so on a
                 // fully connected network the body arrives without any
                 // request. The old TXSET_AUTO_FETCH here (fetch on every SCP
                 // envelope referencing a non-cached set) amplified into many
@@ -1380,10 +1382,9 @@ impl App {
             }
 
             MessageType::BroadcastTxSet => {
-                // Round-1 leader eagerly pushes its nominated TX set to all
-                // peers: cache locally (identical to CacheTxSet) AND broadcast
-                // the full body, so receivers hold it before the nomination
-                // referencing it arrives. See docs/direct-leader-flooding.md.
+                // Round-1 leader caches its nominated TX set and eagerly
+                // disseminates Reed–Solomon shreds, so receivers recover it
+                // before the referencing nomination arrives.
                 // Payload: [hash:32][txSetXDR...]
                 if msg.payload.len() < 33 {
                     warn!("BroadcastTxSet payload too short");
@@ -1405,7 +1406,7 @@ impl App {
                 let tx_set_xdr = msg.payload[32..].to_vec();
 
                 info!(
-                    "TXSET_BROADCAST_REQ: Caching + pushing locally-built TX set {:02x?}... ({} bytes)",
+                    "TXSET_BROADCAST_REQ: Caching + coding locally-built TX set {:02x?}... ({} bytes)",
                     &hash[..4],
                     tx_set_xdr.len()
                 );
@@ -1488,7 +1489,8 @@ impl App {
             }
 
             MessageType::LedgerClosed => {
-                // Parse payload: [ledgerSeq:4][ledgerHash:32]
+                // Payload: [ledgerSeq:4][ledgerHash:32][numClusters:4].
+                // Older Core senders may omit the final field.
                 if msg.payload.len() >= 4 {
                     let ledger_seq = u32::from_le_bytes(msg.payload[0..4].try_into().unwrap());
                     info!("Ledger {} closed", ledger_seq);
@@ -1501,6 +1503,17 @@ impl App {
                     // Evict old TX sets from cache
                     self.tx_set_cache
                         .evict_before(ledger_seq.saturating_sub(12));
+                    if msg.payload.len() >= 40 {
+                        let num_clusters =
+                            u32::from_le_bytes(msg.payload[36..40].try_into().unwrap()) as usize;
+                        if let Err(e) = self
+                            .libp2p_handle
+                            .set_txset_coding_parallelism(num_clusters.max(1))
+                            .await
+                        {
+                            warn!("Ignoring invalid ledger num_clusters={num_clusters}: {e}");
+                        }
+                    }
                 }
             }
 
@@ -1643,6 +1656,18 @@ impl App {
                         let tx_batch_max_size =
                             config["tx_batch_max_size"].as_u64().unwrap_or(0) as usize;
                         self.libp2p_handle.set_tx_batch_max_size(tx_batch_max_size);
+                        let num_clusters = config["num_clusters"]
+                            .as_u64()
+                            .and_then(|value| usize::try_from(value).ok())
+                            .unwrap_or(1)
+                            .max(1);
+                        if let Err(e) = self
+                            .libp2p_handle
+                            .set_txset_coding_parallelism(num_clusters)
+                            .await
+                        {
+                            warn!("Ignoring invalid num_clusters={num_clusters}: {e}");
+                        }
                         self.suppress_tx_broadcast =
                             config["suppress_tx_broadcast"].as_bool().unwrap_or(false);
                         if self.suppress_tx_broadcast {

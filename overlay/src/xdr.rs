@@ -9,8 +9,8 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 use stellar_xdr::curr as xdr;
 use xdr::{
-    Limits, MessageType, ReadXdr, ScpBallot, ScpEnvelope, ScpStatementPledges, StellarMessage,
-    StellarValue,
+    GeneralizedTransactionSet, Limits, MessageType, ReadXdr, ScpBallot, ScpEnvelope,
+    ScpStatementPledges, StellarMessage, StellarValue,
 };
 
 #[derive(Debug)]
@@ -99,6 +99,13 @@ pub(crate) fn frame_get_scp_state(ledger_seq: u32) -> Vec<u8> {
 /// hash/bytes mismatch that would make the set unfetchable network-wide.
 pub fn tx_set_hash_matches(expected_hash: &[u8; 32], data: &[u8]) -> bool {
     &sha256_hash(data) == expected_hash
+}
+
+/// Strictly validate canonical generalized TX-set bytes reconstructed from
+/// network shreds before passing them across the IPC trust boundary.
+pub(crate) fn validate_tx_set(data: &[u8]) -> Result<(), XdrError> {
+    GeneralizedTransactionSet::from_xdr(data, Limits::none())?;
+    Ok(())
 }
 
 /// Strict-decode a `StellarMessage` off the wire (full consumption + zero
@@ -307,6 +314,17 @@ pub(crate) mod tests {
         let hash = sha256_hash(&bytes);
         assert!(tx_set_hash_matches(&hash, &bytes));
         assert!(!tx_set_hash_matches(&[0xff; 32], &bytes));
+    }
+
+    #[test]
+    fn reconstructed_tx_set_validation_is_strict() {
+        let bytes = generalized_tx_set_xdr();
+        assert!(validate_tx_set(&bytes).is_ok());
+
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(validate_tx_set(&trailing).is_err());
+        assert!(validate_tx_set(&bytes[..bytes.len() - 1]).is_err());
     }
 
     // --- SCP tx set hash extraction -----------------------------------------

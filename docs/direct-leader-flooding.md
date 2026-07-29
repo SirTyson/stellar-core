@@ -47,7 +47,8 @@ address.
 | **1** | Pipelined N-2 leader schedule: seed slot N's leaders from `hash(N-2)` so the schedule is computable a full ledger ahead (consensus-level, C++) | **Implemented & tested** (unit equivalence + live-network prediction test) |
 | **2** | Each ledger close, compute the top-K leaders for L+2 and push them to the overlay via a new `SET_LEADERS` IPC message; overlay maps `NodeID → PeerId` (reusing Step 0) and stores them | **Implemented & tested** (e2e push test via metrics snapshot) |
 | **3** | Route TXs directly to the leader connection(s): push full bodies, skip the INV/GETDATA round-trip; TxSet fetch for non-leaders + INV-flood fallback when no leader is connected | **Implemented & tested** (unit push/fallback/relay tests + e2e inclusion test) |
-| 4 | Hardening: production-grade identity (cert instead of seed-in-overlay), continuous connectivity monitoring, metrics | Future |
+| **4** | Eager Reed–Solomon TX-set shreds: two balanced branch roots plus partitioned one-hop Tier-1 forwarding | **Implemented & tested** ([design](txset-shred-dissemination.md)) |
+| 5 | Hardening: production-grade identity (cert instead of seed-in-overlay), continuous connectivity monitoring, metrics | Future |
 
 Each step is a self-contained, reviewable change. We stay in the loop between
 steps — read the result before deciding the next one.

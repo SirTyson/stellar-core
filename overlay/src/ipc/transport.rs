@@ -579,8 +579,10 @@ mod tests {
         // Core sends LedgerClosed
         let ledger_seq: u32 = 100;
         let ledger_hash = [0xAB; 32];
+        let num_clusters: u32 = 8;
         let mut payload = ledger_seq.to_le_bytes().to_vec();
         payload.extend_from_slice(&ledger_hash);
+        payload.extend_from_slice(&num_clusters.to_le_bytes());
 
         MessageCodec::write(
             &mut core,
@@ -596,9 +598,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(received.msg_type, MessageType::LedgerClosed);
-        assert_eq!(received.payload.len(), 36); // 4 + 32
+        assert_eq!(received.payload.len(), 40); // 4 + 32 + 4
         let seq = u32::from_le_bytes(received.payload[0..4].try_into().unwrap());
         assert_eq!(seq, 100);
+        let clusters = u32::from_le_bytes(received.payload[36..40].try_into().unwrap());
+        assert_eq!(clusters, num_clusters);
     }
 
     // ═══ TxSetExternalized Test ═══
@@ -641,8 +645,7 @@ mod tests {
         let mut core = core_side;
 
         // Core sends SetPeerConfig as JSON
-        let config_json =
-            r#"{"known_peers":["1.2.3.4:11625"],"preferred_peers":[],"listen_port":11625}"#;
+        let config_json = r#"{"known_peers":["1.2.3.4:11625"],"preferred_peers":[],"listen_port":11625,"num_clusters":8}"#;
 
         MessageCodec::write(
             &mut core,
@@ -661,6 +664,8 @@ mod tests {
         let received_json = std::str::from_utf8(&received.payload).unwrap();
         assert!(received_json.contains("known_peers"));
         assert!(received_json.contains("1.2.3.4:11625"));
+        let config: serde_json::Value = serde_json::from_str(received_json).unwrap();
+        assert_eq!(config["num_clusters"], 8);
     }
 
     // ═══ RequestTxSet Test ═══

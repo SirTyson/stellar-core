@@ -62,6 +62,21 @@ struct OverlayMetrics
     medida::Meter& mFloodLeaderFallbackMeter;
     medida::Meter& mFloodTxSetPushMeter;
     medida::Meter& mFloodTxSetPushBytesMeter;
+    medida::Meter& mFloodTxSetPushDroppedMeter;
+
+    // ── Eager erasure-coded TxSet shreds ──
+    medida::Meter& mTxSetShardBroadcast;
+    medida::Meter& mTxSetShardOriginalSent;
+    medida::Meter& mTxSetShardRecoverySent;
+    medida::Meter& mTxSetShardRecvUnique;
+    medida::Meter& mTxSetShardRecvDuplicate;
+    medida::Meter& mTxSetShardForwarded;
+    medida::Meter& mTxSetShardReconstructOriginal;
+    medida::Meter& mTxSetShardReconstructRecovery;
+    medida::Meter& mTxSetShardInvalid;
+    medida::Meter& mTxSetShardAccumulatorEvicted;
+    medida::Timer& mTxSetShardEncodeTimer;
+    medida::Timer& mTxSetShardReconstructTimer;
 
     // ── Broadcast / dedup ──
     medida::Meter& mMessagesBroadcast;

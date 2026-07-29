@@ -8,6 +8,7 @@
 #include "herder/Herder.h"
 #include "herder/TxFloodValidation.h"
 #include "herder/TxSetFrame.h"
+#include "ledger/LedgerManager.h"
 #include "lib/json/json.h"
 #include "main/Application.h"
 #include "scp/LocalNode.h"
@@ -173,6 +174,9 @@ RustOverlayManager::start()
     mOverlayIPC->setPeerConfig(
         cfg.KNOWN_PEERS, cfg.PREFERRED_PEERS, cfg.PEER_PORT, quorumMembers,
         cfg.EXPERIMENTAL_TX_BATCH_MAX_SIZE,
+        std::max(1u, mApp.getLedgerManager()
+                         .getLastClosedSorobanNetworkConfig()
+                         .ledgerMaxDependentTxClusters()),
         cfg.ARTIFICIALLY_KEEP_SUBMITTED_TXS_LOCAL_FOR_TESTING);
 
     CLOG_INFO(Overlay, "RustOverlayManager started, peer_port={}",
@@ -245,7 +249,11 @@ RustOverlayManager::clearLedgersBelow(uint32_t ledgerSeq, uint32_t lclSeq)
     if (mOverlayIPC && mOverlayIPC->isConnected())
     {
         Hash dummyHash;
-        mOverlayIPC->notifyLedgerClosed(lclSeq, dummyHash);
+        auto numClusters =
+            std::max(1u, mApp.getLedgerManager()
+                             .getLastClosedSorobanNetworkConfig()
+                             .ledgerMaxDependentTxClusters());
+        mOverlayIPC->notifyLedgerClosed(lclSeq, dummyHash, numClusters);
     }
 }
 
@@ -429,6 +437,20 @@ RustOverlayManager::syncOverlayMetrics()
     markDelta(m.mFloodLeaderFallbackMeter, "flood_leader_fallback");
     markDelta(m.mFloodTxSetPushMeter, "flood_txset_push");
     markDelta(m.mFloodTxSetPushBytesMeter, "flood_txset_push_bytes");
+    markDelta(m.mFloodTxSetPushDroppedMeter, "flood_txset_push_dropped");
+    markDelta(m.mTxSetShardBroadcast, "txset_shard_broadcast");
+    markDelta(m.mTxSetShardOriginalSent, "txset_shard_original_sent");
+    markDelta(m.mTxSetShardRecoverySent, "txset_shard_recovery_sent");
+    markDelta(m.mTxSetShardRecvUnique, "txset_shard_recv_unique");
+    markDelta(m.mTxSetShardRecvDuplicate, "txset_shard_recv_duplicate");
+    markDelta(m.mTxSetShardForwarded, "txset_shard_forwarded");
+    markDelta(m.mTxSetShardReconstructOriginal,
+              "txset_shard_reconstruct_original");
+    markDelta(m.mTxSetShardReconstructRecovery,
+              "txset_shard_reconstruct_recovery");
+    markDelta(m.mTxSetShardInvalid, "txset_shard_invalid");
+    markDelta(m.mTxSetShardAccumulatorEvicted,
+              "txset_shard_accumulator_evicted");
 
     // Send meters per message type
     markDelta(m.mSendSCPMessageSetMeter, "send_scp_message");
@@ -508,6 +530,35 @@ RustOverlayManager::syncOverlayMetrics()
         mLastSyncedValues["fetch_txset_sum_us"] = sum;
         mLastSyncedValues["fetch_txset_count"] = count;
     }
+
+    auto syncTimerSummary = [&](medida::Timer& timer,
+                                std::string const& sumField,
+                                std::string const& countField) {
+        if (!root.isMember(sumField) || !root.isMember(countField))
+        {
+            return;
+        }
+        auto sum = static_cast<int64_t>(root[sumField].asUInt64());
+        auto count = static_cast<int64_t>(root[countField].asUInt64());
+        auto deltaSum = sum - mLastSyncedValues[sumField];
+        auto deltaCount = count - mLastSyncedValues[countField];
+        if (deltaCount > 0 && deltaSum > 0)
+        {
+            auto avgUs = deltaSum / deltaCount;
+            for (int64_t i = 0; i < deltaCount; ++i)
+            {
+                timer.Update(std::chrono::microseconds{avgUs});
+            }
+        }
+        mLastSyncedValues[sumField] = sum;
+        mLastSyncedValues[countField] = count;
+    };
+    syncTimerSummary(m.mTxSetShardEncodeTimer,
+                     "txset_shard_encode_sum_us",
+                     "txset_shard_encode_count");
+    syncTimerSummary(m.mTxSetShardReconstructTimer,
+                     "txset_shard_reconstruct_sum_us",
+                     "txset_shard_reconstruct_count");
 
     // ── Flood TX pull latency timer ──
     if (root.isMember("flood_tx_pull_latency_sum_us") &&
