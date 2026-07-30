@@ -80,6 +80,20 @@ OverlayMetrics::OverlayMetrics(Application& app)
           app.getMetrics().NewTimer({"overlay", "txset-shard", "encode"}))
     , mTxSetShardReconstructTimer(
           app.getMetrics().NewTimer({"overlay", "txset-shard", "reconstruct"}))
+    , mTxSetShardBroadcastSpanTimer(app.getMetrics().NewTimer(
+          {"overlay", "txset-shard", "broadcast-span"}))
+    , mTxSetShardAssemblyTimer(
+          app.getMetrics().NewTimer({"overlay", "txset-shard", "assembly"}))
+    , mTxSetShardForwardLatencyTimer(app.getMetrics().NewTimer(
+          {"overlay", "txset-shard", "forward-latency"}))
+    , mTxSetShardRecvDirect(app.getMetrics().NewMeter(
+          {"overlay", "txset-shard", "recv-direct"}, "shred"))
+    , mTxSetShardRecvRelayed(app.getMetrics().NewMeter(
+          {"overlay", "txset-shard", "recv-relayed"}, "shred"))
+    , mTxSetShardRootMismatch(app.getMetrics().NewMeter(
+          {"overlay", "txset-shard", "root-mismatch"}, "shred"))
+    , mTxSetShardBytesIn(app.getMetrics().NewMeter(
+          {"overlay", "txset-shard", "bytes-in"}, "byte"))
     , mMessagesBroadcast(app.getMetrics().NewMeter(
           {"overlay", "message", "broadcast"}, "message"))
     , mUniqueFloodBytesRecv(app.getMetrics().NewMeter(

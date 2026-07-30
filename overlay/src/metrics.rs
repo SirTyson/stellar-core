@@ -108,6 +108,32 @@ pub struct OverlayMetrics {
     pub txset_shard_reconstruct_sum_us: AtomicU64,
     pub txset_shard_reconstruct_count: AtomicU64,
 
+    // Dissemination timing breakdown. These exist to locate the critical path:
+    // nominator upload, mesh spread, relay turnaround, and topology health.
+    /// Nominator: coding start until the last shred of the set left the wire.
+    /// Compare against setBytes*(1+recovery)/linkRate — if it matches, the
+    /// nominator's uplink is saturated and only sending less data helps.
+    pub txset_shard_broadcast_span_sum_us: AtomicU64,
+    pub txset_shard_broadcast_span_count: AtomicU64,
+    /// Receiver: first shred of a set until the threshold shred arrives. This
+    /// is dissemination latency as the consensus path actually experiences it.
+    pub txset_shard_assembly_sum_us: AtomicU64,
+    pub txset_shard_assembly_count: AtomicU64,
+    /// Relay: shred receipt until its forwarded copy finished sending. Isolates
+    /// a slow relay uplink from slow nominator upload.
+    pub txset_shard_forward_latency_sum_us: AtomicU64,
+    pub txset_shard_forward_latency_count: AtomicU64,
+    /// Shreds arriving straight from the nominator (TTL intact) versus via a
+    /// relay hop. In a healthy mesh, direct is about 1/peers of the total.
+    pub txset_shard_recv_direct: AtomicU64,
+    pub txset_shard_recv_relayed: AtomicU64,
+    /// Shreds dropped because this node did not compute itself as the branch
+    /// root. Non-zero means peer-set disagreement with the nominator, which
+    /// silently costs coverage for those shreds.
+    pub txset_shard_root_mismatch: AtomicU64,
+    /// Total shred bytes accepted, for per-node ingress-rate accounting.
+    pub txset_shard_bytes_in: AtomicU64,
+
     // Connection lifecycle
     /// overlay.inbound.attempt — inbound connection attempts
     pub inbound_attempt: AtomicU64,
@@ -196,6 +222,16 @@ impl Default for OverlayMetrics {
             txset_shard_encode_count: AtomicU64::new(0),
             txset_shard_reconstruct_sum_us: AtomicU64::new(0),
             txset_shard_reconstruct_count: AtomicU64::new(0),
+            txset_shard_broadcast_span_sum_us: AtomicU64::new(0),
+            txset_shard_broadcast_span_count: AtomicU64::new(0),
+            txset_shard_assembly_sum_us: AtomicU64::new(0),
+            txset_shard_assembly_count: AtomicU64::new(0),
+            txset_shard_forward_latency_sum_us: AtomicU64::new(0),
+            txset_shard_forward_latency_count: AtomicU64::new(0),
+            txset_shard_recv_direct: AtomicU64::new(0),
+            txset_shard_recv_relayed: AtomicU64::new(0),
+            txset_shard_root_mismatch: AtomicU64::new(0),
+            txset_shard_bytes_in: AtomicU64::new(0),
             inbound_attempt: AtomicU64::new(0),
             inbound_establish: AtomicU64::new(0),
             inbound_drop: AtomicU64::new(0),
@@ -277,6 +313,16 @@ impl OverlayMetrics {
             txset_shard_encode_count: self.txset_shard_encode_count.load(ORD),
             txset_shard_reconstruct_sum_us: self.txset_shard_reconstruct_sum_us.load(ORD),
             txset_shard_reconstruct_count: self.txset_shard_reconstruct_count.load(ORD),
+            txset_shard_broadcast_span_sum_us: self.txset_shard_broadcast_span_sum_us.load(ORD),
+            txset_shard_broadcast_span_count: self.txset_shard_broadcast_span_count.load(ORD),
+            txset_shard_assembly_sum_us: self.txset_shard_assembly_sum_us.load(ORD),
+            txset_shard_assembly_count: self.txset_shard_assembly_count.load(ORD),
+            txset_shard_forward_latency_sum_us: self.txset_shard_forward_latency_sum_us.load(ORD),
+            txset_shard_forward_latency_count: self.txset_shard_forward_latency_count.load(ORD),
+            txset_shard_recv_direct: self.txset_shard_recv_direct.load(ORD),
+            txset_shard_recv_relayed: self.txset_shard_recv_relayed.load(ORD),
+            txset_shard_root_mismatch: self.txset_shard_root_mismatch.load(ORD),
+            txset_shard_bytes_in: self.txset_shard_bytes_in.load(ORD),
             inbound_attempt: self.inbound_attempt.load(ORD),
             inbound_establish: self.inbound_establish.load(ORD),
             inbound_drop: self.inbound_drop.load(ORD),
@@ -366,6 +412,16 @@ pub struct MetricsSnapshot {
     pub txset_shard_encode_count: u64,
     pub txset_shard_reconstruct_sum_us: u64,
     pub txset_shard_reconstruct_count: u64,
+    pub txset_shard_broadcast_span_sum_us: u64,
+    pub txset_shard_broadcast_span_count: u64,
+    pub txset_shard_assembly_sum_us: u64,
+    pub txset_shard_assembly_count: u64,
+    pub txset_shard_forward_latency_sum_us: u64,
+    pub txset_shard_forward_latency_count: u64,
+    pub txset_shard_recv_direct: u64,
+    pub txset_shard_recv_relayed: u64,
+    pub txset_shard_root_mismatch: u64,
+    pub txset_shard_bytes_in: u64,
     pub inbound_attempt: u64,
     pub inbound_establish: u64,
     pub inbound_drop: u64,

@@ -460,6 +460,10 @@ RustOverlayManager::syncOverlayMetrics()
     markDelta(m.mTxSetShardInvalid, "txset_shard_invalid");
     markDelta(m.mTxSetShardAccumulatorEvicted,
               "txset_shard_accumulator_evicted");
+    markDelta(m.mTxSetShardRecvDirect, "txset_shard_recv_direct");
+    markDelta(m.mTxSetShardRecvRelayed, "txset_shard_recv_relayed");
+    markDelta(m.mTxSetShardRootMismatch, "txset_shard_root_mismatch");
+    markDelta(m.mTxSetShardBytesIn, "txset_shard_bytes_in");
 
     // Send meters per message type
     markDelta(m.mSendSCPMessageSetMeter, "send_scp_message");
@@ -567,6 +571,14 @@ RustOverlayManager::syncOverlayMetrics()
     syncTimerSummary(m.mTxSetShardReconstructTimer,
                      "txset_shard_reconstruct_sum_us",
                      "txset_shard_reconstruct_count");
+    syncTimerSummary(m.mTxSetShardBroadcastSpanTimer,
+                     "txset_shard_broadcast_span_sum_us",
+                     "txset_shard_broadcast_span_count");
+    syncTimerSummary(m.mTxSetShardAssemblyTimer, "txset_shard_assembly_sum_us",
+                     "txset_shard_assembly_count");
+    syncTimerSummary(m.mTxSetShardForwardLatencyTimer,
+                     "txset_shard_forward_latency_sum_us",
+                     "txset_shard_forward_latency_count");
 
     // ── Flood TX pull latency timer ──
     if (root.isMember("flood_tx_pull_latency_sum_us") &&

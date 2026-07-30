@@ -161,8 +161,15 @@ overlay.txset-shard.reconstruct-original  | meter     | TX sets reconstructed wi
 overlay.txset-shard.reconstruct-recovery  | meter     | TX sets reconstructed using recovery shreds
 overlay.txset-shard.invalid               | meter     | malformed, conflicting, undecodable, or hash-invalid shreds/sets
 overlay.txset-shard.accumulator-evicted   | meter     | incomplete TX-set accumulators evicted by capacity or age
+overlay.txset-shard.recv-direct           | meter     | shreds received straight from the nominator (TTL intact)
+overlay.txset-shard.recv-relayed          | meter     | shreds received after their single relay hop
+overlay.txset-shard.root-mismatch         | meter     | shreds not forwarded because this node is not the computed branch root
+overlay.txset-shard.bytes-in              | meter     | TX-set shred bytes accepted, for ingress-rate accounting
 overlay.txset-shard.encode                | timer     | Reed-Solomon encoding time per TX set
 overlay.txset-shard.reconstruct           | timer     | TX-set reconstruction time after the threshold shred arrives
+overlay.txset-shard.broadcast-span        | timer     | nominator: coding start until the last shred of the set left the wire
+overlay.txset-shard.assembly              | timer     | receiver: first shred of a set until the threshold shred arrives
+overlay.txset-shard.forward-latency       | timer     | relay: shred receipt until its forwarded copy finished sending
 overlay.inbound.attempt                   | meter     | inbound connection attempted (accepted on socket)
 overlay.inbound.drop                      | meter     | inbound connection dropped
 overlay.inbound.establish                 | meter     | inbound connection established (added to pending)

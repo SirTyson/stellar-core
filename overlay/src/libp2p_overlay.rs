@@ -22,7 +22,7 @@ use crate::txset_shards::make_txset_shards;
 use crate::txset_shards::{
     assign_shard_branches_to_peer_offsets, make_txset_shards_parallel, relay_target_peer_offsets,
     TxSetCodingExecutor, TxSetShardAccumulator, TxSetShardConfig, TxSetShardMessage,
-    TXSET_MAX_SHARD_BRANCHING_FACTOR, TXSET_SHARD_BRANCHING_FACTOR,
+    TXSET_MAX_SHARD_BRANCHING_FACTOR, TXSET_SHARD_BRANCHING_FACTOR, TXSET_SHARD_HEADER_LEN,
 };
 use crate::wire::ValidatedTx;
 use futures::{AsyncReadExt, AsyncWriteExt, StreamExt};
@@ -1543,12 +1543,19 @@ async fn broadcast_txset_shards_with_branching_factor(
         peer_count
     );
 
-    for (peer, offsets) in peers.into_iter().zip(assign_shard_branches_to_peer_offsets(
-        encoded.len(),
-        peer_count,
-        branch_count,
-    )) {
+    // Nominator upload span: coding start until the last shred leaves the wire.
+    // The sends are spawned per peer, so the task that retires the final message
+    // records it. Compare against codedBytes/linkRate to tell a saturated uplink
+    // from a scheduling problem.
+    let assignments =
+        assign_shard_branches_to_peer_offsets(encoded.len(), peer_count, branch_count);
+    let outstanding = Arc::new(AtomicUsize::new(
+        assignments.iter().map(Vec::len).sum::<usize>().max(1),
+    ));
+
+    for (peer, offsets) in peers.into_iter().zip(assignments) {
         let state = Arc::clone(&state);
+        let outstanding = Arc::clone(&outstanding);
         let messages: Vec<_> = offsets
             .into_iter()
             .map(|(offset, branch_index)| encoded[offset][branch_index].clone())
@@ -1598,6 +1605,18 @@ async fn broadcast_txset_shards_with_branching_factor(
                         );
                     }
                 }
+            }
+            // This peer's share is done, sent or skipped. The task that retires
+            // the last share of the set stamps the nominator's upload span.
+            if outstanding.fetch_sub(message_count, Ordering::Relaxed) == message_count {
+                state
+                    .metrics
+                    .txset_shard_broadcast_span_sum_us
+                    .fetch_add(encode_start.elapsed().as_micros() as u64, Ordering::Relaxed);
+                state
+                    .metrics
+                    .txset_shard_broadcast_span_count
+                    .fetch_add(1, Ordering::Relaxed);
             }
         });
     }
@@ -2957,6 +2976,19 @@ async fn handle_txset_shard_message(state: &Arc<SharedState>, from: PeerId, data
             .txset_shard_recv_duplicate
             .fetch_add(1, Ordering::Relaxed);
     }
+    state.metrics.txset_shard_bytes_in.fetch_add(
+        (TXSET_SHARD_HEADER_LEN + shard.payload.len()) as u64,
+        Ordering::Relaxed,
+    );
+    // A shred still carrying TTL came straight from the nominator; one at zero
+    // has already taken its single relay hop. The ratio shows whether the
+    // one-hop tree is behaving as designed.
+    let source_counter = if shard.ttl > 0 {
+        &state.metrics.txset_shard_recv_direct
+    } else {
+        &state.metrics.txset_shard_recv_relayed
+    };
+    source_counter.fetch_add(1, Ordering::Relaxed);
 
     if shard.ttl > 0 && unique {
         rebroadcast_txset_shard(state, &shard, from).await;
@@ -2965,6 +2997,16 @@ async fn handle_txset_shard_message(state: &Arc<SharedState>, from: PeerId, data
     let Some((accumulator, received_shards, elapsed)) = ready else {
         return;
     };
+    // Dissemination latency as consensus experiences it: first shred of this
+    // set seen locally until the threshold shred that makes it decodable.
+    state
+        .metrics
+        .txset_shard_assembly_sum_us
+        .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
+    state
+        .metrics
+        .txset_shard_assembly_count
+        .fetch_add(1, Ordering::Relaxed);
 
     // Reed–Solomon decoding and strict XDR validation are CPU work. Run both
     // away from Tokio's async workers, just as the nominator does for coding.
@@ -3138,6 +3180,15 @@ async fn rebroadcast_txset_shard(
     let peer_count = leader_peers.len();
     let expected_root = (shard.shard_index * shard.branch_count + shard.branch_index) % peer_count;
     if leader_peers[expected_root] != state.local_peer_id {
+        // Either this node genuinely is not the root, or its peer set differs
+        // from the nominator's and every offset it derived is wrong. The two
+        // are indistinguishable without the nominator's peer count on the wire,
+        // so count them: a rate that tracks membership churn means shreds are
+        // silently losing coverage and the header needs that field.
+        state
+            .metrics
+            .txset_shard_root_mismatch
+            .fetch_add(1, Ordering::Relaxed);
         warn!(
             "TXSET_SHARD_FORWARD_DROP: local node is not branch {} root for shred {} of {:02x?}...",
             shard.branch_index,
@@ -3172,6 +3223,7 @@ async fn rebroadcast_txset_shard(
         .collect();
     drop(streams);
 
+    let forward_start = Instant::now();
     for peer in peers {
         let state = Arc::clone(state);
         let message = Arc::clone(&message);
@@ -3188,6 +3240,16 @@ async fn rebroadcast_txset_shard(
                     state
                         .metrics
                         .txset_shard_forwarded
+                        .fetch_add(1, Ordering::Relaxed);
+                    // Relay turnaround, which separates a slow relay uplink
+                    // from slow nominator upload in the end-to-end number.
+                    state.metrics.txset_shard_forward_latency_sum_us.fetch_add(
+                        forward_start.elapsed().as_micros() as u64,
+                        Ordering::Relaxed,
+                    );
+                    state
+                        .metrics
+                        .txset_shard_forward_latency_count
                         .fetch_add(1, Ordering::Relaxed);
                 }
                 Err(e) => {
