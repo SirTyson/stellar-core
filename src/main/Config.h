@@ -551,6 +551,10 @@ class Config : public std::enable_shared_from_this<Config>
     // Has no effect on non-test builds.
     size_t EXPERIMENTAL_TX_BATCH_MAX_SIZE;
 
+    // Compress nominated TX sets before eager shred dissemination. Receivers
+    // always accept compressed and raw shreds.
+    bool EXPERIMENTAL_TXSET_COMPRESSION;
+
     // Check signatures in the background for transactions received
     // over the network. Does nothing if `BACKGROUND_OVERLAY_PROCESSING` is not
     // also enabled.

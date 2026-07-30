@@ -471,6 +471,23 @@ TEST_CASE("load example configs", "[config]")
     }
 }
 
+TEST_CASE("TX-set compression configuration", "[config]")
+{
+    Config defaults;
+    REQUIRE(defaults.EXPERIMENTAL_TXSET_COMPRESSION);
+
+    auto validator = SecretKey::pseudoRandomForTesting().getStrKeyPublic();
+    std::stringstream ss;
+    ss << "EXPERIMENTAL_TXSET_COMPRESSION=false\n"
+       << "UNSAFE_QUORUM=true\n"
+       << "[QUORUM_SET]\n"
+       << "THRESHOLD_PERCENT=100\n"
+       << "VALIDATORS=[\"" << validator << " A\"]\n";
+    Config configured;
+    configured.load(ss);
+    REQUIRE_FALSE(configured.EXPERIMENTAL_TXSET_COMPRESSION);
+}
+
 TEST_CASE("nesting level", "[config]")
 {
     auto makePublicKey = [](int i) {

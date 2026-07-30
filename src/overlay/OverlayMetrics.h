@@ -77,6 +77,13 @@ struct OverlayMetrics
     medida::Meter& mTxSetShardAccumulatorEvicted;
     medida::Timer& mTxSetShardEncodeTimer;
     medida::Timer& mTxSetShardReconstructTimer;
+    medida::Timer& mTxSetShardCompressTimer;
+    medida::Timer& mTxSetShardDecompressTimer;
+    medida::Meter& mTxSetShardPlainBytes;
+    medida::Meter& mTxSetShardCompressedBytes;
+    medida::Meter& mTxSetShardRawSent;
+    medida::Meter& mTxSetShardRawReceived;
+    medida::Meter& mTxSetShardDictionaryMiss;
     medida::Timer& mTxSetShardBroadcastSpanTimer;
     medida::Timer& mTxSetShardAssemblyTimer;
     medida::Timer& mTxSetShardForwardLatencyTimer;

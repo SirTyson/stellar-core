@@ -654,6 +654,7 @@ impl App {
         let (libp2p_handle, libp2p_event_rx, tx_event_rx, libp2p_overlay) =
             create_overlay(libp2p_keypair, Arc::clone(&metrics))
                 .map_err(|e| format!("Failed to create libp2p overlay: {}", e))?;
+        libp2p_handle.set_txset_compression_enabled(config.txset_compression);
 
         // Use peer_port + 1000 for libp2p QUIC to avoid collision with legacy TCP
         let libp2p_port = config.peer_port + 1000;

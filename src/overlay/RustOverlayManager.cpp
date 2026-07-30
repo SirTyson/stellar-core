@@ -37,7 +37,8 @@ RustOverlayManager::RustOverlayManager(Application& app)
 
     mOverlayIPC = std::make_unique<OverlayIPC>(cfg.OVERLAY_SOCKET_PATH,
                                                cfg.OVERLAY_BINARY_PATH,
-                                               cfg.PEER_PORT, nodeSeedHex);
+                                               cfg.PEER_PORT, nodeSeedHex, 30,
+                                               cfg.EXPERIMENTAL_TXSET_COMPRESSION);
 }
 
 RustOverlayManager::~RustOverlayManager()
@@ -464,6 +465,11 @@ RustOverlayManager::syncOverlayMetrics()
     markDelta(m.mTxSetShardRecvRelayed, "txset_shard_recv_relayed");
     markDelta(m.mTxSetShardRootMismatch, "txset_shard_root_mismatch");
     markDelta(m.mTxSetShardBytesIn, "txset_shard_bytes_in");
+    markDelta(m.mTxSetShardPlainBytes, "txset_shard_plain_bytes");
+    markDelta(m.mTxSetShardCompressedBytes, "txset_shard_compressed_bytes");
+    markDelta(m.mTxSetShardRawSent, "txset_shard_raw_sent");
+    markDelta(m.mTxSetShardRawReceived, "txset_shard_raw_received");
+    markDelta(m.mTxSetShardDictionaryMiss, "txset_shard_dictionary_miss");
 
     // Send meters per message type
     markDelta(m.mSendSCPMessageSetMeter, "send_scp_message");
@@ -571,6 +577,12 @@ RustOverlayManager::syncOverlayMetrics()
     syncTimerSummary(m.mTxSetShardReconstructTimer,
                      "txset_shard_reconstruct_sum_us",
                      "txset_shard_reconstruct_count");
+    syncTimerSummary(m.mTxSetShardCompressTimer,
+                     "txset_shard_compress_sum_us",
+                     "txset_shard_compress_count");
+    syncTimerSummary(m.mTxSetShardDecompressTimer,
+                     "txset_shard_decompress_sum_us",
+                     "txset_shard_decompress_count");
     syncTimerSummary(m.mTxSetShardBroadcastSpanTimer,
                      "txset_shard_broadcast_span_sum_us",
                      "txset_shard_broadcast_span_count");

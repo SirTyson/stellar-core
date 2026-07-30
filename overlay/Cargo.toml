@@ -41,6 +41,8 @@ sha2 = "0.10"
 
 # Erasure coding for eager TX-set shred dissemination.
 reed-solomon-simd = "3.1"
+# Fast, bounded transport compression for eager TX-set dissemination.
+zstd = "0.13"
 # Bounded data-parallel coding. Each overlay owns a pool capped by the
 # network's ledgerMaxDependentTxClusters value.
 rayon = "1"

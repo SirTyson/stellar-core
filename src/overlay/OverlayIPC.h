@@ -71,7 +71,8 @@ class OverlayIPC
     OverlayIPC(std::optional<std::string> socketPath,
                std::optional<std::string> overlayBinaryPath, uint16_t peerPort,
                std::optional<std::string> nodeSeedHex = std::nullopt,
-               uint64_t quorumCheckGraceSecs = 30);
+               uint64_t quorumCheckGraceSecs = 30,
+               bool txSetCompression = true);
 
     static std::string defaultSocketPath(uint16_t peerPort);
     static std::optional<std::string> findOverlayBinaryPath();
@@ -277,6 +278,7 @@ class OverlayIPC
     uint16_t mPeerPort;
     std::optional<std::string> mNodeSeedHex;
     uint64_t mQuorumCheckGraceSecs;
+    bool mTxSetCompression;
     std::optional<std::string> mStartupConfigPath;
 
     std::unique_ptr<IPCChannel> mChannel;

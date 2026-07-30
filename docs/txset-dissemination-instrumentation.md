@@ -10,9 +10,10 @@ keeps `(sum_us, count)` pairs and Core replays them into medida timers, so the
 copies of the mean, so p50/p75/p99 all equal the mean. Read `sum/count`, not
 percentiles.
 
-## Reference numbers for 90 validators, 5 MB sets, 1 Gbit/s
+## Uncompressed reference numbers for 90 validators, 5 MB sets, 1 Gbit/s
 
-At 89 peers a 5 MB set plans to **118 original + 59 recovery = 177 shreds of
+These are the codec-0 baseline. At 89 peers a 5 MB set plans to **118 original +
+59 recovery = 177 shreds of
 42,374 B**, so 7.50 MB of coded data. At 125 MB/s:
 
 | quantity | expected |
@@ -26,18 +27,39 @@ At 89 peers a 5 MB set plans to **118 original + 59 recovery = 177 shreds of
 If measurements land near these, the mesh is running at line rate and the only
 remaining lever is sending fewer bytes. If they land well above, something other
 than bandwidth is the constraint and that is worth finding before optimizing.
+With compression enabled, replace the 5 MB input in these calculations with the
+per-set `compressed-bytes` delta: at a measured 2.0 ratio, expected nominator
+egress is 3.75 MB and the line-rate reference is **30 ms**, not 60 ms.
 
-## The four timers, in critical-path order
+## Compression metrics
+
+**`compress` and `decompress`** are the zstd work per set. `compress` is paid
+only by a nominator and `decompress` by each receiver of codec-1 shreds. Both
+exclude Reed–Solomon work, which remains in `encode`/`reconstruct`.
+
+**`plain-bytes / compressed-bytes`** is the achieved transport ratio. Both
+meters include raw fallback sets (ratio 1), so their quotient reflects the
+actual A/B result rather than successful compression alone.
+
+**`raw-sent`, `raw-received`, and `dictionary-miss`** keep distinct events
+separate. `raw-sent` records the nominator choosing codec 0, `raw-received`
+records a receiver reconstructing codec 0, and `dictionary-miss` records a
+codec-1 set that could not be decoded locally. Unknown codecs and dictionary
+IDs are not parse failures: they leave the normal full-body fetch path in place.
+
+## The dissemination timers, in critical-path order
 
 **`overlay.txset-shard.broadcast-span`** — nominator only. Reed–Solomon coding
 start until the last shred of that set has left the wire. Divide the coded size
 by this to get the achieved uplink rate.
 
-- ≈60 ms at 5 MB → the uplink is saturated; only compression or sending
-  identifiers instead of bodies will help.
-- ≫60 ms → the nominator is not bandwidth-bound. Suspect per-peer stream
+- ≈`1.5 * per-set compressed-bytes / link-rate` (60 ms for raw 5 MB, 30 ms at
+  a 2.0 ratio) → the uplink is saturated; only sending fewer bytes will help.
+- well above that per-set reference → the nominator is not bandwidth-bound.
+  Suspect per-peer stream
   contention, blocking-pool starvation, or the swarm task being busy.
-- ≪60 ms → shreds are being buffered rather than transmitted; trust
+- well below that reference → shreds are being buffered rather than
+  transmitted; trust
   `assembly` over this number.
 
 **`overlay.txset-shard.assembly`** — receiver only, and **the headline number**.
@@ -49,7 +71,8 @@ arrives, so compare it against `broadcast-span` rather than reading it alone.
 **`overlay.txset-shard.forward-latency`** — relay only. Shred receipt until its
 forwarded copy finished sending. Separates a slow relay uplink from slow
 nominator upload when `assembly` is high. With branch factor 1 each relay pushes
-~7.4 MB per set, so a mean far above ~59 ms points at that node's uplink.
+about `1.5 * compressed-bytes` per set, so compare its mean with that quantity
+divided by the link rate.
 
 **`overlay.txset-shard.reconstruct`** — decode plus content-hash plus strict XDR
 validation, on the blocking pool. Now recorded only for reconstructions that

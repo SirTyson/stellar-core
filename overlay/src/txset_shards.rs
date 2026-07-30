@@ -8,9 +8,11 @@
 use rayon::prelude::*;
 use reed_solomon_simd::{ReedSolomonDecoder, ReedSolomonEncoder};
 use std::collections::{hash_map::Entry, HashMap, HashSet};
+use std::fmt;
+use std::io::Read;
 use std::time::Instant;
 
-pub(crate) const TXSET_SHARD_PROTOCOL_VERSION: u8 = 2;
+pub(crate) const TXSET_SHARD_PROTOCOL_VERSION: u8 = 3;
 pub(crate) const TXSET_TARGET_SHARD_SIZE: usize = 1024;
 pub(crate) const TXSET_SHARD_RECOVERY_FACTOR_PERCENT: usize = 50;
 pub(crate) const TXSET_SHARD_INITIAL_TTL: u8 = 1;
@@ -40,10 +42,207 @@ pub(crate) const TXSET_MAX_CODING_PARALLELISM: usize = 128;
 pub(crate) const TXSET_MAX_WIRE_SIZE: usize = 16 * 1024 * 1024 - 32;
 const TXSET_MAX_SHARD_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 const TXSET_MIN_PARALLEL_WORK_BYTES: usize = 512 * 1024;
+const TXSET_ZSTD_COMPRESSION_LEVEL: i32 = 1;
 
 // version + hash + original-count + recovery-count + index + shard-size +
-// original-length + ttl + branch-index + branch-count + payload-length.
-pub(crate) const TXSET_SHARD_HEADER_LEN: usize = 1 + 32 + 2 + 2 + 2 + 4 + 8 + 1 + 1 + 1 + 4;
+// original-length + codec + ttl + branch-index + branch-count + payload-length.
+pub(crate) const TXSET_SHARD_HEADER_LEN: usize = 1 + 32 + 2 + 2 + 2 + 4 + 8 + 1 + 1 + 1 + 1 + 4;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum TxSetCodec {
+    Raw = 0,
+    Zstd = 1,
+}
+
+impl TryFrom<u8> for TxSetCodec {
+    type Error = u8;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            value if value == Self::Raw as u8 => Ok(Self::Raw),
+            value if value == Self::Zstd as u8 => Ok(Self::Zstd),
+            value => Err(value),
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum TxSetShardDecodeError {
+    UnsupportedCodec(u8),
+    Invalid(String),
+}
+
+impl fmt::Display for TxSetShardDecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedCodec(codec) => write!(f, "unsupported TX-set codec {codec}"),
+            Self::Invalid(message) => f.write_str(message),
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum TxSetTransportDecodeError {
+    UnknownDictionary(u32),
+    Invalid(String),
+}
+
+impl fmt::Display for TxSetTransportDecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownDictionary(id) => {
+                write!(f, "unsupported zstd dictionary ID {id}")
+            }
+            Self::Invalid(message) => f.write_str(message),
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct TxSetTransport {
+    pub codec: TxSetCodec,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub(crate) struct TxSetTransportEncodeError {
+    pub data: Vec<u8>,
+    pub message: String,
+}
+
+/// Encode canonical TX-set bytes for transport. Compression is opportunistic:
+/// a frame that does not reduce the payload falls back to raw bytes.
+pub(crate) fn encode_txset_transport(
+    data: Vec<u8>,
+    compression_enabled: bool,
+) -> Result<TxSetTransport, TxSetTransportEncodeError> {
+    if data.is_empty() || data.len() > TXSET_MAX_WIRE_SIZE {
+        return Err(TxSetTransportEncodeError {
+            message: format!(
+                "TX set length must be in 1..={TXSET_MAX_WIRE_SIZE}, got {}",
+                data.len()
+            ),
+            data,
+        });
+    }
+    if !compression_enabled {
+        return Ok(TxSetTransport {
+            codec: TxSetCodec::Raw,
+            data,
+        });
+    }
+
+    let compressed = match zstd::bulk::compress(&data, TXSET_ZSTD_COMPRESSION_LEVEL) {
+        Ok(compressed) => compressed,
+        Err(error) => {
+            return Err(TxSetTransportEncodeError {
+                data,
+                message: format!("zstd compression failed: {error}"),
+            });
+        }
+    };
+    if compressed.len() >= data.len() || compressed.len() > TXSET_MAX_WIRE_SIZE {
+        Ok(TxSetTransport {
+            codec: TxSetCodec::Raw,
+            data,
+        })
+    } else {
+        Ok(TxSetTransport {
+            codec: TxSetCodec::Zstd,
+            data: compressed,
+        })
+    }
+}
+
+/// Decode one or more concatenated zstd frames into canonical TX-set bytes.
+/// Every frame must declare its content size, the sum is capped before any
+/// decompression, and the streaming read is separately bounded as defense in
+/// depth against corrupt or malicious frame headers.
+pub(crate) fn decode_txset_transport(
+    codec: TxSetCodec,
+    data: &[u8],
+) -> Result<Vec<u8>, TxSetTransportDecodeError> {
+    if data.is_empty() || data.len() > TXSET_MAX_WIRE_SIZE {
+        return Err(TxSetTransportDecodeError::Invalid(format!(
+            "transport payload length must be in 1..={TXSET_MAX_WIRE_SIZE}, got {}",
+            data.len()
+        )));
+    }
+    if codec == TxSetCodec::Raw {
+        return Ok(data.to_vec());
+    }
+
+    let mut offset = 0usize;
+    let mut declared_size = 0usize;
+    while offset < data.len() {
+        let remaining = &data[offset..];
+        let frame_len = zstd::zstd_safe::find_frame_compressed_size(remaining).map_err(|e| {
+            TxSetTransportDecodeError::Invalid(format!(
+                "invalid zstd frame at byte {offset}: {}",
+                zstd::zstd_safe::get_error_name(e)
+            ))
+        })?;
+        if frame_len == 0 || frame_len > remaining.len() {
+            return Err(TxSetTransportDecodeError::Invalid(format!(
+                "invalid zstd frame length {frame_len} at byte {offset}"
+            )));
+        }
+        let frame = &remaining[..frame_len];
+        if let Some(id) = zstd::zstd_safe::get_dict_id_from_frame(frame) {
+            return Err(TxSetTransportDecodeError::UnknownDictionary(id.get()));
+        }
+        let frame_size = zstd::zstd_safe::get_frame_content_size(frame)
+            .map_err(|_| {
+                TxSetTransportDecodeError::Invalid(format!(
+                    "invalid zstd content size at byte {offset}"
+                ))
+            })?
+            .ok_or_else(|| {
+                TxSetTransportDecodeError::Invalid(format!(
+                    "zstd frame at byte {offset} omits its content size"
+                ))
+            })?;
+        let frame_size = usize::try_from(frame_size).map_err(|_| {
+            TxSetTransportDecodeError::Invalid("zstd content size does not fit usize".to_string())
+        })?;
+        declared_size = declared_size.checked_add(frame_size).ok_or_else(|| {
+            TxSetTransportDecodeError::Invalid("zstd content size overflow".to_string())
+        })?;
+        if declared_size > TXSET_MAX_WIRE_SIZE {
+            return Err(TxSetTransportDecodeError::Invalid(format!(
+                "decompressed TX set exceeds {TXSET_MAX_WIRE_SIZE} bytes"
+            )));
+        }
+        offset = offset.checked_add(frame_len).ok_or_else(|| {
+            TxSetTransportDecodeError::Invalid("zstd frame offset overflow".to_string())
+        })?;
+    }
+    if declared_size == 0 {
+        return Err(TxSetTransportDecodeError::Invalid(
+            "decompressed TX set is empty".to_string(),
+        ));
+    }
+
+    let decoder = zstd::stream::read::Decoder::new(data).map_err(|e| {
+        TxSetTransportDecodeError::Invalid(format!("failed to create zstd decoder: {e}"))
+    })?;
+    let read_limit = u64::try_from(declared_size)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut bounded = decoder.take(read_limit);
+    let mut decoded = Vec::with_capacity(declared_size);
+    bounded.read_to_end(&mut decoded).map_err(|e| {
+        TxSetTransportDecodeError::Invalid(format!("zstd decompression failed: {e}"))
+    })?;
+    if decoded.len() != declared_size {
+        return Err(TxSetTransportDecodeError::Invalid(format!(
+            "zstd decoded {} bytes, frame headers declared {declared_size}",
+            decoded.len()
+        )));
+    }
+    Ok(decoded)
+}
 
 /// A private Rayon pool prevents TX-set coding from consuming more workers
 /// than the network's configured transaction-cluster parallelism.
@@ -239,6 +438,7 @@ pub(crate) struct TxSetShardMessage {
     pub shard_index: usize,
     pub shard_size: usize,
     pub original_len: usize,
+    pub codec: TxSetCodec,
     pub ttl: u8,
     pub branch_index: usize,
     pub branch_count: usize,
@@ -356,6 +556,7 @@ impl TxSetShardMessage {
         out.extend_from_slice(&shard_index.to_be_bytes());
         out.extend_from_slice(&shard_size.to_be_bytes());
         out.extend_from_slice(&original_len.to_be_bytes());
+        out.push(self.codec as u8);
         out.push(self.ttl);
         out.push(branch_index);
         out.push(branch_count);
@@ -364,12 +565,18 @@ impl TxSetShardMessage {
         Ok(out)
     }
 
-    pub fn decode(data: &[u8]) -> Result<Self, String> {
+    pub fn decode(data: &[u8]) -> Result<Self, TxSetShardDecodeError> {
         if data.len() < TXSET_SHARD_HEADER_LEN {
-            return Err(format!("shred message too short: {}", data.len()));
+            return Err(TxSetShardDecodeError::Invalid(format!(
+                "shred message too short: {}",
+                data.len()
+            )));
         }
         if data[0] != TXSET_SHARD_PROTOCOL_VERSION {
-            return Err(format!("unsupported shred version {}", data[0]));
+            return Err(TxSetShardDecodeError::Invalid(format!(
+                "unsupported shred version {}",
+                data[0]
+            )));
         }
 
         let mut hash = [0u8; 32];
@@ -381,17 +588,22 @@ impl TxSetShardMessage {
         let original_len = u64::from_be_bytes([
             data[43], data[44], data[45], data[46], data[47], data[48], data[49], data[50],
         ]);
-        let original_len = usize::try_from(original_len)
-            .map_err(|_| "original length does not fit usize".to_string())?;
-        let ttl = data[51];
-        let branch_index = data[52] as usize;
-        let branch_count = data[53] as usize;
-        let payload_len = u32::from_be_bytes([data[54], data[55], data[56], data[57]]) as usize;
+        let original_len = usize::try_from(original_len).map_err(|_| {
+            TxSetShardDecodeError::Invalid("original length does not fit usize".to_string())
+        })?;
+        let codec =
+            TxSetCodec::try_from(data[51]).map_err(TxSetShardDecodeError::UnsupportedCodec)?;
+        let ttl = data[52];
+        let branch_index = data[53] as usize;
+        let branch_count = data[54] as usize;
+        let payload_len = u32::from_be_bytes([data[55], data[56], data[57], data[58]]) as usize;
         let payload_end = TXSET_SHARD_HEADER_LEN
             .checked_add(payload_len)
-            .ok_or_else(|| "payload length overflow".to_string())?;
+            .ok_or_else(|| TxSetShardDecodeError::Invalid("payload length overflow".to_string()))?;
         if payload_end != data.len() {
-            return Err("shred payload length mismatch".to_string());
+            return Err(TxSetShardDecodeError::Invalid(
+                "shred payload length mismatch".to_string(),
+            ));
         }
 
         let shard = Self {
@@ -401,12 +613,13 @@ impl TxSetShardMessage {
             shard_index,
             shard_size,
             original_len,
+            codec,
             ttl,
             branch_index,
             branch_count,
             payload: data[TXSET_SHARD_HEADER_LEN..].to_vec(),
         };
-        shard.validate()?;
+        shard.validate().map_err(TxSetShardDecodeError::Invalid)?;
         Ok(shard)
     }
 }
@@ -422,9 +635,21 @@ pub(crate) fn make_txset_shards(
     make_txset_shards_parallel(hash, data, peer_count, config, &executor)
 }
 
+#[cfg(test)]
 pub(crate) fn make_txset_shards_parallel(
     hash: [u8; 32],
     data: &[u8],
+    peer_count: usize,
+    config: TxSetShardConfig,
+    executor: &TxSetCodingExecutor,
+) -> Result<Vec<TxSetShardMessage>, String> {
+    make_txset_shards_parallel_with_codec(hash, data, TxSetCodec::Raw, peer_count, config, executor)
+}
+
+pub(crate) fn make_txset_shards_parallel_with_codec(
+    hash: [u8; 32],
+    data: &[u8],
+    codec: TxSetCodec,
     peer_count: usize,
     config: TxSetShardConfig,
     executor: &TxSetCodingExecutor,
@@ -489,6 +714,7 @@ pub(crate) fn make_txset_shards_parallel(
             shard_index,
             shard_size: plan.shard_size,
             original_len: data.len(),
+            codec,
             ttl: config.initial_ttl,
             branch_index: 0,
             branch_count: 1,
@@ -503,6 +729,7 @@ pub(crate) fn make_txset_shards_parallel(
             shard_index: plan.original_shards + recovery_index,
             shard_size: plan.shard_size,
             original_len: data.len(),
+            codec,
             ttl: config.initial_ttl,
             branch_index: 0,
             branch_count: 1,
@@ -585,6 +812,7 @@ pub(crate) struct TxSetShardAccumulator {
     recovery_shards: usize,
     shard_size: usize,
     original_len: usize,
+    codec: TxSetCodec,
     originals: HashMap<usize, Vec<u8>>,
     recoveries: HashMap<usize, Vec<u8>>,
     pub created_at: Instant,
@@ -597,6 +825,7 @@ impl TxSetShardAccumulator {
             recovery_shards: shard.recovery_shards,
             shard_size: shard.shard_size,
             original_len: shard.original_len,
+            codec: shard.codec,
             originals: HashMap::new(),
             recoveries: HashMap::new(),
             created_at: Instant::now(),
@@ -628,6 +857,7 @@ impl TxSetShardAccumulator {
             && self.recovery_shards == shard.recovery_shards
             && self.shard_size == shard.shard_size
             && self.original_len == shard.original_len
+            && self.codec == shard.codec
     }
 
     pub fn insert(&mut self, shard: &TxSetShardMessage) -> Result<bool, String> {
@@ -750,6 +980,7 @@ impl TxSetShardAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::time::{Duration, Instant};
 
     fn data(len: usize) -> Vec<u8> {
@@ -760,6 +991,265 @@ mod tests {
 
     fn shards(len: usize, peers: usize) -> Vec<TxSetShardMessage> {
         make_txset_shards([0x42; 32], &data(len), peers, TxSetShardConfig::default()).unwrap()
+    }
+
+    #[test]
+    fn protocol_v3_header_has_codec_byte() {
+        assert_eq!(TXSET_SHARD_PROTOCOL_VERSION, 3);
+        assert_eq!(TXSET_SHARD_HEADER_LEN, 59);
+
+        let mut shard = shards(4096, 3)[0].clone();
+        for codec in [TxSetCodec::Raw, TxSetCodec::Zstd] {
+            shard.codec = codec;
+            let encoded = shard.encode().unwrap();
+            assert_eq!(encoded[51], codec as u8);
+            assert_eq!(TxSetShardMessage::decode(&encoded).unwrap(), shard);
+        }
+    }
+
+    #[test]
+    fn compression_disabled_always_uses_raw_transport() {
+        let expected = vec![0u8; 64 * 1024];
+        let original_allocation = expected.as_ptr();
+        let transport = encode_txset_transport(expected, false).unwrap();
+        assert_eq!(transport.codec, TxSetCodec::Raw);
+        assert_eq!(transport.data.as_ptr(), original_allocation);
+        let expected = vec![0u8; 64 * 1024];
+        assert_eq!(transport.data, expected);
+        assert_eq!(
+            decode_txset_transport(transport.codec, &transport.data).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn compression_falls_back_when_zstd_would_expand() {
+        let expected = [0x5a];
+        let transport = encode_txset_transport(expected.to_vec(), true).unwrap();
+        assert_eq!(
+            transport,
+            TxSetTransport {
+                codec: TxSetCodec::Raw,
+                data: expected.to_vec()
+            }
+        );
+    }
+
+    #[test]
+    fn zstd_transport_round_trip_is_smaller_and_declares_size() {
+        let expected: Vec<_> = (0..256 * 1024)
+            .map(|index| ((index / 64) % 17) as u8)
+            .collect();
+        let transport = encode_txset_transport(expected.clone(), true).unwrap();
+        assert_eq!(transport.codec, TxSetCodec::Zstd);
+        assert!(transport.data.len() < expected.len() / 10);
+        assert_eq!(
+            zstd::zstd_safe::get_frame_content_size(&transport.data).unwrap(),
+            Some(expected.len() as u64)
+        );
+        assert!(zstd::zstd_safe::get_dict_id_from_frame(&transport.data).is_none());
+        assert_eq!(
+            decode_txset_transport(transport.codec, &transport.data).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn concatenated_zstd_frames_decode_with_a_total_size_bound() {
+        let first = vec![0x11; 32 * 1024];
+        let second = data(48 * 1024 + 7);
+        let mut encoded = zstd::bulk::compress(&first, 1).unwrap();
+        encoded.extend_from_slice(&zstd::bulk::compress(&second, 1).unwrap());
+
+        let mut expected = first;
+        expected.extend_from_slice(&second);
+        assert_eq!(
+            decode_txset_transport(TxSetCodec::Zstd, &encoded).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn zstd_decoder_rejects_empty_truncated_garbage_and_trailing_data() {
+        assert!(decode_txset_transport(TxSetCodec::Zstd, &[]).is_err());
+        assert!(decode_txset_transport(TxSetCodec::Zstd, b"not zstd").is_err());
+
+        let encoded = zstd::bulk::compress(&vec![0x33; 4096], 1).unwrap();
+        assert!(decode_txset_transport(TxSetCodec::Zstd, &encoded[..encoded.len() - 1]).is_err());
+
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(decode_txset_transport(TxSetCodec::Zstd, &trailing).is_err());
+    }
+
+    #[test]
+    fn zstd_decoder_requires_frame_content_size() {
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 1).unwrap();
+        encoder.include_contentsize(false).unwrap();
+        encoder.write_all(&vec![0x44; 4096]).unwrap();
+        let encoded = encoder.finish().unwrap();
+        assert_eq!(
+            zstd::zstd_safe::get_frame_content_size(&encoded).unwrap(),
+            None
+        );
+        assert!(matches!(
+            decode_txset_transport(TxSetCodec::Zstd, &encoded),
+            Err(TxSetTransportDecodeError::Invalid(message))
+                if message.contains("omits its content size")
+        ));
+    }
+
+    #[test]
+    fn zstd_decoder_rejects_decompression_bomb_before_decoding() {
+        let oversized = vec![0u8; TXSET_MAX_WIRE_SIZE + 1];
+        let encoded = zstd::bulk::compress(&oversized, 1).unwrap();
+        assert!(encoded.len() < TXSET_MAX_WIRE_SIZE);
+        assert!(matches!(
+            decode_txset_transport(TxSetCodec::Zstd, &encoded),
+            Err(TxSetTransportDecodeError::Invalid(message))
+                if message.contains("exceeds")
+        ));
+    }
+
+    #[test]
+    fn zstd_decoder_cleanly_rejects_unknown_dictionary_id() {
+        let samples: Vec<Vec<u8>> = (0..128)
+            .map(|sample| {
+                (0..512)
+                    .map(|index| ((sample * 13 + index / 8) % 251) as u8)
+                    .collect()
+            })
+            .collect();
+        let dictionary = zstd::dict::from_samples(&samples, 4096).unwrap();
+        let expected = samples.concat();
+        let mut compressor = zstd::bulk::Compressor::with_dictionary(1, &dictionary).unwrap();
+        let encoded = compressor.compress(&expected).unwrap();
+        let dictionary_id = zstd::zstd_safe::get_dict_id_from_frame(&encoded)
+            .expect("trained dictionary must carry an ID")
+            .get();
+
+        assert_eq!(
+            decode_txset_transport(TxSetCodec::Zstd, &encoded),
+            Err(TxSetTransportDecodeError::UnknownDictionary(dictionary_id))
+        );
+    }
+
+    #[test]
+    fn transport_input_bounds_are_enforced_for_both_codecs() {
+        assert!(encode_txset_transport(vec![], true).is_err());
+        assert!(encode_txset_transport(vec![0; TXSET_MAX_WIRE_SIZE + 1], true).is_err());
+        assert!(decode_txset_transport(TxSetCodec::Raw, &[]).is_err());
+        assert!(
+            decode_txset_transport(TxSetCodec::Raw, &vec![0; TXSET_MAX_WIRE_SIZE + 1]).is_err()
+        );
+    }
+
+    /// The bound is inclusive: a set of exactly the maximum wire size is a
+    /// legal TX set and must survive the round trip, or the largest sets the
+    /// IPC layer can carry become undisseminatable.
+    #[test]
+    fn transport_accepts_a_payload_of_exactly_the_maximum_wire_size() {
+        let at_limit = data(TXSET_MAX_WIRE_SIZE);
+        let transport = encode_txset_transport(at_limit.clone(), true).unwrap();
+        assert_eq!(
+            decode_txset_transport(transport.codec, &transport.data).unwrap(),
+            at_limit
+        );
+
+        // Raw transport at the limit too, since compression may decline it.
+        let raw = encode_txset_transport(at_limit, false).unwrap();
+        assert_eq!(raw.codec, TxSetCodec::Raw);
+        assert_eq!(
+            decode_txset_transport(raw.codec, &raw.data).unwrap().len(),
+            TXSET_MAX_WIRE_SIZE
+        );
+    }
+
+    /// The codec is part of accumulator compatibility, so shreds carrying two
+    /// different transport encodings of the same content hash must be rejected
+    /// as a conflict rather than blended into an undecodable payload — and the
+    /// rejection must not poison the hash for the stream that follows.
+    #[test]
+    fn mixed_codec_shreds_for_one_hash_conflict_without_poisoning() {
+        let plain = data(96 * 1024 + 11);
+        let hash = [0x5c; 32];
+        let config = TxSetShardConfig::default();
+        let executor = TxSetCodingExecutor::new(1).unwrap();
+
+        let compressed = encode_txset_transport(plain.clone(), true).unwrap();
+        assert_eq!(compressed.codec, TxSetCodec::Zstd);
+        let zstd_shreds = make_txset_shards_parallel_with_codec(
+            hash,
+            &compressed.data,
+            TxSetCodec::Zstd,
+            15,
+            config,
+            &executor,
+        )
+        .unwrap();
+        let raw_shreds = make_txset_shards_parallel_with_codec(
+            hash,
+            &plain,
+            TxSetCodec::Raw,
+            15,
+            config,
+            &executor,
+        )
+        .unwrap();
+
+        let mut accumulator = TxSetShardAccumulator::new(&zstd_shreds[0]);
+        assert!(accumulator.insert(&zstd_shreds[0]).unwrap());
+        // Same hash, same index, different transport encoding.
+        assert!(accumulator.insert(&raw_shreds[0]).is_err());
+
+        // A fresh accumulator for either encoding still completes cleanly.
+        let mut recovered = TxSetShardAccumulator::new(&raw_shreds[0]);
+        for shred in raw_shreds.iter().filter(|shred| shred.is_original()) {
+            recovered.insert(shred).unwrap();
+        }
+        let reconstruction = recovered.reconstruct().unwrap().unwrap();
+        assert_eq!(
+            decode_txset_transport(TxSetCodec::Raw, &reconstruction.data).unwrap(),
+            plain
+        );
+    }
+
+    #[test]
+    fn compressed_transport_survives_recovery_shards_before_decompression() {
+        let expected: Vec<_> = (0..256 * 1024 + 17)
+            .map(|index| ((index / 32) % 19) as u8)
+            .collect();
+        let transport = encode_txset_transport(expected.clone(), true).unwrap();
+        assert_eq!(transport.codec, TxSetCodec::Zstd);
+        let executor = TxSetCodingExecutor::new(4).unwrap();
+        let all = make_txset_shards_parallel_with_codec(
+            [0x90; 32],
+            &transport.data,
+            transport.codec,
+            15,
+            TxSetShardConfig::default(),
+            &executor,
+        )
+        .unwrap();
+        let original_count = all[0].original_shards;
+        let mut accumulator = TxSetShardAccumulator::new(&all[0]);
+        for shard in all
+            .iter()
+            .filter(|shard| shard.shard_index != 0)
+            .take(original_count)
+        {
+            accumulator.insert(shard).unwrap();
+        }
+        let reconstructed = accumulator
+            .reconstruct_parallel(&executor)
+            .unwrap()
+            .unwrap();
+        assert!(reconstructed.used_recovery);
+        assert_eq!(reconstructed.data, transport.data);
+        assert_eq!(
+            decode_txset_transport(transport.codec, &reconstructed.data).unwrap(),
+            expected
+        );
     }
 
     #[test]
@@ -863,13 +1353,20 @@ mod tests {
         assert!(TxSetShardMessage::decode(&bad_index).is_err());
 
         let mut bad_payload_len = encoded.clone();
-        bad_payload_len[54..58].copy_from_slice(&1u32.to_be_bytes());
+        bad_payload_len[55..59].copy_from_slice(&1u32.to_be_bytes());
         assert!(TxSetShardMessage::decode(&bad_payload_len).is_err());
 
         let mut bad_branch = encoded.clone();
-        bad_branch[52] = 2;
         bad_branch[53] = 2;
+        bad_branch[54] = 2;
         assert!(TxSetShardMessage::decode(&bad_branch).is_err());
+
+        let mut unknown_codec = encoded.clone();
+        unknown_codec[51] = 0xff;
+        assert_eq!(
+            TxSetShardMessage::decode(&unknown_codec),
+            Err(TxSetShardDecodeError::UnsupportedCodec(0xff))
+        );
 
         let mut trailing = encoded;
         trailing.push(0);
@@ -942,6 +1439,10 @@ mod tests {
         let mut incompatible = all[original_count].clone();
         incompatible.original_len -= 1;
         assert!(accumulator.insert(&incompatible).is_err());
+
+        let mut incompatible_codec = all[original_count].clone();
+        incompatible_codec.codec = TxSetCodec::Zstd;
+        assert!(accumulator.insert(&incompatible_codec).is_err());
     }
 
     #[test]
@@ -1241,6 +1742,7 @@ mod tests {
                     shard_index: plan.total_shards() - 1,
                     shard_size: plan.shard_size,
                     original_len: data_len,
+                    codec: TxSetCodec::Raw,
                     ttl: config.initial_ttl,
                     branch_index: 0,
                     branch_count: 1,

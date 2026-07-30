@@ -20,9 +20,11 @@ use crate::metrics::OverlayMetrics;
 #[cfg(test)]
 use crate::txset_shards::make_txset_shards;
 use crate::txset_shards::{
-    assign_shard_branches_to_peer_offsets, make_txset_shards_parallel, relay_target_peer_offsets,
-    TxSetCodingExecutor, TxSetShardAccumulator, TxSetShardConfig, TxSetShardMessage,
-    TXSET_MAX_SHARD_BRANCHING_FACTOR, TXSET_SHARD_BRANCHING_FACTOR, TXSET_SHARD_HEADER_LEN,
+    assign_shard_branches_to_peer_offsets, decode_txset_transport, encode_txset_transport,
+    make_txset_shards_parallel_with_codec, relay_target_peer_offsets, TxSetCodec,
+    TxSetCodingExecutor, TxSetShardAccumulator, TxSetShardConfig, TxSetShardDecodeError,
+    TxSetShardMessage, TxSetTransport, TxSetTransportDecodeError, TXSET_MAX_SHARD_BRANCHING_FACTOR,
+    TXSET_SHARD_BRANCHING_FACTOR, TXSET_SHARD_HEADER_LEN,
 };
 use crate::wire::ValidatedTx;
 use futures::{AsyncReadExt, AsyncWriteExt, StreamExt};
@@ -38,7 +40,7 @@ use libp2p::{
 use libp2p_stream::{Behaviour as StreamBehaviour, Control, IncomingStreams};
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex, RwLock};
@@ -48,7 +50,7 @@ use tracing::{debug, error, info, trace, warn};
 pub const SCP_PROTOCOL: StreamProtocol = StreamProtocol::new("/stellar/scp/1.0.0");
 pub const TX_PROTOCOL: StreamProtocol = StreamProtocol::new("/stellar/tx/1.0.0");
 pub const TXSET_PROTOCOL: StreamProtocol = StreamProtocol::new("/stellar/txset/1.0.0");
-pub const TXSET_SHARD_PROTOCOL: StreamProtocol = StreamProtocol::new("/stellar/txset-shard/2.0.0");
+pub const TXSET_SHARD_PROTOCOL: StreamProtocol = StreamProtocol::new("/stellar/txset-shard/3.0.0");
 
 /// Message frame: 4-byte length prefix + payload
 /// Max message size: 16MB (for large TX sets)
@@ -225,6 +227,8 @@ pub struct OverlayHandle {
     /// Private coding pool, replaced when Core reports a new network
     /// transaction-cluster limit.
     txset_coding_executor: Arc<RwLock<Arc<TxSetCodingExecutor>>>,
+    /// Runtime A/B switch. Receivers always accept both codecs.
+    txset_compression_enabled: Arc<AtomicBool>,
 }
 
 impl OverlayHandle {
@@ -257,6 +261,12 @@ impl OverlayHandle {
             num_clusters
         );
         Ok(())
+    }
+
+    pub fn set_txset_compression_enabled(&self, enabled: bool) {
+        self.txset_compression_enabled
+            .store(enabled, Ordering::Relaxed);
+        info!("TX-set compression enabled={enabled}");
     }
 
     pub async fn broadcast_scp(&self, envelope: Vec<u8>) {
@@ -445,6 +455,7 @@ struct SharedState {
     /// Tier-1 validator topology.
     txset_shard_config: TxSetShardConfig,
     txset_coding_executor: Arc<RwLock<Arc<TxSetCodingExecutor>>>,
+    txset_compression_enabled: Arc<AtomicBool>,
     /// Event sender for non-TX events (SCP, TxSet - critical path, unbounded)
     event_tx: mpsc::UnboundedSender<OverlayEvent>,
     /// Bounded TX event sender (backpressure - drops allowed)
@@ -498,6 +509,7 @@ impl SharedState {
         tx_batch_max_size: Arc<AtomicUsize>,
         current_ledger_seq: Arc<AtomicU64>,
         txset_coding_executor: Arc<RwLock<Arc<TxSetCodingExecutor>>>,
+        txset_compression_enabled: Arc<AtomicBool>,
     ) -> Self {
         Self {
             local_peer_id,
@@ -518,6 +530,7 @@ impl SharedState {
             txset_shard_store: Mutex::new(TxSetShardStore::new()),
             txset_shard_config: TxSetShardConfig::default(),
             txset_coding_executor,
+            txset_compression_enabled,
             event_tx,
             tx_event_tx,
             tx_dropped_count: AtomicU64::new(0),
@@ -622,6 +635,7 @@ pub(crate) fn create_overlay_with_txset_shard_config(
     let txset_coding_executor = Arc::new(RwLock::new(Arc::new(
         TxSetCodingExecutor::new(1).expect("serial TX-set coding executor is valid"),
     )));
+    let txset_compression_enabled = Arc::new(AtomicBool::new(true));
     let mut state = SharedState::new(
         peer_id,
         event_tx,
@@ -632,6 +646,7 @@ pub(crate) fn create_overlay_with_txset_shard_config(
         Arc::clone(&tx_batch_max_size),
         Arc::clone(&current_ledger_seq),
         Arc::clone(&txset_coding_executor),
+        Arc::clone(&txset_compression_enabled),
     );
     state.txset_shard_config = txset_shard_config;
     let state = Arc::new(state);
@@ -649,6 +664,7 @@ pub(crate) fn create_overlay_with_txset_shard_config(
         tx_batch_max_size,
         current_ledger_seq,
         txset_coding_executor,
+        txset_compression_enabled,
     };
 
     Ok((handle, event_rx, tx_event_rx, overlay))
@@ -1457,10 +1473,33 @@ async fn broadcast_txset_shards_with_branching_factor(
         .load(Ordering::Relaxed)
         .saturating_add(1);
     let config = state.txset_shard_config;
+    let compression_enabled = state.txset_compression_enabled.load(Ordering::Relaxed);
     let coding_executor = state.txset_coding_executor.read().await.clone();
     let encode_start = Instant::now();
     let encoded = tokio::task::spawn_blocking(move || {
-        let shards = make_txset_shards_parallel(hash, &data, peer_count, config, &coding_executor)?;
+        let compress_start = Instant::now();
+        let (transport, compression_error) = match encode_txset_transport(data, compression_enabled)
+        {
+            Ok(transport) => (transport, None),
+            Err(error) => (
+                TxSetTransport {
+                    codec: TxSetCodec::Raw,
+                    data: error.data,
+                },
+                Some(error.message),
+            ),
+        };
+        let compress_us = compress_start.elapsed().as_micros() as u64;
+        let transport_len = transport.data.len();
+        let codec = transport.codec;
+        let shards = make_txset_shards_parallel_with_codec(
+            hash,
+            &transport.data,
+            codec,
+            peer_count,
+            config,
+            &coding_executor,
+        )?;
         shards
             .into_iter()
             .map(|shard| {
@@ -1475,9 +1514,18 @@ async fn broadcast_txset_shards_with_branching_factor(
                     .collect::<Result<Vec<_>, String>>()
             })
             .collect::<Result<Vec<_>, String>>()
+            .map(|encoded| {
+                (
+                    encoded,
+                    codec,
+                    transport_len,
+                    compress_us,
+                    compression_error,
+                )
+            })
     })
     .await;
-    let encoded = match encoded {
+    let (encoded, codec, transport_len, compress_us, compression_error) = match encoded {
         Ok(Ok(encoded)) => encoded,
         Ok(Err(e)) => {
             warn!(
@@ -1496,6 +1544,23 @@ async fn broadcast_txset_shards_with_branching_factor(
             return;
         }
     };
+    if compression_enabled {
+        state
+            .metrics
+            .txset_shard_compress_sum_us
+            .fetch_add(compress_us, Ordering::Relaxed);
+        state
+            .metrics
+            .txset_shard_compress_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    if let Some(error) = compression_error {
+        warn!(
+            "TXSET_SHARD_COMPRESS_FALLBACK: sending TX set {:02x?}... raw: {}",
+            &hash[..4],
+            error
+        );
+    }
     if state.current_ledger_seq.load(Ordering::Relaxed) >= slot
         || state.txset_shard_generation.load(Ordering::Relaxed) != generation
     {
@@ -1510,6 +1575,20 @@ async fn broadcast_txset_shards_with_branching_factor(
             slot
         );
         return;
+    }
+    state
+        .metrics
+        .txset_shard_plain_bytes
+        .fetch_add(data_len as u64, Ordering::Relaxed);
+    state
+        .metrics
+        .txset_shard_compressed_bytes
+        .fetch_add(transport_len as u64, Ordering::Relaxed);
+    if codec == TxSetCodec::Raw {
+        state
+            .metrics
+            .txset_shard_raw_sent
+            .fetch_add(1, Ordering::Relaxed);
     }
     state
         .metrics
@@ -1534,9 +1613,11 @@ async fn broadcast_txset_shards_with_branching_factor(
         .count();
     let recovery_shards = encoded.len() - original_shards;
     info!(
-        "TXSET_SHARD_BROADCAST: TX set {:02x?}... ({} bytes) -> {} original + {} recovery shreds, branch factor {}, across {} peers",
+        "TXSET_SHARD_BROADCAST: TX set {:02x?}... ({} plain, {} encoded bytes, codec {:?}) -> {} original + {} recovery shreds, branch factor {}, across {} peers",
         &hash[..4],
         data_len,
+        transport_len,
+        codec,
         original_shards,
         recovery_shards,
         branch_count,
@@ -2846,7 +2927,14 @@ async fn handle_inbound_txset_shard_streams(
 async fn handle_txset_shard_message(state: &Arc<SharedState>, from: PeerId, data: Vec<u8>) {
     let shard = match TxSetShardMessage::decode(&data) {
         Ok(shard) => shard,
-        Err(e) => {
+        Err(TxSetShardDecodeError::UnsupportedCodec(codec)) => {
+            debug!(
+                "TXSET_SHARD_CODEC_DROP: unsupported codec {} from {}; using fetch fallback",
+                codec, from
+            );
+            return;
+        }
+        Err(TxSetShardDecodeError::Invalid(e)) => {
             state
                 .metrics
                 .txset_shard_invalid
@@ -3012,24 +3100,89 @@ async fn handle_txset_shard_message(state: &Arc<SharedState>, from: PeerId, data
     // away from Tokio's async workers, just as the nominator does for coding.
     let reconstruct_start = Instant::now();
     let hash = shard.hash;
+    let codec = shard.codec;
     let coding_executor = state.txset_coding_executor.read().await.clone();
+    let metrics = Arc::clone(&state.metrics);
+    enum ReconstructionError {
+        DictionaryMiss(String),
+        Invalid(String),
+    }
     let decoded = tokio::task::spawn_blocking(move || {
-        let result = accumulator
-            .reconstruct_parallel(&coding_executor)?
-            .ok_or_else(|| "ready accumulator did not reconstruct".to_string())?;
-        if !crate::xdr::tx_set_hash_matches(&hash, &result.data) {
-            return Err("reconstructed TX set has the wrong content hash".to_string());
+        let mut result = accumulator
+            .reconstruct_parallel(&coding_executor)
+            .map_err(ReconstructionError::Invalid)?
+            .ok_or_else(|| {
+                ReconstructionError::Invalid("ready accumulator did not reconstruct".to_string())
+            })?;
+        if codec != TxSetCodec::Raw {
+            let decompress_start = Instant::now();
+            result.data = match decode_txset_transport(codec, &result.data) {
+                Ok(data) => {
+                    metrics.txset_shard_decompress_sum_us.fetch_add(
+                        decompress_start.elapsed().as_micros() as u64,
+                        Ordering::Relaxed,
+                    );
+                    metrics
+                        .txset_shard_decompress_count
+                        .fetch_add(1, Ordering::Relaxed);
+                    data
+                }
+                Err(TxSetTransportDecodeError::UnknownDictionary(id)) => {
+                    return Err(ReconstructionError::DictionaryMiss(format!(
+                        "unsupported zstd dictionary ID {id}"
+                    )));
+                }
+                Err(TxSetTransportDecodeError::Invalid(error)) => {
+                    return Err(ReconstructionError::Invalid(format!(
+                        "TX-set decompression failed: {error}"
+                    )));
+                }
+            };
         }
-        crate::xdr::validate_tx_set(&result.data)
-            .map_err(|e| format!("reconstructed TX set is not strict XDR: {e}"))?;
-        Ok::<_, String>(result)
+        if !crate::xdr::tx_set_hash_matches(&hash, &result.data) {
+            let encoding = if codec == TxSetCodec::Zstd {
+                "decompressed"
+            } else {
+                "raw"
+            };
+            return Err(ReconstructionError::Invalid(format!(
+                "{encoding} TX set has the wrong content hash"
+            )));
+        }
+        crate::xdr::validate_tx_set(&result.data).map_err(|e| {
+            ReconstructionError::Invalid(format!("reconstructed TX set is not strict XDR: {e}"))
+        })?;
+        if codec == TxSetCodec::Raw {
+            metrics
+                .txset_shard_raw_received
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Ok::<_, ReconstructionError>(result)
     })
     .await;
     let reconstruct_us = reconstruct_start.elapsed().as_micros() as u64;
 
     let result = match decoded {
         Ok(Ok(result)) => result,
-        Ok(Err(e)) => {
+        Ok(Err(ReconstructionError::DictionaryMiss(e))) => {
+            state
+                .metrics
+                .txset_shard_dictionary_miss
+                .fetch_add(1, Ordering::Relaxed);
+            state
+                .txset_shard_store
+                .lock()
+                .await
+                .reconstructing
+                .remove(&shard.hash);
+            warn!(
+                "TXSET_SHARD_DICTIONARY_MISS: reconstructed transport for {:02x?}... cannot be decoded: {}; using fetch fallback",
+                &shard.hash[..4],
+                e
+            );
+            return;
+        }
+        Ok(Err(ReconstructionError::Invalid(e))) => {
             state
                 .metrics
                 .txset_shard_invalid
@@ -3539,6 +3692,358 @@ mod tests {
         }
     }
 
+    /// A node that has compression switched off must still accept compressed
+    /// shreds. The flag is a nominator-side A/B switch only; if it ever gated
+    /// the receive path, turning it off on one node would make that node unable
+    /// to follow consensus driven by any node that has it on.
+    #[tokio::test]
+    async fn test_receiver_accepts_compressed_shreds_with_compression_disabled() {
+        let metrics = Arc::new(OverlayMetrics::new());
+        let keypair = Keypair::generate_ed25519();
+        let (_handle, mut events, _tx_events, overlay) =
+            create_overlay(keypair, Arc::clone(&metrics)).unwrap();
+        let state = Arc::clone(&overlay.state);
+        state
+            .txset_compression_enabled
+            .store(false, Ordering::Relaxed);
+
+        let (hash, expected) = test_large_txset_xdr(0x93, 64 * 1024);
+        let transport = encode_txset_transport(expected.clone(), true).unwrap();
+        assert_eq!(transport.codec, TxSetCodec::Zstd);
+        let executor = TxSetCodingExecutor::new(1).unwrap();
+        let shreds = make_txset_shards_parallel_with_codec(
+            hash,
+            &transport.data,
+            transport.codec,
+            3,
+            TxSetShardConfig {
+                initial_ttl: 0,
+                ..TxSetShardConfig::default()
+            },
+            &executor,
+        )
+        .unwrap();
+
+        for shred in shreds.iter().filter(|shred| shred.is_original()) {
+            handle_txset_shard_message(&state, PeerId::random(), shred.encode().unwrap()).await;
+        }
+
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("compressed reconstruction event timed out")
+            .expect("event channel closed");
+        assert!(matches!(
+            event,
+            OverlayEvent::TxSetReceived { hash: h, data, .. }
+                if h == hash && data == expected
+        ));
+        assert!(metrics.txset_shard_decompress_count.load(Ordering::Relaxed) > 0);
+    }
+
+    /// End-to-end compressed dissemination over a real mesh. The existing
+    /// three-node broadcast test uses a 44-byte set, which zstd declines, so
+    /// without this the compressed path is never exercised through
+    /// `broadcast_txset` -> shreds -> reconstruct on live sockets.
+    #[tokio::test]
+    async fn test_broadcast_compresses_txset_over_real_mesh() {
+        const NODE_COUNT: usize = 3;
+        const BASE_PORT: u16 = 24701;
+
+        let mut handles = Vec::with_capacity(NODE_COUNT);
+        let mut events = Vec::with_capacity(NODE_COUNT);
+        let mut metrics = Vec::with_capacity(NODE_COUNT);
+        for offset in 0..NODE_COUNT {
+            let keypair = Keypair::generate_ed25519();
+            let node_metrics = Arc::new(OverlayMetrics::new());
+            let (handle, node_events, _tx_events, overlay) =
+                create_overlay(keypair, Arc::clone(&node_metrics)).unwrap();
+            handles.push(handle);
+            events.push(node_events);
+            metrics.push(node_metrics);
+            tokio::spawn(async move {
+                overlay.run("127.0.0.1", BASE_PORT + offset as u16).await;
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        for (node, handle) in handles.iter().enumerate().skip(1) {
+            for prior in 0..node {
+                let address: Multiaddr =
+                    format!("/ip4/127.0.0.1/udp/{}/quic-v1", BASE_PORT + prior as u16)
+                        .parse()
+                        .unwrap();
+                handle.dial(address).await;
+            }
+        }
+        let connect_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut ready = true;
+            for handle in &handles {
+                ready &= handle.connected_peer_count().await == NODE_COUNT - 1;
+            }
+            if ready {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < connect_deadline,
+                "mesh did not fully connect"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for receiver in &mut events {
+            while receiver.try_recv().is_ok() {}
+        }
+
+        // Repeated envelopes make this highly compressible, which is the point:
+        // it forces codec 1 rather than the raw fallback.
+        let (want_hash, want_data) = test_large_txset_xdr(0x94, 256 * 1024);
+        handles[0]
+            .broadcast_txset(want_hash, want_data.clone())
+            .await;
+
+        let mut received = [false; NODE_COUNT];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while received.iter().skip(1).any(|got| !got) {
+            for node in 1..NODE_COUNT {
+                while let Ok(event) = events[node].try_recv() {
+                    if let OverlayEvent::TxSetReceived { hash, data, .. } = event {
+                        if hash == want_hash {
+                            assert_eq!(data, want_data, "peer reconstructed different bytes");
+                            received[node] = true;
+                        }
+                    }
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "peers did not reconstruct the compressed TX set"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // The nominator really compressed, and shipped far fewer bytes than the
+        // plain set for every branch copy it sent.
+        let plain = metrics[0].txset_shard_plain_bytes.load(Ordering::Relaxed);
+        let compressed = metrics[0]
+            .txset_shard_compressed_bytes
+            .load(Ordering::Relaxed);
+        assert_eq!(plain, want_data.len() as u64);
+        assert!(
+            compressed < plain / 2,
+            "expected the repeated-envelope set to compress well, got {compressed} of {plain}"
+        );
+        assert_eq!(metrics[0].txset_shard_raw_sent.load(Ordering::Relaxed), 0);
+        assert!(
+            metrics[0]
+                .txset_shard_compress_count
+                .load(Ordering::Relaxed)
+                >= 1
+        );
+
+        // Receivers decompressed rather than taking the raw path.
+        let decompressed: u64 = metrics
+            .iter()
+            .skip(1)
+            .map(|node| node.txset_shard_decompress_count.load(Ordering::Relaxed))
+            .sum();
+        assert_eq!(decompressed, (NODE_COUNT - 1) as u64);
+        assert_eq!(
+            metrics
+                .iter()
+                .skip(1)
+                .map(|node| node.txset_shard_raw_received.load(Ordering::Relaxed))
+                .sum::<u64>(),
+            0
+        );
+        assert_eq!(
+            metrics
+                .iter()
+                .map(|node| node.txset_shard_dictionary_miss.load(Ordering::Relaxed))
+                .sum::<u64>(),
+            0
+        );
+
+        for handle in handles {
+            handle.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_txset_shred_handler_decompresses_after_recovery() {
+        let metrics = Arc::new(OverlayMetrics::new());
+        let keypair = Keypair::generate_ed25519();
+        let (_handle, mut events, _tx_events, overlay) =
+            create_overlay(keypair, Arc::clone(&metrics)).unwrap();
+        let state = Arc::clone(&overlay.state);
+        let (hash, expected) = test_large_txset_xdr(0x92, 64 * 1024);
+        let transport = encode_txset_transport(expected.clone(), true).unwrap();
+        assert_eq!(transport.codec, TxSetCodec::Zstd);
+        let executor = TxSetCodingExecutor::new(1).unwrap();
+        let shreds = make_txset_shards_parallel_with_codec(
+            hash,
+            &transport.data,
+            transport.codec,
+            3,
+            TxSetShardConfig {
+                target_shard_size: 32,
+                recovery_factor_percent: 50,
+                initial_ttl: 0,
+            },
+            &executor,
+        )
+        .unwrap();
+        let original_count = shreds[0].original_shards;
+        for shred in shreds
+            .iter()
+            .filter(|shred| shred.shard_index != 0)
+            .take(original_count)
+        {
+            handle_txset_shard_message(&state, PeerId::random(), shred.encode().unwrap()).await;
+        }
+
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("compressed reconstruction event timed out")
+            .expect("event channel closed");
+        assert!(matches!(
+            event,
+            OverlayEvent::TxSetReceived {
+                hash: received_hash,
+                data,
+                ..
+            } if received_hash == hash && data == expected
+        ));
+        assert_eq!(
+            metrics.txset_shard_decompress_count.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics
+                .txset_shard_reconstruct_recovery
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(metrics.txset_shard_invalid.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.txset_shard_raw_received.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn test_txset_shred_handler_cleanly_drops_unknown_codec() {
+        let metrics = Arc::new(OverlayMetrics::new());
+        let keypair = Keypair::generate_ed25519();
+        let (_handle, mut events, _tx_events, overlay) =
+            create_overlay(keypair, Arc::clone(&metrics)).unwrap();
+        let state = Arc::clone(&overlay.state);
+        let (hash, expected) = test_txset_xdr(0x93);
+        let mut encoded = make_txset_shards(hash, &expected, 2, TxSetShardConfig::default())
+            .unwrap()[0]
+            .encode()
+            .unwrap();
+        encoded[51] = 0xff;
+
+        handle_txset_shard_message(&state, PeerId::random(), encoded).await;
+
+        assert!(events.try_recv().is_err());
+        assert_eq!(metrics.txset_shard_invalid.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics.txset_shard_dictionary_miss.load(Ordering::Relaxed),
+            0
+        );
+        assert!(state.txset_shard_store.lock().await.partial.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_txset_shred_handler_uses_fetch_fallback_for_unknown_dictionary() {
+        let metrics = Arc::new(OverlayMetrics::new());
+        let keypair = Keypair::generate_ed25519();
+        let (_handle, mut events, _tx_events, overlay) =
+            create_overlay(keypair, Arc::clone(&metrics)).unwrap();
+        let state = Arc::clone(&overlay.state);
+        let (hash, expected) = test_large_txset_xdr(0x94, 64 * 1024);
+        let samples: Vec<Vec<u8>> = expected.chunks(512).map(<[u8]>::to_vec).collect();
+        let dictionary = zstd::dict::from_samples(&samples, 4096).unwrap();
+        let mut compressor = zstd::bulk::Compressor::with_dictionary(1, &dictionary).unwrap();
+        let encoded = compressor.compress(&expected).unwrap();
+        assert!(zstd::zstd_safe::get_dict_id_from_frame(&encoded).is_some());
+        let executor = TxSetCodingExecutor::new(1).unwrap();
+        let shreds = make_txset_shards_parallel_with_codec(
+            hash,
+            &encoded,
+            TxSetCodec::Zstd,
+            2,
+            TxSetShardConfig::default(),
+            &executor,
+        )
+        .unwrap();
+        for shred in shreds.iter().filter(|shred| shred.is_original()) {
+            handle_txset_shard_message(&state, PeerId::random(), shred.encode().unwrap()).await;
+        }
+
+        assert!(events.try_recv().is_err());
+        assert_eq!(metrics.txset_shard_invalid.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics.txset_shard_dictionary_miss.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics.txset_shard_decompress_count.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            metrics
+                .txset_shard_decompress_sum_us
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert!(state
+            .txset_shard_store
+            .lock()
+            .await
+            .reconstructing
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_txset_shred_handler_counts_malformed_zstd_as_invalid() {
+        let metrics = Arc::new(OverlayMetrics::new());
+        let keypair = Keypair::generate_ed25519();
+        let (_handle, mut events, _tx_events, overlay) =
+            create_overlay(keypair, Arc::clone(&metrics)).unwrap();
+        let state = Arc::clone(&overlay.state);
+        let (hash, _) = test_txset_xdr(0x95);
+        let executor = TxSetCodingExecutor::new(1).unwrap();
+        let shreds = make_txset_shards_parallel_with_codec(
+            hash,
+            b"not-a-zstd-frame",
+            TxSetCodec::Zstd,
+            2,
+            TxSetShardConfig::default(),
+            &executor,
+        )
+        .unwrap();
+        for shred in shreds.iter().filter(|shred| shred.is_original()) {
+            handle_txset_shard_message(&state, PeerId::random(), shred.encode().unwrap()).await;
+        }
+
+        assert!(events.try_recv().is_err());
+        assert_eq!(metrics.txset_shard_invalid.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            metrics.txset_shard_dictionary_miss.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            metrics.txset_shard_decompress_count.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            metrics
+                .txset_shard_decompress_sum_us
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
     #[tokio::test]
     async fn test_txset_shred_handler_rejects_wrong_content_hash() {
         let metrics = Arc::new(OverlayMetrics::new());
@@ -3556,6 +4061,7 @@ mod tests {
 
         assert!(events.try_recv().is_err());
         assert_eq!(metrics.txset_shard_invalid.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.txset_shard_raw_received.load(Ordering::Relaxed), 0);
         assert!(state
             .txset_shard_store
             .lock()
@@ -3899,8 +4405,10 @@ mod tests {
 
         // Multi-shred set: 3 peers -> 4 originals + 2 recovery shreds.
         let (want_hash, want_data) = test_large_txset_xdr(0x51, 64 * 1024);
+        let transport = encode_txset_transport(want_data.clone(), true).unwrap();
+        assert_eq!(transport.codec, TxSetCodec::Zstd);
         let plan = crate::txset_shards::plan_txset_shards(
-            want_data.len(),
+            transport.data.len(),
             NODE_COUNT - 1,
             TxSetShardConfig::default(),
         )
@@ -3979,6 +4487,30 @@ mod tests {
         // Leader never forwards (it originates), and no peer requested the
         // full body: the eager coded path alone delivered it.
         assert_eq!(metrics[0].txset_shard_forwarded.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics[0]
+                .txset_shard_compress_count
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics[0].txset_shard_plain_bytes.load(Ordering::Relaxed),
+            want_data.len() as u64
+        );
+        assert_eq!(
+            metrics[0]
+                .txset_shard_compressed_bytes
+                .load(Ordering::Relaxed),
+            transport.data.len() as u64
+        );
+        assert_eq!(
+            metrics
+                .iter()
+                .skip(1)
+                .map(|node| node.txset_shard_decompress_count.load(Ordering::Relaxed))
+                .sum::<u64>(),
+            (NODE_COUNT - 1) as u64
+        );
         assert!(
             !matches!(
                 events[0].try_recv(),
@@ -4797,6 +5329,9 @@ mod tests {
 
         // Leader eagerly assigns shreds. No one requested the full body.
         let (want_hash, want_data) = test_txset_xdr(0x37);
+        let expected_codec = encode_txset_transport(want_data.clone(), true)
+            .unwrap()
+            .codec;
         handle1.broadcast_txset(want_hash, want_data.clone()).await;
 
         // Both peers reconstruct the unsolicited body from the eager shreds.
@@ -4886,6 +5421,26 @@ mod tests {
             2
         );
         assert!(metrics1.flood_txset_push_bytes.load(Ordering::Relaxed) > 0);
+        let raw_sets = (expected_codec == TxSetCodec::Raw) as u64;
+        let compressed_sets = (expected_codec == TxSetCodec::Zstd) as u64;
+        assert_eq!(
+            metrics1.txset_shard_raw_sent.load(Ordering::Relaxed),
+            raw_sets
+        );
+        assert_eq!(
+            metrics2.txset_shard_raw_received.load(Ordering::Relaxed)
+                + metrics3.txset_shard_raw_received.load(Ordering::Relaxed),
+            2 * raw_sets
+        );
+        assert_eq!(
+            metrics2
+                .txset_shard_decompress_count
+                .load(Ordering::Relaxed)
+                + metrics3
+                    .txset_shard_decompress_count
+                    .load(Ordering::Relaxed),
+            2 * compressed_sets
+        );
 
         handle1.shutdown().await;
         handle2.shutdown().await;

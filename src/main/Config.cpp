@@ -277,6 +277,7 @@ Config::Config() : NODE_SEED(SecretKey::random())
     FLOOD_LEADER_COUNT = 2;
     QUORUM_CONNECTIVITY_CHECK_FATAL = false;
     EXPERIMENTAL_TX_BATCH_MAX_SIZE = 0;
+    EXPERIMENTAL_TXSET_COMPRESSION = true;
 
     MAX_BATCH_WRITE_COUNT = 1024;
     MAX_BATCH_WRITE_BYTES = 1 * 1024 * 1024;
@@ -1471,6 +1472,8 @@ Config::processConfig(std::shared_ptr<cpptoml::table> t)
                  [&]() {
                      EXPERIMENTAL_TX_BATCH_MAX_SIZE = readInt<size_t>(item, 0);
                  }},
+                {"EXPERIMENTAL_TXSET_COMPRESSION",
+                 [&]() { EXPERIMENTAL_TXSET_COMPRESSION = readBool(item); }},
                 {"FLOOD_LEADER_COUNT",
                  [&]() { FLOOD_LEADER_COUNT = readInt<size_t>(item, 0); }},
                 {"QUORUM_CONNECTIVITY_CHECK_FATAL",

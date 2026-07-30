@@ -67,7 +67,7 @@ OverlayIPC::OverlayIPC(std::optional<std::string> socketPath,
                        std::optional<std::string> overlayBinaryPath,
                        uint16_t peerPort,
                        std::optional<std::string> nodeSeedHex,
-                       uint64_t quorumCheckGraceSecs)
+                       uint64_t quorumCheckGraceSecs, bool txSetCompression)
     : mSocketPath(socketPath && !socketPath->empty()
                       ? std::move(*socketPath)
                       : defaultSocketPath(peerPort))
@@ -76,6 +76,7 @@ OverlayIPC::OverlayIPC(std::optional<std::string> socketPath,
     , mPeerPort(peerPort)
     , mNodeSeedHex(std::move(nodeSeedHex))
     , mQuorumCheckGraceSecs(quorumCheckGraceSecs)
+    , mTxSetCompression(txSetCompression)
 {
 }
 
@@ -326,9 +327,11 @@ OverlayIPC::spawnOverlay()
         std::string config = fmt::format("core_socket = \"{}\"\n"
                                          "peer_port = {}\n"
                                          "node_seed = \"{}\"\n"
-                                         "quorum_check_grace_secs = {}\n",
+                                         "quorum_check_grace_secs = {}\n"
+                                         "txset_compression = {}\n",
                                          tomlEscape(mSocketPath), mPeerPort,
-                                         *mNodeSeedHex, mQuorumCheckGraceSecs);
+                                         *mNodeSeedHex, mQuorumCheckGraceSecs,
+                                         mTxSetCompression);
         ssize_t written = write(fd, config.data(), config.size());
         if (written < 0 || static_cast<size_t>(written) != config.size())
         {

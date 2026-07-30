@@ -27,6 +27,10 @@ pub struct Config {
     /// Seconds to wait after receiving quorum_members before reporting
     /// connectivity completeness to Core.
     pub quorum_check_grace_secs: u64,
+
+    /// Compress nominated TX sets before Reed–Solomon coding. Receivers always
+    /// accept raw and compressed shreds regardless of this setting.
+    pub txset_compression: bool,
 }
 
 impl Default for Config {
@@ -38,6 +42,7 @@ impl Default for Config {
             log_level: "info".to_string(),
             node_seed: None,
             quorum_check_grace_secs: 30,
+            txset_compression: true,
         }
     }
 }
@@ -99,6 +104,7 @@ mod tests {
         assert_eq!(config.log_level, "info");
         assert_eq!(config.node_seed, None);
         assert_eq!(config.quorum_check_grace_secs, 30);
+        assert!(config.txset_compression);
     }
 
     #[test]
@@ -110,6 +116,7 @@ mod tests {
             log_level = "debug"
             node_seed = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
             quorum_check_grace_secs = 5
+            txset_compression = false
         "#;
 
         let config = Config::from_str(toml).unwrap();
@@ -122,6 +129,7 @@ mod tests {
             Some("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f".to_string())
         );
         assert_eq!(config.quorum_check_grace_secs, 5);
+        assert!(!config.txset_compression);
     }
 
     // ═══ Parse Error Cases ═══

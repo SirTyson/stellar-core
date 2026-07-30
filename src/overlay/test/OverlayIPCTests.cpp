@@ -1356,6 +1356,13 @@ TEST_CASE("TX set eagerly pushed to peers", "[overlay-ipc][herder][.]")
         REQUIRE(root.isMember("txset_shard_recovery_sent"));
         REQUIRE(root.isMember("txset_shard_reconstruct_original"));
         REQUIRE(root.isMember("txset_shard_reconstruct_recovery"));
+        REQUIRE(root.isMember("txset_shard_compress_count"));
+        REQUIRE(root.isMember("txset_shard_decompress_count"));
+        REQUIRE(root.isMember("txset_shard_plain_bytes"));
+        REQUIRE(root.isMember("txset_shard_compressed_bytes"));
+        REQUIRE(root.isMember("txset_shard_raw_sent"));
+        REQUIRE(root.isMember("txset_shard_raw_received"));
+        REQUIRE(root.isMember("txset_shard_dictionary_miss"));
         totalTxSetPush += root["flood_txset_push"].asUInt64();
         totalShardBroadcast += root["txset_shard_broadcast"].asUInt64();
         totalOriginalSent += root["txset_shard_original_sent"].asUInt64();

@@ -107,6 +107,20 @@ pub struct OverlayMetrics {
     pub txset_shard_encode_count: AtomicU64,
     pub txset_shard_reconstruct_sum_us: AtomicU64,
     pub txset_shard_reconstruct_count: AtomicU64,
+    pub txset_shard_compress_sum_us: AtomicU64,
+    pub txset_shard_compress_count: AtomicU64,
+    pub txset_shard_decompress_sum_us: AtomicU64,
+    pub txset_shard_decompress_count: AtomicU64,
+    /// Canonical and encoded payload byte totals. Their quotient is the
+    /// observed compression ratio, including raw fallbacks.
+    pub txset_shard_plain_bytes: AtomicU64,
+    pub txset_shard_compressed_bytes: AtomicU64,
+    /// Keep the three codec outcomes separate: a raw decision at the
+    /// nominator, a raw reconstruction at a receiver, and a compressed set
+    /// that could not be decoded because its dictionary was unavailable.
+    pub txset_shard_raw_sent: AtomicU64,
+    pub txset_shard_raw_received: AtomicU64,
+    pub txset_shard_dictionary_miss: AtomicU64,
 
     // Dissemination timing breakdown. These exist to locate the critical path:
     // nominator upload, mesh spread, relay turnaround, and topology health.
@@ -222,6 +236,15 @@ impl Default for OverlayMetrics {
             txset_shard_encode_count: AtomicU64::new(0),
             txset_shard_reconstruct_sum_us: AtomicU64::new(0),
             txset_shard_reconstruct_count: AtomicU64::new(0),
+            txset_shard_compress_sum_us: AtomicU64::new(0),
+            txset_shard_compress_count: AtomicU64::new(0),
+            txset_shard_decompress_sum_us: AtomicU64::new(0),
+            txset_shard_decompress_count: AtomicU64::new(0),
+            txset_shard_plain_bytes: AtomicU64::new(0),
+            txset_shard_compressed_bytes: AtomicU64::new(0),
+            txset_shard_raw_sent: AtomicU64::new(0),
+            txset_shard_raw_received: AtomicU64::new(0),
+            txset_shard_dictionary_miss: AtomicU64::new(0),
             txset_shard_broadcast_span_sum_us: AtomicU64::new(0),
             txset_shard_broadcast_span_count: AtomicU64::new(0),
             txset_shard_assembly_sum_us: AtomicU64::new(0),
@@ -313,6 +336,15 @@ impl OverlayMetrics {
             txset_shard_encode_count: self.txset_shard_encode_count.load(ORD),
             txset_shard_reconstruct_sum_us: self.txset_shard_reconstruct_sum_us.load(ORD),
             txset_shard_reconstruct_count: self.txset_shard_reconstruct_count.load(ORD),
+            txset_shard_compress_sum_us: self.txset_shard_compress_sum_us.load(ORD),
+            txset_shard_compress_count: self.txset_shard_compress_count.load(ORD),
+            txset_shard_decompress_sum_us: self.txset_shard_decompress_sum_us.load(ORD),
+            txset_shard_decompress_count: self.txset_shard_decompress_count.load(ORD),
+            txset_shard_plain_bytes: self.txset_shard_plain_bytes.load(ORD),
+            txset_shard_compressed_bytes: self.txset_shard_compressed_bytes.load(ORD),
+            txset_shard_raw_sent: self.txset_shard_raw_sent.load(ORD),
+            txset_shard_raw_received: self.txset_shard_raw_received.load(ORD),
+            txset_shard_dictionary_miss: self.txset_shard_dictionary_miss.load(ORD),
             txset_shard_broadcast_span_sum_us: self.txset_shard_broadcast_span_sum_us.load(ORD),
             txset_shard_broadcast_span_count: self.txset_shard_broadcast_span_count.load(ORD),
             txset_shard_assembly_sum_us: self.txset_shard_assembly_sum_us.load(ORD),
@@ -412,6 +444,15 @@ pub struct MetricsSnapshot {
     pub txset_shard_encode_count: u64,
     pub txset_shard_reconstruct_sum_us: u64,
     pub txset_shard_reconstruct_count: u64,
+    pub txset_shard_compress_sum_us: u64,
+    pub txset_shard_compress_count: u64,
+    pub txset_shard_decompress_sum_us: u64,
+    pub txset_shard_decompress_count: u64,
+    pub txset_shard_plain_bytes: u64,
+    pub txset_shard_compressed_bytes: u64,
+    pub txset_shard_raw_sent: u64,
+    pub txset_shard_raw_received: u64,
+    pub txset_shard_dictionary_miss: u64,
     pub txset_shard_broadcast_span_sum_us: u64,
     pub txset_shard_broadcast_span_count: u64,
     pub txset_shard_assembly_sum_us: u64,
@@ -453,6 +494,7 @@ mod tests {
         assert_eq!(m.flood_advertised.load(ORD), 0);
         assert_eq!(m.txset_shard_broadcast.load(ORD), 0);
         assert_eq!(m.txset_shard_reconstruct_recovery.load(ORD), 0);
+        assert_eq!(m.txset_shard_compressed_bytes.load(ORD), 0);
     }
 
     #[test]
@@ -463,6 +505,7 @@ mod tests {
         m.flood_advertised.fetch_add(42, ORD);
         m.txset_shard_original_sent.fetch_add(20, ORD);
         m.txset_shard_encode_sum_us.fetch_add(1234, ORD);
+        m.txset_shard_plain_bytes.fetch_add(8192, ORD);
 
         let snap = m.snapshot();
         assert_eq!(snap.byte_read, 1000);
@@ -470,6 +513,7 @@ mod tests {
         assert_eq!(snap.flood_advertised, 42);
         assert_eq!(snap.txset_shard_original_sent, 20);
         assert_eq!(snap.txset_shard_encode_sum_us, 1234);
+        assert_eq!(snap.txset_shard_plain_bytes, 8192);
     }
 
     #[test]
@@ -498,5 +542,6 @@ mod tests {
         assert!(json.contains("\"connection_authenticated\":5"));
         assert!(json.contains("\"byte_read\":2048"));
         assert!(json.contains("\"txset_shard_broadcast\":0"));
+        assert!(json.contains("\"txset_shard_decompress_count\":0"));
     }
 }

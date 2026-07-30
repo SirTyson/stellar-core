@@ -80,6 +80,20 @@ OverlayMetrics::OverlayMetrics(Application& app)
           app.getMetrics().NewTimer({"overlay", "txset-shard", "encode"}))
     , mTxSetShardReconstructTimer(
           app.getMetrics().NewTimer({"overlay", "txset-shard", "reconstruct"}))
+    , mTxSetShardCompressTimer(
+          app.getMetrics().NewTimer({"overlay", "txset-shard", "compress"}))
+    , mTxSetShardDecompressTimer(
+          app.getMetrics().NewTimer({"overlay", "txset-shard", "decompress"}))
+    , mTxSetShardPlainBytes(app.getMetrics().NewMeter(
+          {"overlay", "txset-shard", "plain-bytes"}, "byte"))
+    , mTxSetShardCompressedBytes(app.getMetrics().NewMeter(
+          {"overlay", "txset-shard", "compressed-bytes"}, "byte"))
+    , mTxSetShardRawSent(app.getMetrics().NewMeter(
+          {"overlay", "txset-shard", "raw-sent"}, "txset"))
+    , mTxSetShardRawReceived(app.getMetrics().NewMeter(
+          {"overlay", "txset-shard", "raw-received"}, "txset"))
+    , mTxSetShardDictionaryMiss(app.getMetrics().NewMeter(
+          {"overlay", "txset-shard", "dictionary-miss"}, "txset"))
     , mTxSetShardBroadcastSpanTimer(app.getMetrics().NewTimer(
           {"overlay", "txset-shard", "broadcast-span"}))
     , mTxSetShardAssemblyTimer(

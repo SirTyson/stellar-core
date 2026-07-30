@@ -49,10 +49,20 @@ reconstruction cancels an in-flight fetch for the same hash.
 ## Wire and safety properties
 
 Shreds use a dedicated QUIC stream protocol,
-`/stellar/txset-shard/2.0.0`, so they do not queue behind full-body fetch
+`/stellar/txset-shard/3.0.0`, so they do not queue behind full-body fetch
 responses or SCP traffic. The shred header is versioned and carries the TX-set
-hash, coding parameters, index, original length, TTL, branch index/count, and
-payload length.
+hash, coding parameters, index, encoded length, codec, TTL, branch index/count,
+and payload length. Codec 0 is raw and codec 1 is zstd. Nominators hash the
+canonical XDR first, then opportunistically compress it at zstd level 1 before
+planning and coding shreds. Compression that expands the payload falls back to
+raw bytes. `EXPERIMENTAL_TXSET_COMPRESSION=false` disables compression on the
+nominator for A/B testing; receivers always accept both codecs.
+
+The protocol bump is intentionally not negotiated with v2. During a rolling
+upgrade, v2 and v3 peers still share the main overlay but cannot open a common
+TX-set-shred stream, so mixed-version edges use `GetTxSet` instead. Expect eager
+reconstruction metrics to dip and fetch traffic to rise mid-roll; that rollout
+shape is not evidence that zstd made dissemination slower.
 
 Receivers enforce:
 
@@ -61,8 +71,11 @@ Receivers enforce:
 - at most 16 incomplete accumulators (under 400 MiB at the maximum set and
   recovery sizes), expired after 60 seconds;
 - duplicate and conflicting-shred detection;
+- clean fetch fallback for unknown codecs and dictionary IDs;
+- a declared and independently enforced 16 MiB decompressed-size cap;
 - content-hash verification and strict generalized-TX-set XDR decoding before
-  delivering reconstructed bytes to Core.
+  delivering reconstructed bytes to Core. The hash covers decompressed
+  canonical XDR, never the transport encoding.
 
 Encoding and recovery decoding are split into independent byte-column ranges
 and executed on a private Rayon pool. Its size is capped by the current
@@ -93,10 +106,13 @@ variant. Tiny sets are not padded to 1024-byte payloads.
 
 ## Verification
 
-`overlay/src/txset_shards.rs` covers wire validation, parameter planning,
-balanced assignment, exact reconstruction, every supported recovery-loss count,
-duplicates/conflicts, bounded parallel coding equivalence, two-root partition
-coverage, bandwidth bounds, and a failed-root dense-mesh model. Its ignored
+`overlay/src/txset_shards.rs` covers codec wire validation, raw and zstd
+round-trips, expansion fallback, concatenated frames, missing content sizes,
+truncated/corrupt frames, decompression bombs, unknown dictionary IDs,
+compressed recovery reconstruction, parameter planning, balanced assignment,
+exact reconstruction, every supported recovery-loss count, duplicates/conflicts,
+bounded parallel coding equivalence, two-root partition coverage, bandwidth
+bounds, and a failed-root dense-mesh model. Its ignored
 `benchmark_txset_coding_throughput` test reports 10 MiB encode and
 recovery-decode latency/throughput.
 

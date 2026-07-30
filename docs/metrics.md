@@ -167,6 +167,13 @@ overlay.txset-shard.root-mismatch         | meter     | shreds not forwarded bec
 overlay.txset-shard.bytes-in              | meter     | TX-set shred bytes accepted, for ingress-rate accounting
 overlay.txset-shard.encode                | timer     | Reed-Solomon encoding time per TX set
 overlay.txset-shard.reconstruct           | timer     | TX-set reconstruction time after the threshold shred arrives
+overlay.txset-shard.compress              | timer     | zstd compression time per nominated TX set
+overlay.txset-shard.decompress            | timer     | bounded zstd decompression time per reconstructed TX set
+overlay.txset-shard.plain-bytes           | meter     | canonical TX-set bytes offered to transport compression
+overlay.txset-shard.compressed-bytes      | meter     | encoded TX-set bytes passed to Reed-Solomon coding
+overlay.txset-shard.raw-sent              | meter     | TX sets sent with the raw codec because compression was disabled, ineffective, or failed
+overlay.txset-shard.raw-received          | meter     | TX sets successfully reconstructed with the raw codec
+overlay.txset-shard.dictionary-miss       | meter     | compressed TX sets rejected because their dictionary was unavailable
 overlay.txset-shard.broadcast-span        | timer     | nominator: coding start until the last shred of the set left the wire
 overlay.txset-shard.assembly              | timer     | receiver: first shred of a set until the threshold shred arrives
 overlay.txset-shard.forward-latency       | timer     | relay: shred receipt until its forwarded copy finished sending
