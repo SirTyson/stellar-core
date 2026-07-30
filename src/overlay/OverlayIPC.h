@@ -31,7 +31,7 @@ class Application;
  *
  * The overlay process handles:
  * - Peer connections and authentication (Noise protocol)
- * - SCP message relay with deduplication
+ * - Direct all-peer SCP broadcast and receive-side deduplication
  * - TX flooding with push-k strategy
  * - Mempool with fee ordering
  */

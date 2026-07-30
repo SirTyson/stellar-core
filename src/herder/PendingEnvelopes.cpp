@@ -602,11 +602,9 @@ PendingEnvelopes::envelopeReady(SCPEnvelope const& envelope)
     // envelope.
     recordReceivedCost(envelope);
 
-    auto msg = std::make_shared<StellarMessage>();
-    msg->type(SCP_MESSAGE);
-    msg->envelope() = envelope;
-    mApp.getOverlayManager().broadcastMessage(msg);
-
+    // Do not relay an envelope received from the network. Locally emitted SCP
+    // envelopes are already sent directly to every peer by HerderImpl, so
+    // relaying here only amplifies duplicates in a dense topology.
     auto envW = mHerder.getHerderSCPDriver().wrapEnvelope(envelope);
     mEnvelopes[slot].mReadyEnvelopes.push_back(envW);
 }

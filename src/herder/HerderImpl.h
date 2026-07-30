@@ -351,6 +351,12 @@ class HerderImpl : public Herder
         // network-close-time anchor to the local prepare-start anchor.
         medida::Meter& mTriggerPrepareStartFallback;
 
+        // Proposal construction mode. Only pre-routed candidate leaders build
+        // the mempool-backed TX set; later-round fallback leaders use the
+        // canonical empty set.
+        medida::Meter& mCandidateTxSetBuild;
+        medida::Meter& mEmptyTxSetFallback;
+
         SCPMetrics(Application& app);
     };
 

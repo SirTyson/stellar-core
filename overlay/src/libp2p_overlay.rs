@@ -5821,8 +5821,20 @@ mod tests {
         handle_b.dial(addr_a.clone()).await;
         handle_c.dial(addr_a).await;
 
-        // Wait for connections to establish
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Wait for both authenticated connections and their protocol streams
+        // to establish before asking A to broadcast. A fixed sleep is flaky
+        // under a busy parallel test runner.
+        let connection_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while (handle_a.connected_peer_count().await != 2
+            || handle_b.connected_peer_count().await != 1
+            || handle_c.connected_peer_count().await != 1)
+            && tokio::time::Instant::now() < connection_deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(handle_a.connected_peer_count().await, 2);
+        assert_eq!(handle_b.connected_peer_count().await, 1);
+        assert_eq!(handle_c.connected_peer_count().await, 1);
 
         // Drain connection events
         while events_b.try_recv().is_ok() {}
@@ -7228,14 +7240,15 @@ async fn test_inv_getdata_three_node_relay() {
     let _ = tokio::time::timeout(Duration::from_secs(1), overlay3_task).await;
 }
 
-/// Test SCP relay through 3 nodes: A→B→C (the bug that was fixed)
+/// Test an explicit repeat broadcast through 3 nodes: A→B→C.
 ///
 /// Topology: Node1 ←→ Node2 ←→ Node3 (Node1 NOT connected to Node3)
-/// Node1 broadcasts SCP. Node2 receives it and relays (re-broadcasts) it.
-/// Node3 must receive it via Node2's relay.
+/// Node1 broadcasts SCP. The test explicitly asks Node2 to broadcast the same
+/// bytes and verifies that Node3 receives them.
 ///
-/// Before the fix, Node2's relay request was silently dropped because
-/// the message was already in `scp_seen` from the initial receive.
+/// Core no longer performs this repeat for received SCP envelopes in the dense
+/// mesh. The primitive remains useful for state repair and verifies that
+/// `scp_seen` does not suppress an explicit outbound request.
 #[tokio::test]
 async fn test_scp_relay_three_nodes() {
     let keypair1 = Keypair::generate_ed25519();
@@ -7313,7 +7326,8 @@ async fn test_scp_relay_three_nodes() {
     }
     assert!(node2_received, "Node2 should receive SCP from Node1");
 
-    // Node2 relays (re-broadcasts) the same SCP message - this is what C++ core does
+    // Explicitly ask Node2 to broadcast the same SCP message. Normal C++ Core
+    // receipt does not do this in the dense-mesh path.
     handle2.broadcast_scp(scp_msg.clone()).await;
 
     // Node3 should receive it via Node2's relay
@@ -7345,11 +7359,11 @@ async fn test_scp_relay_three_nodes() {
     let _ = tokio::time::timeout(Duration::from_secs(1), overlay3_task).await;
 }
 
-/// Test that SCP relay doesn't echo back to the sender
+/// Test that an explicit SCP repeat broadcast doesn't echo to the sender.
 ///
 /// Topology: Node1 ←→ Node2
-/// Node1 broadcasts SCP. Node2 receives it and relays (re-broadcasts).
-/// Node1 must NOT receive it again (no echo).
+/// Node1 broadcasts SCP. The test explicitly asks Node2 to broadcast the same
+/// bytes. Node1 must NOT receive them again.
 #[tokio::test]
 async fn test_scp_relay_no_echo_to_sender() {
     let keypair1 = Keypair::generate_ed25519();
@@ -7406,7 +7420,9 @@ async fn test_scp_relay_no_echo_to_sender() {
     }
     assert!(node2_received, "Node2 should receive SCP from Node1");
 
-    // Node2 relays - this should NOT send back to Node1 (already in scp_sent_to)
+    // An explicit repeat broadcast by Node2 should NOT send back to Node1
+    // (already in scp_sent_to). Normal received envelopes are not rebroadcast
+    // by stellar-core.
     handle2.broadcast_scp(scp_msg.clone()).await;
 
     // Wait and verify Node1 does NOT receive an echo

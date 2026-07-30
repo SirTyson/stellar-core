@@ -286,7 +286,7 @@ TEST_CASE("Rust overlay SCP consensus", "[overlay-ipc][.]")
     // Start all nodes
     simulation->startAllNodes();
 
-    // Target: externalize ledger 5 (proves SCP relay is working)
+    // Target: externalize ledger 5 (proves direct SCP broadcasts are working)
     int const targetLedger = 5;
 
     // Crank until both nodes reach consensus on target ledger
@@ -1252,9 +1252,24 @@ TEST_CASE("TX routed directly to leader", "[overlay-ipc][herder][.]")
     REQUIRE(root0.isMember("flood_leader_push"));
     REQUIRE(root0["flood_leader_push"].asUInt64() >= 1);
 
+    // Candidate leaders must exercise the mempool-backed proposal path. This
+    // fixture uses legacy self-biased leader weights, so all three nodes may
+    // consider themselves part of a two-candidate window; the deterministic
+    // SCP unit test covers the later-leader empty fallback.
+    uint64_t candidateBuilds = 0;
+    for (auto const& node : nodes)
+    {
+        candidateBuilds +=
+            node->getMetrics()
+                .NewMeter({"scp", "txset", "candidate-build"}, "txset")
+                .count();
+    }
+    REQUIRE(candidateBuilds > 0);
+
     LOG_INFO(DEFAULT_LOG,
-             "TX routed directly to leader test passed (leader pushes: {})",
-             root0["flood_leader_push"].asUInt64());
+             "TX routed directly to leader test passed (leader pushes: {}, "
+             "candidate builds: {})",
+             root0["flood_leader_push"].asUInt64(), candidateBuilds);
 }
 
 /**

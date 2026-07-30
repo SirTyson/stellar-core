@@ -85,6 +85,10 @@ HerderImpl::SCPMetrics::SCPMetrics(Application& app)
           {"scp", "envelope", "invalidsig"}, "envelope"))
     , mTriggerPrepareStartFallback(app.getMetrics().NewMeter(
           {"scp", "trigger", "prepare-start-fallback"}, "trigger"))
+    , mCandidateTxSetBuild(app.getMetrics().NewMeter(
+          {"scp", "txset", "candidate-build"}, "txset"))
+    , mEmptyTxSetFallback(app.getMetrics().NewMeter(
+          {"scp", "txset", "empty-fallback"}, "txset"))
 {
 }
 
@@ -1657,127 +1661,161 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
     upperBoundCloseTimeOffset = nextCloseTime - lcl.header.scpValue.closeTime;
     lowerBoundCloseTimeOffset = upperBoundCloseTimeOffset;
 
+    uint32_t const slotIndex = lcl.header.ledgerSeq + 1;
+    auto const candidateLeaders = mHerderSCPDriver.computeLeaderSchedule(
+        lcl.header.previousLedgerHash, slotIndex,
+        mApp.getConfig().FLOOD_LEADER_COUNT);
+    auto const selfID = mApp.getConfig().NODE_SEED.getPublicKey();
+    bool const isValidator = getSCP().isValidator();
+    bool const selfIsCandidateLeader =
+        isValidator &&
+        std::find(candidateLeaders.begin(), candidateLeaders.end(), selfID) !=
+            candidateLeaders.end();
+
     TxSetXDRFrameConstPtr proposedSet;
     ApplicableTxSetFrameConstPtr applicableProposedSet;
     Hash txSetHash;
 
-    // Build TX set from Rust overlay's mempool (not local TransactionQueue)
-    // The Rust overlay maintains the mempool via TX flooding
-    PerPhaseTransactionList txPhases;
-
-    // Get TXs from Rust overlay
-    auto& overlayMgr = mApp.getOverlayManager();
-    auto txEnvelopes = overlayMgr.getTopTransactions(
-        mApp.getLedgerManager().getLastMaxTxSetSizeOps() * 2, 5000);
-
-    CLOG_INFO(Herder, "Got {} transactions from Rust overlay mempool",
-              txEnvelopes.size());
-
-    // Convert TransactionEnvelopes to TransactionFrameBasePtrs and place them
-    // into the phase expected by TxSetFrame. Frame construction (XDR decode +
-    // hashing) fans out to the tx-validation pool.
-    TxFrameList classicTxs;
-    TxFrameList sorobanTxs;
-    Hash const& networkID = mApp.getNetworkID();
-    bool const supportsSoroban = protocolVersionStartsFrom(
-        lcl.header.ledgerVersion, SOROBAN_PROTOCOL_VERSION);
-    std::vector<TransactionEnvelope const*> envPtrs;
-    envPtrs.reserve(txEnvelopes.size());
-    for (auto const& env : txEnvelopes)
+    if (selfIsCandidateLeader)
     {
-        envPtrs.push_back(&env);
-    }
-    for (auto const& txFrame :
-         TxSetUtils::buildTxFramesParallel(networkID, envPtrs, mApp))
-    {
-        if (txFrame->isSoroban())
+        // Only the transaction-routing candidate leaders construct a full TX
+        // set from the Rust overlay's mempool. The Rust overlay maintains the
+        // mempool via TX flooding.
+        PerPhaseTransactionList txPhases;
+        auto txEnvelopes = mApp.getOverlayManager().getTopTransactions(
+            mApp.getLedgerManager().getLastMaxTxSetSizeOps() * 2, 5000);
+
+        CLOG_INFO(Herder,
+                  "Candidate leader got {} transactions from Rust overlay "
+                  "mempool",
+                  txEnvelopes.size());
+
+        // Convert TransactionEnvelopes to TransactionFrameBasePtrs and place
+        // them into the phase expected by TxSetFrame. Frame construction (XDR
+        // decode + hashing) fans out to the tx-validation pool.
+        TxFrameList classicTxs;
+        TxFrameList sorobanTxs;
+        Hash const& networkID = mApp.getNetworkID();
+        bool const supportsSoroban = protocolVersionStartsFrom(
+            lcl.header.ledgerVersion, SOROBAN_PROTOCOL_VERSION);
+        std::vector<TransactionEnvelope const*> envPtrs;
+        envPtrs.reserve(txEnvelopes.size());
+        for (auto const& env : txEnvelopes)
         {
-            if (supportsSoroban)
+            envPtrs.push_back(&env);
+        }
+        for (auto const& txFrame :
+             TxSetUtils::buildTxFramesParallel(networkID, envPtrs, mApp))
+        {
+            if (txFrame->isSoroban())
             {
-                sorobanTxs.push_back(txFrame);
+                if (supportsSoroban)
+                {
+                    sorobanTxs.push_back(txFrame);
+                }
+                else
+                {
+                    CLOG_DEBUG(Herder,
+                               "Ignoring Soroban transaction before Soroban "
+                               "protocol support");
+                }
             }
             else
             {
-                CLOG_DEBUG(Herder,
-                           "Ignoring Soroban transaction before Soroban "
-                           "protocol support");
+                classicTxs.push_back(txFrame);
             }
         }
-        else
+        txPhases.emplace_back(std::move(classicTxs));
+        if (supportsSoroban)
         {
-            classicTxs.push_back(txFrame);
+            txPhases.emplace_back(std::move(sorobanTxs));
         }
+
+        PerPhaseTransactionList invalidTxPhases;
+        invalidTxPhases.resize(txPhases.size());
+
+        std::tie(proposedSet, applicableProposedSet) =
+            makeTxSetFromTransactions(txPhases, mApp,
+                                      lowerBoundCloseTimeOffset,
+                                      upperBoundCloseTimeOffset,
+                                      invalidTxPhases);
+        if (!applicableProposedSet)
+        {
+            releaseAssert(!mApp.getConfig().FORCE_SCP);
+            return;
+        }
+
+        CLOG_INFO(Herder, "Candidate leader built TX set with {} transactions",
+                  proposedSet->sizeTxTotal());
+        mSCPMetrics.mCandidateTxSetBuild.Mark();
     }
-    txPhases.emplace_back(std::move(classicTxs));
-    if (supportsSoroban)
+    else
     {
-        txPhases.emplace_back(std::move(sorobanTxs));
-    }
-
-    PerPhaseTransactionList invalidTxPhases;
-    invalidTxPhases.resize(txPhases.size());
-
-    std::tie(proposedSet, applicableProposedSet) =
-        makeTxSetFromTransactions(txPhases, mApp, lowerBoundCloseTimeOffset,
-                                  upperBoundCloseTimeOffset, invalidTxPhases);
-    CLOG_INFO(Herder, "Proposed TX set has {} transactions",
-              proposedSet->sizeTxTotal());
-
-    if (!applicableProposedSet)
-    {
-        releaseAssert(!mApp.getConfig().FORCE_SCP);
-        return;
+        // Nodes outside the pre-routed candidate-leader window construct the
+        // canonical empty set as their cheap liveness proposal. If nomination
+        // advances past the routed candidates, the newly elected leader can
+        // therefore make progress without having built the full mempool.
+        proposedSet = TxSetXDRFrame::makeEmpty(lcl);
+        applicableProposedSet =
+            proposedSet->prepareForApply(mApp, lcl.header);
+        releaseAssert(applicableProposedSet);
+        CLOG_DEBUG(Herder,
+                   "Node is outside the first {} candidate leaders for slot "
+                   "{}; using canonical empty TX set",
+                   candidateLeaders.size(), slotIndex);
+        if (isValidator)
+        {
+            mSCPMetrics.mEmptyTxSetFallback.Mark();
+        }
     }
 
     txSetHash = proposedSet->getContentsHash();
 
-    CLOG_INFO(Herder, "Built TX set: hash={}",
-              binToHex(txSetHash).substr(0, 8));
-
-    // New proposed tx set must be valid, so we explicitly populate tx set
-    // validity cache so SCP can reuse the result.
+    // Cache only this node's selected proposal: a mempool-backed set for the
+    // first candidate leaders, or the canonical empty set for everyone else.
     mHerderSCPDriver.cacheValidTxSet(*applicableProposedSet, lcl,
                                      upperBoundCloseTimeOffset);
+    mPendingEnvelopes.addTxSet(txSetHash, slotIndex, proposedSet);
 
-    // Inform the item fetcher so queries from other peers about his txSet
-    // can be answered. Note this can trigger SCP callbacks, externalize, etc
-    // if we happen to build a txset that we were trying to download.
-    mPendingEnvelopes.addTxSet(txSetHash, lcl.header.ledgerSeq + 1,
-                               proposedSet);
+    // Empty proposals are not proactively pushed, but must remain servable
+    // when a third-or-later leader nominates one. This also covers a candidate
+    // whose mempool-backed construction happened to produce an empty set.
+    if (proposedSet->sizeTxTotal() == 0 && proposedSet->isGeneralizedTxSet())
+    {
+        GeneralizedTransactionSet emptyXdrTxSet;
+        proposedSet->toXDR(emptyXdrTxSet);
+        mApp.getOverlayManager().cacheTxSet(
+            txSetHash, xdr::xdr_to_opaque(emptyXdrTxSet));
+    }
 
-    // Hand the TX set to the Rust overlay. Note: the overlay only supports
-    // GeneralizedTransactionSet (protocol >= 20).
+    // Hand a non-empty candidate TX set to the Rust overlay. Note: the overlay
+    // only supports GeneralizedTransactionSet (protocol >= 20).
     //
     // Direct leader flooding, TxSet dissemination
     // (docs/direct-leader-flooding.md Step 5): the round-1 leader for the slot
     // being nominated pushes the full body to every peer *now*, so receivers
     // have it by the time they process the nomination that references it --
     // removing the GetTxSet request round-trip from the nomination critical
-    // path. Every other node only caches its own set locally (cache-for-self;
-    // it never proactively floods).
+    // path. Other candidate leaders cache their full set for the fetch
+    // fallback; non-candidates cache only their canonical empty proposal.
     //
     // Round-1 leader is seeded by hash(N-2); when nominating slot N = ledgerSeq
     // + 1 with lcl = N-1, that seed is exactly lcl.header.previousLedgerHash.
     // Under application-specific (non-self-biased) weights every node agrees on
     // this single leader, so exactly one node broadcasts.
     //
-    // Experiment scope: only round-1 pushes and there is no request fallback
-    // (see PendingEnvelopes), so a slot that advances to a round led by a
-    // non-broadcasting node cannot disseminate that node's set -- convergence
-    // then leans on the round-1 leader's value staying viable. Accepted for the
-    // experiment; revisit before any production path.
-    if (proposedSet->isGeneralizedTxSet())
+    // Only round-1 pushes proactively. If the slot advances to another
+    // pre-routed candidate, receivers use the delayed request fallback. If all
+    // pre-routed candidates fail, later leaders nominate the already-cached
+    // empty set.
+    if (proposedSet->sizeTxTotal() != 0 && proposedSet->isGeneralizedTxSet())
     {
         GeneralizedTransactionSet xdrTxSet;
         proposedSet->toXDR(xdrTxSet);
         auto xdrBytes = xdr::xdr_to_opaque(xdrTxSet);
 
-        auto const round1Leaders = mHerderSCPDriver.computeLeaderSchedule(
-            lcl.header.previousLedgerHash, lcl.header.ledgerSeq + 1,
-            /*count=*/1);
         bool const selfIsRound1Leader =
-            !round1Leaders.empty() &&
-            round1Leaders.front() == mApp.getConfig().NODE_SEED.getPublicKey();
+            !candidateLeaders.empty() && candidateLeaders.front() == selfID;
 
         if (mApp.getConfig().ARTIFICIALLY_DROP_NOMINATED_TX_SET_FOR_TESTING)
         {
@@ -1809,15 +1847,13 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
     }
 
     lcl = mLedgerManager.getLastClosedLedgerHeader();
-    // use the slot index from ledger manager here as our vote is based off
-    // the last closed ledger stored in ledger manager
-    uint32_t slotIndex = lcl.header.ledgerSeq + 1;
 
     // no point in sending out a prepare:
     // externalize was triggered on a more recent ledger
     // Also skip trigger if side effects from `addTxSet` caused us to start
     // applying
-    if (ledgerSeqToTrigger != slotIndex || mLedgerManager.isApplying())
+    if (ledgerSeqToTrigger != lcl.header.ledgerSeq + 1 ||
+        ledgerSeqToTrigger != slotIndex || mLedgerManager.isApplying())
     {
         return;
     }
@@ -1852,7 +1888,7 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
     getHerderSCPDriver().recordSCPEvent(slotIndex, true);
 
     // If we are not a validating node we stop here and don't start nomination
-    if (!getSCP().isValidator())
+    if (!isValidator)
     {
         CLOG_DEBUG(Herder, "Non-validating node, skipping nomination (SCP).");
         return;

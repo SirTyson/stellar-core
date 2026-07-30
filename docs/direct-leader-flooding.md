@@ -440,6 +440,24 @@ connected), flowing through the snapshot into medida
   included and applied on all nodes, and the submitter's overlay reports
   `flood_leader_push ≥ 1`.
 
+### Candidate-only proposal construction
+
+The same top `FLOOD_LEADER_COUNT` schedule now gates full TX-set construction.
+For slot `N`, only those pre-routed candidate leaders read the overlay mempool,
+build transaction frames, and run full TX-set validation. Every other validator
+skips that work.
+
+Only validators outside the candidate window construct and cache the canonical
+empty set for their LCL. Consequently, if the pre-routed candidates time out
+and a later leader is elected, that leader proposes its empty set and can
+continue consensus. Peers that did not construct it obtain it through the
+normal TX-set fetch path.
+
+Only the first candidate proactively shreds and pushes a non-empty set. Other
+candidate leaders cache their full sets for the delayed fetch fallback.
+`scp.txset.candidate-build` and `scp.txset.empty-fallback` report which proposal
+path each validator used.
+
 ## Later steps (sketch)
 
 - **Step 4 — Hardening.** Cert-based identity (keep the signing key in Core),

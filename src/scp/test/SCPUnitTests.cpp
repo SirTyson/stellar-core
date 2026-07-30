@@ -487,6 +487,66 @@ TEST_CASE("computeLeaderSchedule matches live leader election", "[scp]")
     }
 }
 
+TEST_CASE("later nomination leader uses supplied empty fallback", "[scp]")
+{
+    SIMULATION_CREATE_NODE(0);
+    SIMULATION_CREATE_NODE(1);
+    SIMULATION_CREATE_NODE(2);
+
+    std::vector<NodeID> nodeIDs = {v0NodeID, v1NodeID, v2NodeID};
+    SCPQuorumSet qSet;
+    qSet.threshold = 2;
+    for (auto const& id : nodeIDs)
+    {
+        qSet.validators.push_back(id);
+    }
+
+    Value seed = {1, 2, 3, 4, 5};
+    uint64_t const slotIndex = 11;
+
+    UniformWeightNominationSCP scheduleDriver(v0NodeID, qSet);
+    SCPQuorumSet normalized = qSet;
+    normalizeQSet(normalized, &v0NodeID);
+    auto const schedule = NominationProtocol::computeLeaderSchedule(
+        scheduleDriver, seed, slotIndex, nodeIDs.size(), normalized, v0NodeID);
+    REQUIRE(schedule.size() == nodeIDs.size());
+
+    // Model a node outside the first two pre-routed candidate leaders. Herder
+    // supplies this node a canonical empty-set value instead of making it
+    // construct a full proposal.
+    NodeID const& laterLeader = schedule[2];
+    REQUIRE(laterLeader != schedule[0]);
+    REQUIRE(laterLeader != schedule[1]);
+
+    auto nomSCP =
+        std::make_shared<UniformWeightNominationSCP>(laterLeader, qSet);
+    auto slot = std::make_shared<Slot>(slotIndex, nomSCP->mSCP);
+    NominationTestHandler nomination(*slot);
+
+    Value previousValue = {9};
+    Value emptyFallback = {0xee};
+    auto wrappedFallback = nomSCP->wrapValue(emptyFallback);
+
+    bool nominatedFallback = false;
+    for (size_t attempt = 0; attempt < 20 && !nominatedFallback; ++attempt)
+    {
+        nomination.nominate(wrappedFallback, previousValue, seed,
+                            /*timedout=*/attempt != 0);
+        auto const* envelope = nomination.getLastMessageSend();
+        if (envelope)
+        {
+            auto const& votes = envelope->statement.pledges.nominate().votes;
+            nominatedFallback =
+                std::find(votes.begin(), votes.end(), emptyFallback) !=
+                votes.end();
+        }
+    }
+
+    // Once nomination timeouts advance to this later leader, it votes for the
+    // supplied empty value exactly as it would any normal local proposal.
+    REQUIRE(nominatedFallback);
+}
+
 // this test case display statistical information on the priority function used
 // by nomination
 TEST_CASE("nomination weight stats", "[scp][!hide]")

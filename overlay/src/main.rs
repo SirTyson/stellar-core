@@ -1,7 +1,8 @@
 //! Stellar Overlay Process
 //!
 //! A process-isolated overlay for stellar-core that handles:
-//! - SCP message relay (latency-critical, via dedicated QUIC stream)
+//! - Direct SCP broadcast and reception (latency-critical, via dedicated QUIC
+//!   stream)
 //! - Transaction flooding (via dedicated QUIC stream)
 //! - Peer management
 //!
