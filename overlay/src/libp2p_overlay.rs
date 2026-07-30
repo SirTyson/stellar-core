@@ -2684,19 +2684,9 @@ async fn handle_inbound_txset_streams(mut incoming: IncomingStreams, state: Arc<
                                 // rather than re-encoding.
                                 let txset_data = data[4..].to_vec();
                                 let hash = crate::xdr::sha256_hash(&txset_data);
-                                let already_completed = {
-                                    let mut store = state.txset_shard_store.lock().await;
-                                    store.partial.remove(&hash);
-                                    store.reconstructing.remove(&hash);
-                                    let already_completed = store.completed.peek(&hash).is_some();
-                                    if !already_completed {
-                                        store.completed.put(hash, HashSet::new());
-                                    }
-                                    already_completed
-                                };
-                                if already_completed {
+                                if is_redundant_txset_body(&state, hash).await {
                                     trace!(
-                                        "TXSET_RECV_DUP: ignoring redundant full TX set {:02x?}... from {}",
+                                        "TXSET_RECV_DUP: ignoring redundant unsolicited TX set {:02x?}... from {}",
                                         &hash[..4],
                                         peer_id
                                     );
@@ -2759,6 +2749,48 @@ async fn handle_inbound_txset_streams(mut incoming: IncomingStreams, state: Arc<
             }
         });
     }
+}
+
+/// Record an inbound full TX-set body as completed and report whether it is a
+/// redundant repeat the caller may drop.
+///
+/// The body supersedes any in-flight shred accumulation for the same hash, but
+/// the shred indexes already seen are carried over: they gate one-hop
+/// forwarding, so discarding them would let every later shred for this hash
+/// relay a second time.
+///
+/// Only an UNSOLICITED repeat is redundant. A response to a request we issued
+/// must always reach Core — Core re-requests sets its own cache evicted, and
+/// dropping those would silently disable the fetch fallback that rescues a
+/// missed flood, which is the recovery path a lost shred depends on.
+async fn is_redundant_txset_body(state: &Arc<SharedState>, hash: [u8; 32]) -> bool {
+    let already_completed = {
+        let mut store = state.txset_shard_store.lock().await;
+        let mut seen = store
+            .partial
+            .remove(&hash)
+            .map(|accumulator| accumulator.shard_indexes())
+            .unwrap_or_default();
+        if let Some(reconstructing) = store.reconstructing.remove(&hash) {
+            seen.extend(reconstructing);
+        }
+        match store.completed.get_mut(&hash) {
+            Some(existing) => {
+                existing.extend(seen);
+                true
+            }
+            None => {
+                store.completed.put(hash, seen);
+                false
+            }
+        }
+    };
+    already_completed
+        && !state
+            .pending_txset_requests
+            .read()
+            .await
+            .contains_key(&hash)
 }
 
 async fn handle_inbound_txset_shard_streams(
@@ -2833,13 +2865,19 @@ async fn handle_txset_shard_message(state: &Arc<SharedState>, from: PeerId, data
             if !store.partial.contains_key(&shard.hash)
                 && store.partial.len() >= TXSET_MAX_ACTIVE_ACCUMULATORS
             {
-                if let Some(oldest) = store
+                // Evict the accumulator with the FEWEST shreds, not the oldest:
+                // the oldest is the one closest to reconstructing, and the
+                // nominator sends each shred exactly once, so discarding it
+                // strands that TX set on the fetch fallback. Ties break on age.
+                if let Some(least_progressed) = store
                     .partial
                     .iter()
-                    .min_by_key(|(_, accumulator)| accumulator.created_at)
+                    .min_by_key(|(_, accumulator)| {
+                        (accumulator.shard_count(), accumulator.created_at)
+                    })
                     .map(|(hash, _)| *hash)
                 {
-                    store.partial.remove(&oldest);
+                    store.partial.remove(&least_progressed);
                     state
                         .metrics
                         .txset_shard_accumulator_evicted
@@ -2946,14 +2984,6 @@ async fn handle_txset_shard_message(state: &Arc<SharedState>, from: PeerId, data
     })
     .await;
     let reconstruct_us = reconstruct_start.elapsed().as_micros() as u64;
-    state
-        .metrics
-        .txset_shard_reconstruct_sum_us
-        .fetch_add(reconstruct_us, Ordering::Relaxed);
-    state
-        .metrics
-        .txset_shard_reconstruct_count
-        .fetch_add(1, Ordering::Relaxed);
 
     let result = match decoded {
         Ok(Ok(result)) => result,
@@ -2975,11 +3005,9 @@ async fn handle_txset_shard_message(state: &Arc<SharedState>, from: PeerId, data
             );
             return;
         }
+        // A join failure is a local blocking-pool panic or a shutting-down
+        // runtime, not a bad shred, so it must not count as invalid input.
         Err(e) => {
-            state
-                .metrics
-                .txset_shard_invalid
-                .fetch_add(1, Ordering::Relaxed);
             state
                 .txset_shard_store
                 .lock()
@@ -3013,6 +3041,18 @@ async fn handle_txset_shard_message(state: &Arc<SharedState>, from: PeerId, data
         );
         return;
     }
+
+    // Timed here, not at the join point, so the timer covers only deliveries
+    // that actually happened: failed decodes and races lost to a full-body
+    // response must not skew it. Keeps count == original + recovery.
+    state
+        .metrics
+        .txset_shard_reconstruct_sum_us
+        .fetch_add(reconstruct_us, Ordering::Relaxed);
+    state
+        .metrics
+        .txset_shard_reconstruct_count
+        .fetch_add(1, Ordering::Relaxed);
 
     let reconstruction_counter = if result.used_recovery {
         &state.metrics.txset_shard_reconstruct_recovery
@@ -3598,6 +3638,296 @@ mod tests {
         assert_eq!(metrics.txset_shard_broadcast.load(Ordering::Relaxed), 0);
         assert_eq!(metrics.flood_txset_push_dropped.load(Ordering::Relaxed), 3);
         assert_eq!(metrics.flood_txset_push.load(Ordering::Relaxed), 0);
+    }
+
+    /// A TX-set body we ASKED for must always reach Core, even when the eager
+    /// coded path already delivered that hash. Core re-requests sets its own
+    /// cache evicted; suppressing those responses disables the fetch fallback
+    /// that rescues a missed flood, which strands the node on the slower
+    /// empty-tx-set recovery.
+    #[tokio::test]
+    async fn test_solicited_txset_body_survives_earlier_shred_delivery() {
+        let metrics = Arc::new(OverlayMetrics::new());
+        let keypair = Keypair::generate_ed25519();
+        let (_handle, mut events, _tx_events, overlay) =
+            create_overlay(keypair, Arc::clone(&metrics)).unwrap();
+        let state = Arc::clone(&overlay.state);
+        let (hash, expected) = test_txset_xdr(0x69);
+        let config = TxSetShardConfig {
+            target_shard_size: 8,
+            recovery_factor_percent: 50,
+            initial_ttl: 0,
+        };
+
+        // The eager coded path delivers the set once.
+        for shred in make_txset_shards(hash, &expected, 2, config)
+            .unwrap()
+            .iter()
+            .filter(|shred| shred.is_original())
+        {
+            handle_txset_shard_message(&state, PeerId::random(), shred.encode().unwrap()).await;
+        }
+        assert!(matches!(
+            events.recv().await.expect("missing reconstruction event"),
+            OverlayEvent::TxSetReceived { hash: h, .. } if h == hash
+        ));
+
+        // An unsolicited repeat of the body is genuinely redundant.
+        assert!(is_redundant_txset_body(&state, hash).await);
+
+        // The same body arriving as a response we requested must NOT be
+        // dropped, however many times the hash was delivered before.
+        state
+            .pending_txset_requests
+            .write()
+            .await
+            .insert(hash, (PeerId::random(), Instant::now()));
+        assert!(
+            !is_redundant_txset_body(&state, hash).await,
+            "a solicited TX-set body must reach Core; dropping it disables the fetch fallback"
+        );
+        assert!(!is_redundant_txset_body(&state, hash).await);
+
+        // Once the request is satisfied and cleared, repeats are redundant again.
+        state.pending_txset_requests.write().await.remove(&hash);
+        assert!(is_redundant_txset_body(&state, hash).await);
+    }
+
+    /// A body for a hash never seen before is always forwarded, and it cancels
+    /// any partial shred accumulation for that hash.
+    #[tokio::test]
+    async fn test_unseen_txset_body_is_forwarded_and_cancels_shred_accumulation() {
+        let metrics = Arc::new(OverlayMetrics::new());
+        let keypair = Keypair::generate_ed25519();
+        let (_handle, _events, _tx_events, overlay) =
+            create_overlay(keypair, Arc::clone(&metrics)).unwrap();
+        let state = Arc::clone(&overlay.state);
+        let (hash, expected) = test_txset_xdr(0x6a);
+        let config = TxSetShardConfig {
+            target_shard_size: 8,
+            recovery_factor_percent: 50,
+            initial_ttl: 0,
+        };
+        let shreds = make_txset_shards(hash, &expected, 2, config).unwrap();
+
+        // One shred in flight, not yet at threshold.
+        handle_txset_shard_message(&state, PeerId::random(), shreds[0].encode().unwrap()).await;
+        assert_eq!(state.txset_shard_store.lock().await.partial.len(), 1);
+
+        assert!(!is_redundant_txset_body(&state, hash).await);
+        let mut store = state.txset_shard_store.lock().await;
+        assert!(store.partial.is_empty(), "body must cancel accumulation");
+        // The seen index carried over, so that shred cannot relay a second time.
+        assert!(store.completed.get_mut(&hash).unwrap().contains(&0));
+    }
+
+    /// A late shred for an already-completed TX set still counts as unique
+    /// (it may owe its one forwarding hop), but must not create a new
+    /// accumulator, a second reconstruction, or a duplicate delivery to Core.
+    #[tokio::test]
+    async fn test_late_shred_after_completion_is_unique_but_not_redelivered() {
+        let metrics = Arc::new(OverlayMetrics::new());
+        let keypair = Keypair::generate_ed25519();
+        let (_handle, mut events, _tx_events, overlay) =
+            create_overlay(keypair, Arc::clone(&metrics)).unwrap();
+        let state = Arc::clone(&overlay.state);
+        let (hash, expected) = test_txset_xdr(0x68);
+        let config = TxSetShardConfig {
+            target_shard_size: 8,
+            recovery_factor_percent: 50,
+            initial_ttl: 0,
+        };
+        let shreds = make_txset_shards(hash, &expected, 2, config).unwrap();
+        assert_eq!(shreds.len(), 3);
+
+        // Complete the set from the two originals.
+        for shred in shreds.iter().filter(|shred| shred.is_original()) {
+            handle_txset_shard_message(&state, PeerId::random(), shred.encode().unwrap()).await;
+        }
+        let event = events.recv().await.expect("missing reconstruction event");
+        assert!(matches!(
+            event,
+            OverlayEvent::TxSetReceived { hash: h, data, .. }
+                if h == hash && data == expected
+        ));
+
+        let unique_before = metrics.txset_shard_recv_unique.load(Ordering::Relaxed);
+        let duplicate_before = metrics.txset_shard_recv_duplicate.load(Ordering::Relaxed);
+
+        // The recovery shred was never seen: unique, but no new accumulator.
+        handle_txset_shard_message(&state, PeerId::random(), shreds[2].encode().unwrap()).await;
+        assert_eq!(
+            metrics.txset_shard_recv_unique.load(Ordering::Relaxed),
+            unique_before + 1
+        );
+        assert!(state.txset_shard_store.lock().await.partial.is_empty());
+
+        // Replaying it is a duplicate.
+        handle_txset_shard_message(&state, PeerId::random(), shreds[2].encode().unwrap()).await;
+        assert_eq!(
+            metrics.txset_shard_recv_duplicate.load(Ordering::Relaxed),
+            duplicate_before + 1
+        );
+
+        assert!(events.try_recv().is_err(), "duplicate delivery to Core");
+        assert_eq!(
+            metrics
+                .txset_shard_reconstruct_count
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    /// One-hop forwarding on a four-validator full mesh: each shred has two
+    /// branch roots among the leader's three peers, so exactly one peer per
+    /// shred is covered only by a root's relay. The three-node test cannot
+    /// exercise this (there, every receiver is a root).
+    #[tokio::test]
+    async fn test_txset_shard_one_hop_forwarding_in_four_node_mesh() {
+        const NODE_COUNT: usize = 4;
+        const BASE_PORT: u16 = 24601;
+
+        let mut handles = Vec::with_capacity(NODE_COUNT);
+        let mut events = Vec::with_capacity(NODE_COUNT);
+        let mut metrics = Vec::with_capacity(NODE_COUNT);
+        for offset in 0..NODE_COUNT {
+            let keypair = Keypair::generate_ed25519();
+            let node_metrics = Arc::new(OverlayMetrics::new());
+            let (handle, node_events, _tx_events, overlay) =
+                create_overlay(keypair, Arc::clone(&node_metrics)).unwrap();
+            handles.push(handle);
+            events.push(node_events);
+            metrics.push(node_metrics);
+            tokio::spawn(async move {
+                overlay.run("127.0.0.1", BASE_PORT + offset as u16).await;
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Dial each undirected edge once for a full mesh.
+        for (node, handle) in handles.iter().enumerate().skip(1) {
+            for prior in 0..node {
+                let address: Multiaddr =
+                    format!("/ip4/127.0.0.1/udp/{}/quic-v1", BASE_PORT + prior as u16)
+                        .parse()
+                        .unwrap();
+                handle.dial(address).await;
+            }
+        }
+        let connect_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut ready = true;
+            for handle in &handles {
+                ready &= handle.connected_peer_count().await == NODE_COUNT - 1;
+            }
+            if ready {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < connect_deadline,
+                "4-node mesh did not fully connect"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Connection establishment precedes the protocol stream opens.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for receiver in &mut events {
+            while receiver.try_recv().is_ok() {}
+        }
+
+        // Multi-shred set: 3 peers -> 4 originals + 2 recovery shreds.
+        let (want_hash, want_data) = test_large_txset_xdr(0x51, 64 * 1024);
+        let plan = crate::txset_shards::plan_txset_shards(
+            want_data.len(),
+            NODE_COUNT - 1,
+            TxSetShardConfig::default(),
+        )
+        .unwrap();
+        let total_shards = plan.total_shards() as u64;
+        assert!(plan.recovery_shards >= 1);
+
+        handles[0]
+            .broadcast_txset(want_hash, want_data.clone())
+            .await;
+
+        let mut received = [false; NODE_COUNT];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while received.iter().skip(1).any(|got| !got) {
+            for node in 1..NODE_COUNT {
+                while let Ok(event) = events[node].try_recv() {
+                    if let OverlayEvent::TxSetReceived { hash, data, .. } = event {
+                        if hash == want_hash {
+                            assert_eq!(data, want_data);
+                            received[node] = true;
+                        }
+                    }
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "not every peer reconstructed the eagerly coded TX set"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Each shred goes to `branches` roots; every peer the leader did not
+        // reach directly is covered by exactly one relay edge for that shred.
+        // Total edges per shred is `peer_count` for any branch factor, which is
+        // why raising the factor trades relay edges for leader egress rather
+        // than adding copies to the mesh.
+        let peer_count = NODE_COUNT as u64 - 1;
+        let branches = (TXSET_SHARD_BRANCHING_FACTOR as u64).min(peer_count);
+        let expected_leader_sends = total_shards * branches;
+        let expected_forwarded = total_shards * (peer_count - branches);
+        let flush_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let leader_sends = metrics[0].txset_shard_original_sent.load(Ordering::Relaxed)
+                + metrics[0].txset_shard_recovery_sent.load(Ordering::Relaxed);
+            let forwarded: u64 = metrics
+                .iter()
+                .skip(1)
+                .map(|node| node.txset_shard_forwarded.load(Ordering::Relaxed))
+                .sum();
+            if leader_sends >= expected_leader_sends && forwarded >= expected_forwarded {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < flush_deadline,
+                "coded sends did not flush"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            metrics[0].txset_shard_original_sent.load(Ordering::Relaxed)
+                + metrics[0].txset_shard_recovery_sent.load(Ordering::Relaxed),
+            expected_leader_sends
+        );
+        assert_eq!(
+            metrics[0].flood_txset_push.load(Ordering::Relaxed),
+            expected_leader_sends
+        );
+        assert_eq!(
+            metrics
+                .iter()
+                .skip(1)
+                .map(|node| node.txset_shard_forwarded.load(Ordering::Relaxed))
+                .sum::<u64>(),
+            expected_forwarded
+        );
+        // Leader never forwards (it originates), and no peer requested the
+        // full body: the eager coded path alone delivered it.
+        assert_eq!(metrics[0].txset_shard_forwarded.load(Ordering::Relaxed), 0);
+        assert!(
+            !matches!(
+                events[0].try_recv(),
+                Ok(OverlayEvent::TxSetRequested { .. })
+            ),
+            "leader should not receive a TxSet request on the coded push path"
+        );
+
+        for handle in handles {
+            handle.shutdown().await;
+        }
     }
 
     #[tokio::test]
@@ -4438,27 +4768,45 @@ mod tests {
             !matches!(events1.try_recv(), Ok(OverlayEvent::TxSetRequested { .. })),
             "leader should not receive a TxSet request on the push path"
         );
-        // Two originals + 50% recovery are sent to both branch roots.
+        // Two originals + 50% recovery, one copy per branch root. Derived from
+        // the production branch factor so the test tracks it: leader egress is
+        // proportional to the factor, and whatever the factor leaves uncovered
+        // is reached by exactly one relay edge per shred.
+        let peer_count = 2u64;
+        let branches = (TXSET_SHARD_BRANCHING_FACTOR as u64).min(peer_count);
+        let expected_pushes = 3 * branches;
+        let expected_forwards = 3 * (peer_count - branches);
         let send_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
         while tokio::time::Instant::now() < send_deadline
-            && metrics1.flood_txset_push.load(Ordering::Relaxed) < 6
+            && metrics1.flood_txset_push.load(Ordering::Relaxed) < expected_pushes
         {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert_eq!(metrics1.flood_txset_push.load(Ordering::Relaxed), 6);
-        assert_eq!(metrics1.send_txset.load(Ordering::Relaxed), 6);
+        assert_eq!(
+            metrics1.flood_txset_push.load(Ordering::Relaxed),
+            expected_pushes
+        );
+        assert_eq!(metrics1.send_txset.load(Ordering::Relaxed), expected_pushes);
         assert_eq!(
             metrics1.txset_shard_original_sent.load(Ordering::Relaxed),
-            4
+            2 * branches
         );
         assert_eq!(
             metrics1.txset_shard_recovery_sent.load(Ordering::Relaxed),
-            2
+            branches
         );
+        let forward_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while tokio::time::Instant::now() < forward_deadline
+            && metrics2.txset_shard_forwarded.load(Ordering::Relaxed)
+                + metrics3.txset_shard_forwarded.load(Ordering::Relaxed)
+                < expected_forwards
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert_eq!(
             metrics2.txset_shard_forwarded.load(Ordering::Relaxed)
                 + metrics3.txset_shard_forwarded.load(Ordering::Relaxed),
-            0
+            expected_forwards
         );
         assert_eq!(
             metrics2

@@ -79,6 +79,10 @@ class RustOverlayManager
     }
 
   private:
+    // Max Reed-Solomon coding workers for the overlay's TX-set shreds, from
+    // ledgerMaxDependentTxClusters. 1 when there is no Soroban config yet.
+    uint32_t txSetCodingParallelism() const;
+
     Application& mApp;
     std::unique_ptr<OverlayIPC> mOverlayIPC;
     std::atomic<bool> mShuttingDown{false};

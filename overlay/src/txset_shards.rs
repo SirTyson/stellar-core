@@ -16,8 +16,25 @@ pub(crate) const TXSET_SHARD_RECOVERY_FACTOR_PERCENT: usize = 50;
 pub(crate) const TXSET_SHARD_INITIAL_TTL: u8 = 1;
 pub(crate) const TXSET_TARGET_SHARDS_PER_PEER: usize = 2;
 pub(crate) const TXSET_MAX_TOTAL_SHARDS: usize = 255;
-pub(crate) const TXSET_SHARD_BRANCHING_FACTOR: usize = 2;
+/// Branch roots per shred. Leader egress is `factor * (1 + recovery) * setSize`
+/// and does not depend on peer count, while each relay's egress is about
+/// `(1 + recovery) * setSize` regardless of the factor. At 1 those two are
+/// equal, so no node is a hotspot; every value above 1 multiplies the leader's
+/// share alone and rebuilds the bottleneck this scheme exists to remove. At 89
+/// peers and a 5 MB set that is 7.50 MB from the leader against 7.42 MB from
+/// each relay, versus 15.00 MB from the leader at factor 2.
+///
+/// A single dead root costs only the shreds it is root for, about
+/// `total / peers` of them, against a recovery budget of `total / 3`: at that
+/// scale roughly 30 roots can fail before reconstruction does, so the extra
+/// root that factor 2 buys is redundant insurance at double the scarce cost.
+pub(crate) const TXSET_SHARD_BRANCHING_FACTOR: usize = 1;
+/// Largest factor peers accept on the wire. Must stay >= the value above: a
+/// nominator that exceeded it would have every shred it sends rejected
+/// network-wide, silently disabling dissemination.
 pub(crate) const TXSET_MAX_SHARD_BRANCHING_FACTOR: usize = 2;
+const _: () = assert!(TXSET_SHARD_BRANCHING_FACTOR >= 1);
+const _: () = assert!(TXSET_SHARD_BRANCHING_FACTOR <= TXSET_MAX_SHARD_BRANCHING_FACTOR);
 pub(crate) const TXSET_MAX_CODING_PARALLELISM: usize = 128;
 // Core IPC caps an entire [hash:32][txSetXDR...] payload at 16 MiB.
 pub(crate) const TXSET_MAX_WIRE_SIZE: usize = 16 * 1024 * 1024 - 32;
@@ -1080,6 +1097,220 @@ mod tests {
         }
         assert!(TxSetCodingExecutor::new(0).is_err());
         assert!(TxSetCodingExecutor::new(TXSET_MAX_CODING_PARALLELISM + 1).is_err());
+    }
+
+    #[test]
+    fn wire_validation_rejects_adversarial_parameter_combinations() {
+        let template = shards(4096, 3)[0].clone();
+        assert!(template.encode().is_ok());
+
+        let mut odd_originals = template.clone();
+        odd_originals.original_shards = 3;
+        assert!(odd_originals.encode().is_err());
+
+        let mut one_original = template.clone();
+        one_original.original_shards = 1;
+        assert!(one_original.encode().is_err());
+
+        let mut no_recovery = template.clone();
+        no_recovery.recovery_shards = 0;
+        assert!(no_recovery.encode().is_err());
+
+        let mut too_many_total = template.clone();
+        too_many_total.recovery_shards = TXSET_MAX_TOTAL_SHARDS;
+        assert!(too_many_total.encode().is_err());
+
+        let mut odd_shard_size = template.clone();
+        odd_shard_size.shard_size -= 1;
+        odd_shard_size.payload.pop();
+        assert!(odd_shard_size.encode().is_err());
+
+        let mut payload_length_mismatch = template.clone();
+        payload_length_mismatch.payload.pop();
+        assert!(payload_length_mismatch.encode().is_err());
+
+        let mut zero_original_len = template.clone();
+        zero_original_len.original_len = 0;
+        assert!(zero_original_len.encode().is_err());
+
+        let mut oversized_original_len = template.clone();
+        oversized_original_len.original_len = TXSET_MAX_WIRE_SIZE + 1;
+        assert!(oversized_original_len.encode().is_err());
+
+        // Declared TX-set length that the declared shreds cannot contain.
+        let mut uncontainable = template.clone();
+        uncontainable.original_len = uncontainable.original_shards * uncontainable.shard_size + 1;
+        assert!(uncontainable.encode().is_err());
+
+        // Padded size far beyond an honest plan: caps the memory a malicious
+        // first shred can commit an accumulator to.
+        let mut oversized_padding = template.clone();
+        oversized_padding.original_shards = 254;
+        oversized_padding.recovery_shards = 1;
+        oversized_padding.shard_size = 128 * 1024;
+        oversized_padding.payload = vec![0u8; 128 * 1024];
+        oversized_padding.original_len = TXSET_MAX_WIRE_SIZE;
+        assert!(oversized_padding.encode().is_err());
+
+        let mut excessive_ttl = template.clone();
+        excessive_ttl.ttl = 2;
+        assert!(excessive_ttl.encode().is_err());
+    }
+
+    #[test]
+    fn recovery_only_shreds_reconstruct_all_originals() {
+        let expected = data(96 * 1024 + 5);
+        let config = TxSetShardConfig {
+            recovery_factor_percent: 100,
+            ..TxSetShardConfig::default()
+        };
+        let all = make_txset_shards([0x77; 32], &expected, 15, config).unwrap();
+        let original_count = all[0].original_shards;
+        assert_eq!(all[0].recovery_shards, original_count);
+
+        // The decoder must restore every original from recovery shreds alone.
+        let mut accumulator = TxSetShardAccumulator::new(&all[0]);
+        for shard in all.iter().filter(|shard| !shard.is_original()) {
+            assert!(accumulator.insert(shard).unwrap());
+        }
+        assert!(accumulator.is_ready());
+        assert_eq!(
+            accumulator.reconstruct().unwrap().unwrap(),
+            TxSetReconstruction {
+                data: expected.clone(),
+                used_recovery: true
+            }
+        );
+
+        let executor = TxSetCodingExecutor::new(4).unwrap();
+        assert_eq!(
+            accumulator
+                .reconstruct_parallel(&executor)
+                .unwrap()
+                .unwrap()
+                .data,
+            expected
+        );
+    }
+
+    #[test]
+    fn relay_target_offsets_reject_invalid_parameters() {
+        assert!(relay_target_peer_offsets(0, 0, 0, 1).is_err());
+        assert!(relay_target_peer_offsets(5, 1, 0, 0).is_err());
+        assert!(relay_target_peer_offsets(5, 1, 2, 2).is_err());
+        assert!(relay_target_peer_offsets(2, 1, 0, 3).is_err());
+    }
+
+    #[test]
+    fn single_root_branching_covers_every_non_root_exactly_once() {
+        for (shred_count, peer_count) in [(1, 1), (3, 2), (10, 3), (30, 15), (255, 64)] {
+            let assignments = assign_shard_branches_to_peer_offsets(shred_count, peer_count, 1);
+            for shard_index in 0..shred_count {
+                let root = shard_index % peer_count;
+                assert!(assignments[root].contains(&(shard_index, 0)));
+
+                let mut deliveries: HashMap<usize, usize> = HashMap::from([(root, 1)]);
+                for target in relay_target_peer_offsets(peer_count, shard_index, 0, 1).unwrap() {
+                    *deliveries.entry(target).or_default() += 1;
+                }
+                assert_eq!(deliveries.len(), peer_count);
+                assert!(deliveries.values().all(|count| *count == 1));
+            }
+        }
+    }
+
+    #[test]
+    fn plan_invariants_hold_across_sizes_and_peer_counts() {
+        let config = TxSetShardConfig::default();
+        for data_len in [1, 100, 1024, 65_536, 1_048_576, TXSET_MAX_WIRE_SIZE] {
+            for peer_count in [1, 2, 3, 7, 15, 64, 255, 1000] {
+                let plan = plan_txset_shards(data_len, peer_count, config).unwrap();
+                assert!(plan.original_shards >= 2);
+                assert!(plan.original_shards.is_multiple_of(2));
+                assert!(plan.recovery_shards >= 1);
+                assert!(plan.total_shards() <= TXSET_MAX_TOTAL_SHARDS);
+                assert!(plan.shard_size >= 2);
+                assert!(plan.shard_size.is_multiple_of(2));
+                assert!(plan.original_shards * plan.shard_size >= data_len);
+
+                // Every planned shred passes wire validation end to end.
+                let message = TxSetShardMessage {
+                    hash: [0x88; 32],
+                    original_shards: plan.original_shards,
+                    recovery_shards: plan.recovery_shards,
+                    shard_index: plan.total_shards() - 1,
+                    shard_size: plan.shard_size,
+                    original_len: data_len,
+                    ttl: config.initial_ttl,
+                    branch_index: 0,
+                    branch_count: 1,
+                    payload: vec![0u8; plan.shard_size],
+                };
+                assert_eq!(
+                    TxSetShardMessage::decode(&message.encode().unwrap()).unwrap(),
+                    message
+                );
+            }
+        }
+    }
+
+    /// The production operating point: a large validator set on links where the
+    /// nominator's uplink is the binding constraint. Pins the property that
+    /// makes the branch factor 1: the nominator sends no more than any single
+    /// relay does, so dissemination has no hotspot.
+    #[test]
+    fn deployment_scale_plan_leaves_no_bandwidth_hotspot() {
+        let peer_count = 89;
+        let set_len = 5_000_000;
+        let plan = plan_txset_shards(set_len, peer_count, TxSetShardConfig::default()).unwrap();
+        let coded_bytes = plan.total_shards() * plan.shard_size;
+
+        // Coding overhead stays near the configured recovery factor.
+        assert!(coded_bytes >= set_len);
+        assert!(coded_bytes <= set_len * 8 / 5);
+
+        // Shreds stay well clear of both hard caps.
+        assert!(plan.total_shards() <= TXSET_MAX_TOTAL_SHARDS);
+        assert!(plan.shard_size + TXSET_SHARD_HEADER_LEN < 16 * 1024 * 1024);
+
+        let branches = TXSET_SHARD_BRANCHING_FACTOR.min(peer_count);
+        let leader_egress = branches * coded_bytes;
+        // Each peer roots total/peers shreds and relays each to peer_count-b
+        // others, so its egress is coded_bytes*(peer_count-b)/peer_count.
+        let relay_egress = coded_bytes * (peer_count - branches) / peer_count;
+        assert!(
+            leader_egress <= relay_egress * 11 / 10,
+            "leader egress {leader_egress} exceeds a relay's {relay_egress} by more than 10%: \
+             raising the branch factor rebuilds the nominator bottleneck"
+        );
+
+        // And it must beat sending the whole body to everyone by a wide margin.
+        assert!(leader_egress * 50 < peer_count * set_len);
+
+        // A dead root costs only the shreds it roots; recovery covers many.
+        let shreds_per_root = plan.total_shards().div_ceil(peer_count);
+        assert!(plan.recovery_shards / shreds_per_root >= 10);
+    }
+
+    #[test]
+    fn coding_ranges_partition_shard_columns_evenly() {
+        for parallelism in [1, 2, 3, 8] {
+            let executor = TxSetCodingExecutor::new(parallelism).unwrap();
+            for (shard_size, original_shards) in [(2, 2), (1024, 4), (4096, 254), (1_000_000, 2)] {
+                let ranges = executor.ranges(shard_size, original_shards);
+                assert!(!ranges.is_empty());
+                assert!(ranges.len() <= parallelism);
+                let mut cursor = 0;
+                for (start, end) in ranges {
+                    assert_eq!(start, cursor);
+                    assert!(end > start);
+                    assert!(start.is_multiple_of(2));
+                    assert!(end.is_multiple_of(2));
+                    cursor = end;
+                }
+                assert_eq!(cursor, shard_size);
+            }
+        }
     }
 
     #[test]

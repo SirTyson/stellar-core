@@ -10,28 +10,38 @@ The design intentionally targets the branch's fully-connected Tier-1 topology.
 If the nominator has `N` connected validators:
 
 1. It creates at most `2N` shreds (capped at 255), with 50% recovery data.
-2. It assigns each shred to two branch roots, balancing root assignments
-   round-robin.
-3. The two roots deterministically partition the remaining validators. Each
-   root immediately forwards the shred to its half of the partition. Forwarded
+2. It assigns each shred to `b` branch roots, balancing root assignments
+   round-robin. `b` is 1 (see below).
+3. The roots deterministically partition the remaining validators. Each root
+   immediately forwards the shred to its share of the partition. Forwarded
    shreds have TTL 0, so this is exactly one hop, and each validator receives
    each shred over exactly one edge.
 4. A validator reconstructs after receiving any `original_shards` distinct
    shreds and immediately sends the canonical generalized TX set to Core.
 
-For a large set, coding produces about 1.5 copies of the set. The branch factor
-of two makes the nominator upload about 3 copies, independent of `N`, instead of
-`N` full copies. Those extra source edges replace relay edges: each coded shred
-still crosses exactly `N` edges in total (for `N` receiver validators), so
-aggregate traffic remains roughly 1.5 times eager full broadcast rather than
-doubling with the branch factor.
+With `N` receiving validators, a set of size `S`, branch factor `b` and recovery
+fraction `r`, the traffic is:
 
-For the target case of a 5 MB TX set and a 1 Gbit/s link, one body takes about
-40 ms to serialize. The coded body is 7.5 MB, and two roots therefore cost the
-leader about 15 MB / 120 ms at line rate. A branch factor of three would raise
-that floor to 22.5 MB / 180 ms. Two is the latency-oriented compromise: it
-removes dependence on a single root for every shred while keeping leader
-serialization comfortably below a consensus timeout.
+- nominator egress `b * (1 + r) * S`, **independent of `N`** (versus `N * S` for
+  eager full broadcast);
+- aggregate mesh traffic `(1 + r) * N * S`, because each coded shred still
+  crosses exactly `N` edges regardless of `b` — extra source edges replace relay
+  edges rather than adding copies;
+- per-receiver ingress `(1 + r) * S`.
+
+Nominator egress is the binding constraint: it is the only term that grows with
+validator count, so it is what puts a bandwidth-limited leader over a consensus
+timeout. At `N = 22` and a 5 MB set, eager full broadcast asks the leader for
+110 MB per ledger — about 880 ms of serialization on a 1 Gbit/s link — while
+coding at `b = 1` asks for 7.5 MB, about 60 ms.
+
+**Branch factor is 1.** The 15-validator baseline below measured one root at
+224.6 ms / 7.87 MB of leader traffic against two roots at 218.8 ms / 15.73 MB:
+double the leader bytes — the scarce resource — for a latency difference well
+inside the noise of three samples. Two roots buy independence from any single
+root, but 50% recovery already covers that far more cheaply: losing a root costs
+only the shreds it is root for, roughly `total/N` of them, against a budget of
+`total/3`. So a third of the roots can fail before reconstruction does.
 
 The legacy `GetTxSet` request/response path remains as a safety net. Eager
 reconstruction cancels an in-flight fetch for the same hash.
@@ -69,8 +79,13 @@ ledger close cancels unsent shreds from older coding/sending tasks.
   for large sets or small peer counts);
 - recovery data: 50%;
 - initial TTL: 1;
-- branch roots per shred: 2 (or the connected peer count when smaller);
+- branch roots per shred: 1 (or the connected peer count when smaller);
 - target total shreds: 2 per connected peer.
+
+`TXSET_SHARD_BRANCHING_FACTOR` may be raised to
+`TXSET_MAX_SHARD_BRANCHING_FACTOR`, which is the largest value peers accept on
+the wire; a static assertion keeps the two in order, because a nominator that
+exceeded the wire bound would have every shred rejected network-wide.
 
 For large sets the peer-count limit produces shreds close to `1/N` of the
 TX-set size, matching the reference experiment's best-performing larger-shred

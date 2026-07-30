@@ -51,7 +51,7 @@ OverlayMetrics::OverlayMetrics(Application& app)
     , mFloodLeaderFallbackMeter(app.getMetrics().NewMeter(
           {"overlay", "flood", "leader-fallback"}, "message"))
     , mFloodTxSetPushMeter(app.getMetrics().NewMeter(
-          {"overlay", "flood", "txset-push"}, "message"))
+          {"overlay", "flood", "txset-push"}, "shred"))
     , mFloodTxSetPushBytesMeter(app.getMetrics().NewMeter(
           {"overlay", "flood", "txset-push-bytes"}, "byte"))
     , mFloodTxSetPushDroppedMeter(app.getMetrics().NewMeter(
@@ -69,11 +69,9 @@ OverlayMetrics::OverlayMetrics(Application& app)
     , mTxSetShardForwarded(app.getMetrics().NewMeter(
           {"overlay", "txset-shard", "forwarded"}, "shred"))
     , mTxSetShardReconstructOriginal(app.getMetrics().NewMeter(
-          {"overlay", "txset-shard", "reconstruct-original"},
-          "reconstruction"))
+          {"overlay", "txset-shard", "reconstruct-original"}, "reconstruction"))
     , mTxSetShardReconstructRecovery(app.getMetrics().NewMeter(
-          {"overlay", "txset-shard", "reconstruct-recovery"},
-          "reconstruction"))
+          {"overlay", "txset-shard", "reconstruct-recovery"}, "reconstruction"))
     , mTxSetShardInvalid(app.getMetrics().NewMeter(
           {"overlay", "txset-shard", "invalid"}, "shred"))
     , mTxSetShardAccumulatorEvicted(app.getMetrics().NewMeter(

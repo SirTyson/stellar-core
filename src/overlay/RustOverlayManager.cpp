@@ -45,6 +45,21 @@ RustOverlayManager::~RustOverlayManager()
     shutdown();
 }
 
+uint32_t
+RustOverlayManager::txSetCodingParallelism() const
+{
+    // Bounds the overlay's Reed-Solomon coding pool. A pre-Soroban ledger has
+    // no network config to read it from (and getLastClosedSorobanNetworkConfig
+    // release-asserts there), so fall back to serial coding.
+    if (!mApp.getLedgerManager().hasLastClosedSorobanNetworkConfig())
+    {
+        return 1;
+    }
+    return std::max(1u, mApp.getLedgerManager()
+                            .getLastClosedSorobanNetworkConfig()
+                            .ledgerMaxDependentTxClusters());
+}
+
 void
 RustOverlayManager::start()
 {
@@ -173,10 +188,7 @@ RustOverlayManager::start()
 
     mOverlayIPC->setPeerConfig(
         cfg.KNOWN_PEERS, cfg.PREFERRED_PEERS, cfg.PEER_PORT, quorumMembers,
-        cfg.EXPERIMENTAL_TX_BATCH_MAX_SIZE,
-        std::max(1u, mApp.getLedgerManager()
-                         .getLastClosedSorobanNetworkConfig()
-                         .ledgerMaxDependentTxClusters()),
+        cfg.EXPERIMENTAL_TX_BATCH_MAX_SIZE, txSetCodingParallelism(),
         cfg.ARTIFICIALLY_KEEP_SUBMITTED_TXS_LOCAL_FOR_TESTING);
 
     CLOG_INFO(Overlay, "RustOverlayManager started, peer_port={}",
@@ -249,11 +261,8 @@ RustOverlayManager::clearLedgersBelow(uint32_t ledgerSeq, uint32_t lclSeq)
     if (mOverlayIPC && mOverlayIPC->isConnected())
     {
         Hash dummyHash;
-        auto numClusters =
-            std::max(1u, mApp.getLedgerManager()
-                             .getLastClosedSorobanNetworkConfig()
-                             .ledgerMaxDependentTxClusters());
-        mOverlayIPC->notifyLedgerClosed(lclSeq, dummyHash, numClusters);
+        mOverlayIPC->notifyLedgerClosed(lclSeq, dummyHash,
+                                        txSetCodingParallelism());
     }
 }
 
@@ -553,8 +562,7 @@ RustOverlayManager::syncOverlayMetrics()
         mLastSyncedValues[sumField] = sum;
         mLastSyncedValues[countField] = count;
     };
-    syncTimerSummary(m.mTxSetShardEncodeTimer,
-                     "txset_shard_encode_sum_us",
+    syncTimerSummary(m.mTxSetShardEncodeTimer, "txset_shard_encode_sum_us",
                      "txset_shard_encode_count");
     syncTimerSummary(m.mTxSetShardReconstructTimer,
                      "txset_shard_reconstruct_sum_us",
