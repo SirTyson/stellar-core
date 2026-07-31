@@ -119,7 +119,7 @@ pub enum OverlayCommand {
     },
     /// Eagerly code and assign a nominated TX set across connected Tier-1
     /// peers so receivers skip the GetTxSet round-trip.
-    BroadcastTxSet { hash: [u8; 32], data: Vec<u8> },
+    BroadcastTxSet { hash: [u8; 32], data: Vec<u8>, slot: u64 },
     /// Relay a network-received TX that Core has validated (see the
     /// validation gate in main.rs): store it for GETDATA service, then push
     /// to connected leaders (or INV-announce as fallback), excluding the
@@ -334,11 +334,14 @@ impl OverlayHandle {
         }
     }
 
-    /// Eagerly disseminate a TX set as Reed–Solomon shreds.
-    pub async fn broadcast_txset(&self, hash: [u8; 32], data: Vec<u8>) {
+    /// Eagerly disseminate a TX set as Reed–Solomon shreds. `slot` is the
+    /// consensus slot the set is proposed for; it is carried explicitly so a
+    /// broadcast issued right after a ledger close is never mis-attributed
+    /// to the just-closed slot and cancelled as stale.
+    pub async fn broadcast_txset(&self, hash: [u8; 32], data: Vec<u8>, slot: u64) {
         if let Err(e) = self
             .cmd_tx
-            .send(OverlayCommand::BroadcastTxSet { hash, data })
+            .send(OverlayCommand::BroadcastTxSet { hash, data, slot })
             .await
         {
             warn!(
@@ -767,7 +770,7 @@ impl StellarOverlay {
                         OverlayCommand::SendTxSet { hash, data, to } => {
                             self.send_txset_response(to, hash, data).await;
                         }
-                        OverlayCommand::BroadcastTxSet { hash, data } => {
+                        OverlayCommand::BroadcastTxSet { hash, data, slot } => {
                             // Reed–Solomon coding can take milliseconds for a
                             // maximum-size set. Keep it off the swarm task so
                             // SCP and connection polling remain responsive.
@@ -777,7 +780,8 @@ impl StellarOverlay {
                                 .fetch_add(1, Ordering::Relaxed)
                                 .wrapping_add(1);
                             tokio::spawn(async move {
-                                broadcast_txset_shards(state, hash, data, generation).await;
+                                broadcast_txset_shards(state, hash, data, generation, slot)
+                                    .await;
                             });
                         }
                         OverlayCommand::RecordTxSetSource { hash, peer } => {
@@ -1420,12 +1424,14 @@ async fn broadcast_txset_shards(
     hash: [u8; 32],
     data: Vec<u8>,
     generation: u64,
+    slot: u64,
 ) {
     broadcast_txset_shards_with_branching_factor(
         state,
         hash,
         data,
         generation,
+        slot,
         TXSET_SHARD_BRANCHING_FACTOR,
     )
     .await;
@@ -1436,6 +1442,7 @@ async fn broadcast_txset_shards_with_branching_factor(
     hash: [u8; 32],
     data: Vec<u8>,
     generation: u64,
+    slot: u64,
     requested_branch_count: usize,
 ) {
     if !(1..=TXSET_MAX_SHARD_BRANCHING_FACTOR).contains(&requested_branch_count) {
@@ -1468,10 +1475,10 @@ async fn broadcast_txset_shards_with_branching_factor(
     let data_len = data.len();
     let peer_count = peers.len();
     let branch_count = requested_branch_count.min(peer_count);
-    let slot = state
-        .current_ledger_seq
-        .load(Ordering::Relaxed)
-        .saturating_add(1);
+    // `slot` arrives with the broadcast request (never inferred from
+    // `current_ledger_seq`): the round-1 leader pushes its pre-built set
+    // right after apply-finish, and inferring the slot here would race the
+    // LEDGER_CLOSED bookkeeping and drop every shred as stale.
     let config = state.txset_shard_config;
     let compression_enabled = state.txset_compression_enabled.load(Ordering::Relaxed);
     let coding_executor = state.txset_coding_executor.read().await.clone();
@@ -3799,7 +3806,7 @@ mod tests {
         // it forces codec 1 rather than the raw fallback.
         let (want_hash, want_data) = test_large_txset_xdr(0x94, 256 * 1024);
         handles[0]
-            .broadcast_txset(want_hash, want_data.clone())
+            .broadcast_txset(want_hash, want_data.clone(), 1)
             .await;
 
         let mut received = [false; NODE_COUNT];
@@ -4201,7 +4208,7 @@ mod tests {
         state.txset_shard_generation.store(2, Ordering::Relaxed);
         let (hash, data) = test_txset_xdr(0x67);
 
-        broadcast_txset_shards(state, hash, data, 1).await;
+        broadcast_txset_shards(state, hash, data, 1, 1).await;
 
         assert_eq!(metrics.txset_shard_broadcast.load(Ordering::Relaxed), 0);
         assert_eq!(metrics.flood_txset_push_dropped.load(Ordering::Relaxed), 3);
@@ -4417,7 +4424,7 @@ mod tests {
         assert!(plan.recovery_shards >= 1);
 
         handles[0]
-            .broadcast_txset(want_hash, want_data.clone())
+            .broadcast_txset(want_hash, want_data.clone(), 1)
             .await;
 
         let mut received = [false; NODE_COUNT];
@@ -4904,6 +4911,112 @@ mod tests {
         handle_c.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn test_leader_relay_targets_switched_leaders() {
+        // The in-flight-tail rescue behind eager post-apply proposals: a TX
+        // reaches node B while C is the flood leader, but Core's validation
+        // verdict lands only after the leader schedule switched to D (as
+        // pushLeaderSchedule does at apply-finish, when C's proposal is
+        // already frozen). The relay must read the flood targets live at
+        // verdict time and push the body to D, not to the frozen leader C.
+        let keypair_a = Keypair::generate_ed25519();
+        let keypair_b = Keypair::generate_ed25519();
+        let keypair_c = Keypair::generate_ed25519();
+        let keypair_d = Keypair::generate_ed25519();
+        let peer_c = keypair_c.public().to_peer_id();
+        let peer_d = keypair_d.public().to_peer_id();
+
+        let metrics_b = Arc::new(OverlayMetrics::new());
+        let (handle_a, _events_a, _tx_events_a, overlay_a) =
+            create_overlay(keypair_a, Arc::new(OverlayMetrics::new())).unwrap();
+        let (handle_b, _events_b, mut tx_events_b, overlay_b) =
+            create_overlay(keypair_b, Arc::clone(&metrics_b)).unwrap();
+        let (handle_c, _events_c, mut tx_events_c, overlay_c) =
+            create_overlay(keypair_c, Arc::new(OverlayMetrics::new())).unwrap();
+        let (handle_d, _events_d, mut tx_events_d, overlay_d) =
+            create_overlay(keypair_d, Arc::new(OverlayMetrics::new())).unwrap();
+
+        let port_b = 24160;
+        tokio::spawn(async move { overlay_a.run("127.0.0.1", 24161).await });
+        tokio::spawn(async move { overlay_b.run("127.0.0.1", port_b).await });
+        tokio::spawn(async move { overlay_c.run("127.0.0.1", 24162).await });
+        tokio::spawn(async move { overlay_d.run("127.0.0.1", 24163).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // A, C and D all connect to B.
+        let addr_b: Multiaddr = format!("/ip4/127.0.0.1/udp/{}/quic-v1", port_b)
+            .parse()
+            .unwrap();
+        handle_a.dial(addr_b.clone()).await;
+        handle_c.dial(addr_b.clone()).await;
+        handle_d.dial(addr_b).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // C leads while the TX is in flight to B.
+        handle_b.set_leaders(vec![peer_c]).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let tx = test_tx_xdr(7);
+        handle_a
+            .broadcast_tx(ValidatedTx::from_core_trusted(tx.clone(), 0, 1).unwrap())
+            .await;
+
+        // B receives the body; the validation gate holds it for Core's
+        // verdict. Do NOT relay yet -- the verdict is still in flight.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut held: Option<(Arc<ValidatedTx>, PeerId)> = None;
+        while tokio::time::Instant::now() < deadline && held.is_none() {
+            tokio::select! {
+                Some(event) = tx_events_b.recv() => {
+                    if let OverlayEvent::TxReceived { tx: recv_tx, from } = event {
+                        assert_eq!(recv_tx.bytes(), tx.as_slice());
+                        held = Some((recv_tx, from));
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+        let (held_tx, held_from) = held.expect("B should receive the TX body");
+
+        // Apply finishes on B: the schedule switches to D (C's proposal is
+        // frozen). Only then does the delayed verdict land.
+        handle_b.set_leaders(vec![peer_d]).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        handle_b.relay_validated_tx(held_tx, held_from).await;
+
+        // D (the live leader at verdict time) must get the full body.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut d_received = false;
+        while tokio::time::Instant::now() < deadline && !d_received {
+            tokio::select! {
+                Some(event) = tx_events_d.recv() => {
+                    if let OverlayEvent::TxReceived { tx: recv_tx, .. } = event {
+                        assert_eq!(recv_tx.bytes(), tx.as_slice());
+                        d_received = true;
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+        assert!(d_received, "new leader D should receive the late-verdict TX");
+        assert_eq!(metrics_b.flood_leader_push.load(Ordering::Relaxed), 1);
+
+        // The frozen ex-leader C must NOT have been pushed the body.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut c_received = false;
+        while let Ok(event) = tx_events_c.try_recv() {
+            if let OverlayEvent::TxReceived { .. } = event {
+                c_received = true;
+            }
+        }
+        assert!(!c_received, "frozen ex-leader C must not receive the TX");
+
+        handle_a.shutdown().await;
+        handle_b.shutdown().await;
+        handle_c.shutdown().await;
+        handle_d.shutdown().await;
+    }
+
     #[test]
     fn test_blake2b_hash() {
         let data = b"test data";
@@ -5332,7 +5445,7 @@ mod tests {
         let expected_codec = encode_txset_transport(want_data.clone(), true)
             .unwrap()
             .codec;
-        handle1.broadcast_txset(want_hash, want_data.clone()).await;
+        handle1.broadcast_txset(want_hash, want_data.clone(), 1).await;
 
         // Both peers reconstruct the unsolicited body from the eager shreds.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -5572,6 +5685,7 @@ mod tests {
                 coded_hash,
                 coded_data.clone(),
                 generation,
+                1,
                 branch_count,
             )
             .await;

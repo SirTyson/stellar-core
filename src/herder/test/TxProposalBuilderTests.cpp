@@ -10,6 +10,7 @@
 #include "test/TestUtils.h"
 #include "test/TxTests.h"
 #include "test/test.h"
+#include "util/MetricsRegistry.h"
 
 #include <thread>
 
@@ -185,6 +186,66 @@ TEST_CASE("TxProposalBuilder basic operation", "[herder][proposalbuilder]")
         }
         REQUIRE(builder.size() == numThreads * perThread);
     }
+}
+
+// Pre-built proposals (docs/direct-leader-flooding.md): with a single-node
+// quorum and FLOOD_LEADER_COUNT=1, this validator is always the round-1
+// leader, so every apply-finish pre-builds the next slot's proposal and every
+// trigger reuses it (the manual-close close-time offset is 1 second, inside
+// the pre-trim window [1, U]).
+TEST_CASE("round-1 leader pre-builds proposal at apply-finish and trigger "
+          "reuses it",
+          "[herder][proposalbuilder]")
+{
+    VirtualClock clock;
+    Config cfg(getTestConfig());
+    cfg.FLOOD_LEADER_COUNT = 1;
+    Application::pointer app = createTestApplication(clock, cfg);
+
+    auto& preBuilt =
+        app->getMetrics().NewMeter({"scp", "prebuild", "built"}, "txset");
+    auto& reused =
+        app->getMetrics().NewMeter({"scp", "prebuild", "reused"}, "txset");
+    auto& stale =
+        app->getMetrics().NewMeter({"scp", "prebuild", "stale"}, "txset");
+    auto& candidateBuild = app->getMetrics().NewMeter(
+        {"scp", "txset", "candidate-build"}, "txset");
+
+    // Prime: the first close's apply-finish pre-builds for the next slot.
+    app->manualClose(std::nullopt, std::nullopt);
+    auto preBuiltAfterFirst = preBuilt.count();
+    REQUIRE(preBuiltAfterFirst >= 1);
+
+    auto reusedBefore = reused.count();
+    auto candidateBefore = candidateBuild.count();
+    app->manualClose(std::nullopt, std::nullopt);
+
+    // The second close's trigger reused the proposal pre-built at the first
+    // close's apply-finish -- and still counts as a candidate-path proposal.
+    REQUIRE(reused.count() == reusedBefore + 1);
+    REQUIRE(candidateBuild.count() == candidateBefore + 1);
+    REQUIRE(stale.count() == 0);
+    // And that close's apply-finish pre-built the next one.
+    REQUIRE(preBuilt.count() == preBuiltAfterFirst + 1);
+}
+
+// Outside the candidate window nothing is pre-built: FLOOD_LEADER_COUNT=0
+// excludes the sole validator from round-1 leadership.
+TEST_CASE("non-leader does not pre-build proposals",
+          "[herder][proposalbuilder]")
+{
+    VirtualClock clock;
+    Config cfg(getTestConfig());
+    cfg.FLOOD_LEADER_COUNT = 0;
+    Application::pointer app = createTestApplication(clock, cfg);
+
+    auto& preBuilt =
+        app->getMetrics().NewMeter({"scp", "prebuild", "built"}, "txset");
+
+    app->manualClose(std::nullopt, std::nullopt);
+    app->manualClose(std::nullopt, std::nullopt);
+
+    REQUIRE(preBuilt.count() == 0);
 }
 
 } // namespace

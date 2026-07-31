@@ -1387,30 +1387,38 @@ impl App {
                 // Round-1 leader caches its nominated TX set and eagerly
                 // disseminates Reed–Solomon shreds, so receivers recover it
                 // before the referencing nomination arrives.
-                // Payload: [hash:32][txSetXDR...]
-                if msg.payload.len() < 33 {
+                // Payload: [hash:32][slot:8][txSetXDR...]. The slot travels
+                // with the request: Core may broadcast right after a ledger
+                // close (ahead of the trigger timer), and inferring the slot
+                // from `current_ledger_seq` would race the LEDGER_CLOSED
+                // bookkeeping and cancel the shreds as stale.
+                if msg.payload.len() < 41 {
                     warn!("BroadcastTxSet payload too short");
                     return true;
                 }
 
                 let mut hash = [0u8; 32];
                 hash.copy_from_slice(&msg.payload[0..32]);
+                let mut slot_bytes = [0u8; 8];
+                slot_bytes.copy_from_slice(&msg.payload[32..40]);
+                let slot = u64::from_le_bytes(slot_bytes);
                 // Core's own nominated set (trusted); skip the redundant
                 // decode/re-encode (perf fix #5357) and just guard the
                 // hash/bytes match.
-                if !xdr::tx_set_hash_matches(&hash, &msg.payload[32..]) {
+                if !xdr::tx_set_hash_matches(&hash, &msg.payload[40..]) {
                     warn!(
                         "TXSET_BROADCAST_DROP: Dropping TX set {:02x?}... from Core: hash/bytes mismatch",
                         &hash[..4]
                     );
                     return true;
                 }
-                let tx_set_xdr = msg.payload[32..].to_vec();
+                let tx_set_xdr = msg.payload[40..].to_vec();
 
                 info!(
-                    "TXSET_BROADCAST_REQ: Caching + coding locally-built TX set {:02x?}... ({} bytes)",
+                    "TXSET_BROADCAST_REQ: Caching + coding locally-built TX set {:02x?}... ({} bytes, slot {})",
                     &hash[..4],
-                    tx_set_xdr.len()
+                    tx_set_xdr.len(),
+                    slot
                 );
 
                 cache_tx_set_xdr(
@@ -1423,7 +1431,7 @@ impl App {
                 // Spawn so the main loop never awaits the bounded command channel.
                 let handle = self.libp2p_handle.clone();
                 tokio::spawn(async move {
-                    handle.broadcast_txset(hash, tx_set_xdr).await;
+                    handle.broadcast_txset(hash, tx_set_xdr, slot).await;
                 });
             }
 

@@ -284,6 +284,47 @@ class HerderImpl : public Herder
     void processSCPQueueUpToIndex(uint64 slotIndex);
     void newSlotExternalized(StellarValue const& value);
     void purgeOldSlotsAndProcessSCPQueue(bool synchronous);
+
+    // A proposal built ahead of the trigger timer by the round-1 candidate
+    // leader, immediately after apply of the previous ledger finished. The
+    // TX set was trimmed against the close-time window
+    // [mLowerOffset, mUpperOffset], so it is reusable at trigger time for
+    // any exact offset inside that window; outside it the trigger rebuilds.
+    struct PreBuiltProposal
+    {
+        uint32_t mSlotIndex;
+        Hash mLclHash;
+        TxSetXDRFrameConstPtr mProposedSet;
+        // shared_ptr: ApplicableTxSetFrameConstPtr is move-only, and the
+        // trigger needs to observe the frame while this struct keeps owning
+        // it across slots.
+        std::shared_ptr<ApplicableTxSetFrame const> mApplicableSet;
+        Hash mTxSetHash;
+        TimePoint mLowerOffset;
+        TimePoint mUpperOffset;
+        bool mPushed;
+    };
+    std::optional<PreBuiltProposal> mPreBuiltProposal;
+
+    // Build a candidate TX set from the proposal builder's current contents,
+    // trimmed/validated against the given close-time offset window.
+    std::pair<TxSetXDRFrameConstPtr, ApplicableTxSetFrameConstPtr>
+    buildCandidateTxSet(LedgerHeaderHistoryEntry const& lcl,
+                        TimePoint lowerBoundCloseTimeOffset,
+                        TimePoint upperBoundCloseTimeOffset);
+
+    // Hand a freshly built proposal to the overlay: eager shred broadcast
+    // for the round-1 leader, plain caching otherwise (and for empty sets).
+    // Honors the ARTIFICIALLY_* test knobs. Returns true iff broadcast.
+    bool pushOrCacheProposedTxSet(TxSetXDRFrameConstPtr const& proposedSet,
+                                  Hash const& txSetHash,
+                                  bool selfIsRound1Leader, uint32_t slotIndex);
+
+    // If this node is the round-1 candidate leader for the next slot,
+    // pre-build the proposal and eagerly push it, ahead of the trigger
+    // timer. Called from lastClosedLedgerIncreased; nomination itself still
+    // waits for the trigger to preserve cadence.
+    void maybePreBuildProposal();
     void purgeOldPersistedTxSets();
     void writeDebugTxSet(LedgerCloseData const& lcd);
 
@@ -368,6 +409,14 @@ class HerderImpl : public Herder
         // canonical empty set.
         medida::Meter& mCandidateTxSetBuild;
         medida::Meter& mEmptyTxSetFallback;
+
+        // Pre-built proposals (round-1 leader, at apply-finish): built and
+        // eagerly pushed ahead of the trigger; reused vs discarded-as-stale
+        // at trigger time.
+        medida::Meter& mProposalPreBuilt;
+        medida::Meter& mProposalPrePushed;
+        medida::Meter& mProposalPreBuildReused;
+        medida::Meter& mProposalPreBuildStale;
 
         SCPMetrics(Application& app);
     };

@@ -56,8 +56,11 @@ class RustOverlayManager
     // Cache a locally-built TX set in Rust overlay
     void cacheTxSet(Hash const& txSetHash, std::vector<uint8_t> const& xdr);
 
-    // Eagerly code and disseminate a TX set (round-1 leader only)
-    void broadcastTxSet(Hash const& txSetHash, std::vector<uint8_t> const& xdr);
+    // Eagerly code and disseminate a TX set (round-1 leader only). The slot
+    // the set is proposed for travels with the request so the overlay never
+    // mis-attributes an early (pre-trigger) broadcast to the previous slot.
+    void broadcastTxSet(Hash const& txSetHash, std::vector<uint8_t> const& xdr,
+                        uint64_t slotIndex);
 
     // Get top transactions from Rust overlay's mempool for TX set building
     std::vector<TransactionEnvelope> getTopTransactions(size_t count,

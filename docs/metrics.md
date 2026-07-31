@@ -225,8 +225,12 @@ scp.timing.externalized                   | timer     | time spent in ballot pro
 scp.timing.first-to-self-externalize-lag  | timer     | delay between first externalize message and local node externalizing
 scp.timing.self-to-others-externalize-lag | timer     | delay between local node externalizing and later externalize messages from other nodes
 scp.trigger.prepare-start-fallback        | meter     | experimental trigger timer fell back from the network-close-time anchor to the local prepare-start anchor
-scp.txset.candidate-build                 | meter     | full mempool-backed TX set built because this node is among the pre-routed candidate leaders
+scp.txset.candidate-build                 | meter     | trigger proposed a candidate (mempool-backed) TX set, whether built at trigger time or reused from a pre-built proposal
 scp.txset.empty-fallback                  | meter     | canonical empty TX set selected because this node is outside the pre-routed candidate leaders
+scp.prebuild.built                        | meter     | round-1 leader pre-built the next slot's proposal at apply-finish, ahead of the trigger timer
+scp.prebuild.pushed                       | meter     | pre-built proposal was eagerly shred-broadcast at apply-finish
+scp.prebuild.reused                       | meter     | trigger reused the pre-built proposal (close-time offset inside the pre-trim window)
+scp.prebuild.stale                        | meter     | pre-built proposal discarded at trigger (LCL moved or trigger fired past the pre-trim window); proposal rebuilt
 scp.value.invalid                         | meter     | SCP value is invalid
 scp.value.valid                           | meter     | SCP value is valid
 scp.slot.values-referenced                | histogram | number of values referenced per consensus round

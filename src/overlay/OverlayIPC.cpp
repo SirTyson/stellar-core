@@ -894,7 +894,8 @@ OverlayIPC::cacheTxSet(Hash const& hash, std::vector<uint8_t> const& xdr)
 }
 
 void
-OverlayIPC::broadcastTxSet(Hash const& hash, std::vector<uint8_t> const& xdr)
+OverlayIPC::broadcastTxSet(Hash const& hash, std::vector<uint8_t> const& xdr,
+                           uint64_t slotIndex)
 {
     if (!mChannel || !mChannel->isConnected())
     {
@@ -903,12 +904,15 @@ OverlayIPC::broadcastTxSet(Hash const& hash, std::vector<uint8_t> const& xdr)
 
     IPCMessage msg;
     msg.type = IPCMessageType::BROADCAST_TX_SET;
-    msg.payload.resize(32 + xdr.size());
+    msg.payload.resize(32 + 8 + xdr.size());
     std::memcpy(msg.payload.data(), hash.data(), 32);
-    std::memcpy(msg.payload.data() + 32, xdr.data(), xdr.size());
+    std::memcpy(msg.payload.data() + 32, &slotIndex, 8);
+    std::memcpy(msg.payload.data() + 40, xdr.data(), xdr.size());
 
-    CLOG_DEBUG(Overlay, "Requesting coded TX set dissemination for {} ({} bytes)",
-               hexAbbrev(hash), xdr.size());
+    CLOG_DEBUG(Overlay,
+               "Requesting coded TX set dissemination for {} ({} bytes, "
+               "slot {})",
+               hexAbbrev(hash), xdr.size(), slotIndex);
     std::lock_guard<std::mutex> lock(mSendMutex);
     mChannel->send(msg);
 }

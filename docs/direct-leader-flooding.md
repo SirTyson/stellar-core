@@ -484,6 +484,43 @@ frame rebuild (XDR decode + two hashes per tx) from the nomination critical
 path. `GET_TOP_TXS` remains available for tools and tests but is off the
 proposal path.
 
+### Pre-built proposals: build and push at apply-finish, nominate at trigger
+
+The round-1 leader for slot N is knowable the moment ledger N-1 closes (the
+seed is `hash(N-2)` = the new LCL's `previousLedgerHash`). Instead of waiting
+for the trigger timer, that leader now snapshots the builder, runs
+`makeTxSetFromTransactions`, and eagerly shred-broadcasts the set **at
+apply-finish** (`HerderImpl::maybePreBuildProposal`, called at the end of
+`lastClosedLedgerIncreased`). The trigger-anchor idle window between apply
+and the next trigger absorbs the whole build + dissemination; receivers
+assemble the set while SCP is quiet. Nomination itself still waits for the
+trigger timer — cadence is unchanged; the trigger simply reuses the pre-built
+set and goes straight to upgrades + `nominate`.
+
+Because the exact close time (and hence the close-time offset that
+parameterizes trimming and the validity-cache key) is only chosen at trigger
+time, the pre-build trims against a conservative window `[1, U]` where `U` is
+the flood gate's own upper-bound estimate (expected close time x
+`EXPECTED_CLOSE_TIME_MULT` + drift). `checkValid`'s window semantics are
+monotone, so the set is valid at any exact offset the trigger picks inside
+the window; if the trigger fires later than `U` (or the LCL moved), the
+pre-built proposal is discarded (`scp.prebuild.stale`) and rebuilt exactly as
+before. The trigger never re-broadcasts a reused set — a second
+`BROADCAST_TX_SET` would bump the overlay's latest-wins shred generation and
+cancel the in-flight shreds.
+
+Ordering invariants at apply-finish: `pushLeaderSchedule` (flood targets
+switch to slot N+1's leaders) and `purgeOldSlotsAndProcessSCPQueue` (sends
+`LEDGER_CLOSED(N-1)`) both run before the eager push. The first means
+transactions arriving after the proposal froze already flood to the *next*
+leaders — and a tx whose validation verdict lands after the switch is
+relayed to the new targets (`relay_validated_tx` reads the leader set live),
+so the in-flight tail at the frozen leader loses at most one slot. The
+second, together with the explicit slot in `BROADCAST_TX_SET`, keeps the
+overlay's stale-shred cancellation working on the right slot. Second and
+later candidates do not pre-build; they build at trigger time from the
+builder and cache for the fetch fallback, as before.
+
 ## Later steps (sketch)
 
 - **Step 4 — Hardening.** Cert-based identity (keep the signing key in Core),

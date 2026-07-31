@@ -46,6 +46,16 @@ only the shreds it is root for, roughly `total/N` of them, against a budget of
 The legacy `GetTxSet` request/response path remains as a safety net. Eager
 reconstruction cancels an in-flight fetch for the same hash.
 
+The nominator's `BROADCAST_TX_SET` IPC request carries the consensus slot
+explicitly (payload `[hash:32][slot:8][xdr]`). Slot attribution used to be
+inferred as `current_ledger_seq + 1`, which was correct only for broadcasts
+issued at trigger time; the round-1 leader now pre-builds and pushes its set
+immediately after apply of the previous ledger finishes
+(docs/direct-leader-flooding.md), where the inference would race the
+`LEDGER_CLOSED` bookkeeping and cancel every shred as stale. The latest-wins
+cancellation (a newer local broadcast or the close of the shred's own slot)
+is unchanged, just keyed on the explicit slot.
+
 ## Wire and safety properties
 
 Shreds use a dedicated QUIC stream protocol,

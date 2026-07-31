@@ -208,10 +208,18 @@ class OverlayIPC
      * references it -- removing the GetTxSet request round-trip from the
      * nomination critical path. Intended for the round-1 leader only.
      *
+     * The slot the set is proposed for is carried explicitly (payload
+     * [hash:32][slot:8 LE][xdr]) rather than inferred from the overlay's
+     * last-closed-ledger bookkeeping, so a broadcast issued right after a
+     * ledger close (before/while LEDGER_CLOSED is processed) is never
+     * mis-attributed to the just-closed slot and cancelled as stale.
+     *
      * @param hash The TX set hash
      * @param xdr The serialized TX set XDR
+     * @param slotIndex The slot (ledger seq) the set is proposed for
      */
-    void broadcastTxSet(Hash const& hash, std::vector<uint8_t> const& xdr);
+    void broadcastTxSet(Hash const& hash, std::vector<uint8_t> const& xdr,
+                        uint64_t slotIndex);
 
     /// Set callback for received SCP envelopes
     void setOnSCPReceived(SCPReceivedCallback cb);

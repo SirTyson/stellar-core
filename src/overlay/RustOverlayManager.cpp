@@ -298,11 +298,12 @@ RustOverlayManager::cacheTxSet(Hash const& txSetHash,
 
 void
 RustOverlayManager::broadcastTxSet(Hash const& txSetHash,
-                                   std::vector<uint8_t> const& xdr)
+                                   std::vector<uint8_t> const& xdr,
+                                   uint64_t slotIndex)
 {
     if (mOverlayIPC && !mShuttingDown)
     {
-        mOverlayIPC->broadcastTxSet(txSetHash, xdr);
+        mOverlayIPC->broadcastTxSet(txSetHash, xdr, slotIndex);
     }
 }
 

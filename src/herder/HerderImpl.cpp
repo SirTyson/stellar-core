@@ -89,6 +89,14 @@ HerderImpl::SCPMetrics::SCPMetrics(Application& app)
           {"scp", "txset", "candidate-build"}, "txset"))
     , mEmptyTxSetFallback(app.getMetrics().NewMeter(
           {"scp", "txset", "empty-fallback"}, "txset"))
+    , mProposalPreBuilt(
+          app.getMetrics().NewMeter({"scp", "prebuild", "built"}, "txset"))
+    , mProposalPrePushed(
+          app.getMetrics().NewMeter({"scp", "prebuild", "pushed"}, "txset"))
+    , mProposalPreBuildReused(
+          app.getMetrics().NewMeter({"scp", "prebuild", "reused"}, "txset"))
+    , mProposalPreBuildStale(
+          app.getMetrics().NewMeter({"scp", "prebuild", "stale"}, "txset"))
 {
 }
 
@@ -1197,6 +1205,16 @@ HerderImpl::lastClosedLedgerIncreased(bool latest, TxSetXDRFrameConstPtr txSet,
         // the next slot. Posted to the main thread so control returns to the
         // caller first, matching the previous post-externalize behavior.
         purgeOldSlotsAndProcessSCPQueue(false);
+
+        // If we lead the next slot's round 1, pre-build the proposal and
+        // eagerly push it now, filling the idle window until the trigger
+        // timer; nomination itself still waits for the trigger (cadence is
+        // unchanged). MUST run after purgeOldSlotsAndProcessSCPQueue -- that
+        // is what sends LEDGER_CLOSED(N-1), and a BROADCAST_TX_SET ordered
+        // before it would race the overlay's slot bookkeeping -- and after
+        // pushLeaderSchedule, so post-freeze tx arrivals flood to the next
+        // slot's leaders rather than this frozen proposal.
+        maybePreBuildProposal();
     }
 }
 
@@ -1590,6 +1608,220 @@ HerderImpl::setInSyncAndTriggerNextLedger()
 
 // called to take a position during the next round
 // uses the state in LedgerManager to derive a starting position
+std::pair<TxSetXDRFrameConstPtr, ApplicableTxSetFrameConstPtr>
+HerderImpl::buildCandidateTxSet(LedgerHeaderHistoryEntry const& lcl,
+                                TimePoint lowerBoundCloseTimeOffset,
+                                TimePoint upperBoundCloseTimeOffset)
+{
+    ZoneScoped;
+    releaseAssert(threadIsMain());
+
+    // The candidates are the flood targets, so their proposal builder holds
+    // the already-validated frames of every routed tx — no mempool IPC fetch
+    // and no frame rebuild (docs/direct-leader-flooding.md, streaming
+    // proposal construction).
+    PerPhaseTransactionList txPhases;
+    TxFrameList classicTxs;
+    TxFrameList sorobanTxs;
+    mTxProposalBuilder.snapshot(classicTxs, sorobanTxs);
+
+    CLOG_INFO(Herder,
+              "Candidate leader snapshotted {} classic + {} soroban txs "
+              "from the proposal builder",
+              classicTxs.size(), sorobanTxs.size());
+
+    bool const supportsSoroban = protocolVersionStartsFrom(
+        lcl.header.ledgerVersion, SOROBAN_PROTOCOL_VERSION);
+    if (!supportsSoroban && !sorobanTxs.empty())
+    {
+        CLOG_DEBUG(Herder,
+                   "Ignoring {} Soroban transactions before Soroban "
+                   "protocol support",
+                   sorobanTxs.size());
+    }
+    txPhases.emplace_back(std::move(classicTxs));
+    if (supportsSoroban)
+    {
+        txPhases.emplace_back(std::move(sorobanTxs));
+    }
+
+    PerPhaseTransactionList invalidTxPhases;
+    invalidTxPhases.resize(txPhases.size());
+
+    auto res = makeTxSetFromTransactions(txPhases, mApp,
+                                         lowerBoundCloseTimeOffset,
+                                         upperBoundCloseTimeOffset,
+                                         invalidTxPhases);
+
+    // NB: trim-rejected txs deliberately stay in the builder. The list
+    // mixes permanently-invalid txs with not-yet-valid deep-chain txs
+    // (the gate admits seq gaps up to MAX_SEQ_GAP_FOR_FLOODING; strict
+    // sequencing holds here), and the latter become valid as their
+    // predecessors apply — exactly like the Rust mempool, whose entries
+    // also survive a failed proposal until inclusion or age-out.
+
+    if (res.second)
+    {
+        CLOG_INFO(Herder, "Candidate leader built TX set with {} transactions",
+                  res.first->sizeTxTotal());
+    }
+    return res;
+}
+
+bool
+HerderImpl::pushOrCacheProposedTxSet(TxSetXDRFrameConstPtr const& proposedSet,
+                                     Hash const& txSetHash,
+                                     bool selfIsRound1Leader,
+                                     uint32_t slotIndex)
+{
+    // Empty proposals are not proactively pushed, but must remain servable
+    // when a third-or-later leader nominates one. This also covers a
+    // candidate whose mempool-backed construction happened to produce an
+    // empty set. Note: the overlay only supports GeneralizedTransactionSet
+    // (protocol >= 20).
+    if (!proposedSet->isGeneralizedTxSet())
+    {
+        return false;
+    }
+
+    GeneralizedTransactionSet xdrTxSet;
+    proposedSet->toXDR(xdrTxSet);
+    auto xdrBytes = xdr::xdr_to_opaque(xdrTxSet);
+
+    if (proposedSet->sizeTxTotal() == 0)
+    {
+        mApp.getOverlayManager().cacheTxSet(txSetHash, xdrBytes);
+        return false;
+    }
+
+    // Direct leader flooding, TxSet dissemination
+    // (docs/direct-leader-flooding.md Step 5): the round-1 leader for the
+    // slot being nominated pushes the full body to every peer, so receivers
+    // have it by the time they process the nomination that references it --
+    // removing the GetTxSet request round-trip from the nomination critical
+    // path. Other candidate leaders cache their full set for the fetch
+    // fallback; non-candidates cache only their canonical empty proposal.
+    //
+    // Round-1 leader is seeded by hash(N-2); for slot N = ledgerSeq + 1 with
+    // lcl = N-1, that seed is exactly lcl.header.previousLedgerHash. Under
+    // application-specific (non-self-biased) weights every node agrees on
+    // this single leader, so exactly one node broadcasts.
+    //
+    // Only round-1 pushes proactively. If the slot advances to another
+    // pre-routed candidate, receivers use the delayed request fallback. If
+    // all pre-routed candidates fail, later leaders nominate the
+    // already-cached empty set.
+    if (mApp.getConfig().ARTIFICIALLY_DROP_NOMINATED_TX_SET_FOR_TESTING)
+    {
+        // Wedge-repro testing: the nominated set is neither pushed nor
+        // cached (leader or not), so NO peer can obtain the body -- the
+        // limit case of "leader delivery too slow". Only the empty-tx-set
+        // recovery can unblock the slot.
+        CLOG_INFO(Herder,
+                  "TESTING: dropping nominated TX set {} (not pushed, "
+                  "not cached)",
+                  binToHex(txSetHash).substr(0, 8));
+        return false;
+    }
+    if (selfIsRound1Leader &&
+        !mApp.getConfig().ARTIFICIALLY_SUPPRESS_TX_SET_FLOOD_FOR_TESTING)
+    {
+        CLOG_DEBUG(Herder,
+                   "Round-1 leader: eagerly broadcasting TX set {} to peers "
+                   "for slot {}",
+                   binToHex(txSetHash).substr(0, 8), slotIndex);
+        mApp.getOverlayManager().broadcastTxSet(txSetHash, xdrBytes,
+                                                slotIndex);
+        return true;
+    }
+    // Non-leader, or a test simulating a flood miss: keep the set servable
+    // for fetches without pushing it.
+    mApp.getOverlayManager().cacheTxSet(txSetHash, xdrBytes);
+    return false;
+}
+
+void
+HerderImpl::maybePreBuildProposal()
+{
+    ZoneScoped;
+    releaseAssert(threadIsMain());
+
+    // Any previously pre-built proposal is for an older slot now.
+    mPreBuiltProposal.reset();
+
+    if (!getSCP().isValidator() || !isTracking() ||
+        !mLedgerManager.isSynced() || mLedgerManager.isApplying())
+    {
+        return;
+    }
+
+    auto lcl = mLedgerManager.getLastClosedLedgerHeader();
+    uint32_t const slotIndex = lcl.header.ledgerSeq + 1;
+    auto const candidateLeaders = mHerderSCPDriver.computeLeaderSchedule(
+        lcl.header.previousLedgerHash, slotIndex,
+        mApp.getConfig().FLOOD_LEADER_COUNT);
+    auto const selfID = mApp.getConfig().NODE_SEED.getPublicKey();
+    if (candidateLeaders.empty() || candidateLeaders.front() != selfID)
+    {
+        // Only the round-1 leader pre-builds and eagerly pushes; other
+        // candidates build at trigger time and cache for the fetch fallback.
+        return;
+    }
+
+    // Conservative close-time window: the trigger clamps nextCloseTime to at
+    // least lcl.closeTime + 1, so 1 is the lowest offset it can pick; the
+    // upper bound is the same estimate the flood gate validates against
+    // (expected close time x EXPECTED_CLOSE_TIME_MULT + drift). checkValid's
+    // window semantics are monotone (TransactionFrame::isTooEarly/isTooLate),
+    // so a set trimmed against [1, U] is valid at any exact offset o <= U
+    // the trigger may pick. If the trigger fires later than U, it rebuilds.
+    TimePoint const lowerOffset = 1;
+    TimePoint const upperOffset = std::max<TimePoint>(
+        lowerOffset, getUpperBoundCloseTimeOffset(
+                         mApp, lcl.header.scpValue.closeTime));
+
+    auto built = buildCandidateTxSet(lcl, lowerOffset, upperOffset);
+    if (!built.second)
+    {
+        return;
+    }
+    auto proposedSet = built.first;
+    std::shared_ptr<ApplicableTxSetFrame const> applicableSet(
+        std::move(built.second));
+    auto txSetHash = proposedSet->getContentsHash();
+
+    mPendingEnvelopes.addTxSet(txSetHash, slotIndex, proposedSet);
+
+    // Eager dissemination fills the trigger-anchor idle window: receivers
+    // assemble (and, with eager validation, verify) the set while SCP is
+    // quiet, taking the whole dissemination off the nomination critical
+    // path. IPC-ordering invariant: this runs after
+    // purgeOldSlotsAndProcessSCPQueue sent LEDGER_CLOSED(N-1) and after
+    // pushLeaderSchedule switched the flood targets to slot N+1's leaders,
+    // so shreds are attributed to the right slot and post-freeze tx arrivals
+    // already route to the next leaders, not to this frozen proposal.
+    bool const pushed =
+        pushOrCacheProposedTxSet(proposedSet, txSetHash,
+                                 /*selfIsRound1Leader=*/true, slotIndex);
+
+    mSCPMetrics.mProposalPreBuilt.Mark();
+    if (pushed)
+    {
+        mSCPMetrics.mProposalPrePushed.Mark();
+    }
+
+    mPreBuiltProposal =
+        PreBuiltProposal{slotIndex,       lcl.hash,   proposedSet,
+                         applicableSet,   txSetHash,  lowerOffset,
+                         upperOffset,     pushed};
+
+    CLOG_DEBUG(Herder,
+               "Pre-built TX set {} for slot {} at apply-finish "
+               "(window [{}, {}], pushed={})",
+               hexAbbrev(txSetHash), slotIndex, lowerOffset, upperOffset,
+               pushed);
+}
+
 void
 HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
                               bool checkTrackingSCP)
@@ -1688,65 +1920,57 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
             candidateLeaders.end();
 
     TxSetXDRFrameConstPtr proposedSet;
+    // Owns the applicable frame when built in this call; on pre-built reuse
+    // the frame stays owned by mPreBuiltProposal and only the observing
+    // pointer below is set.
     ApplicableTxSetFrameConstPtr applicableProposedSet;
+    ApplicableTxSetFrame const* applicableForValidity = nullptr;
     Hash txSetHash;
 
-    if (selfIsCandidateLeader)
+    bool reusedPreBuiltProposal = false;
+    if (selfIsCandidateLeader && mPreBuiltProposal &&
+        mPreBuiltProposal->mSlotIndex == slotIndex &&
+        mPreBuiltProposal->mLclHash == lcl.hash &&
+        lowerBoundCloseTimeOffset >= mPreBuiltProposal->mLowerOffset &&
+        upperBoundCloseTimeOffset <= mPreBuiltProposal->mUpperOffset)
     {
-        // Only the transaction-routing candidate leaders construct a full TX
-        // set. The candidates are the flood targets, so their proposal
-        // builder holds the already-validated frames of every routed tx —
-        // no mempool IPC fetch and no frame rebuild at trigger time
-        // (docs/direct-leader-flooding.md, streaming proposal construction).
-        PerPhaseTransactionList txPhases;
-        TxFrameList classicTxs;
-        TxFrameList sorobanTxs;
-        mTxProposalBuilder.snapshot(classicTxs, sorobanTxs);
-
-        CLOG_INFO(Herder,
-                  "Candidate leader snapshotted {} classic + {} soroban txs "
-                  "from the proposal builder",
-                  classicTxs.size(), sorobanTxs.size());
-
-        bool const supportsSoroban = protocolVersionStartsFrom(
-            lcl.header.ledgerVersion, SOROBAN_PROTOCOL_VERSION);
-        if (!supportsSoroban && !sorobanTxs.empty())
+        // The proposal pre-built (and eagerly pushed) at apply-finish is
+        // valid for this trigger's exact close-time offset: every tx was
+        // trimmed against a window covering it. Reuse it -- the whole build
+        // and dissemination happened off the nomination critical path.
+        proposedSet = mPreBuiltProposal->mProposedSet;
+        applicableForValidity = mPreBuiltProposal->mApplicableSet.get();
+        reusedPreBuiltProposal = true;
+        // scp.txset.candidate-build tracks which proposal path the trigger
+        // took (candidate vs empty fallback), whether built now or reused.
+        mSCPMetrics.mCandidateTxSetBuild.Mark();
+        mSCPMetrics.mProposalPreBuildReused.Mark();
+        CLOG_DEBUG(Herder, "Reusing pre-built TX set {} for slot {}",
+                   hexAbbrev(mPreBuiltProposal->mTxSetHash), slotIndex);
+    }
+    else if (selfIsCandidateLeader)
+    {
+        if (mPreBuiltProposal && mPreBuiltProposal->mSlotIndex == slotIndex)
         {
+            // Pre-built but unusable: the LCL moved, or the trigger fired
+            // later than the pre-trim window allows. Rebuild at the exact
+            // offset.
+            mSCPMetrics.mProposalPreBuildStale.Mark();
             CLOG_DEBUG(Herder,
-                       "Ignoring {} Soroban transactions before Soroban "
-                       "protocol support",
-                       sorobanTxs.size());
+                       "Pre-built TX set for slot {} is stale "
+                       "(offset {} outside [{}, {}]); rebuilding",
+                       slotIndex, upperBoundCloseTimeOffset,
+                       mPreBuiltProposal->mLowerOffset,
+                       mPreBuiltProposal->mUpperOffset);
         }
-        txPhases.emplace_back(std::move(classicTxs));
-        if (supportsSoroban)
-        {
-            txPhases.emplace_back(std::move(sorobanTxs));
-        }
-
-        PerPhaseTransactionList invalidTxPhases;
-        invalidTxPhases.resize(txPhases.size());
-
-        std::tie(proposedSet, applicableProposedSet) =
-            makeTxSetFromTransactions(txPhases, mApp,
-                                      lowerBoundCloseTimeOffset,
-                                      upperBoundCloseTimeOffset,
-                                      invalidTxPhases);
-
-        // NB: trim-rejected txs deliberately stay in the builder. The list
-        // mixes permanently-invalid txs with not-yet-valid deep-chain txs
-        // (the gate admits seq gaps up to MAX_SEQ_GAP_FOR_FLOODING; strict
-        // sequencing holds here), and the latter become valid as their
-        // predecessors apply — exactly like the Rust mempool, whose entries
-        // also survive a failed proposal until inclusion or age-out.
-
+        std::tie(proposedSet, applicableProposedSet) = buildCandidateTxSet(
+            lcl, lowerBoundCloseTimeOffset, upperBoundCloseTimeOffset);
         if (!applicableProposedSet)
         {
             releaseAssert(!mApp.getConfig().FORCE_SCP);
             return;
         }
-
-        CLOG_INFO(Herder, "Candidate leader built TX set with {} transactions",
-                  proposedSet->sizeTxTotal());
+        applicableForValidity = applicableProposedSet.get();
         mSCPMetrics.mCandidateTxSetBuild.Mark();
     }
     else
@@ -1759,6 +1983,7 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
         applicableProposedSet =
             proposedSet->prepareForApply(mApp, lcl.header);
         releaseAssert(applicableProposedSet);
+        applicableForValidity = applicableProposedSet.get();
         CLOG_DEBUG(Herder,
                    "Node is outside the first {} candidate leaders for slot "
                    "{}; using canonical empty TX set",
@@ -1773,78 +1998,24 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
 
     // Cache only this node's selected proposal: a mempool-backed set for the
     // first candidate leaders, or the canonical empty set for everyone else.
-    mHerderSCPDriver.cacheValidTxSet(*applicableProposedSet, lcl,
+    // Keyed under the exact offset this trigger chose; a reused pre-built
+    // set was validated across a window covering it.
+    releaseAssert(applicableForValidity);
+    mHerderSCPDriver.cacheValidTxSet(*applicableForValidity, lcl,
                                      upperBoundCloseTimeOffset);
-    mPendingEnvelopes.addTxSet(txSetHash, slotIndex, proposedSet);
 
-    // Empty proposals are not proactively pushed, but must remain servable
-    // when a third-or-later leader nominates one. This also covers a candidate
-    // whose mempool-backed construction happened to produce an empty set.
-    if (proposedSet->sizeTxTotal() == 0 && proposedSet->isGeneralizedTxSet())
+    if (!reusedPreBuiltProposal)
     {
-        GeneralizedTransactionSet emptyXdrTxSet;
-        proposedSet->toXDR(emptyXdrTxSet);
-        mApp.getOverlayManager().cacheTxSet(
-            txSetHash, xdr::xdr_to_opaque(emptyXdrTxSet));
-    }
-
-    // Hand a non-empty candidate TX set to the Rust overlay. Note: the overlay
-    // only supports GeneralizedTransactionSet (protocol >= 20).
-    //
-    // Direct leader flooding, TxSet dissemination
-    // (docs/direct-leader-flooding.md Step 5): the round-1 leader for the slot
-    // being nominated pushes the full body to every peer *now*, so receivers
-    // have it by the time they process the nomination that references it --
-    // removing the GetTxSet request round-trip from the nomination critical
-    // path. Other candidate leaders cache their full set for the fetch
-    // fallback; non-candidates cache only their canonical empty proposal.
-    //
-    // Round-1 leader is seeded by hash(N-2); when nominating slot N = ledgerSeq
-    // + 1 with lcl = N-1, that seed is exactly lcl.header.previousLedgerHash.
-    // Under application-specific (non-self-biased) weights every node agrees on
-    // this single leader, so exactly one node broadcasts.
-    //
-    // Only round-1 pushes proactively. If the slot advances to another
-    // pre-routed candidate, receivers use the delayed request fallback. If all
-    // pre-routed candidates fail, later leaders nominate the already-cached
-    // empty set.
-    if (proposedSet->sizeTxTotal() != 0 && proposedSet->isGeneralizedTxSet())
-    {
-        GeneralizedTransactionSet xdrTxSet;
-        proposedSet->toXDR(xdrTxSet);
-        auto xdrBytes = xdr::xdr_to_opaque(xdrTxSet);
+        mPendingEnvelopes.addTxSet(txSetHash, slotIndex, proposedSet);
 
         bool const selfIsRound1Leader =
             !candidateLeaders.empty() && candidateLeaders.front() == selfID;
-
-        if (mApp.getConfig().ARTIFICIALLY_DROP_NOMINATED_TX_SET_FOR_TESTING)
-        {
-            // Wedge-repro testing: the nominated set is neither pushed nor
-            // cached (leader or not), so NO peer can obtain the body -- the
-            // limit case of "leader delivery too slow". Only the empty-tx-set
-            // recovery can unblock the slot.
-            CLOG_INFO(Herder,
-                      "TESTING: dropping nominated TX set {} (not pushed, "
-                      "not cached)",
-                      binToHex(txSetHash).substr(0, 8));
-        }
-        else if (selfIsRound1Leader &&
-                 !mApp.getConfig()
-                      .ARTIFICIALLY_SUPPRESS_TX_SET_FLOOD_FOR_TESTING)
-        {
-            CLOG_DEBUG(
-                Herder,
-                "Round-1 leader: eagerly broadcasting TX set {} to peers",
-                binToHex(txSetHash).substr(0, 8));
-            mApp.getOverlayManager().broadcastTxSet(txSetHash, xdrBytes);
-        }
-        else
-        {
-            // Non-leader, or a test simulating a flood miss: keep the set
-            // servable for fetches without pushing it.
-            mApp.getOverlayManager().cacheTxSet(txSetHash, xdrBytes);
-        }
+        pushOrCacheProposedTxSet(proposedSet, txSetHash, selfIsRound1Leader,
+                                 slotIndex);
     }
+    // else: the pre-built set was added and pushed (or cached, per the test
+    // knobs) at apply-finish. Re-broadcasting here would bump the overlay's
+    // latest-wins shred generation and cancel our own in-flight shreds.
 
     lcl = mLedgerManager.getLastClosedLedgerHeader();
 
