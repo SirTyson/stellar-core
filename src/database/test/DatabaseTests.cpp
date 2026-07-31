@@ -471,10 +471,11 @@ TEST_CASE("Database splitting migration works correctly", "[db]")
             return count > 0;
         };
 
-        // Insert test data into all tables that should be migrated
-        execSQL("INSERT INTO peers (ip, port, nextattempt, numfailures, type) "
-                "VALUES ('127.0.0.1', 11625, '2024-01-01 00:00:00', 0, 1)",
-                db.getSession());
+        // Insert test data into all tables that should be migrated. Note:
+        // the `peers` table is no longer created on this branch (the C++
+        // PeerManager was removed with the Rust overlay); the migration
+        // itself tolerates missing source tables, so this test exercises
+        // the remaining misc tables.
         execSQL("INSERT INTO ban (nodeid) VALUES "
                 "('GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF')",
                 db.getSession());
@@ -512,7 +513,6 @@ TEST_CASE("Database splitting migration works correctly", "[db]")
                 db.getSession());
 
         // Verify data exists in main before migration
-        REQUIRE(countRows("peers", db.getSession()) == 1);
         REQUIRE(countRows("ban", db.getSession()) == 1);
         REQUIRE(countRows("scphistory", db.getSession()) == 1);
         REQUIRE(countRows("scpquorums", db.getSession()) == 1);
@@ -542,7 +542,9 @@ TEST_CASE("Database splitting migration works correctly", "[db]")
         // Verify main-only data did NOT get migrated to misc DB
         REQUIRE_FALSE(tableExists("storestate", db.getMiscSession()));
 
-        // Verify all misc tables are dropped from main
+        // Verify all misc tables are dropped from main ("peers" trivially:
+        // it is never created on this branch, and migration must not
+        // resurrect it)
         std::vector<std::string> migratedTables = {"peers",      "ban",
                                                    "scphistory", "scpquorums",
                                                    "quoruminfo", "slotstate"};
@@ -553,7 +555,6 @@ TEST_CASE("Database splitting migration works correctly", "[db]")
 
         // Verify data was migrated to misc DB
         // Note: slotstate has 2 rows (test data + miscdatabaseschema)
-        REQUIRE(countRows("peers", db.getMiscSession()) == 1);
         REQUIRE(countRows("ban", db.getMiscSession()) == 1);
         REQUIRE(countRows("scphistory", db.getMiscSession()) == 1);
         REQUIRE(countRows("scpquorums", db.getMiscSession()) == 1);
@@ -561,19 +562,6 @@ TEST_CASE("Database splitting migration works correctly", "[db]")
         REQUIRE(countRows("slotstate", db.getMiscSession()) == 2);
 
         // Verify specific data values in misc DB
-        {
-            std::string ip;
-            int port = 0;
-            auto prep = db.getPreparedStatement("SELECT ip, port FROM peers",
-                                                db.getMiscSession());
-            auto& st = prep.statement();
-            st.exchange(soci::into(ip));
-            st.exchange(soci::into(port));
-            st.define_and_bind();
-            st.execute(true);
-            REQUIRE(ip == "127.0.0.1");
-            REQUIRE(port == 11625);
-        }
         {
             std::string state;
             auto prep = db.getPreparedStatement(

@@ -683,6 +683,14 @@ HerderImpl::recvTransaction(TransactionFrameBasePtr tx, bool submittedFromSelf,
                hexAbbrev(tx->getFullHash()),
                KeyUtils::toShortString(tx->getSourceID()));
 
+    // Feed the proposal builder synchronously for every local submission:
+    // the tx must be proposable by the very next trigger (a manual close can
+    // follow the submit immediately), and the async gate verdict below would
+    // race that trigger. Admitting it pre-verdict is safe -- trimInvalid at
+    // proposal time is the validity gate for builder contents -- and the
+    // gate's own post-verdict add dedups by hash.
+    mTxProposalBuilder.addTransaction(tx);
+
     bool skipValidation = force;
 #ifdef BUILD_TESTS
     // Loadgen txs are locally generated and known-valid; validating them
@@ -691,10 +699,6 @@ HerderImpl::recvTransaction(TransactionFrameBasePtr tx, bool submittedFromSelf,
 #endif
     if (skipValidation)
     {
-        // The pre-flood gate normally feeds the proposal builder; a
-        // validation-skipping submission must feed it directly or the tx is
-        // never proposable by this node.
-        mTxProposalBuilder.addTransaction(tx);
         auto const& env = tx->getEnvelope();
         mApp.getOverlayManager().broadcastTransaction(env, tx->getFullFee(),
                                                       tx->getNumOperations());

@@ -530,7 +530,7 @@ TEST_CASE("validateTxBatchForFlooding classifies a mixed batch",
 
     // (c) Source account does not exist -> expected verdict 0.
     {
-        auto missing = SecretKey::random();
+        auto missing = SecretKey::pseudoRandomForTesting();
         auto tx = transactionFromOperations(*app, missing, /*seq=*/1,
                                             {payment(*root, 1)}, /*fee=*/100);
         batch.push_back(tx->getEnvelope());
