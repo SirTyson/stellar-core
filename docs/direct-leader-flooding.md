@@ -521,6 +521,37 @@ overlay's stale-shred cancellation working on the right slot. Second and
 later candidates do not pre-build; they build at trigger time from the
 builder and cache for the fetch fallback, as before.
 
+### Receiver-side eager validation
+
+The eager push lands on receivers during the same pre-trigger idle window,
+so they no longer wait for the referencing NOMINATE to start validating.
+`PendingEnvelopes::recvTxSet` now (a) rejects any body whose computed
+contents hash differs from the announced hash (previously trusted
+unchecked in C++ — a mismatch would have validated and applied a different
+set than the one the value names), and (b) hands the set to
+`HerderSCPDriver::eagerValidateTxSet`. If the set's parent is the current
+LCL and no apply is running, the driver builds the applicable frame and
+runs `checkValid` across the same conservative close-time window `[1, U]`
+the leader pre-trimmed against, recording the result in two LCL-scoped
+caches: an applicable-frame cache (`{lcl, set} -> ApplicableTxSetFrame`)
+and a conservative-validity record (`{lcl, set} -> U`). Sets arriving
+while the previous ledger is still applying are parked and drained by
+`lastClosedLedgerIncreased` once the LCL settles; parking never records a
+negative (a premature validation against the wrong parent would poison the
+validity cache).
+
+`checkAndCacheTxSetValid` consults the conservative record before doing any
+work — validity across `[1, U]` implies validity at the value's exact
+offset inside the window — and otherwise reuses the cached applicable frame
+instead of re-running `prepareForApply`. `combineCandidates` draws from the
+same frame cache, eliminating its previously uncached per-candidate
+rebuild. Net effect: on the nomination critical path, a receiver that got
+the eager push validates the value with two cache lookups; the
+`prepareForApply`-per-set count per ledger drops from three to one, built
+in the idle window. Eager validation is bounded per LCL (an unsolicited-set
+flood falls back to on-demand validation, exactly the pre-existing cost
+model).
+
 ## Later steps (sketch)
 
 - **Step 4 — Hardening.** Cert-based identity (keep the signing key in Core),

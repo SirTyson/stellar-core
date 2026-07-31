@@ -231,6 +231,10 @@ scp.prebuild.built                        | meter     | round-1 leader pre-built
 scp.prebuild.pushed                       | meter     | pre-built proposal was eagerly shred-broadcast at apply-finish
 scp.prebuild.reused                       | meter     | trigger reused the pre-built proposal (close-time offset inside the pre-trim window)
 scp.prebuild.stale                        | meter     | pre-built proposal discarded at trigger (LCL moved or trigger fired past the pre-trim window); proposal rebuilt
+scp.txset.eager-validated                 | meter     | TX set validated eagerly on intake (applicable frame + conservative close-time window), ahead of any referencing envelope
+scp.txset.eager-deferred                  | meter     | TX set parked on intake because its parent ledger was still applying / not yet the LCL; revalidated when the LCL settles
+scp.txset.conservative-validity-hit       | meter     | validateValue satisfied from the conservative-window validity record without re-running checkValid
+scp.txset.applicable-cache-hit            | meter     | prepareForApply skipped because the applicable frame was already cached for this {lcl, set}
 scp.value.invalid                         | meter     | SCP value is invalid
 scp.value.valid                           | meter     | SCP value is valid
 scp.slot.values-referenced                | histogram | number of values referenced per consensus round

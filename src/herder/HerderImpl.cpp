@@ -1189,6 +1189,11 @@ HerderImpl::lastClosedLedgerIncreased(bool latest, TxSetXDRFrameConstPtr txSet,
                       mLedgerManager.getLastClosedLedgerNum());
         releaseAssert(mLedgerManager.isSynced());
 
+        // TX sets that arrived while this ledger was applying can now be
+        // eagerly validated against the settled LCL, ahead of the trigger
+        // and of any envelope referencing them.
+        mHerderSCPDriver.drainPendingEagerValidation();
+
         setupTriggerNextLedger();
 
         // The just-closed ledger's hash seeds leader election for slot L+2

@@ -246,6 +246,22 @@ PendingEnvelopes::recvTxSet(Hash const& hash, TxSetXDRFrameConstPtr txset)
     ZoneScoped;
     CLOG_INFO(Herder, "Got TxSet {}", hexAbbrev(hash));
 
+    // The announced hash names the set everywhere downstream (value
+    // validation, externalize), while validity caches key off the computed
+    // contents hash. Never store a body under a hash it does not match --
+    // a mismatched entry would validate and apply a different set than the
+    // one the nominated value names. (The Rust overlay derives the hash from
+    // the received bytes, so a mismatch here means a bug or a hostile local
+    // producer, not a network peer.)
+    if (txset->getContentsHash() != hash)
+    {
+        CLOG_WARNING(Herder,
+                     "Dropping TxSet whose contents hash {} does not match "
+                     "its announced hash {}",
+                     hexAbbrev(txset->getContentsHash()), hexAbbrev(hash));
+        return false;
+    }
+
     // Direct leader flooding (docs/direct-leader-flooding.md): the round-1
     // leader eagerly pushes its nominated TX set body to all peers, so it can
     // arrive BEFORE we process the nomination referencing it -- i.e. before the
@@ -271,6 +287,15 @@ PendingEnvelopes::recvTxSet(Hash const& hash, TxSetXDRFrameConstPtr txset)
     // created before it arrived, so it survives LRU eviction while SCP is still
     // considering those values (docs/direct-leader-flooding.md).
     mHerder.getHerderSCPDriver().onTxSetReceived(hash, txset);
+
+    // Eager receiver-side validation (docs/direct-leader-flooding.md): a
+    // round-1 leader pushes its set right after apply-finish, well before the
+    // trigger fires anywhere. Build the applicable frame and prove validity
+    // across the conservative close-time window now, in the pre-trigger idle
+    // span, so validateValue on the referencing envelope is a cache hit --
+    // and do it before replaying any parked envelopes below, which then
+    // validate cheaply.
+    mHerder.getHerderSCPDriver().eagerValidateTxSet(hash, txset);
 
     // If we were already waiting on this set (nomination processed first),
     // resume the envelopes that were blocked on it.

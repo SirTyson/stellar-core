@@ -18,6 +18,8 @@
 #include "scp/QuorumSetUtils.h"
 #include "scp/SCP.h"
 #include "scp/Slot.h"
+#include "transactions/TransactionUtils.h"
+#include "util/GlobalChecks.h"
 #include "util/Logging.h"
 #include "util/Math.h"
 #include "util/MetricsRegistry.h"
@@ -38,6 +40,20 @@ namespace stellar
 {
 
 uint32_t const TXSETVALID_CACHE_SIZE = 1000;
+
+// Applicable frames are heavyweight (they hold every tx frame of a set) and
+// only the current slot's few candidate sets matter; conservative-validity
+// records are tiny.
+uint32_t const APPLICABLE_TXSET_CACHE_SIZE = 8;
+uint32_t const CONSERVATIVE_VALIDITY_CACHE_SIZE = 64;
+
+// Bound on main-thread eager validations per LCL: an unsolicited-set flood
+// must not turn intake into unbounded prepareForApply/checkValid work. Sets
+// beyond the cap validate on demand, exactly as before this optimization.
+uint32_t const MAX_EAGER_VALIDATIONS_PER_LCL = 4;
+
+// Bound on sets parked while their parent ledger applies.
+size_t const MAX_PENDING_EAGER_VALIDATIONS = 8;
 
 Hash
 HerderSCPDriver::getHashOf(std::vector<xdr::opaque_vec<>> const& vals) const
@@ -155,6 +171,14 @@ HerderSCPDriver::SCPMetrics::SCPMetrics(Application& app)
           {"scp", "timing", "self-to-others-externalize-lag"}))
     , mEmptyTxSetValueReplaced(app.getMetrics().NewCounter(
           {"scp", "empty-tx-set", "value-replaced"}))
+    , mEagerTxSetValidated(app.getMetrics().NewMeter(
+          {"scp", "txset", "eager-validated"}, "txset"))
+    , mEagerTxSetDeferred(app.getMetrics().NewMeter(
+          {"scp", "txset", "eager-deferred"}, "txset"))
+    , mTxSetConservativeValidityHit(app.getMetrics().NewMeter(
+          {"scp", "txset", "conservative-validity-hit"}, "txset"))
+    , mApplicableTxSetCacheHit(app.getMetrics().NewMeter(
+          {"scp", "txset", "applicable-cache-hit"}, "txset"))
 {
 }
 
@@ -177,6 +201,8 @@ HerderSCPDriver::HerderSCPDriver(Application& app, HerderImpl& herder,
           {"scp", "slot", "values-referenced"})}
     , mLedgerSeqNominating(0)
     , mTxSetValidCache(TXSETVALID_CACHE_SIZE)
+    , mApplicableTxSetCache(APPLICABLE_TXSET_CACHE_SIZE)
+    , mTxSetConservativeValidity(CONSERVATIVE_VALIDITY_CACHE_SIZE)
 {
 }
 
@@ -822,9 +848,9 @@ HerderSCPDriver::getNominationEmitDelayForTesting() const
 // returns true if l < r
 // lh, rh are the hashes of l,h
 static bool
-compareTxSets(ApplicableTxSetFrameConstPtr const& l,
-              ApplicableTxSetFrameConstPtr const& r, Hash const& lh,
-              Hash const& rh, std::optional<size_t> lEncodedSize,
+compareTxSets(ApplicableTxSetFrame const* l, ApplicableTxSetFrame const* r,
+              Hash const& lh, Hash const& rh,
+              std::optional<size_t> lEncodedSize,
               std::optional<size_t> rEncodedSize, LedgerHeader const& header,
               Hash const& s)
 {
@@ -997,7 +1023,7 @@ HerderSCPDriver::combineCandidates(uint64_t slotIndex,
     {
         auto highest = candidateValues.cend();
         TxSetXDRFrameConstPtr highestTxSet;
-        ApplicableTxSetFrameConstPtr highestApplicableTxSet;
+        std::shared_ptr<ApplicableTxSetFrame const> highestApplicableTxSet;
         for (auto it = candidateValues.cbegin(); it != candidateValues.cend();
              ++it)
         {
@@ -1012,14 +1038,18 @@ HerderSCPDriver::combineCandidates(uint64_t slotIndex,
             // in nomination with no ballot flow to carry it -> lost sync.
             TxSetXDRFrameConstPtr cTxSet =
                 mPendingEnvelopes.getTxSet(sv.txSetHash);
-            // Only valid applicable tx sets should be combined.
-            ApplicableTxSetFrameConstPtr cApplicableTxSet =
-                cTxSet ? cTxSet->prepareForApply(mApp, lcl.header) : nullptr;
+            // Only valid applicable tx sets should be combined. The
+            // applicable frame is fetched from (or built into) the shared
+            // cache: eager validation or validateValue typically already
+            // built it, so this no longer re-runs prepareForApply per
+            // candidate on the nomination critical path.
+            std::shared_ptr<ApplicableTxSetFrame const> cApplicableTxSet =
+                cTxSet ? getOrBuildApplicableTxSet(*cTxSet, lcl) : nullptr;
             if (!cTxSet || cTxSet->previousLedgerHash() == lcl.hash)
             {
                 if (highest == candidateValues.cend() ||
                     compareTxSets(
-                        highestApplicableTxSet, cApplicableTxSet,
+                        highestApplicableTxSet.get(), cApplicableTxSet.get(),
                         highest->txSetHash, sv.txSetHash,
                         highestTxSet
                             ? std::make_optional(highestTxSet->encodedSize())
@@ -1760,16 +1790,27 @@ HerderSCPDriver::checkAndCacheTxSetValid(TxSetXDRFrame const& txSet,
     bool* pRes = mTxSetValidCache.maybeGet(key);
     if (pRes == nullptr)
     {
+        TxSetLclKey lclKey{lcl.hash, txSet.getContentsHash()};
+
+        // Eager validation may already have proven the set valid across the
+        // conservative close-time window [1, U]; the window checks are
+        // monotone, so validity there implies validity at any exact offset
+        // inside it.
+        uint64_t* pWindow = mTxSetConservativeValidity.maybeGet(lclKey);
+        if (pWindow != nullptr && closeTimeOffset >= 1 &&
+            closeTimeOffset <= *pWindow)
+        {
+            mSCPMetrics.mTxSetConservativeValidityHit.Mark();
+            mTxSetValidCache.put(key, true);
+            return true;
+        }
+
         // The invariant here is that we only validate tx sets nominated
         // to be applied to the current ledger state. However, in case
         // if we receive a bad SCP value for the current state, we still
         // might end up with malformed tx set that doesn't refer to the
         // LCL.
-        ApplicableTxSetFrameConstPtr applicableTxSet;
-        if (txSet.previousLedgerHash() == lcl.hash)
-        {
-            applicableTxSet = txSet.prepareForApply(mApp, lcl.header);
-        }
+        auto applicableTxSet = getOrBuildApplicableTxSet(txSet, lcl);
 
         bool res = true;
         if (applicableTxSet == nullptr)
@@ -1793,6 +1834,143 @@ HerderSCPDriver::checkAndCacheTxSetValid(TxSetXDRFrame const& txSet,
         return *pRes;
     }
 }
+
+std::shared_ptr<ApplicableTxSetFrame const>
+HerderSCPDriver::getOrBuildApplicableTxSet(
+    TxSetXDRFrame const& txSet, LedgerHeaderHistoryEntry const& lcl) const
+{
+    releaseAssert(threadIsMain());
+    TxSetLclKey key{lcl.hash, txSet.getContentsHash()};
+    auto* pCached = mApplicableTxSetCache.maybeGet(key);
+    if (pCached != nullptr)
+    {
+        mSCPMetrics.mApplicableTxSetCacheHit.Mark();
+        return *pCached;
+    }
+    if (txSet.previousLedgerHash() != lcl.hash)
+    {
+        return nullptr;
+    }
+    std::shared_ptr<ApplicableTxSetFrame const> applicable(
+        txSet.prepareForApply(mApp, lcl.header));
+    if (applicable != nullptr)
+    {
+        mApplicableTxSetCache.put(key, applicable);
+    }
+    return applicable;
+}
+
+void
+HerderSCPDriver::eagerValidateTxSet(Hash const& hash,
+                                    TxSetXDRFrameConstPtr const& txset)
+{
+    ZoneScoped;
+    releaseAssert(threadIsMain());
+    releaseAssert(txset);
+
+    if (!mHerder.isTracking() || !mLedgerManager.isSynced())
+    {
+        return;
+    }
+
+    // While the previous ledger applies, the parent LCL is not settled and
+    // prepareForApply/checkValid must not run (surge-pricing lane
+    // construction asserts !isApplying, and a mismatched-parent validation
+    // would poison the validity cache with a false negative). Park the set
+    // until lastClosedLedgerIncreased drains it.
+    if (mLedgerManager.isApplying() ||
+        txset->previousLedgerHash() !=
+            mLedgerManager.getLastClosedLedgerHeader().hash)
+    {
+        if (mPendingEagerValidation.size() >= MAX_PENDING_EAGER_VALIDATIONS)
+        {
+            mPendingEagerValidation.pop_front();
+        }
+        mPendingEagerValidation.emplace_back(hash, txset);
+        mSCPMetrics.mEagerTxSetDeferred.Mark();
+        return;
+    }
+
+    eagerValidateAgainstLcl(hash, *txset,
+                            mLedgerManager.getLastClosedLedgerHeader());
+}
+
+void
+HerderSCPDriver::eagerValidateAgainstLcl(Hash const& hash,
+                                         TxSetXDRFrame const& txSet,
+                                         LedgerHeaderHistoryEntry const& lcl)
+{
+    ZoneScoped;
+    TxSetLclKey key{lcl.hash, txSet.getContentsHash()};
+    if (mTxSetConservativeValidity.maybeGet(key) != nullptr)
+    {
+        return;
+    }
+    if (mEagerValidationsThisLcl >= MAX_EAGER_VALIDATIONS_PER_LCL)
+    {
+        // Unsolicited-set flood guard: fall back to on-demand validation.
+        return;
+    }
+    ++mEagerValidationsThisLcl;
+
+    auto applicable = getOrBuildApplicableTxSet(txSet, lcl);
+    if (applicable == nullptr)
+    {
+        // Never record a negative eagerly; the exact-offset path decides.
+        return;
+    }
+
+    // The same conservative window the round-1 leader pre-trims against: the
+    // trigger clamps the offset to at least 1, and U is the flood gate's
+    // upper-bound estimate. Validity across [1, U] implies validity at any
+    // exact offset the nominated value's close time lands on inside it.
+    uint64_t const upperOffset = std::max<uint64_t>(
+        1, getUpperBoundCloseTimeOffset(mApp, lcl.header.scpValue.closeTime));
+    if (applicable->checkValid(mApp, 1, upperOffset))
+    {
+        mTxSetConservativeValidity.put(key, upperOffset);
+        mSCPMetrics.mEagerTxSetValidated.Mark();
+        CLOG_DEBUG(Herder,
+                   "Eagerly validated TX set {} against LCL {} "
+                   "(close-time window [1, {}])",
+                   hexAbbrev(hash), lcl.header.ledgerSeq, upperOffset);
+    }
+    // A window failure is NOT recorded: the set may still be valid at the
+    // exact offset the value carries (e.g. a tx whose minTime is past
+    // lcl.closeTime + 1), so leave that decision to checkAndCacheTxSetValid.
+}
+
+void
+HerderSCPDriver::drainPendingEagerValidation()
+{
+    ZoneScoped;
+    releaseAssert(threadIsMain());
+
+    // New LCL: reset the per-ledger eager-validation budget.
+    mEagerValidationsThisLcl = 0;
+
+    if (mPendingEagerValidation.empty())
+    {
+        return;
+    }
+    auto pending = std::move(mPendingEagerValidation);
+    mPendingEagerValidation.clear();
+    if (!mHerder.isTracking() || !mLedgerManager.isSynced() ||
+        mLedgerManager.isApplying())
+    {
+        return;
+    }
+    auto const& lcl = mLedgerManager.getLastClosedLedgerHeader();
+    for (auto const& [hash, txset] : pending)
+    {
+        // Only sets whose parent settled as the new LCL are still relevant;
+        // the rest stay stored in PendingEnvelopes and validate on demand.
+        if (txset->previousLedgerHash() == lcl.hash)
+        {
+            eagerValidateAgainstLcl(hash, *txset, lcl);
+        }
+    }
+}
 size_t
 HerderSCPDriver::TxSetValidityKeyHash::operator()(
     TxSetValidityKey const& key) const
@@ -1802,6 +1980,14 @@ HerderSCPDriver::TxSetValidityKeyHash::operator()(
     hashMix(res, std::hash<Hash>()(std::get<1>(key)));
     hashMix(res, std::get<2>(key));
     hashMix(res, std::get<3>(key));
+    return res;
+}
+
+size_t
+HerderSCPDriver::TxSetLclKeyHash::operator()(TxSetLclKey const& key) const
+{
+    size_t res = std::hash<Hash>()(key.first);
+    hashMix(res, std::hash<Hash>()(key.second));
     return res;
 }
 

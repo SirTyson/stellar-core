@@ -12,6 +12,7 @@
 #include "util/ProtocolVersion.h"
 #include "util/RandomEvictionCache.h"
 #include "xdr/Stellar-ledger.h"
+#include <deque>
 #include <optional>
 
 namespace medida
@@ -204,6 +205,20 @@ class HerderSCPDriver : public SCPDriver
                          LedgerHeaderHistoryEntry const& lcl,
                          uint64_t closeTimeOffset) const;
 
+    // Eager receiver-side TX set validation (docs/direct-leader-flooding.md):
+    // called on intake of a (typically eagerly pushed) TX set body. If the
+    // set's parent is the current LCL and no apply is running, build the
+    // applicable frame and check validity across the conservative close-time
+    // window now -- in the idle span before the trigger -- so validateValue
+    // later is a pure cache hit. Otherwise park the set and revalidate when
+    // the LCL settles. Main thread only.
+    void eagerValidateTxSet(Hash const& hash,
+                            TxSetXDRFrameConstPtr const& txset);
+
+    // Validate any parked sets whose parent became the (new) LCL; drop the
+    // rest. Called from lastClosedLedgerIncreased on the main thread.
+    void drainPendingEagerValidation();
+
     // Get the number of nomination timeouts that occurred for a given slot
     std::optional<int64_t> getNominationTimeouts(uint64_t slotIndex) const;
 
@@ -254,6 +269,15 @@ class HerderSCPDriver : public SCPDriver
         // Empty-tx-set recovery: how often a stuck value was replaced with an
         // empty-tx-set value (docs/direct-leader-flooding.md).
         medida::Counter& mEmptyTxSetValueReplaced;
+
+        // Eager receiver-side TX set validation
+        // (docs/direct-leader-flooding.md): sets validated on intake ahead
+        // of any referencing envelope, sets parked until their parent ledger
+        // settles, and the cache layers validateValue then hits.
+        medida::Meter& mEagerTxSetValidated;
+        medida::Meter& mEagerTxSetDeferred;
+        medida::Meter& mTxSetConservativeValidityHit;
+        medida::Meter& mApplicableTxSetCacheHit;
 
         SCPMetrics(Application& app);
     };
@@ -306,6 +330,53 @@ class HerderSCPDriver : public SCPDriver
     // validity of txSet
     mutable RandomEvictionCache<TxSetValidityKey, bool, TxSetValidityKeyHash>
         mTxSetValidCache;
+
+    // {lcl.hash, txSetHash} key for LCL-scoped TX set caches.
+    using TxSetLclKey = std::pair<Hash, Hash>;
+    class TxSetLclKeyHash
+    {
+      public:
+        size_t operator()(TxSetLclKey const& key) const;
+    };
+
+    // Applicable frames built once per {lcl, set} and shared between eager
+    // validation, checkAndCacheTxSetValid, and combineCandidates. The frame
+    // build (prepareForApply) is the expensive half of receiver-side
+    // validation and used to run up to three times per set per ledger.
+    // Deliberately small: entries are heavyweight and only the current
+    // slot's few candidate sets matter.
+    mutable RandomEvictionCache<TxSetLclKey,
+                                std::shared_ptr<ApplicableTxSetFrame const>,
+                                TxSetLclKeyHash>
+        mApplicableTxSetCache;
+
+    // Conservative validity: the set passed checkValid across the close-time
+    // window [1, U]. The bound checks are monotone across the window
+    // (TransactionFrame::isTooEarly/isTooLate), so the set is valid at any
+    // exact offset in [1, U], whatever close time the leader's trigger
+    // picks. Only positive results are recorded: a window failure does not
+    // imply failure at an exact offset.
+    mutable RandomEvictionCache<TxSetLclKey, uint64_t, TxSetLclKeyHash>
+        mTxSetConservativeValidity;
+
+    // Sets received while their parent ledger was still applying, awaiting
+    // drainPendingEagerValidation. Bounded; overflow drops the oldest (the
+    // normal validateValue path still covers dropped sets).
+    std::deque<std::pair<Hash, TxSetXDRFrameConstPtr>> mPendingEagerValidation;
+
+    // Eager validations performed against the current LCL; reset when the
+    // LCL advances. Bounds the main-thread work an unsolicited-set flood can
+    // trigger -- sets beyond the cap fall back to on-demand validation.
+    uint32_t mEagerValidationsThisLcl{0};
+
+    // Fetch (or build and cache) the applicable frame for a set whose parent
+    // is the current LCL; null if it cannot be prepared.
+    std::shared_ptr<ApplicableTxSetFrame const>
+    getOrBuildApplicableTxSet(TxSetXDRFrame const& txSet,
+                              LedgerHeaderHistoryEntry const& lcl) const;
+
+    void eagerValidateAgainstLcl(Hash const& hash, TxSetXDRFrame const& txSet,
+                                 LedgerHeaderHistoryEntry const& lcl);
 
     SCPDriver::ValidationLevel
     validateValueAgainstLocalState(uint64_t slotIndex, StellarValue const& sv,
