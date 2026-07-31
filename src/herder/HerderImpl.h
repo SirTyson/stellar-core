@@ -302,7 +302,6 @@ class HerderImpl : public Herder
         Hash mTxSetHash;
         TimePoint mLowerOffset;
         TimePoint mUpperOffset;
-        bool mPushed;
     };
     std::optional<PreBuiltProposal> mPreBuiltProposal;
 

@@ -1816,9 +1816,8 @@ HerderImpl::maybePreBuildProposal()
     }
 
     mPreBuiltProposal =
-        PreBuiltProposal{slotIndex,       lcl.hash,   proposedSet,
-                         applicableSet,   txSetHash,  lowerOffset,
-                         upperOffset,     pushed};
+        PreBuiltProposal{slotIndex,     lcl.hash,  proposedSet, applicableSet,
+                         txSetHash,     lowerOffset, upperOffset};
 
     CLOG_DEBUG(Herder,
                "Pre-built TX set {} for slot {} at apply-finish "
@@ -1963,8 +1962,10 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
             mSCPMetrics.mProposalPreBuildStale.Mark();
             CLOG_DEBUG(Herder,
                        "Pre-built TX set for slot {} is stale "
-                       "(offset {} outside [{}, {}]); rebuilding",
-                       slotIndex, upperBoundCloseTimeOffset,
+                       "(lclMatch={}, offset {} vs window [{}, {}]); "
+                       "rebuilding",
+                       slotIndex, mPreBuiltProposal->mLclHash == lcl.hash,
+                       upperBoundCloseTimeOffset,
                        mPreBuiltProposal->mLowerOffset,
                        mPreBuiltProposal->mUpperOffset);
         }

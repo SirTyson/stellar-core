@@ -95,8 +95,11 @@ class TxProposalBuilder
         bool operator()(FeeOrder const& a, FeeOrder const& b) const;
     };
 
-    // All private helpers require mMutex to be held.
-    bool eraseLocked(Hash const& hash);
+    // All private helpers require mMutex to be held. `hash` is taken by
+    // value: callers pass references into the very entry being erased (e.g.
+    // the incumbent's own getFullHash() during same-seq replacement), which
+    // would dangle mid-erase if bound by reference.
+    bool eraseLocked(Hash hash);
     void evictChainTailLocked();
     void enforceCapacityLocked();
 

@@ -3,10 +3,8 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "herder/TxProposalBuilder.h"
-#include "crypto/Hex.h"
 #include "herder/SurgePricingUtils.h"
 #include "util/GlobalChecks.h"
-#include "util/Logging.h"
 
 #include <Tracy.hpp>
 
@@ -156,7 +154,7 @@ TxProposalBuilder::size() const
 }
 
 bool
-TxProposalBuilder::eraseLocked(Hash const& hash)
+TxProposalBuilder::eraseLocked(Hash hash)
 {
     auto it = mByHash.find(hash);
     if (it == mByHash.end())
