@@ -114,6 +114,9 @@ HerderImpl::HerderImpl(Application& app)
     mPendingEnvelopes.addSCPQuorumSet(ln->getQuorumSetHash(),
                                       ln->getQuorumSet());
 
+    // Only validators can lead, so only they accumulate candidate proposals.
+    mTxProposalBuilder.setEnabled(getSCP().isValidator());
+
     // Note: Rust overlay is now managed by RustOverlayManager
     // SCP broadcasts go through getOverlayManager().broadcastMessage()
 }
@@ -365,6 +368,9 @@ HerderImpl::processExternalized(uint64 slotIndex, StellarValue const& value,
         mApp.getLoadGenerator().cleanupAccounts(txFramesList);
 #endif
     }
+    // Externalized txs leave the candidate-proposal builder alongside the
+    // Rust mempool.
+    mTxProposalBuilder.removeTransactions(txHashes);
     mApp.getOverlayManager().notifyTxSetExternalized(value.txSetHash, txHashes);
 
     {
@@ -677,6 +683,10 @@ HerderImpl::recvTransaction(TransactionFrameBasePtr tx, bool submittedFromSelf,
 #endif
     if (skipValidation)
     {
+        // The pre-flood gate normally feeds the proposal builder; a
+        // validation-skipping submission must feed it directly or the tx is
+        // never proposable by this node.
+        mTxProposalBuilder.addTransaction(tx);
         auto const& env = tx->getEnvelope();
         mApp.getOverlayManager().broadcastTransaction(env, tx->getFullFee(),
                                                       tx->getNumOperations());
@@ -1176,6 +1186,11 @@ HerderImpl::lastClosedLedgerIncreased(bool latest, TxSetXDRFrameConstPtr txSet,
         // The just-closed ledger's hash seeds leader election for slot L+2
         // (N-2 pipelining); push the newly-computable leaders to the overlay.
         pushLeaderSchedule();
+
+        // Refresh the proposal builder's capacity against the (possibly
+        // upgraded) ledger limits and sweep out aged-out candidates.
+        mTxProposalBuilder.setCapacityAndSweep(std::max<size_t>(
+            1000, 2 * mLedgerManager.getLastMaxTxSetSizeOps()));
 
         // Now that the new ledger is closed, purge SCP slots outside of our
         // validity bracket and process any already-buffered SCP envelopes for
@@ -1679,51 +1694,28 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
     if (selfIsCandidateLeader)
     {
         // Only the transaction-routing candidate leaders construct a full TX
-        // set from the Rust overlay's mempool. The Rust overlay maintains the
-        // mempool via TX flooding.
+        // set. The candidates are the flood targets, so their proposal
+        // builder holds the already-validated frames of every routed tx —
+        // no mempool IPC fetch and no frame rebuild at trigger time
+        // (docs/direct-leader-flooding.md, streaming proposal construction).
         PerPhaseTransactionList txPhases;
-        auto txEnvelopes = mApp.getOverlayManager().getTopTransactions(
-            mApp.getLedgerManager().getLastMaxTxSetSizeOps() * 2, 5000);
-
-        CLOG_INFO(Herder,
-                  "Candidate leader got {} transactions from Rust overlay "
-                  "mempool",
-                  txEnvelopes.size());
-
-        // Convert TransactionEnvelopes to TransactionFrameBasePtrs and place
-        // them into the phase expected by TxSetFrame. Frame construction (XDR
-        // decode + hashing) fans out to the tx-validation pool.
         TxFrameList classicTxs;
         TxFrameList sorobanTxs;
-        Hash const& networkID = mApp.getNetworkID();
+        mTxProposalBuilder.snapshot(classicTxs, sorobanTxs);
+
+        CLOG_INFO(Herder,
+                  "Candidate leader snapshotted {} classic + {} soroban txs "
+                  "from the proposal builder",
+                  classicTxs.size(), sorobanTxs.size());
+
         bool const supportsSoroban = protocolVersionStartsFrom(
             lcl.header.ledgerVersion, SOROBAN_PROTOCOL_VERSION);
-        std::vector<TransactionEnvelope const*> envPtrs;
-        envPtrs.reserve(txEnvelopes.size());
-        for (auto const& env : txEnvelopes)
+        if (!supportsSoroban && !sorobanTxs.empty())
         {
-            envPtrs.push_back(&env);
-        }
-        for (auto const& txFrame :
-             TxSetUtils::buildTxFramesParallel(networkID, envPtrs, mApp))
-        {
-            if (txFrame->isSoroban())
-            {
-                if (supportsSoroban)
-                {
-                    sorobanTxs.push_back(txFrame);
-                }
-                else
-                {
-                    CLOG_DEBUG(Herder,
-                               "Ignoring Soroban transaction before Soroban "
-                               "protocol support");
-                }
-            }
-            else
-            {
-                classicTxs.push_back(txFrame);
-            }
+            CLOG_DEBUG(Herder,
+                       "Ignoring {} Soroban transactions before Soroban "
+                       "protocol support",
+                       sorobanTxs.size());
         }
         txPhases.emplace_back(std::move(classicTxs));
         if (supportsSoroban)
@@ -1739,6 +1731,14 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
                                       lowerBoundCloseTimeOffset,
                                       upperBoundCloseTimeOffset,
                                       invalidTxPhases);
+
+        // NB: trim-rejected txs deliberately stay in the builder. The list
+        // mixes permanently-invalid txs with not-yet-valid deep-chain txs
+        // (the gate admits seq gaps up to MAX_SEQ_GAP_FOR_FLOODING; strict
+        // sequencing holds here), and the latter become valid as their
+        // predecessors apply — exactly like the Rust mempool, whose entries
+        // also survive a failed proposal until inclusion or age-out.
+
         if (!applicableProposedSet)
         {
             releaseAssert(!mApp.getConfig().FORCE_SCP);

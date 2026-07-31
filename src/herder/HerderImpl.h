@@ -9,6 +9,7 @@
 #include "herder/LedgerCloseData.h"
 #include "herder/PendingEnvelopes.h"
 #include "herder/QuorumIntersectionChecker.h"
+#include "herder/TxProposalBuilder.h"
 #include "herder/Upgrades.h"
 #include "overlay/NetworkConstants.h"
 #include "util/Timer.h"
@@ -154,6 +155,12 @@ class HerderImpl : public Herder
 
     bool recvSCPQuorumSet(Hash const& hash, SCPQuorumSet const& qset) override;
     bool recvTxSet(Hash const& hash, TxSetXDRFrameConstPtr txset) override;
+
+    TxProposalBuilder&
+    getTxProposalBuilder() override
+    {
+        return mTxProposalBuilder;
+    }
     TxSetXDRFrameConstPtr getTxSet(Hash const& hash) override;
     SCPQuorumSetPtr getQSet(Hash const& qSetHash) override;
 
@@ -283,6 +290,11 @@ class HerderImpl : public Herder
     PendingEnvelopes mPendingEnvelopes;
     Upgrades mUpgrades;
     HerderSCPDriver mHerderSCPDriver;
+
+    // Streaming candidate-proposal builder, fed by the pre-flood validation
+    // gate (tx-validation pool threads) and local submissions; snapshotted by
+    // candidate leaders at proposal time.
+    TxProposalBuilder mTxProposalBuilder;
 
     void herderOutOfSync();
 

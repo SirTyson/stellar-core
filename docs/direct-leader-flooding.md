@@ -458,6 +458,32 @@ candidate leaders cache their full sets for the delayed fetch fallback.
 `scp.txset.candidate-build` and `scp.txset.empty-fallback` report which proposal
 path each validator used.
 
+### Streaming proposal construction
+
+Candidate leaders no longer fetch the mempool over IPC at trigger time. The
+pre-flood validation gate already builds and fully validates a frame for every
+transaction body this node receives (`TxFloodValidation.cpp`); instead of
+discarding that work, the gate now feeds the frames into a
+`TxProposalBuilder` owned by the Herder (validation-skipping local
+submissions, e.g. loadgen, feed it directly from `recvTransaction`). The
+builder keeps per-account sequence-ordered chains with an
+inclusion-fee-rate eviction index, capacity-capped at twice the ledger's op
+limit (mirroring the old 2x over-fetch) and age-swept after 300 s (mirroring
+the Rust mempool). Externalized transactions are removed as part of the same
+hash harvest that already feeds `TX_SET_EXTERNALIZED`.
+
+At trigger time the candidate leader snapshots the builder — already-built,
+already-validated frames — and hands them straight to
+`makeTxSetFromTransactions`. trimInvalid remains the strict per-account
+sequencing and fee-coverage gate (the flood gate's sequence check is relaxed
+by `MAX_SEQ_GAP_FOR_FLOODING`, so chain positions past the head stay in the
+builder across proposals and become proposable as their predecessors apply,
+exactly like Rust mempool entries). This removes the blocking `GET_TOP_TXS`
+round-trip, the 2x envelope payload crossing the IPC socket, and the full
+frame rebuild (XDR decode + two hashes per tx) from the nomination critical
+path. `GET_TOP_TXS` remains available for tools and tests but is off the
+proposal path.
+
 ## Later steps (sketch)
 
 - **Step 4 — Hardening.** Cert-based identity (keep the signing key in Core),

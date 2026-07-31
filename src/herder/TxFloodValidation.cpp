@@ -5,6 +5,7 @@
 #include "herder/TxFloodValidation.h"
 #include "crypto/Hex.h"
 #include "herder/Herder.h"
+#include "herder/TxProposalBuilder.h"
 #include "ledger/ImmutableLedgerView.h"
 #include "ledger/LedgerManager.h"
 #include "main/Application.h"
@@ -174,7 +175,16 @@ validateChunk(std::shared_ptr<Batch> const& batch, size_t begin, size_t end)
                                      0, batch->mUpperBoundCloseTimeOffset,
                                      diagnostics, batch->mValidationLedgerSeq);
         batch->mVerdicts[i] = result->isSuccess() ? 1 : 0;
-        if (!result->isSuccess())
+        if (result->isSuccess())
+        {
+            // Streaming proposal construction: keep the frame this gate just
+            // built and validated so a candidate leader can snapshot a
+            // proposal without re-decoding or re-validating it
+            // (docs/direct-leader-flooding.md). Thread-safe; no-op on
+            // non-validators.
+            app.getHerder().getTxProposalBuilder().addTransaction(tx);
+        }
+        else
         {
             CLOG_DEBUG(Herder, "Pre-flood validation rejected tx {} (code {})",
                        hexAbbrev(tx->getFullHash()),
