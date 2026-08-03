@@ -3,6 +3,7 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "herder/Herder.h"
+#include "herder/HerderImpl.h"
 #include "herder/TxSetFrame.h"
 #include "ledger/LedgerManager.h"
 #include "main/Application.h"
@@ -37,6 +38,10 @@ TEST_CASE("unsolicited TX set is eagerly validated on intake",
         {"scp", "txset", "eager-validated"}, "txset");
     auto& eagerDeferred = app->getMetrics().NewMeter(
         {"scp", "txset", "eager-deferred"}, "txset");
+    auto& conservativeHit = app->getMetrics().NewMeter(
+        {"scp", "txset", "conservative-validity-hit"}, "txset");
+    auto& applicableHit = app->getMetrics().NewMeter(
+        {"scp", "txset", "applicable-cache-hit"}, "txset");
 
     auto makeValidTxSet = [&]() {
         auto tx = transactionFromOperations(
@@ -70,6 +75,26 @@ TEST_CASE("unsolicited TX set is eagerly validated on intake",
         // Duplicate delivery does not re-validate.
         REQUIRE(herder.recvTxSet(hash, txSet));
         REQUIRE(eagerValidated.count() == 1);
+
+        // The first SCP validation at an exact close time consumes the eager
+        // conservative-window proof instead of running checkValid again.
+        auto const lcl = app->getLedgerManager().getLastClosedLedgerHeader();
+        auto sv =
+            herder.makeStellarValue(hash, lcl.header.scpValue.closeTime + 1,
+                                    emptyUpgradeSteps, cfg.NODE_SEED);
+        auto& driver = static_cast<HerderImpl&>(herder).getHerderSCPDriver();
+        auto wrapped = driver.wrapValue(xdr::xdr_to_opaque(sv));
+        REQUIRE(driver.validateValue(lcl.header.ledgerSeq + 1,
+                                     wrapped->getValue(),
+                                     true) == SCPDriver::kFullyValidatedValue);
+        REQUIRE(conservativeHit.count() == 1);
+
+        // Candidate combination reuses the ApplicableTxSetFrame that eager
+        // intake built, so prepareForApply is not repeated.
+        ValueWrapperPtrSet candidates{wrapped};
+        REQUIRE(driver.combineCandidates(lcl.header.ledgerSeq + 1,
+                                         candidates) != nullptr);
+        REQUIRE(applicableHit.count() == 1);
     }
 
     SECTION("mismatched announced hash is rejected")

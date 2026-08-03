@@ -33,11 +33,11 @@ namespace stellar
 // sequence-ordered chains so eviction never strands a successor whose
 // predecessor was dropped.
 //
-// Thread-safety: insertions arrive from tx-validation pool threads (gate
-// verdict callbacks) and the main thread (local submissions); removal,
-// capacity updates, and snapshots run on the main thread. All state is
-// guarded by a single mutex, and nothing under the lock touches ledger state
-// or other locks.
+// Thread-safety: validated insertions arrive from tx-validation pool threads;
+// tentative insertions for locally-submitted transactions arrive from the main
+// thread. Removal, capacity updates, and snapshots can race either one. All
+// state is guarded by a single mutex, and nothing under the lock touches ledger
+// state or other locks.
 class TxProposalBuilder
 {
   public:
@@ -57,6 +57,18 @@ class TxProposalBuilder
     // Callable from any thread.
     void addTransaction(TransactionFrameBasePtr const& tx);
 
+    // Add a locally-submitted transaction before its asynchronous flood-gate
+    // verdict is available. Tentative entries are kept separately: they may be
+    // selected by an immediate snapshot, but cannot evict or permanently
+    // replace validated candidates. A later addTransaction with the same hash
+    // promotes the gate-built frame; a failed verdict removes it through
+    // removeTentativeTransaction. Callable from any thread.
+    void addTentativeTransaction(TransactionFrameBasePtr const& tx);
+
+    // Remove a pre-verdict local submission after the flood gate rejects it.
+    // No-op if it was already promoted, superseded, or evicted.
+    void removeTentativeTransaction(Hash const& hash);
+
     // Drop the given transactions, e.g. because they were externalized in a
     // ledger or found invalid by trimInvalid. Callable from any thread.
     void removeTransactions(std::vector<Hash> const& hashes);
@@ -72,6 +84,7 @@ class TxProposalBuilder
     // sequence-number order, split into classic and Soroban lists.
     void snapshot(TxFrameList& classicTxs, TxFrameList& sorobanTxs) const;
 
+    // Total number of validated and tentative entries retained.
     size_t size() const;
 
   private:
@@ -100,8 +113,11 @@ class TxProposalBuilder
     // the incumbent's own getFullHash() during same-seq replacement), which
     // would dangle mid-erase if bound by reference.
     bool eraseLocked(Hash hash);
+    bool eraseTentativeLocked(Hash hash);
     void evictChainTailLocked();
+    void evictTentativeChainTailLocked();
     void enforceCapacityLocked();
+    void enforceTentativeCapacityLocked();
 
     mutable std::mutex mMutex;
     bool mEnabled{false};
@@ -109,6 +125,15 @@ class TxProposalBuilder
     UnorderedMap<Hash, std::pair<AccountID, SequenceNumber>> mByHash;
     UnorderedMap<AccountID, AccountChain> mByAccount;
     std::set<FeeOrder, FeeOrderLess> mByFeeRate;
+
+    // Pre-verdict local submissions are isolated from validated state and use
+    // only capacity not occupied by validated entries. This preserves
+    // submit-then-immediate-close behavior without allowing a bad signature or
+    // malformed high-fee replacement to poison the builder for MAX_TX_AGE or
+    // evict a valid same-sequence transaction.
+    UnorderedMap<Hash, std::pair<AccountID, SequenceNumber>> mTentativeByHash;
+    UnorderedMap<AccountID, AccountChain> mTentativeByAccount;
+    std::set<FeeOrder, FeeOrderLess> mTentativeByFeeRate;
 };
 
 } // namespace stellar

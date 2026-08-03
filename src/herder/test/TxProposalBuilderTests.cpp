@@ -2,6 +2,7 @@
 // under the Apache License, Version 2.0. See the COPYING file at the root
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
+#include "herder/Herder.h"
 #include "herder/TxProposalBuilder.h"
 #include "main/Application.h"
 #include "main/Config.h"
@@ -103,6 +104,83 @@ TEST_CASE("TxProposalBuilder basic operation", "[herder][proposalbuilder]")
         REQUIRE(classic[0]->getFullHash() == rich->getFullHash());
     }
 
+    SECTION("tentative replacement cannot permanently displace validated tx")
+    {
+        auto validated = makeTx(acctA, seqA + 1, 200);
+        auto tentative = makeTx(acctA, seqA + 1, 500);
+        builder.addTransaction(validated);
+        builder.addTentativeTransaction(tentative);
+        REQUIRE(builder.size() == 2);
+
+        TxFrameList classic, soroban;
+        builder.snapshot(classic, soroban);
+        REQUIRE(classic.size() == 1);
+        REQUIRE(classic[0]->getFullHash() == tentative->getFullHash());
+
+        // A failed gate verdict removes only the tentative shadow and reveals
+        // the validated incumbent again.
+        builder.removeTentativeTransaction(tentative->getFullHash());
+        REQUIRE(builder.size() == 1);
+        classic.clear();
+        builder.snapshot(classic, soroban);
+        REQUIRE(classic.size() == 1);
+        REQUIRE(classic[0]->getFullHash() == validated->getFullHash());
+    }
+
+    SECTION("successful verdict promotes tentative gate frame")
+    {
+        auto submitted = makeTx(acctA, seqA + 1, 500);
+        auto gateFrame = TransactionFrameBase::makeTransactionFromWire(
+            app->getNetworkID(), submitted->getEnvelope());
+        builder.addTentativeTransaction(submitted);
+        builder.addTransaction(gateFrame);
+
+        // Promotion replaces the pre-verdict frame rather than deduplicating
+        // against it. A later failure cleanup is therefore a no-op.
+        REQUIRE(builder.size() == 1);
+        builder.removeTentativeTransaction(submitted->getFullHash());
+        REQUIRE(builder.size() == 1);
+
+        TxFrameList classic, soroban;
+        builder.snapshot(classic, soroban);
+        REQUIRE(classic.size() == 1);
+        REQUIRE(classic[0] == gateFrame);
+    }
+
+    SECTION("tentative and validated sequences merge in chain order")
+    {
+        auto seq2 = makeTx(acctA, seqA + 2, 300);
+        auto seq1 = makeTx(acctA, seqA + 1, 200);
+        builder.addTransaction(seq2);
+        builder.addTentativeTransaction(seq1);
+
+        TxFrameList classic, soroban;
+        builder.snapshot(classic, soroban);
+        REQUIRE(classic.size() == 2);
+        REQUIRE(classic[0]->getSeqNum() == seqA + 1);
+        REQUIRE(classic[1]->getSeqNum() == seqA + 2);
+    }
+
+    SECTION("tentative capacity never evicts validated candidates")
+    {
+        auto validated = makeTx(acctA, seqA + 1, 200);
+        auto tentative1 = makeTx(acctB, seqB + 1, 500);
+        auto tentative2 = makeTx(acctB, seqB + 2, 1000);
+        builder.setCapacityAndSweep(1);
+        builder.addTransaction(validated);
+        builder.addTentativeTransaction(tentative1);
+        REQUIRE(builder.size() == 1);
+        builder.addTentativeTransaction(tentative2);
+
+        // Validated entries consume capacity first, so tentative submissions
+        // are dropped without disturbing validated state.
+        REQUIRE(builder.size() == 1);
+        TxFrameList classic, soroban;
+        builder.snapshot(classic, soroban);
+        REQUIRE(classic.size() == 1);
+        REQUIRE(classic[0]->getFullHash() == validated->getFullHash());
+    }
+
     SECTION("removal keeps same-account successors")
     {
         auto tx1 = makeTx(acctA, seqA + 1, 200);
@@ -186,6 +264,26 @@ TEST_CASE("TxProposalBuilder basic operation", "[herder][proposalbuilder]")
         }
         REQUIRE(builder.size() == numThreads * perThread);
     }
+}
+
+TEST_CASE("rejected local submission leaves proposal builder",
+          "[herder][proposalbuilder]")
+{
+    Config cfg(getTestConfig());
+    VirtualClock clock;
+    Application::pointer app = createTestApplication(clock, cfg);
+    auto missing = SecretKey::pseudoRandomForTesting();
+    auto invalid = transactionFromOperations(
+        *app, missing, 1, {payment(*app->getRoot(), 1)}, 100);
+    auto& builder = app->getHerder().getTxProposalBuilder();
+
+    REQUIRE(app->getHerder().recvTransaction(invalid, true) ==
+            TxSubmitStatus::TX_STATUS_PENDING);
+    REQUIRE(builder.size() == 1);
+
+    testutil::crankUntil(
+        app, [&]() { return builder.size() == 0; }, std::chrono::seconds(5));
+    REQUIRE(builder.size() == 0);
 }
 
 // Pre-built proposals (docs/direct-leader-flooding.md): with a single-node

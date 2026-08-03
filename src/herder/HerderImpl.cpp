@@ -683,14 +683,6 @@ HerderImpl::recvTransaction(TransactionFrameBasePtr tx, bool submittedFromSelf,
                hexAbbrev(tx->getFullHash()),
                KeyUtils::toShortString(tx->getSourceID()));
 
-    // Feed the proposal builder synchronously for every local submission:
-    // the tx must be proposable by the very next trigger (a manual close can
-    // follow the submit immediately), and the async gate verdict below would
-    // race that trigger. Admitting it pre-verdict is safe -- trimInvalid at
-    // proposal time is the validity gate for builder contents -- and the
-    // gate's own post-verdict add dedups by hash.
-    mTxProposalBuilder.addTransaction(tx);
-
     bool skipValidation = force;
 #ifdef BUILD_TESTS
     // Loadgen txs are locally generated and known-valid; validating them
@@ -699,10 +691,23 @@ HerderImpl::recvTransaction(TransactionFrameBasePtr tx, bool submittedFromSelf,
 #endif
     if (skipValidation)
     {
+        // Force/loadgen submissions deliberately bypass the asynchronous gate
+        // and are admitted directly. Proposal-time trimInvalid remains the
+        // final validity gate.
+        mTxProposalBuilder.addTransaction(tx);
         auto const& env = tx->getEnvelope();
         mApp.getOverlayManager().broadcastTransaction(env, tx->getFullFee(),
                                                       tx->getNumOperations());
         return TxSubmitStatus::TX_STATUS_PENDING;
+    }
+
+    if (submittedFromSelf)
+    {
+        // Preserve submit-then-immediate-close ordering without treating an
+        // unverified local frame as durable builder state. The gate promotes
+        // this tentative entry on success or the callback removes it on
+        // failure; tentative entries cannot evict validated candidates.
+        mTxProposalBuilder.addTentativeTransaction(tx);
     }
 
     // Pre-flood validation gate: run the overlay validity checks on the
@@ -725,6 +730,7 @@ HerderImpl::recvTransaction(TransactionFrameBasePtr tx, bool submittedFromSelf,
             }
             else
             {
+                mTxProposalBuilder.removeTentativeTransaction(fullHash);
                 CLOG_DEBUG(Herder,
                            "Dropping submitted tx {} that failed pre-flood "
                            "validation",

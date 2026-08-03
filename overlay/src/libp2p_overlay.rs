@@ -119,7 +119,11 @@ pub enum OverlayCommand {
     },
     /// Eagerly code and assign a nominated TX set across connected Tier-1
     /// peers so receivers skip the GetTxSet round-trip.
-    BroadcastTxSet { hash: [u8; 32], data: Vec<u8>, slot: u64 },
+    BroadcastTxSet {
+        hash: [u8; 32],
+        data: Vec<u8>,
+        slot: u64,
+    },
     /// Relay a network-received TX that Core has validated (see the
     /// validation gate in main.rs): store it for GETDATA service, then push
     /// to connected leaders (or INV-announce as fallback), excluding the
@@ -2439,6 +2443,18 @@ async fn connected_flood_leaders(state: &Arc<SharedState>) -> Option<Vec<PeerId>
     )
 }
 
+fn leader_relay_targets(
+    leaders: &[PeerId],
+    from: &PeerId,
+    known_sources: &HashSet<PeerId>,
+) -> Vec<PeerId> {
+    leaders
+        .iter()
+        .filter(|p| *p != from && !known_sources.contains(p))
+        .cloned()
+        .collect()
+}
+
 /// INV-announce a TX to every connected peer (the legacy flood primitive,
 /// also used to rescue a TX whose direct leader push failed so it remains
 /// pullable). Assumes the TX is already in `tx_buffer`.
@@ -2671,11 +2687,7 @@ async fn relay_validated_tx(state: &Arc<SharedState>, tx: Arc<ValidatedTx>, from
     let connected_leaders = connected_flood_leaders(state).await;
     if let Some(leaders) = &connected_leaders {
         if !leaders.is_empty() {
-            let targets: Vec<PeerId> = leaders
-                .iter()
-                .filter(|p| **p != from && !known_sources.contains(p))
-                .cloned()
-                .collect();
+            let targets = leader_relay_targets(leaders, &from, &known_sources);
             if !targets.is_empty() {
                 debug!(
                     "TX_LEADER_RELAY: Pushing TX {:02x?}... to {} leaders",
@@ -4912,13 +4924,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_leader_relay_targets_switched_leaders() {
+    async fn test_leader_relay_target_selection_uses_current_schedule() {
         // The in-flight-tail rescue behind eager post-apply proposals: a TX
         // reaches node B while C is the flood leader, but Core's validation
         // verdict lands only after the leader schedule switched to D (as
         // pushLeaderSchedule does at apply-finish, when C's proposal is
         // already frozen). The relay must read the flood targets live at
         // verdict time and push the body to D, not to the frozen leader C.
+        let keypair_b = Keypair::generate_ed25519();
+        let keypair_c = Keypair::generate_ed25519();
+        let keypair_d = Keypair::generate_ed25519();
+        let peer_c = keypair_c.public().to_peer_id();
+        let peer_d = keypair_d.public().to_peer_id();
+
+        let (handle_b, _events_b, _tx_events_b, overlay_b) =
+            create_overlay(keypair_b, Arc::new(OverlayMetrics::new())).unwrap();
+        let state = Arc::clone(&overlay_b.state);
+
+        // This unit test does not need live QUIC sockets. Mark C and D as
+        // connected directly so it deterministically exercises the shared
+        // leader schedule read used by relay_validated_tx.
+        {
+            let mut streams = state.peer_streams.write().await;
+            streams.insert(peer_c.clone(), Arc::new(PeerOutboundStreams::new()));
+            streams.insert(peer_d.clone(), Arc::new(PeerOutboundStreams::new()));
+        }
+
+        // C leads while the TX is in flight to B.
+        handle_b.set_leaders(vec![peer_c.clone()]).await;
+        let old_leaders = connected_flood_leaders(&state).await.unwrap();
+        let from = PeerId::random();
+        assert_eq!(
+            leader_relay_targets(&old_leaders, &from, &HashSet::new()),
+            vec![peer_c.clone()]
+        );
+
+        // Apply finishes on B: the schedule switches to D (C's proposal is
+        // frozen). A delayed verdict calls connected_flood_leaders only now,
+        // so its target set contains D and cannot contain the stale C.
+        handle_b.set_leaders(vec![peer_d.clone()]).await;
+        let verdict_time_leaders = connected_flood_leaders(&state).await.unwrap();
+        let targets = leader_relay_targets(&verdict_time_leaders, &from, &HashSet::new());
+        assert_eq!(targets, vec![peer_d]);
+        assert!(!targets.contains(&peer_c));
+    }
+
+    #[tokio::test]
+    async fn test_leader_relay_targets_switched_leaders() {
+        // End-to-end coverage for the same in-flight-tail rescue: the TX
+        // reaches B under leader C, but B relays its full body only after the
+        // schedule changes to D. The live message path must use D and skip C.
         let keypair_a = Keypair::generate_ed25519();
         let keypair_b = Keypair::generate_ed25519();
         let keypair_c = Keypair::generate_ed25519();
@@ -4998,7 +5053,10 @@ mod tests {
                 _ = tokio::time::sleep(Duration::from_millis(50)) => {}
             }
         }
-        assert!(d_received, "new leader D should receive the late-verdict TX");
+        assert!(
+            d_received,
+            "new leader D should receive the late-verdict TX"
+        );
         assert_eq!(metrics_b.flood_leader_push.load(Ordering::Relaxed), 1);
 
         // The frozen ex-leader C must NOT have been pushed the body.
@@ -5445,7 +5503,9 @@ mod tests {
         let expected_codec = encode_txset_transport(want_data.clone(), true)
             .unwrap()
             .codec;
-        handle1.broadcast_txset(want_hash, want_data.clone(), 1).await;
+        handle1
+            .broadcast_txset(want_hash, want_data.clone(), 1)
+            .await;
 
         // Both peers reconstruct the unsolicited body from the eager shreds.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
