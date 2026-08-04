@@ -142,6 +142,38 @@ loadFreezeBypassTxsFromLedger(Application& app)
     return result;
 }
 
+TEST_CASE("checkValid snapshot view serves Soroban config",
+          "[snapshot][soroban][tx]")
+{
+    VirtualClock clock;
+    auto app = createTestApplication(clock, getTestConfig());
+    REQUIRE(app->getState() == Application::State::APP_SYNCED_STATE);
+    overrideSorobanNetworkConfigForTest(*app);
+
+    auto const& expectedConfig =
+        app->getLedgerManager().getLastClosedSorobanNetworkConfig();
+    auto snapshot = app->getLedgerManager().copyImmutableLedgerView();
+    CheckValidLedgerViewWrapper appView(*app);
+    CheckValidLedgerViewWrapper snapshotView(snapshot);
+    REQUIRE(appView.getSorobanNetworkConfig(app->getAppConnector()) ==
+            expectedConfig);
+    REQUIRE(snapshotView.getSorobanNetworkConfig(app->getAppConnector()) ==
+            expectedConfig);
+
+    SorobanResources resources;
+    resources.instructions = 800'000;
+    resources.diskReadBytes = 1000;
+    resources.writeBytes = 1000;
+    auto tx = createUploadWasmTx(*app, *app->getRoot(), 1000,
+                                 100'000'000, resources);
+    auto appResult =
+        tx->checkValid(app->getAppConnector(), appView, 0, 0, 0);
+    auto snapshotResult =
+        tx->checkValid(app->getAppConnector(), snapshotView, 0, 0, 0);
+    REQUIRE(appResult->isSuccess());
+    REQUIRE(snapshotResult->getXDR() == appResult->getXDR());
+}
+
 TEST_CASE("frozen ledger keys config setting does not exist prior to p26",
           "[frozenledgerkeys][upgrades]")
 {

@@ -8,6 +8,7 @@
 #include "bucket/LiveBucketList.h"
 #include "ledger/LedgerManager.h"
 #include "ledger/LedgerTxn.h"
+#include "main/AppConnector.h"
 #include "main/Application.h"
 #include "transactions/TransactionFrame.h"
 #include "transactions/TransactionUtils.h"
@@ -177,15 +178,29 @@ CheckValidLedgerViewWrapper::CheckValidLedgerViewWrapper(Application& app)
     else
 #endif
     {
-        mGetter = std::make_unique<ImmutableLedgerView>(
+        auto view = std::make_unique<ImmutableLedgerView>(
             app.getLedgerManager().copyImmutableLedgerView());
+        mSnapshotView = view.get();
+        mGetter = std::move(view);
     }
 }
 
 CheckValidLedgerViewWrapper::CheckValidLedgerViewWrapper(
     ImmutableLedgerView const& ledgerView)
-    : mGetter(std::make_unique<ImmutableLedgerView>(ledgerView))
 {
+    auto view = std::make_unique<ImmutableLedgerView>(ledgerView);
+    mSnapshotView = view.get();
+    mGetter = std::move(view);
+}
+
+SorobanNetworkConfig const&
+CheckValidLedgerViewWrapper::getSorobanNetworkConfig(AppConnector& app) const
+{
+    if (mSnapshotView)
+    {
+        return mSnapshotView->getState().getSorobanConfig();
+    }
+    return app.getLastClosedSorobanNetworkConfig();
 }
 
 LedgerHeaderWrapper
