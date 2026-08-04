@@ -260,6 +260,7 @@ ImmutableLedgerData::ImmutableLedgerData(
 SorobanNetworkConfig const&
 ImmutableLedgerData::getSorobanConfig() const
 {
+    releaseAssert(hasSorobanConfig());
     return mSorobanConfig.value();
 }
 
