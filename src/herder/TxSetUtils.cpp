@@ -27,8 +27,9 @@
 
 #include <Tracy.hpp>
 #include <algorithm>
-#include <future>
+#include <condition_variable>
 #include <list>
+#include <mutex>
 #include <numeric>
 
 namespace stellar
@@ -182,19 +183,40 @@ void
 runOnTxValidationPoolAndJoin(Application& app,
                              std::vector<std::function<void()>>&& tasks)
 {
-    std::vector<std::future<void>> futures;
-    futures.reserve(tasks.size());
-    std::exception_ptr postException;
-    for (auto& task : tasks)
+    struct JoinState
     {
-        auto packaged =
-            std::make_shared<std::packaged_task<void()>>(std::move(task));
-        auto future = packaged->get_future();
+        std::mutex mutex;
+        std::condition_variable completedCV;
+        size_t completed{0};
+        std::vector<std::exception_ptr> exceptions;
+    };
+
+    auto state = std::make_shared<JoinState>();
+    state->exceptions.resize(tasks.size());
+    std::exception_ptr postException;
+    size_t posted = 0;
+    for (size_t i = 0; i < tasks.size(); ++i)
+    {
         try
         {
-            app.postOnTxValidationThread([packaged]() { (*packaged)(); },
-                                         "parallel tx validation");
-            futures.emplace_back(std::move(future));
+            app.postOnTxValidationThread(
+                [state, task = std::move(tasks[i]), i]() mutable {
+                    try
+                    {
+                        task();
+                    }
+                    catch (...)
+                    {
+                        state->exceptions[i] = std::current_exception();
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(state->mutex);
+                        ++state->completed;
+                    }
+                    state->completedCV.notify_one();
+                },
+                "parallel tx validation");
+            ++posted;
         }
         catch (...)
         {
@@ -203,22 +225,24 @@ runOnTxValidationPoolAndJoin(Application& app,
         }
     }
 
-    // Always observe every future before rethrowing. Otherwise an early
+    // Always wait for every posted task before rethrowing. Otherwise an early
     // exception would unwind while later chunks still reference the caller's
-    // stack (including txValid and the base snapshot).
-    std::exception_ptr firstException;
-    for (auto& future : futures)
+    // stack (including txValid and the base snapshot). The explicit completion
+    // state also keeps promise destruction from overlapping future.get(),
+    // which libc++'s TSAN instrumentation reports as a lifetime race.
     {
-        try
+        std::unique_lock<std::mutex> lock(state->mutex);
+        state->completedCV.wait(
+            lock, [&state, posted]() { return state->completed == posted; });
+    }
+
+    std::exception_ptr firstException;
+    for (auto const& exception : state->exceptions)
+    {
+        if (exception)
         {
-            future.get();
-        }
-        catch (...)
-        {
-            if (!firstException)
-            {
-                firstException = std::current_exception();
-            }
+            firstException = exception;
+            break;
         }
     }
     if (firstException)
