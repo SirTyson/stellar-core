@@ -35,6 +35,12 @@ class AccountTransactionQueue
 class TxSetUtils
 {
   public:
+#ifdef BUILD_TESTS
+    // Test hook: force the serial validation path so differential tests can
+    // compare parallel and serial results on identical inputs.
+    static bool gForceSerialValidation;
+#endif
+
     static bool hashTxSorter(TransactionFrameBasePtr const& tx1,
                              TransactionFrameBasePtr const& tx2);
 
