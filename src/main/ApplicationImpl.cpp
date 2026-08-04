@@ -107,6 +107,10 @@ ApplicationImpl::ApplicationImpl(VirtualClock& clock, Config const& cfg)
           mLedgerCloseIOContext
               ? std::make_unique<asio::io_context::work>(*mLedgerCloseIOContext)
               : nullptr)
+    , mTxValidationIOContext(
+          std::make_unique<asio::io_context>(mConfig.TX_VALIDATION_THREADS))
+    , mTxValidationWork(
+          std::make_unique<asio::io_context::work>(*mTxValidationIOContext))
     , mWorkerThreads()
     , mEvictionThread()
     , mBatchExecutor(std::make_unique<BatchExecutor>())
@@ -127,6 +131,8 @@ ApplicationImpl::ApplicationImpl(VirtualClock& clock, Config const& cfg)
           mMetrics->NewTimer({"app", "post-on-overlay-thread", "delay"}))
     , mPostOnLedgerCloseThreadDelay(
           mMetrics->NewTimer({"app", "post-on-ledger-close-thread", "delay"}))
+    , mPostOnTxValidationThreadDelay(
+          mMetrics->NewTimer({"app", "post-on-tx-validation-thread", "delay"}))
     , mStartedOn(clock.system_now())
 {
 #ifdef SIGQUIT
@@ -201,6 +207,20 @@ ApplicationImpl::ApplicationImpl(VirtualClock& clock, Config const& cfg)
         });
         mThreadTypes[thread->get_id()] = ThreadType::WORKER;
         mWorkerThreads.emplace_back(std::move(thread));
+    }
+
+    // Transaction validation sits on the consensus critical path, so like
+    // eviction it runs at medium priority to avoid queuing behind long-running
+    // low-priority work.
+    releaseAssert(mConfig.TX_VALIDATION_THREADS > 0);
+    for (int i = 0; i < mConfig.TX_VALIDATION_THREADS; ++i)
+    {
+        auto thread = std::make_unique<std::thread>([this]() {
+            runCurrentThreadWithMediumPriority();
+            mTxValidationIOContext->run();
+        });
+        mThreadTypes[thread->get_id()] = ThreadType::TX_VALIDATION;
+        mTxValidationThreads.emplace_back(std::move(thread));
     }
 
     if (mConfig.BACKGROUND_OVERLAY_PROCESSING)
@@ -961,6 +981,15 @@ ApplicationImpl::joinAllThreads()
     }
     mWorkerThreads.clear();
 
+    for (auto& t : mTxValidationThreads)
+    {
+        joined += shutdownThread(t, mTxValidationWork, "tx validation");
+    }
+    // getTxValidationThreadCount() returning zero after shutdown forces the
+    // validation caller onto its serial fallback. This prevents posting work
+    // to the drained context and then hanging on future.get().
+    mTxValidationThreads.clear();
+
     joined += shutdownThread(mOverlayThread, mOverlayWork, "overlay");
     joined += shutdownThread(mEvictionThread, mEvictionWork, "eviction");
     if (joined)
@@ -1604,6 +1633,27 @@ ApplicationImpl::postOnEvictionBackgroundThread(std::function<void()>&& f,
         mPostOnBackgroundThreadDelay.Update(isSlow.checkElapsedTime());
         f();
     });
+}
+
+void
+ApplicationImpl::postOnTxValidationThread(std::function<void()>&& f,
+                                          std::string jobName)
+{
+    JITTER_INJECT_DELAY();
+    releaseAssert(mTxValidationIOContext);
+    LogSlowExecution isSlow{std::move(jobName), LogSlowExecution::Mode::MANUAL,
+                            "executed after"};
+    asio::post(*mTxValidationIOContext, [this, f = std::move(f), isSlow]() {
+        JITTER_INJECT_DELAY();
+        mPostOnTxValidationThreadDelay.Update(isSlow.checkElapsedTime());
+        f();
+    });
+}
+
+size_t
+ApplicationImpl::getTxValidationThreadCount() const
+{
+    return mTxValidationThreads.size();
 }
 
 void
