@@ -174,7 +174,8 @@ class Application
         WORKER,
         EVICTION,
         OVERLAY,
-        APPLY
+        APPLY,
+        TX_VALIDATION
     };
 
     virtual ~Application() {};
@@ -269,6 +270,12 @@ class Application
                                      std::string jobName) = 0;
     virtual void postOnLedgerCloseThread(std::function<void()>&& f,
                                          std::string jobName) = 0;
+    // Post to the medium-priority transaction-validation pool (sized by
+    // TX_VALIDATION_THREADS). Used for parallel checkValid fan-outs; keep
+    // long-running work off this pool.
+    virtual void postOnTxValidationThread(std::function<void()>&& f,
+                                          std::string jobName) = 0;
+    virtual size_t getTxValidationThreadCount() const = 0;
 
     // Perform actions necessary to transition from BOOTING_STATE to other
     // states. In particular: either reload or reinitialize the database, and
