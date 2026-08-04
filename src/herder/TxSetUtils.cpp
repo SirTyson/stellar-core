@@ -27,11 +27,17 @@
 
 #include <Tracy.hpp>
 #include <algorithm>
+#include <future>
 #include <list>
 #include <numeric>
 
 namespace stellar
 {
+
+#ifdef BUILD_TESTS
+bool TxSetUtils::gForceSerialValidation = false;
+#endif
+
 namespace
 {
 // Target use case is to remove a subset of invalid transactions from a TxSet.
@@ -162,6 +168,96 @@ TxSetUtils::buildAccountTxQueues(TxFrameList const& txs)
     return queues;
 }
 
+namespace
+{
+
+// Minimum number of transactions for which the parallel validation fan-out is
+// worth the fork-join overhead; smaller lists validate serially.
+constexpr size_t MIN_TXS_FOR_PARALLEL_VALIDATION = 32;
+
+// Run `tasks` on the tx-validation pool and block until all complete.
+// Exceptions are rethrown on the calling thread, lowest task index first, so
+// failure behavior is deterministic regardless of scheduling.
+void
+runOnTxValidationPoolAndJoin(Application& app,
+                             std::vector<std::function<void()>>&& tasks)
+{
+    std::vector<std::future<void>> futures;
+    futures.reserve(tasks.size());
+    std::exception_ptr postException;
+    for (auto& task : tasks)
+    {
+        auto packaged =
+            std::make_shared<std::packaged_task<void()>>(std::move(task));
+        auto future = packaged->get_future();
+        try
+        {
+            app.postOnTxValidationThread([packaged]() { (*packaged)(); },
+                                         "parallel tx validation");
+            futures.emplace_back(std::move(future));
+        }
+        catch (...)
+        {
+            postException = std::current_exception();
+            break;
+        }
+    }
+
+    // Always observe every future before rethrowing. Otherwise an early
+    // exception would unwind while later chunks still reference the caller's
+    // stack (including txValid and the base snapshot).
+    std::exception_ptr firstException;
+    for (auto& future : futures)
+    {
+        try
+        {
+            future.get();
+        }
+        catch (...)
+        {
+            if (!firstException)
+            {
+                firstException = std::current_exception();
+            }
+        }
+    }
+    if (firstException)
+    {
+        std::rethrow_exception(firstException);
+    }
+    if (postException)
+    {
+        std::rethrow_exception(postException);
+    }
+}
+
+// Split [0, count) into contiguous chunks sized for the validation pool:
+// enough chunks to balance uneven per-tx costs (Soroban vs classic), but
+// never so many that per-chunk setup (a ledger view copy, ~100us) dominates.
+std::vector<std::pair<size_t, size_t>>
+makeValidationChunks(size_t count, size_t numThreads)
+{
+    constexpr size_t chunksPerThread = 2;
+    constexpr size_t minChunkSize = 8;
+    size_t numChunks =
+        std::min(std::max<size_t>(1, count / minChunkSize),
+                 std::max<size_t>(1, numThreads * chunksPerThread));
+    std::vector<std::pair<size_t, size_t>> chunks;
+    chunks.reserve(numChunks);
+    size_t chunkSize = count / numChunks;
+    size_t remainder = count % numChunks;
+    size_t start = 0;
+    for (size_t i = 0; i < numChunks; ++i)
+    {
+        size_t end = start + chunkSize + (i < remainder ? 1 : 0);
+        chunks.emplace_back(start, end);
+        start = end;
+    }
+    return chunks;
+}
+
+} // namespace
+
 template <typename T>
 TxFrameListWithErrors
 TxSetUtils::getInvalidTxListWithErrors(
@@ -171,20 +267,125 @@ TxSetUtils::getInvalidTxListWithErrors(
 {
     ZoneScoped;
     releaseAssert(threadIsMain());
-    CheckValidLedgerViewWrapper ledgerView(app);
+
+    // Materialize the container for stable per-index access across threads
+    // (T may be a phase frame with a flattening iterator).
+    std::vector<TransactionFrameBasePtr> flatTxs;
+    for (auto const& tx : txs)
+    {
+        flatTxs.push_back(tx);
+    }
+
+    bool skipSeqNumCheck = false;
 #ifdef BUILD_TESTS
     // See TransactionQueue::canAdd for the overlay-only-mode rationale.
-    ledgerView.mSkipSeqNumCheck = app.getRunInOverlayOnlyMode();
+    skipSeqNumCheck = app.getRunInOverlayOnlyMode();
 #endif
+
+    bool useParallel = flatTxs.size() >= MIN_TXS_FOR_PARALLEL_VALIDATION &&
+                       app.getTxValidationThreadCount() > 0;
+#ifdef BUILD_TESTS
+    // The in-memory-ledger test mode has no bucket list snapshot to copy, so
+    // it must use the (main-thread-only) legacy LedgerTxn-backed view.
+    useParallel = useParallel && !app.getConfig().MODE_USES_IN_MEMORY_LEDGER &&
+                  !gForceSerialValidation;
+#endif
+
+    if (useParallel)
+    {
+        // The public helper can be called directly with the same frame object
+        // more than once. Fall back to serial in that adversarial case: lazy
+        // frame memoization is not synchronized, even though distinct frames
+        // reconstructed from an identical envelope are safe to validate in
+        // parallel and retain the duplicate-full-hash semantics below.
+        std::unordered_set<TransactionFrameBase const*> frames;
+        frames.reserve(flatTxs.size());
+        for (auto const& tx : flatTxs)
+        {
+            if (!frames.emplace(tx.get()).second)
+            {
+                useParallel = false;
+                break;
+            }
+        }
+    }
+
+    // checkValid mutates per-frame lazy state (cached hashes and, for fee
+    // bumps, the inner frame), so each frame is validated by exactly one
+    // thread. Each chunk also gets its own view copy because views own
+    // per-instance file streams. The _DEBUG contents-hash swap is safe under
+    // the same one-frame-one-thread invariant.
+    std::vector<uint8_t> txValid(flatTxs.size(), 0);
+    std::optional<ImmutableLedgerView> baseView;
+    std::unique_ptr<CheckValidLedgerViewWrapper> serialLedgerView;
+
     // Validate minSeqLedgerGap and LedgerBounds against the next ledgerSeq,
     // which is what will be used at apply time.
     std::optional<uint32_t> validationLedgerSeq;
-    if (protocolVersionStartsFrom(
-            ledgerView.getLedgerHeader().current().ledgerVersion,
-            ProtocolVersion::V_19))
+    auto computeValidationLedgerSeq = [&](LedgerHeader const& lclHeader) {
+        if (protocolVersionStartsFrom(lclHeader.ledgerVersion,
+                                      ProtocolVersion::V_19))
+        {
+            validationLedgerSeq =
+                app.getLedgerManager().getLastClosedLedgerNum() + 1;
+        }
+    };
+
+    // Pass 1: per-tx checkValid. Each tx is validated independently against
+    // the same LCL snapshot (current=0 reads sequence numbers directly from
+    // ledger state, so there is no cross-tx sequencing here).
+    if (useParallel)
     {
-        validationLedgerSeq =
-            app.getLedgerManager().getLastClosedLedgerNum() + 1;
+        baseView.emplace(app.getLedgerManager().copyImmutableLedgerView());
+        auto header = baseView->getLedgerHeader().current();
+        computeValidationLedgerSeq(header);
+
+        auto validateChunk = [&](size_t begin, size_t end) {
+            CheckValidLedgerViewWrapper chunkView(*baseView);
+#ifdef BUILD_TESTS
+            chunkView.mSkipSeqNumCheck = skipSeqNumCheck;
+#endif
+            auto diagnostics = DiagnosticEventManager::createDisabled();
+            for (size_t i = begin; i < end; ++i)
+            {
+                auto txResult = flatTxs[i]->checkValid(
+                    app.getAppConnector(), chunkView, 0,
+                    lowerBoundCloseTimeOffset, upperBoundCloseTimeOffset,
+                    diagnostics, validationLedgerSeq);
+                txValid[i] = txResult->isSuccess() ? 1 : 0;
+            }
+        };
+
+        auto chunks = makeValidationChunks(flatTxs.size(),
+                                           app.getTxValidationThreadCount());
+        std::vector<std::function<void()>> tasks;
+        tasks.reserve(chunks.size());
+        for (auto const& [begin, end] : chunks)
+        {
+            tasks.emplace_back([&validateChunk, begin, end]() {
+                validateChunk(begin, end);
+            });
+        }
+        runOnTxValidationPoolAndJoin(app, std::move(tasks));
+    }
+    else
+    {
+        serialLedgerView =
+            std::make_unique<CheckValidLedgerViewWrapper>(app);
+#ifdef BUILD_TESTS
+        serialLedgerView->mSkipSeqNumCheck = skipSeqNumCheck;
+#endif
+        auto header = serialLedgerView->getLedgerHeader().current();
+        computeValidationLedgerSeq(header);
+        auto diagnostics = DiagnosticEventManager::createDisabled();
+        for (size_t i = 0; i < flatTxs.size(); ++i)
+        {
+            auto txResult = flatTxs[i]->checkValid(
+                app.getAppConnector(), *serialLedgerView, 0,
+                lowerBoundCloseTimeOffset, upperBoundCloseTimeOffset,
+                diagnostics, validationLedgerSeq);
+            txValid[i] = txResult->isSuccess() ? 1 : 0;
+        }
     }
 
     TxFrameListWithErrors invalidTxsWithError;
@@ -193,13 +394,12 @@ TxSetUtils::getInvalidTxListWithErrors(
     errorCode = TxSetValidationResult::VALID;
 
     std::unordered_set<Hash> seenInvalidTxs;
-    auto diagnostics = DiagnosticEventManager::createDisabled();
-    for (auto const& tx : txs)
+    // Reduce pass 1 on the main thread in input order, preserving invalid-list
+    // order and error-code precedence exactly.
+    for (size_t i = 0; i < flatTxs.size(); ++i)
     {
-        auto txResult = tx->checkValid(
-            app.getAppConnector(), ledgerView, 0, lowerBoundCloseTimeOffset,
-            upperBoundCloseTimeOffset, diagnostics, validationLedgerSeq);
-        if (!txResult->isSuccess())
+        auto const& tx = flatTxs[i];
+        if (!txValid[i])
         {
             invalidTxs.emplace_back(tx);
             seenInvalidTxs.emplace(tx->getFullHash());
@@ -207,6 +407,9 @@ TxSetUtils::getInvalidTxListWithErrors(
         }
         else
         {
+            // All admitted addends are nonnegative (classic fees are uint32;
+            // fee-bump XDRProvidesValidFee rejects negative fees), so this
+            // saturating sum is order-independent even with pre-seeded values.
             int64_t& accFee = accountFeeMap[tx->getFeeSourceID()];
             if (INT64_MAX - accFee < tx->getFullFee())
             {
@@ -219,41 +422,61 @@ TxSetUtils::getInvalidTxListWithErrors(
         }
     }
 
-    auto header = ledgerView.getLedgerHeader().current();
-    for (auto const& tx : txs)
-    {
-        // Already added invalid tx
-        if (seenInvalidTxs.find(tx->getFullHash()) != seenInvalidTxs.end())
+    // Pass 2 deliberately remains serial and hash-gated. The evolving hash set
+    // suppresses later duplicates, so only the first unaffordable transaction
+    // with a given full hash is appended.
+    auto runPass2 = [&](CheckValidLedgerViewWrapper const& ledgerView) {
+        auto header = ledgerView.getLedgerHeader().current();
+        for (auto const& tx : txs)
         {
-            continue;
-        }
-
-        auto feeSourceID = tx->getFeeSourceID();
-        auto feeSource = ledgerView.getAccount(feeSourceID);
-        // feeSource should exist since we've already run checkValid, log
-        // internal bug
-        if (!feeSource)
-        {
-            CLOG_ERROR(Herder,
-                       "Account not found when checking TxSet validity");
-            CLOG_ERROR(Herder, "{}", REPORT_INTERNAL_BUG);
-            continue;
-        }
-        auto it = accountFeeMap.find(feeSourceID);
-        auto totFee = it->second;
-        if (getAvailableBalance(header, feeSource.current()) < totFee)
-        {
-            invalidTxs.push_back(tx);
-            // Only override the error code if it wasn't already set
-            if (errorCode == TxSetValidationResult::VALID)
+            // Already added invalid tx
+            if (seenInvalidTxs.find(tx->getFullHash()) != seenInvalidTxs.end())
             {
-                errorCode = TxSetValidationResult::ACCOUNT_CANT_PAY_FEE;
+                continue;
             }
-            releaseAssert(seenInvalidTxs.insert(tx->getFullHash()).second);
-            CLOG_DEBUG(
-                Herder, "Got bad txSet: account can't pay fee tx: {}",
-                xdrToCerealString(tx->getEnvelope(), "TransactionEnvelope"));
+
+            auto feeSourceID = tx->getFeeSourceID();
+            auto feeSource = ledgerView.getAccount(feeSourceID);
+            // feeSource should exist since we've already run checkValid, log
+            // internal bug
+            if (!feeSource)
+            {
+                CLOG_ERROR(Herder,
+                           "Account not found when checking TxSet validity");
+                CLOG_ERROR(Herder, "{}", REPORT_INTERNAL_BUG);
+                continue;
+            }
+            auto it = accountFeeMap.find(feeSourceID);
+            auto totFee = it->second;
+            if (getAvailableBalance(header, feeSource.current()) < totFee)
+            {
+                invalidTxs.push_back(tx);
+                // Only override the error code if it wasn't already set
+                if (errorCode == TxSetValidationResult::VALID)
+                {
+                    errorCode = TxSetValidationResult::ACCOUNT_CANT_PAY_FEE;
+                }
+                releaseAssert(seenInvalidTxs.insert(tx->getFullHash()).second);
+                CLOG_DEBUG(
+                    Herder, "Got bad txSet: account can't pay fee tx: {}",
+                    xdrToCerealString(tx->getEnvelope(), "TransactionEnvelope"));
+            }
         }
+    };
+
+    if (useParallel)
+    {
+        // Chunk views are gone after the join; pass 2 gets a fresh wrapper over
+        // the exact same pinned snapshot.
+        CheckValidLedgerViewWrapper pass2View(*baseView);
+#ifdef BUILD_TESTS
+        pass2View.mSkipSeqNumCheck = skipSeqNumCheck;
+#endif
+        runPass2(pass2View);
+    }
+    else
+    {
+        runPass2(*serialLedgerView);
     }
 
     return invalidTxsWithError;
