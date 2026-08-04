@@ -1936,8 +1936,7 @@ TransactionFrame::checkValidWithOptionallyChargedFee(
     // Load sorobanConfig for all transactions at protocol >= V20.
     if (protocolVersionStartsFrom(ledgerVersion, SOROBAN_PROTOCOL_VERSION))
     {
-        sorobanConfig =
-            &app.getLedgerManager().getLastClosedSorobanNetworkConfig();
+        sorobanConfig = &ledgerView.getSorobanNetworkConfig(app);
         if (isSoroban())
         {
             sorobanResourceFee = computePreApplySorobanResourceFee(

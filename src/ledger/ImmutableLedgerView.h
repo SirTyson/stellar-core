@@ -15,6 +15,7 @@
 namespace stellar
 {
 
+class AppConnector;
 class Application;
 class TransactionFrame;
 class CheckValidLedgerViewWrapper;
@@ -219,6 +220,10 @@ class CheckValidLedgerViewWrapper : public NonMovableOrCopyable
 {
     std::unique_ptr<AbstractLedgerView const> mGetter;
     std::unique_ptr<LedgerTxn> mLegacyLedgerTxn;
+    // Set iff mGetter is an ImmutableLedgerView, so the Soroban config can be
+    // served from the snapshot itself (safe from any thread) instead of the
+    // main-thread-only LCL state.
+    ImmutableLedgerView const* mSnapshotView{nullptr};
 
   public:
     CheckValidLedgerViewWrapper(AbstractLedgerTxn& ltx);
@@ -246,6 +251,14 @@ class CheckValidLedgerViewWrapper : public NonMovableOrCopyable
         return mGetter->getAccount(header, tx, AccountID);
     }
     LedgerEntryWrapper load(LedgerKey const& key) const;
+
+    // The Soroban network config consistent with this view. Snapshot-backed
+    // views return the config pinned by the snapshot, which is valid from any
+    // thread; legacy LedgerTxn-backed views fall back to the main-thread-only
+    // LCL config. Callers must gate on the view's own protocol version (the
+    // config only exists from SOROBAN_PROTOCOL_VERSION on).
+    SorobanNetworkConfig const&
+    getSorobanNetworkConfig(AppConnector& app) const;
 
     // Execute a function with a nested snapshot, if supported. This is needed
     // to support the replay of old buggy protocols (<8), see
