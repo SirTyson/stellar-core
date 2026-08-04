@@ -5,6 +5,7 @@
 #include "crypto/SecretKey.h"
 #include "herder/TxSetFrame.h"
 #include "herder/TxSetUtils.h"
+#include "herder/test/TestTxSetUtils.h"
 #include "ledger/LedgerManager.h"
 #include "main/Application.h"
 #include "main/Config.h"
@@ -88,12 +89,23 @@ sameFeeMap(UnorderedMap<AccountID, int64_t> const& a,
 
 ValidationOutput
 runValidation(Application& app, TxFrameList const& txs, bool forceSerial,
-              UnorderedMap<AccountID, int64_t> feeMap = {})
+              UnorderedMap<AccountID, int64_t> feeMap = {},
+              uint64_t lowerBoundCloseTimeOffset = 0,
+              uint64_t upperBoundCloseTimeOffset = 0)
 {
     ForceSerialGuard guard(forceSerial);
-    auto result =
-        TxSetUtils::getInvalidTxListWithErrors(txs, app, feeMap, 0, 0);
+    auto result = TxSetUtils::getInvalidTxListWithErrors(
+        txs, app, feeMap, lowerBoundCloseTimeOffset,
+        upperBoundCloseTimeOffset);
     return {std::move(result.first), result.second, std::move(feeMap)};
+}
+
+TxSetValidationResult
+runApplicableValidation(Application& app, ApplicableTxSetFrame const& txSet,
+                        bool forceSerial)
+{
+    ForceSerialGuard guard(forceSerial);
+    return txSet.checkValidWithResult(app, 0, 0);
 }
 
 void
@@ -459,6 +471,127 @@ TEST_CASE("parallel validation size boundaries",
         TxFrameList txs(allTxs.begin(), allTxs.begin() + size);
         requireSame(runValidation(*app, txs, true),
                     runValidation(*app, txs, false));
+    }
+}
+
+TEST_CASE("parallel validation honors close-time offsets",
+          "[txset][parallelvalidation]")
+{
+    VirtualClock clock;
+    auto app = makeParallelValidationApp(clock);
+    auto root = app->getRoot();
+    auto balance = app->getLedgerManager().getLastMinBalance(2) + 1'000'000;
+    auto accounts = fundAccounts(*root, "timeOffset", 40, balance);
+    auto txs = makePayments(*app, *root, accounts);
+
+    auto closeTime = app->getLedgerManager()
+                         .getLastClosedLedgerHeader()
+                         .header.scpValue.closeTime;
+    PreconditionsV2 cond;
+    cond.timeBounds.activate().maxTime = closeTime + 4;
+    txs[0] = transactionFromOperationsV1(
+        *app, accounts[0].getSecretKey(),
+        accounts[0].loadSequenceNumber() + 1, {payment(*root, 1)}, 100,
+        cond);
+
+    auto serialAtBoundary = runValidation(*app, txs, true, {}, 0, 4);
+    auto parallelAtBoundary = runValidation(*app, txs, false, {}, 0, 4);
+    requireSame(serialAtBoundary, parallelAtBoundary);
+    REQUIRE(std::get<1>(parallelAtBoundary) == TxSetValidationResult::VALID);
+
+    auto serialPastBoundary = runValidation(*app, txs, true, {}, 0, 5);
+    auto parallelPastBoundary = runValidation(*app, txs, false, {}, 0, 5);
+    requireSame(serialPastBoundary, parallelPastBoundary);
+    REQUIRE(std::get<1>(parallelPastBoundary) ==
+            TxSetValidationResult::TX_VALIDATION_FAILED);
+    REQUIRE(std::get<0>(parallelPastBoundary).size() == 1);
+}
+
+TEST_CASE("parallel validation covers generalized phase iterators",
+          "[txset][parallelvalidation]")
+{
+    VirtualClock clock;
+    auto app = makeParallelValidationApp(clock);
+    overrideSorobanNetworkConfigForTest(*app);
+    auto root = app->getRoot();
+    auto balance =
+        app->getLedgerManager().getLastMinBalance(2) + 1'000'000'000;
+
+    auto classicAccounts = fundAccounts(*root, "phaseClassic", 40, balance);
+    auto classicTxs = makePayments(*app, *root, classicAccounts);
+    auto sorobanAccounts = fundAccounts(*root, "phaseSoroban", 40, balance);
+    TxFrameList sorobanTxs;
+    SorobanResources resources;
+    resources.instructions = 800'000;
+    resources.diskReadBytes = 1000;
+    resources.writeBytes = 1000;
+    for (size_t i = 0; i < sorobanAccounts.size(); ++i)
+    {
+        auto& account = sorobanAccounts[i];
+        sorobanTxs.emplace_back(createUploadWasmTx(
+            *app, account, 1000, 100'000'000, resources, std::nullopt, 0,
+            std::nullopt, account.loadSequenceNumber() + 1, 10'000 + i));
+    }
+
+    // Exercise the phase-frame flattening iterator across stage boundaries,
+    // not merely the TxFrameList template instantiation used by trimming.
+    TxStageFrameList sorobanStages;
+    TxStageFrame firstStage;
+    firstStage.emplace_back(sorobanTxs.begin(), sorobanTxs.begin() + 20);
+    sorobanStages.emplace_back(std::move(firstStage));
+    TxStageFrame secondStage;
+    secondStage.emplace_back(sorobanTxs.begin() + 20, sorobanTxs.end());
+    sorobanStages.emplace_back(std::move(secondStage));
+
+    auto makeTxSet = [&](TxFrameList const& classic) {
+        testtxset::PhaseComponents components{
+            {std::optional<int64_t>{100}, classic}};
+        auto lcl = app->getLedgerManager().getLastClosedLedgerHeader();
+        return testtxset::makeNonValidatedGeneralizedTxSet(
+            components, std::optional<int64_t>{1000}, sorobanStages, *app,
+            lcl.hash);
+    };
+
+    SECTION("valid classic and parallel Soroban phases")
+    {
+        auto [_, txSet] = makeTxSet(classicTxs);
+        REQUIRE(txSet);
+        REQUIRE(txSet->getPhase(TxSetPhase::CLASSIC).sizeTx() == 40);
+        auto const& stages =
+            txSet->getPhase(TxSetPhase::SOROBAN).getParallelStages();
+        REQUIRE(stages.size() == 2);
+        REQUIRE(stages[0].size() == 1);
+        REQUIRE(stages[0][0].size() == 20);
+        REQUIRE(stages[1].size() == 1);
+        REQUIRE(stages[1][0].size() == 20);
+
+        auto serial = runApplicableValidation(*app, *txSet, true);
+        auto parallel = runApplicableValidation(*app, *txSet, false);
+        REQUIRE(serial == TxSetValidationResult::VALID);
+        REQUIRE(parallel == serial);
+    }
+
+    SECTION("classic pass 2 rejects aggregate fees")
+    {
+        auto mixedClassic = classicTxs;
+        mixedClassic.resize(32);
+        auto minBalance = app->getLedgerManager().getLastMinBalance(0);
+        int64_t const outerFee = 1000;
+        auto poor = root->create("phasePoor", minBalance + 3 * outerFee);
+        auto innerAccounts = fundAccounts(*root, "phaseInner", 8, balance);
+        for (auto& inner : innerAccounts)
+        {
+            mixedClassic.emplace_back(feeBump(
+                *app, poor, inner.tx({payment(*root, 1)}), outerFee));
+        }
+        REQUIRE(mixedClassic.size() == 40);
+
+        auto [_, txSet] = makeTxSet(mixedClassic);
+        REQUIRE(txSet);
+        auto serial = runApplicableValidation(*app, *txSet, true);
+        auto parallel = runApplicableValidation(*app, *txSet, false);
+        REQUIRE(serial == TxSetValidationResult::ACCOUNT_CANT_PAY_FEE);
+        REQUIRE(parallel == serial);
     }
 }
 

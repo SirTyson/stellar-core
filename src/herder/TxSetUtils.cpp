@@ -298,6 +298,9 @@ TxSetUtils::getInvalidTxListWithErrors(
         // frame memoization is not synchronized, even though distinct frames
         // reconstructed from an identical envelope are safe to validate in
         // parallel and retain the duplicate-full-hash semantics below.
+        // Production frame construction also gives every fee-bump frame its
+        // own inner frame; distinct top-level frames must not alias an inner
+        // TransactionFramePtr.
         std::unordered_set<TransactionFrameBase const*> frames;
         frames.reserve(flatTxs.size());
         for (auto const& tx : flatTxs)
@@ -333,7 +336,9 @@ TxSetUtils::getInvalidTxListWithErrors(
 
     // Pass 1: per-tx checkValid. Each tx is validated independently against
     // the same LCL snapshot (current=0 reads sequence numbers directly from
-    // ledger state, so there is no cross-tx sequencing here).
+    // ledger state, so there is no cross-tx sequencing here). checkValid never
+    // reads accountFeeMap, which is only in a defined state on normal return;
+    // both callers own it locally and discard it if validation throws.
     if (useParallel)
     {
         baseView.emplace(app.getLedgerManager().copyImmutableLedgerView());
