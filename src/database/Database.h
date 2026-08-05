@@ -26,6 +26,7 @@ class Counter;
 namespace stellar
 {
 class Application;
+class Config;
 
 // smallest schema version supported
 static constexpr unsigned long MIN_SCHEMA_VERSION = 25;
@@ -187,6 +188,7 @@ class Database : NonMovableOrCopyable
     // Return true if the Database can use a miscellaneous database, which is
     // supported only for on-disk SQLite
     bool canUseMiscDB() const;
+    static bool canUseMiscDB(Config const& config);
 
     // Return an optional SQL COLLATION clause to use for text-typed columns in
     // this database, in order to ensure they're compared "simply" using

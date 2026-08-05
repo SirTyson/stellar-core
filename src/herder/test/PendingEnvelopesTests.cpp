@@ -5,6 +5,7 @@
 #include "crypto/SHA.h"
 #include "herder/HerderImpl.h"
 #include "herder/PendingEnvelopes.h"
+#include "herder/TxSetPersistor.h"
 #include "herder/test/TestTxSetUtils.h"
 #include "main/Application.h"
 #include "test/Catch2.h"
@@ -386,6 +387,7 @@ TEST_CASE_VERSIONS("PendingEnvelopes recvSCPEnvelope", "[herder]")
             pendingEnvelopes.eraseOutsideRange(minSlot, std::nullopt,
                                                lastCheckpointSeq);
             auto saneQSetP = pendingEnvelopes.getQSet(saneQSetHash);
+            herder.getTxSetPersistor().drain();
 
             // 3 as we have "p", "txSet" and SCP
             REQUIRE(txSet.use_count() == 3);
@@ -470,6 +472,7 @@ TEST_CASE_VERSIONS("PendingEnvelopes recvSCPEnvelope", "[herder]")
                                                lastCheckpointSeq);
 
             auto saneQSetP = pendingEnvelopes.getQSet(saneQSetHash);
+            herder.getTxSetPersistor().drain();
 
             // txSet refs: "p", "txSet", SCP (saneEnvelope's slot still in SCP)
             REQUIRE(txSet.use_count() == 3);

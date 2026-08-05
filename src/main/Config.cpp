@@ -177,6 +177,7 @@ Config::Config() : NODE_SEED(SecretKey::random())
     BACKGROUND_OVERLAY_PROCESSING = true;
     PARALLEL_LEDGER_APPLY = true;
     EXPERIMENTAL_PARALLEL_TX_SET_DOWNLOAD = false;
+    EXPERIMENTAL_BACKGROUND_TX_SET_PERSIST = true;
     DISABLE_SOROBAN_METRICS_FOR_TESTING = false;
     DISABLE_TX_META_FOR_TESTING = false;
     BACKGROUND_TX_SIG_VERIFICATION = true;
@@ -1235,6 +1236,10 @@ Config::processConfig(std::shared_ptr<cpptoml::table> t)
                 {"EXPERIMENTAL_PARALLEL_TX_SET_DOWNLOAD",
                  [&]() {
                      EXPERIMENTAL_PARALLEL_TX_SET_DOWNLOAD = readBool(item);
+                 }},
+                {"EXPERIMENTAL_BACKGROUND_TX_SET_PERSIST",
+                 [&]() {
+                     EXPERIMENTAL_BACKGROUND_TX_SET_PERSIST = readBool(item);
                  }},
                 {"DISABLE_SOROBAN_METRICS_FOR_TESTING",
                  [&]() {

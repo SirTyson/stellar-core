@@ -110,6 +110,14 @@ ApplicationImpl::ApplicationImpl(VirtualClock& clock, Config const& cfg)
           std::make_unique<asio::io_context>(mConfig.TX_VALIDATION_THREADS))
     , mTxValidationWork(
           std::make_unique<asio::io_context::work>(*mTxValidationIOContext))
+    , mTxSetPersistIOContext(mConfig.EXPERIMENTAL_BACKGROUND_TX_SET_PERSIST &&
+                                     Database::canUseMiscDB(mConfig)
+                                 ? std::make_unique<asio::io_context>(1)
+                                 : nullptr)
+    , mTxSetPersistWork(mTxSetPersistIOContext
+                            ? std::make_unique<asio::io_context::work>(
+                                  *mTxSetPersistIOContext)
+                            : nullptr)
     , mWorkerThreads()
     , mEvictionThread()
     , mStopSignals(clock.getIOContext(), SIGINT)
@@ -219,6 +227,15 @@ ApplicationImpl::ApplicationImpl(VirtualClock& clock, Config const& cfg)
         });
         mThreadTypes[thread->get_id()] = ThreadType::TX_VALIDATION;
         mTxValidationThreads.emplace_back(std::move(thread));
+    }
+
+    if (mTxSetPersistIOContext)
+    {
+        mTxSetPersistThread = std::make_unique<std::thread>([this]() {
+            runCurrentThreadWithHighPriority();
+            mTxSetPersistIOContext->run();
+        });
+        mThreadTypes[mTxSetPersistThread->get_id()] = ThreadType::TXSET_PERSIST;
     }
 
     if (mConfig.BACKGROUND_OVERLAY_PROCESSING)
@@ -988,6 +1005,9 @@ ApplicationImpl::joinAllThreads()
     // to the drained context and then hanging on future.get().
     mTxValidationThreads.clear();
 
+    joined += shutdownThread(mTxSetPersistThread, mTxSetPersistWork,
+                             "tx-set persist");
+
     joined += shutdownThread(mOverlayThread, mOverlayWork, "overlay");
     joined += shutdownThread(mEvictionThread, mEvictionWork, "eviction");
     if (joined)
@@ -1645,6 +1665,21 @@ size_t
 ApplicationImpl::getTxValidationThreadCount() const
 {
     return mTxValidationThreads.size();
+}
+
+bool
+ApplicationImpl::postOnTxSetPersistThread(std::function<void()>&& f,
+                                          std::string)
+{
+    releaseAssert(threadIsMain());
+    if (!mTxSetPersistThread || !mTxSetPersistIOContext)
+    {
+        return false;
+    }
+
+    JITTER_INJECT_DELAY();
+    asio::post(*mTxSetPersistIOContext, [f = std::move(f)]() { f(); });
+    return true;
 }
 
 void

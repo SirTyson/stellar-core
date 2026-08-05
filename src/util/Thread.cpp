@@ -43,6 +43,12 @@ runCurrentThreadWithMediumPriority()
     runCurrentThreadWithPriority(THREAD_PRIORITY_BELOW_NORMAL);
 }
 
+void
+runCurrentThreadWithHighPriority()
+{
+    runCurrentThreadWithPriority(THREAD_PRIORITY_NORMAL);
+}
+
 #elif defined(__linux__)
 
 static void
@@ -51,8 +57,8 @@ runCurrentThreadWithPriority(int priority)
     auto newNice = nice(priority);
     if (newNice != priority)
     {
-        LOG_DEBUG(DEFAULT_LOG, "Unable to run worker thread with low priority. "
-                               "Normal priority will be used.");
+        LOG_DEBUG(DEFAULT_LOG,
+                  "Unable to run worker thread at requested priority.");
     }
 }
 
@@ -66,6 +72,12 @@ void
 runCurrentThreadWithMediumPriority()
 {
     runCurrentThreadWithPriority(/*MED_PRIORITY_NICE*/ 3);
+}
+
+void
+runCurrentThreadWithHighPriority()
+{
+    runCurrentThreadWithPriority(/*HIGH_PRIORITY_NICE*/ 1);
 }
 
 #elif defined(__APPLE__)
@@ -103,6 +115,12 @@ runCurrentThreadWithMediumPriority()
 {
     runCurrentThreadWithPriority(/*MED_PRIORITY_NICE*/ 3);
 }
+
+void
+runCurrentThreadWithHighPriority()
+{
+    runCurrentThreadWithPriority(/*HIGH_PRIORITY_NICE*/ 1);
+}
 #else
 
 void
@@ -112,6 +130,11 @@ runCurrentThreadWithLowPriority()
 
 void
 runCurrentThreadWithMediumPriority()
+{
+}
+
+void
+runCurrentThreadWithHighPriority()
 {
 }
 

@@ -169,7 +169,8 @@ class PendingEnvelopes
      * in PendingEnvelopes.
      */
     void addTxSet(Hash const& hash, uint64 lastSeenSlotIndex,
-                  TxSetXDRFrameConstPtr txset);
+                  TxSetXDRFrameConstPtr txset,
+                  bool kickOffBackgroundPersist = true);
 
     /**
         Adds @p txset to the cache and returns the txset referenced by the cache
@@ -177,7 +178,8 @@ class PendingEnvelopes
        use the returned value instead
     */
     TxSetXDRFrameConstPtr putTxSet(Hash const& hash, uint64 slot,
-                                   TxSetXDRFrameConstPtr txset);
+                                   TxSetXDRFrameConstPtr txset,
+                                   bool kickOffBackgroundPersist = true);
 
     /**
      * Check if @p txset identified by @p hash was requested before from peers.
@@ -197,7 +199,6 @@ class PendingEnvelopes
 
     // Returns true if every tx set referenced by `env` is available locally
     bool areTxSetsFetched(SCPEnvelope const& env) const;
-
 
     SCPEnvelopeWrapperPtr pop(uint64 slotIndex);
 

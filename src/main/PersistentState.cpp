@@ -54,19 +54,42 @@ void
 PersistentState::deleteTxSets(std::unordered_set<Hash> hashesToDelete)
 {
     releaseAssert(threadIsMain());
-    soci::transaction tx(mApp.getDatabase().getRawMiscSession());
+    deleteTxSets(std::move(hashesToDelete),
+                 mApp.getDatabase().getMiscSession());
+}
+
+void
+PersistentState::deleteTxSets(std::unordered_set<Hash> hashesToDelete,
+                              SessionWrapper& session)
+{
+    releaseAssert(threadIsMain() ||
+                  mApp.threadIsType(Application::ThreadType::TXSET_PERSIST));
+    soci::transaction tx(session.session());
     for (auto const& hash : hashesToDelete)
     {
         auto name = getStoreStateNameForTxSet(hash);
         auto prep = mApp.getDatabase().getPreparedStatement(
             fmt::format("DELETE FROM {} WHERE statename = :n;", kSlotTableName),
-            mApp.getDatabase().getMiscSession());
+            session);
 
         auto& st = prep.statement();
         st.exchange(soci::use(name));
         st.define_and_bind();
         st.execute(true);
     }
+    tx.commit();
+}
+
+void
+PersistentState::persistTxSet(Hash const& txSetHash,
+                              std::string const& encodedTxSet,
+                              SessionWrapper& session)
+{
+    releaseAssert(threadIsMain() ||
+                  mApp.threadIsType(Application::ThreadType::TXSET_PERSIST));
+    soci::transaction tx(session.session());
+    updateDb(getStoreStateNameForTxSet(txSetHash), encodedTxSet, session,
+             kSlotTableName);
     tx.commit();
 }
 
@@ -283,7 +306,8 @@ PersistentState::updateDb(std::string const& entry, std::string const& value,
 {
     ZoneScoped;
     releaseAssert(threadIsMain() ||
-                  mApp.threadIsType(Application::ThreadType::APPLY));
+                  mApp.threadIsType(Application::ThreadType::APPLY) ||
+                  mApp.threadIsType(Application::ThreadType::TXSET_PERSIST));
     auto prep = mApp.getDatabase().getPreparedStatement(
         fmt::format("UPDATE {} SET state = :v WHERE statename = :n;",
                     tableName),
@@ -401,7 +425,8 @@ PersistentState::getFromDb(std::string const& entry, SessionWrapper& sess,
 {
     ZoneScoped;
     releaseAssert(threadIsMain() ||
-                  mApp.threadIsType(Application::ThreadType::APPLY));
+                  mApp.threadIsType(Application::ThreadType::APPLY) ||
+                  mApp.threadIsType(Application::ThreadType::TXSET_PERSIST));
     std::string res;
 
     auto& db = mApp.getDatabase();

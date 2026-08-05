@@ -13,6 +13,7 @@ namespace stellar
 
 void runCurrentThreadWithLowPriority();
 void runCurrentThreadWithMediumPriority();
+void runCurrentThreadWithHighPriority();
 
 template <typename T>
 bool

@@ -540,6 +540,11 @@ class Config : public std::enable_shared_from_this<Config>
     // Allow downloading of transaction sets in parallel with SCP (experimental)
     bool EXPERIMENTAL_PARALLEL_TX_SET_DOWNLOAD;
 
+    // Persist received transaction sets in the background while validating
+    // them. This is inert on Postgres and in-memory SQLite because it requires
+    // the split on-disk SQLite miscellaneous database.
+    bool EXPERIMENTAL_BACKGROUND_TX_SET_PERSIST;
+
     // Disable expensive Soroban metrics for performance testing
     bool DISABLE_SOROBAN_METRICS_FOR_TESTING;
 

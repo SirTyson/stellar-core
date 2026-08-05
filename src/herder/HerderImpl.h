@@ -9,6 +9,7 @@
 #include "herder/LedgerCloseData.h"
 #include "herder/PendingEnvelopes.h"
 #include "herder/QuorumIntersectionChecker.h"
+#include "herder/TxSetPersistor.h"
 #include "herder/Upgrades.h"
 #include "overlay/NetworkConstants.h"
 #include "util/Timer.h"
@@ -216,9 +217,16 @@ class HerderImpl : public Herder
 
     void startTxSetGCTimer();
 
+    TxSetPersistor&
+    getTxSetPersistor()
+    {
+        return mTxSetPersistor;
+    }
+
 #ifdef BUILD_TESTS
     PendingEnvelopes& getPendingEnvelopes();
     Upgrades const& getUpgrades() const;
+    std::function<void(SCPEnvelope const&)> mBroadcastHook;
 #endif
 
     // helper function to verify envelopes are signed
@@ -271,6 +279,7 @@ class HerderImpl : public Herder
     void purgeOldPersistedTxSets();
     void writeDebugTxSet(LedgerCloseData const& lcd);
 
+    TxSetPersistor mTxSetPersistor;
     PendingEnvelopes mPendingEnvelopes;
     Upgrades mUpgrades;
     HerderSCPDriver mHerderSCPDriver;

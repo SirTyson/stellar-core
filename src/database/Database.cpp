@@ -634,7 +634,15 @@ Database::canUsePool() const
 bool
 Database::canUseMiscDB() const
 {
-    return canUsePool() && isSqlite();
+    return canUseMiscDB(mApp.getConfig());
+}
+
+bool
+Database::canUseMiscDB(Config const& config)
+{
+    auto const& connectionString = config.DATABASE.value;
+    return connectionString != "sqlite3://:memory:" &&
+           connectionString.rfind("sqlite3://", 0) == 0;
 }
 
 void

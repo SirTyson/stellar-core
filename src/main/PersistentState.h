@@ -62,6 +62,10 @@ class PersistentState
 
     bool hasTxSet(Hash const& txSetHash);
     void deleteTxSets(std::unordered_set<Hash> hashesToDelete);
+    void deleteTxSets(std::unordered_set<Hash> hashesToDelete,
+                      SessionWrapper& session);
+    void persistTxSet(Hash const& txSetHash, std::string const& encodedTxSet,
+                      SessionWrapper& session);
     static std::string getStoreStateName(Entry n, uint32 subscript = 0);
 
   private:

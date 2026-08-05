@@ -176,7 +176,8 @@ PendingEnvelopes::updateMetrics()
 
 TxSetXDRFrameConstPtr
 PendingEnvelopes::putTxSet(Hash const& hash, uint64 slot,
-                           TxSetXDRFrameConstPtr txset)
+                           TxSetXDRFrameConstPtr txset,
+                           bool kickOffBackgroundPersist)
 {
     // Cannot add a tx set for the empty-tx-set hash
     releaseAssert(hash != Herder::EMPTY_TX_SET_HASH);
@@ -187,6 +188,10 @@ PendingEnvelopes::putTxSet(Hash const& hash, uint64 slot,
         res = txset;
         mKnownTxSets[hash] = res;
         mTxSetCache.put(hash, std::make_pair(slot, res));
+        if (kickOffBackgroundPersist)
+        {
+            mHerder.getTxSetPersistor().kickOffPersist(hash, slot, res);
+        }
     }
     return res;
 }
@@ -241,12 +246,13 @@ PendingEnvelopes::hasTxSet(Hash const& hash) const
 
 void
 PendingEnvelopes::addTxSet(Hash const& hash, uint64 lastSeenSlotIndex,
-                           TxSetXDRFrameConstPtr txset)
+                           TxSetXDRFrameConstPtr txset,
+                           bool kickOffBackgroundPersist)
 {
     ZoneScoped;
     CLOG_TRACE(Herder, "Add TxSet {}", hexAbbrev(hash));
 
-    putTxSet(hash, lastSeenSlotIndex, txset);
+    putTxSet(hash, lastSeenSlotIndex, txset, kickOffBackgroundPersist);
 }
 
 bool

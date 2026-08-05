@@ -105,6 +105,8 @@ class ApplicationImpl : public Application
     virtual void postOnTxValidationThread(std::function<void()>&& f,
                                           std::string jobName) override;
     virtual size_t getTxValidationThreadCount() const override;
+    virtual bool postOnTxSetPersistThread(std::function<void()>&& f,
+                                          std::string jobName) override;
     virtual void start() override;
     void startServices();
 
@@ -182,6 +184,9 @@ class ApplicationImpl : public Application
     std::unique_ptr<asio::io_context> mTxValidationIOContext;
     std::unique_ptr<asio::io_context::work> mTxValidationWork;
 
+    std::unique_ptr<asio::io_context> mTxSetPersistIOContext;
+    std::unique_ptr<asio::io_context::work> mTxSetPersistWork;
+
     std::unique_ptr<BucketManager> mBucketManager;
     std::unique_ptr<Database> mDatabase;
     std::unique_ptr<RustOverlayManager> mOverlayManager;
@@ -243,6 +248,10 @@ class ApplicationImpl : public Application
     // Medium-priority pool for parallel transaction validation (see
     // Config::TX_VALIDATION_THREADS).
     std::vector<std::unique_ptr<std::thread>> mTxValidationThreads;
+
+    // Tx-set persistence is consensus-critical and runs at high priority,
+    // above the medium validation and eviction pools.
+    std::unique_ptr<std::thread> mTxSetPersistThread;
 
     // Unlike mWorkerThreads (which are low priority), eviction scans require a
     // medium priority thread. In the future, this may become a more general

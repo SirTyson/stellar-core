@@ -1958,6 +1958,10 @@ HerderSCPDriver::checkAndCacheTxSetValid(TxSetXDRFrame const& txSet,
         }
 
         mTxSetValidCache.put(key, res);
+        if (!res)
+        {
+            mHerder.getTxSetPersistor().discardPersist(txSet.getContentsHash());
+        }
         return res;
     }
     else

@@ -88,7 +88,8 @@ HerderImpl::SCPMetrics::SCPMetrics(Application& app)
 }
 
 HerderImpl::HerderImpl(Application& app)
-    : mPendingEnvelopes(app, *this)
+    : mTxSetPersistor(app)
+    , mPendingEnvelopes(app, *this)
     , mHerderSCPDriver(app, *this, mUpgrades, mPendingEnvelopes)
     , mLastSlotSaved(0)
     , mTrackingTimer(app)
@@ -601,6 +602,12 @@ void
 HerderImpl::broadcast(SCPEnvelope const& e)
 {
     ZoneScoped;
+#ifdef BUILD_TESTS
+    if (mBroadcastHook)
+    {
+        mBroadcastHook(e);
+    }
+#endif
     if (!mApp.getConfig().MANUAL_CLOSE)
     {
         CLOG_DEBUG(Herder, "broadcast  s:{} i:{}", e.statement.pledges.type(),
@@ -2247,7 +2254,9 @@ HerderImpl::persistSCPState(uint64 slot)
     scpState.v(1);
 
     auto& latestEnvs = scpState.v1().scpEnvelopes;
-    std::map<Hash, TxSetXDRFrameConstPtr> txSets;
+    std::map<Hash, TxSetXDRFrameConstPtr> joinTxSets;
+    std::map<Hash, TxSetXDRFrameConstPtr> fallbackTxSets;
+    std::unordered_set<Hash> referencedTxSets;
     std::map<Hash, SCPQuorumSetPtr> quorumSets;
 
     for (auto const& e : getSCP().getLatestMessagesSend(slot))
@@ -2260,9 +2269,24 @@ HerderImpl::persistSCPState(uint64 slot)
             auto result = mPendingEnvelopes.getTxSet(h);
             if (auto* txSetPtr = std::get_if<TxSetXDRFrameConstPtr>(&result))
             {
-                if (*txSetPtr && !mApp.getPersistentState().hasTxSet(h))
+                if (*txSetPtr)
                 {
-                    txSets.insert(std::make_pair(h, *txSetPtr));
+                    referencedTxSets.emplace(h);
+                    auto state = mTxSetPersistor.getState(h);
+                    bool alreadyPersisted =
+                        mApp.getPersistentState().hasTxSet(h);
+                    // An in-flight operation can be either a write or a
+                    // sequenced discard. Wait for both: otherwise a discard
+                    // could run after the statement commit and remove its
+                    // referenced body.
+                    if (state == TxSetPersistor::State::IN_FLIGHT)
+                    {
+                        joinTxSets.emplace(h, *txSetPtr);
+                    }
+                    else if (!alreadyPersisted)
+                    {
+                        fallbackTxSets.emplace(h, *txSetPtr);
+                    }
                 }
             }
             // EmptyTxSet: nothing to persist
@@ -2281,15 +2305,33 @@ HerderImpl::persistSCPState(uint64 slot)
         latestQSets.emplace_back(*it.second);
     }
 
+    std::unordered_set<Hash> joinSet;
+    for (auto const& [hash, _] : joinTxSets)
+    {
+        joinSet.emplace(hash);
+    }
+    mTxSetPersistor.waitForPersists(joinSet);
+
+    // Rechecking after the join is the correctness backstop for failed writes,
+    // sequenced discards, and GC races.
+    for (auto const& [hash, txSet] : joinTxSets)
+    {
+        if (!mApp.getPersistentState().hasTxSet(hash))
+        {
+            fallbackTxSets.emplace(hash, txSet);
+        }
+    }
+
     stellar::Value latestSCPData;
 
     std::unordered_map<Hash, std::string> txSetsToPersist;
-    for (auto it : txSets)
+    for (auto const& [hash, txSet] : fallbackTxSets)
     {
         StoredTransactionSet tempTxSet;
-        it.second->storeXDR(tempTxSet);
+        txSet->storeXDR(tempTxSet);
         txSetsToPersist.emplace(
-            it.first, decoder::encode_b64(xdr::xdr_to_opaque(tempTxSet)));
+            hash, decoder::encode_b64(xdr::xdr_to_opaque(tempTxSet)));
+        mTxSetPersistor.markFallback();
     }
 
     latestSCPData = xdr::xdr_to_opaque(scpState);
@@ -2298,6 +2340,7 @@ HerderImpl::persistSCPState(uint64 slot)
 
     mApp.getPersistentState().setSCPStateV1ForSlot(slot, encodedScpState,
                                                    txSetsToPersist);
+    mTxSetPersistor.noteReferenced(referencedTxSets);
 }
 
 void
@@ -2322,7 +2365,7 @@ HerderImpl::restoreSCPState()
             TxSetXDRFrameConstPtr cur =
                 TxSetXDRFrame::makeFromStoredTxSet(storedSet);
             Hash h = cur->getContentsHash();
-            mPendingEnvelopes.addTxSet(h, 0, cur);
+            mPendingEnvelopes.addTxSet(h, 0, cur, false);
         }
         catch (std::exception& e)
         {
@@ -2447,6 +2490,10 @@ HerderImpl::maybeHandleUpgrade()
 void
 HerderImpl::start()
 {
+    // Database initialization can recreate the SQLite files, so the
+    // persistence pool must not be leased before Herder startup.
+    mTxSetPersistor.start();
+
     mMaxTxSize = mApp.getHerder().getMaxClassicTxSize();
     {
         uint32_t version = mApp.getLedgerManager()
@@ -2567,13 +2614,15 @@ HerderImpl::purgeOldPersistedTxSets()
                            e.what());
             }
         }
+        mTxSetPersistor.filterGCDeleteSet(hashesToDelete,
+                                          getMinLedgerSeqToRemember());
         mApp.getPersistentState().deleteTxSets(hashesToDelete);
-        startTxSetGCTimer();
     }
     catch (std::exception& e)
     {
         CLOG_ERROR(Herder, "Error while deleting old tx sets: {}", e.what());
     }
+    startTxSetGCTimer();
 }
 
 void

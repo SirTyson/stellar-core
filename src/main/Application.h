@@ -175,7 +175,8 @@ class Application
         EVICTION,
         OVERLAY,
         APPLY,
-        TX_VALIDATION
+        TX_VALIDATION,
+        TXSET_PERSIST
     };
 
     virtual ~Application() {};
@@ -276,6 +277,10 @@ class Application
     virtual void postOnTxValidationThread(std::function<void()>&& f,
                                           std::string jobName) = 0;
     virtual size_t getTxValidationThreadCount() const = 0;
+    // Post to the dedicated high-priority tx-set persistence thread. Returns
+    // false when the feature is unavailable or the thread has been drained.
+    virtual bool postOnTxSetPersistThread(std::function<void()>&& f,
+                                          std::string jobName) = 0;
 
     // Perform actions necessary to transition from BOOTING_STATE to other
     // states. In particular: either reload or reinitialize the database, and
