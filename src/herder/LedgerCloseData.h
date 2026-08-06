@@ -26,7 +26,8 @@ class LedgerCloseData
   public:
     LedgerCloseData(
         uint32_t ledgerSeq, TxSetXDRFrameConstPtr txSet, StellarValue const& v,
-        std::optional<Hash> const& expectedLedgerHash = std::nullopt);
+        std::optional<Hash> const& expectedLedgerHash = std::nullopt,
+        ApplicableTxSetFrameSharedPtr applicableTxSet = nullptr);
 
 #ifdef BUILD_TESTS
     LedgerCloseData(uint32_t ledgerSeq, TxSetXDRFrameConstPtr txSet,
@@ -54,6 +55,11 @@ class LedgerCloseData
     getExpectedHash() const
     {
         return mExpectedLedgerHash;
+    }
+    ApplicableTxSetFrameSharedPtr const&
+    getApplicableTxSet() const
+    {
+        return mApplicableTxSet;
     }
 #ifdef BUILD_TESTS
     std::optional<TransactionResultSet> const&
@@ -96,6 +102,9 @@ class LedgerCloseData
     TxSetXDRFrameConstPtr mTxSet;
     StellarValue mValue;
     std::optional<Hash> mExpectedLedgerHash = std::nullopt;
+    // Optional shallow clone of the applicable frame. The wire frame remains
+    // authoritative for serialization and catchup/replay compatibility.
+    ApplicableTxSetFrameSharedPtr mApplicableTxSet;
 #ifdef BUILD_TESTS
     std::optional<TransactionResultSet> mExpectedResults = std::nullopt;
 #endif // BUILD_TESTS

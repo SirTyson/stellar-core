@@ -27,6 +27,8 @@ class ApplicableTxSetFrame;
 using TxSetXDRFrameConstPtr = std::shared_ptr<TxSetXDRFrame const>;
 using ApplicableTxSetFrameConstPtr =
     std::unique_ptr<ApplicableTxSetFrame const>;
+using ApplicableTxSetFrameSharedPtr =
+    std::shared_ptr<ApplicableTxSetFrame const>;
 
 #ifdef BUILD_TESTS
 namespace txtest
@@ -250,6 +252,13 @@ class TxSetXDRFrame : public NonMovableOrCopyable
 
 #ifdef BUILD_TESTS
     mutable ApplicableTxSetFrameConstPtr mApplicableTxSetOverride;
+    mutable uint64_t mPrepareForApplyCount{0};
+
+    uint64_t
+    getPrepareForApplyCount() const
+    {
+        return mPrepareForApplyCount;
+    }
 
     StellarMessage toStellarMessage() const;
 #endif
@@ -444,6 +453,22 @@ class TxSetPhaseFrame
 class ApplicableTxSetFrame
 {
   public:
+    // Returns a shallow copy that shares transaction frames and inclusion-fee
+    // maps with this frame, but has fresh lazy apply-order state.
+    //
+    // Transaction contents hashes may still be cold when a frame was first
+    // built by candidate combination. The clone is handed to the apply thread,
+    // which is then the only thread that can populate them.
+    ApplicableTxSetFrameConstPtr clone() const;
+
+#ifdef BUILD_TESTS
+    bool
+    hasApplyOrder() const
+    {
+        return !mApplyOrderPhases.empty();
+    }
+#endif
+
     // Returns the base fee for the transaction or std::nullopt when the
     // transaction is not discounted.
     std::optional<int64_t>

@@ -17,15 +17,20 @@ namespace stellar
 LedgerCloseData::LedgerCloseData(uint32_t ledgerSeq,
                                  TxSetXDRFrameConstPtr txSet,
                                  StellarValue const& v,
-                                 std::optional<Hash> const& expectedLedgerHash)
+                                 std::optional<Hash> const& expectedLedgerHash,
+                                 ApplicableTxSetFrameSharedPtr applicableTxSet)
     : mLedgerSeq(ledgerSeq)
     , mTxSet(txSet)
     , mValue(v)
     , mExpectedLedgerHash(expectedLedgerHash)
+    , mApplicableTxSet(std::move(applicableTxSet))
 {
     Hash const& valueTxHash = mValue.txSetHash;
     releaseAssert(valueTxHash == Herder::EMPTY_TX_SET_HASH ||
                   txSet->getContentsHash() == valueTxHash);
+    releaseAssert(!mApplicableTxSet ||
+                  mApplicableTxSet->getContentsHash() ==
+                      txSet->getContentsHash());
 }
 
 #ifdef BUILD_TESTS

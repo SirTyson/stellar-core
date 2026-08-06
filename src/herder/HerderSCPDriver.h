@@ -213,9 +213,27 @@ class HerderSCPDriver : public SCPDriver
       public:
         size_t operator()(TxSetValidityKey const& key) const;
     };
+
+    // For caching applicable transaction sets. Consists of
+    // {lcl.hash, txSetHash}.
+    using TxSetLclKey = std::pair<Hash, Hash>;
+
+    class TxSetLclKeyHash
+    {
+      public:
+        size_t operator()(TxSetLclKey const& key) const;
+    };
+
     void cacheValidTxSet(ApplicableTxSetFrame const& txSet,
                          LedgerHeaderHistoryEntry const& lcl,
                          uint64_t closeTimeOffset) const;
+
+    // Returns a cached applicable frame by value. Cache pointers must never be
+    // retained across code that can re-enter candidate combination and build
+    // another frame.
+    ApplicableTxSetFrameSharedPtr
+    getCachedApplicableTxSet(Hash const& txSetHash,
+                             LedgerHeaderHistoryEntry const& lcl) const;
 
     // Get the number of nomination timeouts that occurred for a given slot
     std::optional<int64_t> getNominationTimeouts(uint64_t slotIndex) const;
@@ -225,6 +243,12 @@ class HerderSCPDriver : public SCPDriver
     getTxSetValidityCache()
     {
         return mTxSetValidCache;
+    }
+
+    auto const&
+    getApplicableTxSetCacheCounters() const
+    {
+        return mApplicableTxSetCache.getCounters();
     }
 #endif
 
@@ -270,6 +294,9 @@ class HerderSCPDriver : public SCPDriver
 
         // Timer tracking time to check and cache a tx set
         medida::Timer& mTxSetValidation;
+
+        // Counts reuse of an applicable transaction-set frame.
+        medida::Meter& mApplicableTxSetCacheHit;
 
         // Tracks how many ledgers we externalized an empty-tx-set value.
         medida::Counter& mEmptyTxSetExternalized;
@@ -338,6 +365,16 @@ class HerderSCPDriver : public SCPDriver
     mutable RandomEvictionCache<TxSetValidityKey, bool, TxSetValidityKeyHash>
         mTxSetValidCache;
 
+    // Main-thread only. An apply clone shares transaction frames with its
+    // cached source, so checkValid may use a cached frame only while no apply
+    // is active. Other consumers are limited to immutable state and warm full
+    // hashes; they must not call transaction getContentsHash() (an
+    // unconditional writer in _DEBUG builds) or checkValid(). LCL is part of
+    // the key, making stale entries unreachable without explicit invalidation.
+    mutable RandomEvictionCache<TxSetLclKey, ApplicableTxSetFrameSharedPtr,
+                                TxSetLclKeyHash>
+        mApplicableTxSetCache;
+
     SCPDriver::ValidationLevel
     validateValueAgainstLocalState(uint64_t slotIndex, StellarValue const& sv,
                                    bool nomination) const;
@@ -361,6 +398,10 @@ class HerderSCPDriver : public SCPDriver
     bool checkAndCacheTxSetValid(TxSetXDRFrame const& txSet,
                                  LedgerHeaderHistoryEntry const& lcl,
                                  uint64_t closeTimeOffset) const;
+
+    ApplicableTxSetFrameSharedPtr
+    getOrBuildApplicableTxSet(TxSetXDRFrame const& txSet,
+                              LedgerHeaderHistoryEntry const& lcl) const;
 
     bool deserializeAndValidateStellarValue(Value const& value,
                                             StellarValue& sv) const;

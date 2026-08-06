@@ -325,8 +325,9 @@ HerderImpl::processExternalized(uint64 slotIndex, StellarValue const& value,
     }
 
     auto result = mPendingEnvelopes.getTxSet(value.txSetHash);
+    bool const isEmptyTxSet = std::holds_alternative<EmptyTxSet>(result);
     TxSetXDRFrameConstPtr externalizedSet;
-    if (std::holds_alternative<EmptyTxSet>(result))
+    if (isEmptyTxSet)
     {
 #ifdef CAP_0083
         auto const& ov = value.ext.proposedValue();
@@ -345,20 +346,54 @@ HerderImpl::processExternalized(uint64 slotIndex, StellarValue const& value,
     // Notify overlay to clear TXs from mempool (for RustOverlayManager)
     // Extract TX hashes from the externalized set so Rust can remove them
     std::vector<Hash> txHashes;
+    auto const& lcl = mLedgerManager.getLastClosedLedgerHeader();
+    ApplicableTxSetFrameSharedPtr cachedApplicableTxSet;
+    if (!isEmptyTxSet)
+    {
+        cachedApplicableTxSet =
+            mHerderSCPDriver.getCachedApplicableTxSet(value.txSetHash, lcl);
+    }
     if (externalizedSet)
     {
-        auto txFramesList =
-            externalizedSet->createTransactionFrames(mApp.getNetworkID());
-        for (auto const& txPhase : txFramesList)
+        if (cachedApplicableTxSet)
         {
-            for (auto const& txFrame : txPhase)
-            {
-                txHashes.push_back(txFrame->getFullHash());
-            }
-        }
 #ifdef BUILD_TESTS
-        mApp.getLoadGenerator().cleanupAccounts(txFramesList);
+            PerPhaseTransactionList txFramesList;
+            txFramesList.reserve(cachedApplicableTxSet->numPhases());
 #endif
+            for (auto const& txPhase : cachedApplicableTxSet->getPhases())
+            {
+#ifdef BUILD_TESTS
+                auto& frames = txFramesList.emplace_back();
+                frames.reserve(txPhase.sizeTx());
+#endif
+                for (auto const& txFrame : txPhase)
+                {
+#ifdef BUILD_TESTS
+                    frames.emplace_back(txFrame);
+#endif
+                    txHashes.push_back(txFrame->getFullHash());
+                }
+            }
+#ifdef BUILD_TESTS
+            mApp.getLoadGenerator().cleanupAccounts(txFramesList);
+#endif
+        }
+        else
+        {
+            auto txFramesList =
+                externalizedSet->createTransactionFrames(mApp.getNetworkID());
+            for (auto const& txPhase : txFramesList)
+            {
+                for (auto const& txFrame : txPhase)
+                {
+                    txHashes.push_back(txFrame->getFullHash());
+                }
+            }
+#ifdef BUILD_TESTS
+            mApp.getLoadGenerator().cleanupAccounts(txFramesList);
+#endif
+        }
     }
     mApp.getOverlayManager().notifyTxSetExternalized(value.txSetHash, txHashes);
 
@@ -396,8 +431,14 @@ HerderImpl::processExternalized(uint64 slotIndex, StellarValue const& value,
     // tell the LedgerManager that this value got externalized
     // LedgerManager will perform the proper action based on its internal
     // state: apply, trigger catchup, etc
+    ApplicableTxSetFrameSharedPtr applicableTxSetForApply;
+    if (cachedApplicableTxSet)
+    {
+        applicableTxSetForApply = cachedApplicableTxSet->clone();
+    }
     LedgerCloseData ledgerData(static_cast<uint32_t>(slotIndex),
-                               externalizedSet, value);
+                               externalizedSet, value, std::nullopt,
+                               std::move(applicableTxSetForApply));
 
     // Only dump the most recent externalized tx set. Ledger sequence on a
     // written tx set shall only strictly move forward; it may have gaps with

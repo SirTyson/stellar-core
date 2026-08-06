@@ -1097,6 +1097,7 @@ TxSetXDRFrame::prepareForApply(Application& app,
                                LedgerHeader const& lclHeader) const
 {
 #ifdef BUILD_TESTS
+    ++mPrepareForApplyCount;
     if (mApplicableTxSetOverride)
     {
         return ApplicableTxSetFrameConstPtr(
@@ -2037,6 +2038,15 @@ ApplicableTxSetFrame::ApplicableTxSetFrame(
                                     SOROBAN_PROTOCOL_VERSION),
           lclHeader.hash, phases, contentsHash)
 {
+}
+
+ApplicableTxSetFrameConstPtr
+ApplicableTxSetFrame::clone() const
+{
+    auto cloned =
+        std::unique_ptr<ApplicableTxSetFrame>(new ApplicableTxSetFrame(*this));
+    cloned->mApplyOrderPhases.clear();
+    return ApplicableTxSetFrameConstPtr(std::move(cloned));
 }
 
 Hash const&

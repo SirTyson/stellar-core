@@ -49,6 +49,12 @@ isEmptyTxSetStellarValue(StellarValue const& sv)
 
 uint32_t const TXSETVALID_CACHE_SIZE = 1000;
 
+// Two flood leaders plus the spread from repeated nomination timeout rounds
+// normally fit comfortably in eight entries. This is entry-bounded rather
+// than byte-bounded: a full 6000-transaction classic frame is roughly 6-8 MB,
+// and Soroban frames can be larger.
+uint32_t const APPLICABLE_TXSET_CACHE_SIZE = 8;
+
 Hash
 HerderSCPDriver::getHashOf(std::vector<xdr::opaque_vec<>> const& vals) const
 {
@@ -80,6 +86,8 @@ HerderSCPDriver::SCPMetrics::SCPMetrics(Application& app)
           {"scp", "timing", "ballot-blocked-on-txset"}))
     , mTxSetValidation(
           app.getMetrics().NewTimer({"herder", "txset", "validate"}))
+    , mApplicableTxSetCacheHit(app.getMetrics().NewMeter(
+          {"herder", "txset", "applicable-cache-hit"}, "hit"))
     , mEmptyTxSetExternalized(
           app.getMetrics().NewCounter({"scp", "empty-tx-set", "externalized"}))
     , mEmptyTxSetValueReplaced(app.getMetrics().NewCounter(
@@ -106,6 +114,7 @@ HerderSCPDriver::HerderSCPDriver(Application& app, HerderImpl& herder,
           {"scp", "slot", "values-referenced"})}
     , mLedgerSeqNominating(0)
     , mTxSetValidCache(TXSETVALID_CACHE_SIZE)
+    , mApplicableTxSetCache(APPLICABLE_TXSET_CACHE_SIZE)
 {
 }
 
@@ -873,9 +882,9 @@ HerderSCPDriver::getNominationEmitDelayForTesting() const
 // returns true if l < r
 // lh, rh are the hashes of l,h
 static bool
-compareTxSets(ApplicableTxSetFrameConstPtr const& l,
-              ApplicableTxSetFrameConstPtr const& r, Hash const& lh,
-              Hash const& rh, std::optional<size_t> lEncodedSize,
+compareTxSets(ApplicableTxSetFrame const* l, ApplicableTxSetFrame const* r,
+              Hash const& lh, Hash const& rh,
+              std::optional<size_t> lEncodedSize,
               std::optional<size_t> rEncodedSize, LedgerHeader const& header,
               Hash const& s)
 {
@@ -1047,7 +1056,7 @@ HerderSCPDriver::combineCandidates(uint64_t slotIndex,
     {
         auto highest = candidateValues.cend();
         TxSetXDRFrameConstPtr highestTxSet;
-        ApplicableTxSetFrameConstPtr highestApplicableTxSet;
+        ApplicableTxSetFrameSharedPtr highestApplicableTxSet;
         for (auto it = candidateValues.cbegin(); it != candidateValues.cend();
              ++it)
         {
@@ -1063,13 +1072,13 @@ HerderSCPDriver::combineCandidates(uint64_t slotIndex,
 
             // Only valid applicable tx sets should be combined.
             auto cApplicableTxSet =
-                cTxSet ? cTxSet->prepareForApply(mApp, lcl.header) : nullptr;
+                cTxSet ? getOrBuildApplicableTxSet(*cTxSet, lcl) : nullptr;
             if (!cTxSet || cTxSet->previousLedgerHash() == lcl.hash)
             {
 
                 if (highest == candidateValues.cend() ||
                     compareTxSets(
-                        highestApplicableTxSet, cApplicableTxSet,
+                        highestApplicableTxSet.get(), cApplicableTxSet.get(),
                         highest->txSetHash, sv.txSetHash,
                         highestTxSet
                             ? std::make_optional(highestTxSet->encodedSize())
@@ -1915,6 +1924,51 @@ HerderSCPDriver::cacheValidTxSet(ApplicableTxSetFrame const& txSet,
     }
 }
 
+ApplicableTxSetFrameSharedPtr
+HerderSCPDriver::getCachedApplicableTxSet(
+    Hash const& txSetHash, LedgerHeaderHistoryEntry const& lcl) const
+{
+    releaseAssert(threadIsMain());
+    auto key = TxSetLclKey{lcl.hash, txSetHash};
+    auto const* cached = mApplicableTxSetCache.maybeGet(key);
+    if (cached == nullptr)
+    {
+        return nullptr;
+    }
+
+    mSCPMetrics.mApplicableTxSetCacheHit.Mark();
+    // Take ownership before returning: callers can trigger re-entrant cache
+    // builds, and RandomEvictionCache pointers must not survive those builds.
+    return *cached;
+}
+
+ApplicableTxSetFrameSharedPtr
+HerderSCPDriver::getOrBuildApplicableTxSet(
+    TxSetXDRFrame const& txSet, LedgerHeaderHistoryEntry const& lcl) const
+{
+    releaseAssert(threadIsMain());
+    auto txSetHash = txSet.getContentsHash();
+    if (auto cached = getCachedApplicableTxSet(txSetHash, lcl))
+    {
+        return cached;
+    }
+
+    if (txSet.previousLedgerHash() != lcl.hash)
+    {
+        return nullptr;
+    }
+
+    auto applicable = txSet.prepareForApply(mApp, lcl.header);
+    if (!applicable)
+    {
+        return nullptr;
+    }
+
+    ApplicableTxSetFrameSharedPtr shared(std::move(applicable));
+    mApplicableTxSetCache.put(TxSetLclKey{lcl.hash, txSetHash}, shared);
+    return shared;
+}
+
 bool
 HerderSCPDriver::checkAndCacheTxSetValid(TxSetXDRFrame const& txSet,
                                          LedgerHeaderHistoryEntry const& lcl,
@@ -1937,10 +1991,21 @@ HerderSCPDriver::checkAndCacheTxSetValid(TxSetXDRFrame const& txSet,
         // if we receive a bad SCP value for the current state, we still
         // might end up with malformed tx set that doesn't refer to the
         // LCL.
-        ApplicableTxSetFrameConstPtr applicableTxSet;
-        if (txSet.previousLedgerHash() == lcl.hash)
+        ApplicableTxSetFrameSharedPtr cachedApplicableTxSet;
+        ApplicableTxSetFrameConstPtr freshApplicableTxSet;
+        ApplicableTxSetFrame const* applicableTxSet = nullptr;
+        if (!mLedgerManager.isApplying())
         {
-            applicableTxSet = txSet.prepareForApply(mApp, lcl.header);
+            cachedApplicableTxSet = getOrBuildApplicableTxSet(txSet, lcl);
+            applicableTxSet = cachedApplicableTxSet.get();
+        }
+        else if (txSet.previousLedgerHash() == lcl.hash)
+        {
+            // The apply thread may be mutating transaction-frame validation
+            // memos shared with cached frames. Preserve the old behavior while
+            // apply is active by constructing and validating a throwaway copy.
+            freshApplicableTxSet = txSet.prepareForApply(mApp, lcl.header);
+            applicableTxSet = freshApplicableTxSet.get();
         }
 
         bool res = true;
@@ -1980,6 +2045,14 @@ HerderSCPDriver::TxSetValidityKeyHash::operator()(
     hashMix(res, std::hash<Hash>()(std::get<1>(key)));
     hashMix(res, std::get<2>(key));
     hashMix(res, std::get<3>(key));
+    return res;
+}
+
+size_t
+HerderSCPDriver::TxSetLclKeyHash::operator()(TxSetLclKey const& key) const
+{
+    size_t res = std::hash<Hash>()(key.first);
+    hashMix(res, std::hash<Hash>()(key.second));
     return res;
 }
 

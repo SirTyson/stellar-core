@@ -1750,7 +1750,11 @@ LedgerManagerImpl::applyLedger(LedgerCloseData const& ledgerData,
     header.current().scpValue = sv;
 
     maybeResetLedgerCloseMetaDebugStream(header.current().ledgerSeq);
-    auto applicableTxSet = txSet->prepareForApply(mApp, prevHeader);
+    auto applicableTxSet = ledgerData.getApplicableTxSet();
+    if (!applicableTxSet)
+    {
+        applicableTxSet = txSet->prepareForApply(mApp, prevHeader);
+    }
 
     if (applicableTxSet == nullptr)
     {
