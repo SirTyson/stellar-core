@@ -33,8 +33,9 @@ enum class IPCMessageType : uint32_t
     /// Broadcast this SCP envelope to all peers
     BROADCAST_SCP = 1,
 
-    /// Request top N transactions from mempool for nomination
-    /// Payload: [count:4]
+    /// Request transactions from mempool for nomination.
+    /// Legacy payload: [count:u32]
+    /// V2 payload: [requestId:u64][classicCount:u32][sorobanCount:u32]
     GET_TOP_TXS = 2,
 
     /// Request current SCP state (peer asked via GET_SCP_STATE)
@@ -81,8 +82,10 @@ enum class IPCMessageType : uint32_t
     /// Received SCP envelope from network
     SCP_RECEIVED = 100,
 
-    /// Response to GET_TOP_TXS request
-    /// Payload: [count:4][len1:4][tx1:len1][len2:4][tx2:len2]...
+    /// Response to GET_TOP_TXS request. The response layout matches the
+    /// request layout:
+    /// Legacy: [count:u32][len1:u32][tx1:len1]...
+    /// V2: [requestId:u64][count:u32][len1:u32][tx1:len1]...
     TOP_TXS_RESPONSE = 101,
 
     /// Peer requested SCP state

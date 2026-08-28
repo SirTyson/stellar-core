@@ -124,6 +124,20 @@ class OverlayIPC
     std::vector<TransactionEnvelope> getTopTransactions(size_t count);
 
     /**
+     * Request independent classic and Soroban transaction windows.
+     *
+     * Uses the correlated v2 GET_TOP_TXS wire format. Counts larger than a
+     * u32 are saturated on the wire.
+     *
+     * @param classicCount Maximum classic transactions to request
+     * @param sorobanCount Maximum Soroban transactions to request
+     * @return Both windows, with classic transactions followed by Soroban
+     * transactions
+     */
+    std::vector<TransactionEnvelope>
+    getTopTransactions(size_t classicCount, size_t sorobanCount);
+
+    /**
      * Submit a transaction to the overlay for flooding.
      *
      * @param tx The transaction envelope
@@ -223,6 +237,10 @@ class OverlayIPC
     void sendScpStateResponse(uint64_t requestId,
                               std::vector<SCPEnvelope> const& envelopes);
 
+    std::vector<TransactionEnvelope>
+    requestTopTransactions(IPCMessage request,
+                           std::optional<uint64_t> requestId);
+
     std::string mSocketPath;
     std::optional<std::string> mOverlayBinaryPath;
     uint16_t mPeerPort;
@@ -240,10 +258,20 @@ class OverlayIPC
     ScpStateRequestCallback mOnScpStateRequest;
     TxSetReceivedCallback mOnTxSetReceived;
 
-    // For synchronous request/response (getTopTransactions)
+    // Only one GET_TOP_TXS request is sent at a time. Legacy responses have
+    // no correlation field, so serialization is also required when legacy
+    // and v2 callers coexist.
+    std::mutex mTopTxRequestMutex;
+
+    // Response state protected by mRequestMutex. For v2 requests,
+    // mPendingRequestId is matched before a response is delivered to the
+    // waiter; stale or otherwise mismatched responses are discarded.
     std::mutex mRequestMutex;
     std::condition_variable mRequestCv;
+    bool mRequestPending{false};
+    std::optional<uint64_t> mPendingRequestId;
     std::optional<IPCMessage> mPendingResponse;
+    std::atomic<uint64_t> mNextTxRequestId{1};
 
     // For synchronous metrics request/response
     std::mutex mMetricsMutex;

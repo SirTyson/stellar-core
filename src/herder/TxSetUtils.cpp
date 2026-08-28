@@ -15,6 +15,7 @@
 #include "main/Application.h"
 #include "main/Config.h"
 #include "main/ErrorMessages.h"
+#include "herder/SurgePricingUtils.h"
 #include "transactions/MutableTransactionResult.h"
 #include "transactions/TransactionUtils.h"
 #include "util/GlobalChecks.h"
@@ -27,39 +28,12 @@
 
 #include <Tracy.hpp>
 #include <algorithm>
+#include <limits>
 #include <list>
 #include <numeric>
 
 namespace stellar
 {
-namespace
-{
-// Target use case is to remove a subset of invalid transactions from a TxSet.
-// I.e. txSet.size() >= txsToRemove.size()
-TxFrameList
-removeTxs(TxFrameList const& txs, TxFrameList const& txsToRemove)
-{
-    UnorderedSet<Hash> txsToRemoveSet;
-    txsToRemoveSet.reserve(txsToRemove.size());
-    std::transform(
-        txsToRemove.cbegin(), txsToRemove.cend(),
-        std::inserter(txsToRemoveSet, txsToRemoveSet.end()),
-        [](TransactionFrameBasePtr const& tx) { return tx->getFullHash(); });
-
-    TxFrameList newTxs;
-    newTxs.reserve(txs.size() - txsToRemove.size());
-    for (auto const& tx : txs)
-    {
-        if (txsToRemoveSet.find(tx->getFullHash()) == txsToRemoveSet.end())
-        {
-            newTxs.emplace_back(tx);
-        }
-    }
-
-    return newTxs;
-}
-} // namespace
-
 AccountTransactionQueue::AccountTransactionQueue(
     std::vector<TransactionFrameBasePtr> const& accountTxs)
     : mTxs(accountTxs.begin(), accountTxs.end())
@@ -278,11 +252,180 @@ TxSetUtils::trimInvalid(TxFrameList const& txs, Application& app,
                         uint64_t upperBoundCloseTimeOffset,
                         TxFrameList& invalidTxs)
 {
-    invalidTxs = getInvalidTxListWithErrors(txs, app, accountFeeMap,
-                                            lowerBoundCloseTimeOffset,
-                                            upperBoundCloseTimeOffset)
-                     .first;
-    return removeTxs(txs, invalidTxs);
+    // Validate and reserve fees one transaction at a time, in the same
+    // highest-inclusion-fee-rate order used by surge pricing. The validation
+    // routine deliberately rejects an externally supplied set when the
+    // aggregate fees exceed a fee source's available balance. During local
+    // construction, however, marking every individually-valid transaction
+    // from that fee source invalid would produce an empty proposal forever.
+    // Incremental reservation keeps the highest-priority affordable subset
+    // and reports only the remainder as invalid/deferred.
+    TxFrameList priorityOrder = txs;
+    std::sort(priorityOrder.begin(), priorityOrder.end(),
+              TxFeeComparator(/*isGreater=*/true,
+                              rand_uniform<size_t>(
+                                  0, std::numeric_limits<size_t>::max())));
+
+    UnorderedSet<Hash> selected;
+    selected.reserve(txs.size());
+    invalidTxs.clear();
+    auto reservedFees = accountFeeMap;
+    for (auto const& tx : priorityOrder)
+    {
+        auto feesIfIncluded = reservedFees;
+        TxFrameList one{tx};
+        auto invalid = getInvalidTxListWithErrors(
+                           one, app, feesIfIncluded,
+                           lowerBoundCloseTimeOffset,
+                           upperBoundCloseTimeOffset)
+                           .first;
+        if (invalid.empty())
+        {
+            selected.emplace(tx->getFullHash());
+            reservedFees = std::move(feesIfIncluded);
+        }
+        else
+        {
+            invalidTxs.emplace_back(tx);
+        }
+    }
+    accountFeeMap = std::move(reservedFees);
+
+    TxFrameList valid;
+    valid.reserve(selected.size());
+    for (auto const& tx : txs)
+    {
+        if (selected.count(tx->getFullHash()) != 0)
+        {
+            valid.emplace_back(tx);
+        }
+    }
+    return valid;
+}
+
+TxSetUtils::TxSetCandidates
+TxSetUtils::selectTxSetCandidates(TxFrameList const& candidates,
+                                  bool supportsSoroban,
+                                  AccountSeqLookup const& seqOf)
+{
+    ZoneScoped;
+    TxSetCandidates res;
+    res.phases.resize(supportsSoroban ? 2 : 1);
+
+    // Account sequence numbers are looked up once per account.
+    UnorderedMap<AccountID, std::optional<SequenceNumber>> accountSeqs;
+    // Index (into `candidates`) of the best candidate seen so far for each
+    // source account.
+    UnorderedMap<AccountID, size_t> bestBySource;
+
+    for (size_t i = 0; i < candidates.size(); ++i)
+    {
+        auto const& tx = candidates[i];
+        if (tx->isSoroban() && !supportsSoroban)
+        {
+            // Not applicable yet; leave it in the mempool for after the
+            // protocol upgrade.
+            continue;
+        }
+        auto const source = tx->getSourceID();
+        auto [seqIt, firstSeen] = accountSeqs.try_emplace(source, std::nullopt);
+        if (firstSeen)
+        {
+            seqIt->second = seqOf(source);
+        }
+        auto const& accountSeq = seqIt->second;
+        if (!accountSeq || tx->getSeqNum() <= *accountSeq)
+        {
+            // No such account, or the sequence number has already been
+            // consumed: this can never apply.
+            res.toRemove.push_back(tx->getFullHash());
+            continue;
+        }
+        // From here on accountSeq < seq, so the lowest sequence number among
+        // an account's candidates is accountSeq + 1 whenever such a candidate
+        // exists; otherwise it is the first chained tx. On ties the earlier
+        // candidate (better fee rate) wins.
+        auto [bestIt, isFirst] = bestBySource.try_emplace(source, i);
+        if (!isFirst &&
+            tx->getSeqNum() < candidates[bestIt->second]->getSeqNum())
+        {
+            bestIt->second = i;
+        }
+    }
+    res.numSourceAccounts = accountSeqs.size();
+
+    // Emit the winners in candidate (fee) order.
+    for (size_t i = 0; i < candidates.size(); ++i)
+    {
+        auto const& tx = candidates[i];
+        auto it = bestBySource.find(tx->getSourceID());
+        if (it == bestBySource.end() || it->second != i)
+        {
+            continue;
+        }
+        auto phase = static_cast<size_t>(tx->isSoroban() ? TxSetPhase::SOROBAN
+                                                         : TxSetPhase::CLASSIC);
+        res.phases[phase].push_back(tx);
+    }
+    return res;
+}
+
+bool
+TxSetUtils::isTransientValidationFailure(
+    TransactionResultCode code, SequenceNumber txSeq,
+    std::optional<SequenceNumber> const& accountSeq)
+{
+    switch (code)
+    {
+    case txSUCCESS:
+        // The tx itself is valid; it was only trimmed because its fee source
+        // cannot pay for all of its pending txs at once.
+    case txTOO_EARLY:
+    case txBAD_MIN_SEQ_AGE_OR_GAP:
+        return true;
+    case txBAD_SEQ:
+        // A chained tx whose predecessor has not applied yet.
+        return accountSeq &&
+               *accountSeq < std::numeric_limits<SequenceNumber>::max() &&
+               txSeq > *accountSeq + 1;
+    default:
+        return false;
+    }
+}
+
+std::vector<Hash>
+TxSetUtils::permanentlyInvalidTxHashes(PerPhaseTransactionList const& invalid,
+                                       TxResultCodeLookup const& codeOf,
+                                       AccountSeqLookup const& seqOf)
+{
+    ZoneScoped;
+    std::vector<Hash> res;
+    UnorderedMap<AccountID, std::optional<SequenceNumber>> accountSeqs;
+    for (auto const& phase : invalid)
+    {
+        for (auto const& tx : phase)
+        {
+            auto code = codeOf(tx);
+            std::optional<SequenceNumber> accountSeq;
+            if (code == txBAD_SEQ)
+            {
+                auto const source = tx->getSourceID();
+                auto [it, firstSeen] =
+                    accountSeqs.try_emplace(source, std::nullopt);
+                if (firstSeen)
+                {
+                    it->second = seqOf(source);
+                }
+                accountSeq = it->second;
+            }
+            if (!isTransientValidationFailure(code, tx->getSeqNum(),
+                                              accountSeq))
+            {
+                res.push_back(tx->getFullHash());
+            }
+        }
+    }
+    return res;
 }
 
 } // namespace stellar

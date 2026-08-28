@@ -78,6 +78,11 @@ class RustOverlayManager
     // Blocks until the overlay responds, shuts down, or disconnects.
     std::vector<TransactionEnvelope> getTopTransactions(size_t count);
 
+    // Get independent classic and Soroban transaction windows. Uses the
+    // request-correlated v2 IPC layout.
+    std::vector<TransactionEnvelope>
+    getTopTransactions(size_t classicCount, size_t sorobanCount);
+
     // Metrics and managers
     OverlayMetrics& getOverlayMetrics();
 

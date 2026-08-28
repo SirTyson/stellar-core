@@ -11,8 +11,10 @@
 #include "herder/QuorumIntersectionChecker.h"
 #include "herder/Upgrades.h"
 #include "overlay/NetworkConstants.h"
+#include "transactions/TransactionFrameBase.h"
 #include "util/Timer.h"
 #include "util/UnorderedMap.h"
+#include "util/UnorderedSet.h"
 #include "util/XDROperators.h"
 #include <deque>
 #include <memory>
@@ -108,6 +110,35 @@ class HerderImpl : public Herder
                                    bool submittedFromSelf,
                                    bool force = false) override;
 #endif
+    // Same as recvTransaction, but also returns the validation result: the
+    // error result for TX_STATUS_ERROR, the validation success result for
+    // TX_STATUS_PENDING (may be null when validation was skipped), null
+    // otherwise.
+    std::pair<TxSubmitStatus, MutableTxResultPtr>
+    recvTransactionWithResult(TransactionFrameBasePtr tx,
+                              bool submittedFromSelf, bool force = false
+#ifdef BUILD_TESTS
+                              ,
+                              bool isLoadgenTx = false
+#endif
+    );
+
+    // Number of closed ledgers for which a hash removed from the mempool
+    // (applied, or dropped as invalid at nomination) is refused on
+    // re-submission with TX_STATUS_TRY_AGAIN_LATER. Mirrors the ban depth of
+    // the overlay mempool.
+    static constexpr size_t TX_BAN_LEDGERS = 10;
+    // Largest accepted distance between a submitted tx's sequence number and
+    // the source account's next sequence number: a tx with
+    // seq > accountSeq + 1 + MAX_PENDING_SEQ_GAP is refused with
+    // TX_STATUS_TRY_AGAIN_LATER. Keep in sync with the per-account chain cap
+    // of the overlay mempool (`max_txs_per_account`).
+    static constexpr int64_t MAX_PENDING_SEQ_GAP = 8;
+
+    void banTxs(std::vector<Hash> const& hashes);
+    bool isBannedTx(Hash const& hash) const;
+    // Ages the ban ring by one ledger; called once per closed ledger.
+    void shiftBannedTxs();
 
     EnvelopeStatus recvSCPEnvelope(SCPEnvelope const& envelope) override;
 #ifdef BUILD_TESTS
@@ -372,6 +403,31 @@ class HerderImpl : public Herder
     ConsensusData mTrackingSCP;
 
     uint32_t mMaxTxSize{0};
+
+    // Ring of recently banned tx hashes, one set per closed ledger; front is
+    // the current ledger. See TX_BAN_LEDGERS.
+    std::deque<UnorderedSet<Hash>> mBannedTxs;
+
+    struct MempoolMetrics
+    {
+        // Candidates returned by the mempool at nomination.
+        medida::Counter& mCandidates;
+        // Candidates handed to tx set construction after selection.
+        medida::Counter& mSelected;
+        // Candidates dropped from the mempool as stale (seq <= account seq or
+        // unknown account).
+        medida::Counter& mStaleRemoved;
+        // Candidates that failed validation for a permanent reason and were
+        // dropped from the mempool.
+        medida::Counter& mInvalidRemoved;
+        // Candidates that failed validation for a transient reason (chained
+        // seq, too early, min seq age/gap) and were kept in the mempool.
+        medida::Counter& mTransientKept;
+
+        MempoolMetrics(Application& app);
+    };
+
+    MempoolMetrics mMempoolMetrics;
 
     UnorderedSet<LedgerKey>
     recomputeKeysToFilter(uint32_t protocolVersion) const;

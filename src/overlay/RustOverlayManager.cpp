@@ -240,6 +240,17 @@ RustOverlayManager::getTopTransactions(size_t count)
     return {};
 }
 
+std::vector<TransactionEnvelope>
+RustOverlayManager::getTopTransactions(size_t classicCount,
+                                       size_t sorobanCount)
+{
+    if (mOverlayIPC && !mShuttingDown)
+    {
+        return mOverlayIPC->getTopTransactions(classicCount, sorobanCount);
+    }
+    return {};
+}
+
 OverlayMetrics&
 RustOverlayManager::getOverlayMetrics()
 {

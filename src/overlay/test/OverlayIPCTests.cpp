@@ -1662,3 +1662,201 @@ TEST_CASE("Rust overlay applies Soroban TX count upgrade", "[overlay-ipc]")
 
     LOG_INFO(DEFAULT_LOG, "✓ Soroban TX count upgrade works with Rust overlay");
 }
+
+/**
+ * The mempool must hand nomination at most one transaction per source
+ * account -- that account's lowest pending seqnum -- even when the account has
+ * a chain of equally-priced transactions queued, and removing (banning) the
+ * head must promote the next seqnum while keeping the removed hash out.
+ * Pins design-txqueue-v2.md §2.2 end-to-end over IPC
+ * (SUBMIT_TX / GET_TOP_TXS / REMOVE_TXS).
+ */
+TEST_CASE("Rust overlay top transactions are one per source account",
+          "[overlay-ipc][mempool][.]")
+{
+    std::string overlayBinary = requireOverlayBinary();
+    TmpDir tmpDir("overlay_ipc_one_per_account_test");
+    std::string socketPath = tmpDir.getName() + "/overlay.sock";
+    uint16_t peerPort = getTestConfig(7).PEER_PORT;
+
+    auto ipc =
+        std::make_unique<OverlayIPC>(socketPath, overlayBinary, peerPort);
+    REQUIRE(ipc->start());
+
+    auto aa1 = makeTxEnvelope(1000, 1, 0xAA);
+    auto aa2 = makeTxEnvelope(1000, 2, 0xAA);
+    auto aa3 = makeTxEnvelope(1000, 3, 0xAA);
+    auto bb1 = makeTxEnvelope(500, 1, 0xBB);
+
+    // Submit the chain out of order so that "first submitted" cannot
+    // masquerade as "lowest seqnum".
+    ipc->submitTransaction(aa3, 1000, 1);
+    ipc->submitTransaction(aa1, 1000, 1);
+    ipc->submitTransaction(aa2, 1000, 1);
+    ipc->submitTransaction(bb1, 500, 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    auto accountByte = [](TransactionEnvelope const& env) {
+        return env.v1().tx.sourceAccount.ed25519()[0];
+    };
+    auto seqOfAccount = [&](std::vector<TransactionEnvelope> const& txs,
+                            uint8_t account) -> std::optional<int64_t> {
+        std::optional<int64_t> seq;
+        for (auto const& env : txs)
+        {
+            if (accountByte(env) == account)
+            {
+                REQUIRE(!seq); // at most one per account
+                seq = env.v1().tx.seqNum;
+            }
+        }
+        return seq;
+    };
+
+    auto txs = ipc->getTopTransactions(100);
+    REQUIRE(txs.size() == 2);
+    REQUIRE(seqOfAccount(txs, 0xAA) == 1);
+    REQUIRE(seqOfAccount(txs, 0xBB) == 1);
+
+    // Removing the head (what nomination does with a permanently invalid tx)
+    // promotes the next seqnum of that account.
+    ipc->removeTransactions({xdrSha256(aa1)});
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    txs = ipc->getTopTransactions(100);
+    REQUIRE(txs.size() == 2);
+    REQUIRE(seqOfAccount(txs, 0xAA) == 2);
+    REQUIRE(seqOfAccount(txs, 0xBB) == 1);
+
+    // The removed hash is banned: re-submitting it does not bring it back.
+    ipc->submitTransaction(aa1, 1000, 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    txs = ipc->getTopTransactions(100);
+    REQUIRE(txs.size() == 2);
+    REQUIRE(seqOfAccount(txs, 0xAA) == 2);
+
+    // Externalizing the new head promotes the last link of the chain.
+    Hash txSetHash;
+    std::fill(txSetHash.begin(), txSetHash.end(), 0x42);
+    ipc->notifyTxSetExternalized(txSetHash, {xdrSha256(aa2)});
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    txs = ipc->getTopTransactions(100);
+    REQUIRE(txs.size() == 2);
+    REQUIRE(seqOfAccount(txs, 0xAA) == 3);
+
+    ipc->shutdown();
+}
+
+/**
+ * At most one transaction per (account, seqnum) lives in the mempool: two
+ * competing transactions for the same seqnum are resolved in favour of the
+ * higher inclusion fee per op regardless of arrival order
+ * (design-txqueue-v2.md §2.2 replace-by-fee).
+ */
+TEST_CASE("Rust overlay same account and seqnum keeps the higher fee",
+          "[overlay-ipc][mempool][.]")
+{
+    std::string overlayBinary = requireOverlayBinary();
+    TmpDir tmpDir("overlay_ipc_same_seq_test");
+    std::string socketPath = tmpDir.getName() + "/overlay.sock";
+    uint16_t peerPort = getTestConfig(8).PEER_PORT;
+
+    auto ipc =
+        std::make_unique<OverlayIPC>(socketPath, overlayBinary, peerPort);
+    REQUIRE(ipc->start());
+
+    // Same account and seqnum, different fees => different hashes.
+    auto low = makeTxEnvelope(100, 7, 0xCC);
+    auto high = makeTxEnvelope(5000, 7, 0xCC);
+    auto lower = makeTxEnvelope(50, 7, 0xCC);
+
+    ipc->submitTransaction(low, 100, 1);
+    ipc->submitTransaction(high, 5000, 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    auto txs = ipc->getTopTransactions(100);
+    REQUIRE(txs.size() == 1);
+    REQUIRE(txs[0].v1().tx.fee == 5000);
+
+    // A later, cheaper competitor for the same seqnum does not displace it.
+    ipc->submitTransaction(lower, 50, 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    txs = ipc->getTopTransactions(100);
+    REQUIRE(txs.size() == 1);
+    REQUIRE(txs[0].v1().tx.fee == 5000);
+
+    ipc->shutdown();
+}
+
+TEST_CASE("Rust overlay returns independent classic and Soroban candidate "
+          "windows",
+          "[overlay-ipc][mempool][.]")
+{
+    std::string overlayBinary = requireOverlayBinary();
+    TmpDir tmpDir("overlay_ipc_per_phase_heads_test");
+    std::string socketPath = tmpDir.getName() + "/overlay.sock";
+    uint16_t peerPort = getTestConfig(9).PEER_PORT;
+
+    auto ipc =
+        std::make_unique<OverlayIPC>(socketPath, overlayBinary, peerPort);
+    REQUIRE(ipc->start());
+
+    // More high-fee classic heads than the total requested window used to
+    // hide every Soroban head when Core made a single merged request.
+    for (uint8_t i = 1; i <= 5; ++i)
+    {
+        auto classic = makeTxEnvelope(10'000 - i, 1, i);
+        ipc->submitTransaction(classic, classic.v1().tx.fee, 1);
+    }
+    for (uint8_t i = 101; i <= 103; ++i)
+    {
+        auto soroban = makeTxEnvelope(100 + i, 1, i);
+        soroban.v1().tx.ext.v(1);
+        soroban.v1().tx.ext.sorobanData().resourceFee = 0;
+        ipc->submitTransaction(soroban, soroban.v1().tx.fee, 1);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    auto txs = ipc->getTopTransactions(/*classicCount=*/2,
+                                       /*sorobanCount=*/2);
+    REQUIRE(txs.size() == 4);
+    REQUIRE(std::count_if(txs.begin(), txs.end(), [](auto const& tx) {
+                return tx.v1().tx.ext.v() == 0;
+            }) == 2);
+    REQUIRE(std::count_if(txs.begin(), txs.end(), [](auto const& tx) {
+                return tx.v1().tx.ext.v() == 1;
+            }) == 2);
+
+    ipc->shutdown();
+}
+
+TEST_CASE("Rust overlay ages transaction bans on ledger close",
+          "[overlay-ipc][mempool][.]")
+{
+    std::string overlayBinary = requireOverlayBinary();
+    TmpDir tmpDir("overlay_ipc_mempool_ban_expiry_test");
+    std::string socketPath = tmpDir.getName() + "/overlay.sock";
+    uint16_t peerPort = getTestConfig(10).PEER_PORT;
+
+    auto ipc =
+        std::make_unique<OverlayIPC>(socketPath, overlayBinary, peerPort);
+    REQUIRE(ipc->start());
+
+    auto tx = makeTxEnvelope(1'000, 1, 0xDD);
+    auto hash = xdrSha256(tx);
+    ipc->submitTransaction(tx, 1'000, 1);
+    REQUIRE(ipc->getTopTransactions(10).size() == 1);
+
+    ipc->removeTransactions({hash});
+    ipc->submitTransaction(tx, 1'000, 1);
+    REQUIRE(ipc->getTopTransactions(10).empty());
+
+    Hash ledgerHash{};
+    for (uint32_t ledger = 1; ledger <= 10; ++ledger)
+    {
+        ipc->notifyLedgerClosed(ledger, ledgerHash);
+    }
+    ipc->submitTransaction(tx, 1'000, 1);
+    REQUIRE(ipc->getTopTransactions(10).size() == 1);
+
+    ipc->shutdown();
+}

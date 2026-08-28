@@ -33,6 +33,7 @@
 #include "main/PersistentState.h"
 #include "overlay/OverlayMetrics.h"
 #include "overlay/RustOverlayManager.h"
+#include "rust/RustBridge.h"
 #include "test/Catch2.h"
 #include "test/TxTests.h"
 #include "transactions/OperationFrame.h"
@@ -40,6 +41,7 @@
 #include "transactions/TransactionBridge.h"
 #include "transactions/TransactionFrame.h"
 #include "transactions/TransactionUtils.h"
+#include "transactions/test/SorobanTxTestUtils.h"
 #include "transactions/test/TransactionTestFrame.h"
 #include "util/Decoder.h"
 #include "util/Math.h"
@@ -60,6 +62,7 @@
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <thread>
 
 using namespace stellar;
 using namespace stellar::txbridge;
@@ -588,7 +591,11 @@ testTxSetWithFeeBumps(uint32 protocolVersion)
                 TxFrameList invalidTxs;
                 auto txSet = makeTxSetFromTransactions({fb1, fb2, fb3}, *app, 0,
                                                        0, invalidTxs);
-                compareTxs(invalidTxs, {fb1, fb2, fb3});
+                // fb2 is malformed. Of the other two, keep the higher-fee
+                // affordable fb3 and defer only fb1 rather than rejecting the
+                // entire fee-source group.
+                compareTxs(invalidTxs, {fb1, fb2});
+                REQUIRE(txSet.first->sizeTxTotal() == 1);
             }
             SECTION("validate block")
             {
@@ -631,9 +638,12 @@ testTxSetWithFeeBumps(uint32 protocolVersion)
             {
                 auto txSet = makeTxSetFromTransactions({fb1, fb2}, *app, 0, 0,
                                                        invalidTxs);
-                // Both are marked invalid because their combined fees exceed
-                // account2's balance
-                compareTxs(invalidTxs, {fb1, fb2});
+                // The set builder must make progress: keep the higher-fee
+                // affordable transaction and defer only the lower-priority
+                // one. Marking both invalid leaves an empty set forever when
+                // these are stable mempool heads.
+                compareTxs(invalidTxs, {fb1});
+                REQUIRE(txSet.first->sizeTxTotal() == 1);
             }
             SECTION("validate block")
             {
@@ -707,9 +717,10 @@ testTxSetWithFeeBumps(uint32 protocolVersion)
             {
                 auto txSet = makeTxSetFromTransactions({{}, {fb1, fb2}}, *app,
                                                        0, 0, invalidPerPhase);
-                // Both are marked invalid because their combined fees exceed
-                // feeSourceAccount's balance
-                compareTxs(invalidPerPhase[1], {fb1, fb2});
+                // Keep the higher-fee affordable transaction and defer only
+                // its lower-priority competitor.
+                compareTxs(invalidPerPhase[1], {fb1});
+                REQUIRE(txSet.first->sizeTxTotal() == 1);
             }
             SECTION("validate block")
             {
@@ -5932,5 +5943,977 @@ TEST_CASE("trigger timer switches anchor at protocol 28 upgrade",
     {
         auto const result = runSimulation(true);
         REQUIRE(result.postUpgrade + cadenceMargin > result.preUpgrade);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mempool -> tx set integration tests (scratchpad design-txqueue-v2.md §5).
+//
+// Every node below is a validator backed by a real `stellar-overlay` process
+// and the simulation runs in REAL TIME with 1 s ledgers
+// (ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING). Rules these tests follow:
+//  * ledger state is only read through CheckValidLedgerViewWrapper (the apply
+//    thread owns the LedgerTxn root of a live node);
+//  * cross-node properties are waited for with a bounded crank, never asserted
+//    instantaneously;
+//  * what was proposed/externalized is read from the externalized tx set of
+//    each closed ledger (Herder::getTxSet(lcl.scpValue.txSetHash)).
+// ---------------------------------------------------------------------------
+namespace
+{
+// Externalized tx set of one closed ledger (both phases flattened).
+struct ClosedLedgerTxs
+{
+    uint32_t seq{0};
+    uint64_t closeTime{0};
+    TxFrameList txs;
+};
+
+// Records the externalized tx set of every ledger a node closes. `poll()` has
+// to run after every crank so that no 1 s ledger is skipped.
+class ExternalizedTxSetObserver
+{
+    Application& mApp;
+    uint32_t mLastSeen;
+    std::vector<ClosedLedgerTxs> mLedgers;
+
+  public:
+    explicit ExternalizedTxSetObserver(Application& app)
+        : mApp(app)
+        , mLastSeen(app.getLedgerManager().getLastClosedLedgerNum())
+    {
+    }
+
+    // Returns true iff a new ledger was recorded.
+    bool
+    poll()
+    {
+        auto const& lcl = mApp.getLedgerManager().getLastClosedLedgerHeader();
+        auto seq = lcl.header.ledgerSeq;
+        if (seq == mLastSeen)
+        {
+            return false;
+        }
+        if (seq != mLastSeen + 1)
+        {
+            throw std::runtime_error(
+                fmt::format("tx set observer skipped ledgers {} -> {}",
+                            mLastSeen, seq));
+        }
+        mLastSeen = seq;
+        ClosedLedgerTxs entry;
+        entry.seq = seq;
+        entry.closeTime = lcl.header.scpValue.closeTime;
+        auto res = mApp.getHerder().getTxSet(lcl.header.scpValue.txSetHash);
+        auto txSet = std::get_if<TxSetXDRFrameConstPtr>(&res);
+        if (txSet && *txSet)
+        {
+            for (auto const& phase :
+                 (*txSet)->createTransactionFrames(mApp.getNetworkID()))
+            {
+                entry.txs.insert(entry.txs.end(), phase.begin(), phase.end());
+            }
+        }
+        mLedgers.push_back(std::move(entry));
+        return true;
+    }
+
+    std::vector<ClosedLedgerTxs> const&
+    ledgers() const
+    {
+        return mLedgers;
+    }
+
+    // Ledger in which `fullHash` was externalized, 0 if not (yet).
+    uint32_t
+    ledgerOf(Hash const& fullHash) const
+    {
+        for (auto const& l : mLedgers)
+        {
+            for (auto const& tx : l.txs)
+            {
+                if (tx->getFullHash() == fullHash)
+                {
+                    return l.seq;
+                }
+            }
+        }
+        return 0;
+    }
+
+    size_t
+    countExternalized(std::vector<Hash> const& hashes) const
+    {
+        return std::count_if(hashes.begin(), hashes.end(),
+                             [&](Hash const& h) { return ledgerOf(h) != 0; });
+    }
+};
+
+// Design §0.1 / master I18: a tx set never contains two txs from the same
+// source account, in any phase.
+void
+requireOneTxPerSourceAccount(ClosedLedgerTxs const& ledger)
+{
+    UnorderedSet<AccountID> sources;
+    for (auto const& tx : ledger.txs)
+    {
+        INFO(fmt::format("ledger {} has two txs from {}", ledger.seq,
+                         KeyUtils::toShortString(tx->getSourceID())));
+        REQUIRE(sources.insert(tx->getSourceID()).second);
+    }
+}
+
+size_t
+countIn(ClosedLedgerTxs const& ledger, std::vector<Hash> const& hashes)
+{
+    return std::count_if(ledger.txs.begin(), ledger.txs.end(),
+                         [&](TransactionFrameBasePtr const& tx) {
+                             return std::find(hashes.begin(), hashes.end(),
+                                              tx->getFullHash()) !=
+                                    hashes.end();
+                         });
+}
+
+// Simulation::crankUntil evaluates its predicate only once per second, which
+// can skip whole 1 s ledgers; this re-evaluates after every crank so that
+// per-ledger observers see every closed ledger. Throws on timeout.
+void
+crankUntilEveryTick(Simulation& sim, std::function<bool()> const& done,
+                    std::chrono::milliseconds timeout)
+{
+    auto const deadline = std::chrono::steady_clock::now() + timeout;
+    while (!done())
+    {
+        if (std::chrono::steady_clock::now() > deadline)
+        {
+            throw std::runtime_error(
+                "mempool simulation timed out waiting for condition");
+        }
+        if (sim.crankAllNodes() == 0)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+}
+
+struct MempoolSim
+{
+    Simulation::pointer sim;
+    std::vector<Application::pointer> nodes;
+    std::chrono::milliseconds ledgerTime;
+
+    std::chrono::milliseconds
+    ledgers(int n) const
+    {
+        return n * ledgerTime;
+    }
+
+    bool
+    allNodesAtLeast(uint32_t seq) const
+    {
+        return std::all_of(nodes.begin(), nodes.end(),
+                           [&](Application::pointer const& n) {
+                               return n->getLedgerManager()
+                                          .getLastClosedLedgerNum() >= seq;
+                           });
+    }
+};
+
+// Three validators (threshold 3), full mesh on instance-derived ports, 1 s
+// ledgers. Returns once every node has closed ledger 3, i.e. the protocol and
+// TESTING_UPGRADE_* upgrades (applied at ledger 2) are in effect everywhere.
+MempoolSim
+makeMempoolSim(std::function<void(Config&)> tweak)
+{
+    auto networkID = sha256(getTestConfig().NETWORK_PASSPHRASE);
+    auto sim = Topologies::core(3, 1, networkID, [tweak](int i) {
+        auto cfg = getTestConfig(i, Config::TESTDB_DEFAULT);
+        cfg.ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING = true;
+        tweak(cfg);
+        return cfg;
+    });
+    sim->startAllNodes();
+    MempoolSim res{sim, sim->getNodes(), sim->getExpectedLedgerCloseTime()};
+    sim->crankUntil([&]() { return res.allNodesAtLeast(3); }, res.ledgers(30),
+                    false);
+    return res;
+}
+
+SequenceNumber
+ledgerSeqNumOf(Application& app, PublicKey const& pk)
+{
+    CheckValidLedgerViewWrapper ledgerView(app);
+    auto acc = ledgerView.getAccount(pk);
+    REQUIRE(acc);
+    return acc.current().data.account().seqNum;
+}
+
+bool
+accountExistsOn(Application& app, PublicKey const& pk)
+{
+    CheckValidLedgerViewWrapper ledgerView(app);
+    return static_cast<bool>(ledgerView.getAccount(pk));
+}
+
+// Full hashes of the transactions the node's Rust mempool currently offers to
+// nomination (one head per account, both phases). Synchronous IPC round trip:
+// only call from the test thread between cranks.
+std::vector<Hash>
+mempoolHeads(Application& app)
+{
+    std::vector<Hash> res;
+    for (auto const& env : app.getOverlayManager().getTopTransactions(100))
+    {
+        res.push_back(
+            TransactionFrameBase::makeTransactionFromWire(app.getNetworkID(),
+                                                          env)
+                ->getFullHash());
+    }
+    return res;
+}
+
+bool
+containsHash(std::vector<Hash> const& hashes, Hash const& h)
+{
+    return std::find(hashes.begin(), hashes.end(), h) != hashes.end();
+}
+
+TxSubmitStatus
+submitTx(Application& app, TransactionFrameBasePtr tx)
+{
+    return app.getHerder().recvTransaction(tx, /*submittedFromSelf*/ true);
+}
+
+// Valid Soroban wasm-upload tx from `source` with the given inclusion fee; the
+// declared resource fee is the computed one plus DEFAULT_TEST_RESOURCE_FEE
+// plus `extraResourceFee` (refundable, but it inflates the *full* fee).
+TransactionTestFramePtr
+makeUploadWasmTx(Application& app, TestAccount& source, uint32_t inclusionFee,
+                 int64_t extraResourceFee)
+{
+    auto wasm = rust_bridge::get_test_wasm_add_i32();
+    Operation op;
+    op.body.type(INVOKE_HOST_FUNCTION);
+    auto& hf = op.body.invokeHostFunctionOp().hostFunction;
+    hf.type(HOST_FUNCTION_TYPE_UPLOAD_CONTRACT_WASM);
+    hf.wasm().assign(wasm.data.begin(), wasm.data.end());
+    auto ledgerVersion =
+        app.getLedgerManager().getLastClosedLedgerHeader().header.ledgerVersion;
+    auto resources =
+        defaultUploadWasmResourcesWithoutFootprint(wasm, ledgerVersion);
+    resources.footprint.readWrite = {contractCodeKey(sha256(hf.wasm()))};
+    int64_t resourceFee =
+        sorobanResourceFee(app, resources, 1000 + wasm.data.size(), 40) +
+        DEFAULT_TEST_RESOURCE_FEE + extraResourceFee;
+    return sorobanTransactionFrameFromOps(app.getNetworkID(), source, {op}, {},
+                                          resources, inclusionFee,
+                                          resourceFee);
+}
+} // namespace
+
+TEST_CASE("tx set has one tx per account with chained submissions",
+          "[herder][mempool]")
+{
+    // Invariant (design §0.1-§0.3, §5.1): when several accounts each submit a
+    // chain of seq+1..seq+k txs at once, every externalized set contains at
+    // most one tx per account, the sets stay as full as the number of
+    // accounts allows (k full sets), the chained txs wait in the mempool
+    // instead of being dropped, and all of them apply.
+    constexpr uint32_t kAccounts = 5;
+    constexpr uint32_t kChain = 4;
+
+    auto ms = makeMempoolSim(
+        [](Config& cfg) { cfg.GENESIS_TEST_ACCOUNT_COUNT = kAccounts; });
+    auto& node0 = *ms.nodes[0];
+    auto rootPk = txtest::getRoot(node0.getNetworkID()).getPublicKey();
+
+    std::vector<TestAccount> accounts;
+    std::vector<SequenceNumber> startSeq;
+    std::vector<Hash> submitted;
+    for (uint32_t i = 0; i < kAccounts; ++i)
+    {
+        accounts.emplace_back(getGenesisAccount(node0, i));
+        startSeq.push_back(accounts.back().getLastSequenceNumber());
+    }
+    for (uint32_t i = 0; i < kAccounts; ++i)
+    {
+        for (uint32_t k = 0; k < kChain; ++k)
+        {
+            auto tx = accounts[i].tx({payment(rootPk, 1)});
+            REQUIRE(submitTx(node0, tx) == TxSubmitStatus::TX_STATUS_PENDING);
+            submitted.push_back(tx->getFullHash());
+        }
+    }
+
+    ExternalizedTxSetObserver observer(node0);
+    crankUntilEveryTick(
+        *ms.sim,
+        [&]() {
+            observer.poll();
+            return observer.countExternalized(submitted) == submitted.size();
+        },
+        ms.ledgers(kChain + 12));
+
+    size_t ledgersWithOurs = 0;
+    size_t fullSets = 0;
+    for (auto const& ledger : observer.ledgers())
+    {
+        requireOneTxPerSourceAccount(ledger);
+        auto n = countIn(ledger, submitted);
+        if (n == 0)
+        {
+            continue;
+        }
+        ++ledgersWithOurs;
+        if (n == kAccounts)
+        {
+            ++fullSets;
+        }
+    }
+    // kAccounts*kChain txs at <= 1 per account per ledger need kChain
+    // ledgers; allow one more in case the first nomination raced the
+    // submissions. At least kChain-1 of them must have been full.
+    INFO(fmt::format("{} ledgers carried the chains, {} were full",
+                     ledgersWithOurs, fullSets));
+    REQUIRE(ledgersWithOurs <= kChain + 1);
+    REQUIRE(fullSets >= kChain - 1);
+
+    // Every chain fully applied on every node (nothing was removed).
+    ms.sim->crankUntil(
+        [&]() {
+            for (auto const& node : ms.nodes)
+            {
+                for (uint32_t i = 0; i < kAccounts; ++i)
+                {
+                    if (ledgerSeqNumOf(*node, accounts[i].getPublicKey()) !=
+                        startSeq[i] + kChain)
+                    {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        },
+        ms.ledgers(5), false);
+
+    // Nothing left behind in the mempool.
+    auto heads = mempoolHeads(node0);
+    for (auto const& h : submitted)
+    {
+        REQUIRE(!containsHash(heads, h));
+    }
+}
+
+TEST_CASE("one account cannot crowd out others", "[herder][mempool]")
+{
+    // Invariant (design §0.3, §2.2 heads, §5.2): the mempool offers nomination
+    // one head per account, so an account with a long chain of high-fee txs
+    // (longer than the 2*maxOps candidate window) cannot crowd the others out:
+    // every set is full with distinct accounts until the others drain, the
+    // crowding account still gets exactly one tx per ledger, and everything
+    // applies.
+    constexpr uint32_t kMaxOps = 3; // TESTING_UPGRADE_MAX_TX_SET_SIZE
+    // > 2*kMaxOps (candidate window) and == the mempool per-account chain cap
+    // (design §2.2 max_txs_per_account = 8).
+    constexpr uint32_t kChain = 8;
+    constexpr uint32_t kOthers = 10;
+    constexpr uint32_t kCrowdFee = 10'000;
+
+    auto ms = makeMempoolSim([](Config& cfg) {
+        cfg.TESTING_UPGRADE_MAX_TX_SET_SIZE = kMaxOps;
+        cfg.GENESIS_TEST_ACCOUNT_COUNT = kOthers + 1;
+    });
+    auto& node0 = *ms.nodes[0];
+    auto rootPk = txtest::getRoot(node0.getNetworkID()).getPublicKey();
+    ms.sim->crankUntil(
+        [&]() {
+            return std::all_of(ms.nodes.begin(), ms.nodes.end(),
+                               [&](Application::pointer const& n) {
+                                   return n->getLedgerManager()
+                                              .getLastMaxTxSetSizeOps() ==
+                                          kMaxOps;
+                               });
+        },
+        ms.ledgers(10), false);
+
+    auto crowd = getGenesisAccount(node0, 0);
+    auto crowdStart = crowd.getLastSequenceNumber();
+    std::vector<TestAccount> others;
+    std::vector<SequenceNumber> othersStart;
+    for (uint32_t i = 1; i <= kOthers; ++i)
+    {
+        others.emplace_back(getGenesisAccount(node0, i));
+        othersStart.push_back(others.back().getLastSequenceNumber());
+    }
+
+    std::vector<Hash> crowdTxs;
+    std::vector<Hash> otherTxs;
+    for (uint32_t k = 0; k < kChain; ++k)
+    {
+        auto tx = transactionFromOperations(node0, crowd.getSecretKey(),
+                                            crowd.nextSequenceNumber(),
+                                            {payment(rootPk, 1)}, kCrowdFee);
+        REQUIRE(submitTx(node0, tx) == TxSubmitStatus::TX_STATUS_PENDING);
+        crowdTxs.push_back(tx->getFullHash());
+    }
+    for (auto& acc : others)
+    {
+        auto tx = acc.tx({payment(rootPk, 1)}); // base fee
+        REQUIRE(submitTx(node0, tx) == TxSubmitStatus::TX_STATUS_PENDING);
+        otherTxs.push_back(tx->getFullHash());
+    }
+
+    ExternalizedTxSetObserver observer(node0);
+    crankUntilEveryTick(
+        *ms.sim,
+        [&]() {
+            observer.poll();
+            return observer.countExternalized(crowdTxs) == kChain &&
+                   observer.countExternalized(otherTxs) == kOthers;
+        },
+        ms.ledgers(kChain + 12));
+
+    size_t crowdApplied = 0;
+    size_t othersApplied = 0;
+    size_t ledgersWithOurs = 0;
+    for (auto const& ledger : observer.ledgers())
+    {
+        requireOneTxPerSourceAccount(ledger);
+        REQUIRE(ledger.txs.size() <= kMaxOps);
+        auto nCrowd = countIn(ledger, crowdTxs);
+        auto nOthers = countIn(ledger, otherTxs);
+        if (nCrowd + nOthers == 0)
+        {
+            continue;
+        }
+        // The first set may have been nominated while the submissions were
+        // still flooding; from then on every set must be as full as the
+        // number of accounts with a pending head allows, and the crowding
+        // account (highest fee) must be in it exactly once while it has
+        // pending txs.
+        if (ledgersWithOurs > 0)
+        {
+            size_t pendingAccounts =
+                (crowdApplied < kChain ? 1 : 0) + (kOthers - othersApplied);
+            INFO(fmt::format("ledger {}: {} crowd + {} others, {} accounts "
+                             "pending",
+                             ledger.seq, nCrowd, nOthers, pendingAccounts));
+            REQUIRE(nCrowd == (crowdApplied < kChain ? 1 : 0));
+            REQUIRE(nCrowd + nOthers ==
+                    std::min<size_t>(kMaxOps, pendingAccounts));
+        }
+        ++ledgersWithOurs;
+        crowdApplied += nCrowd;
+        othersApplied += nOthers;
+    }
+    REQUIRE(crowdApplied == kChain);
+    REQUIRE(othersApplied == kOthers);
+    REQUIRE(ledgersWithOurs <= kChain + 1);
+
+    ms.sim->crankUntil(
+        [&]() {
+            for (auto const& node : ms.nodes)
+            {
+                if (ledgerSeqNumOf(*node, crowd.getPublicKey()) !=
+                    crowdStart + kChain)
+                {
+                    return false;
+                }
+                for (size_t i = 0; i < others.size(); ++i)
+                {
+                    if (ledgerSeqNumOf(*node, others[i].getPublicKey()) !=
+                        othersStart[i] + 1)
+                    {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        },
+        ms.ledgers(5), false);
+}
+
+TEST_CASE("transient high fee heads do not leave a tx set underfilled",
+          "[herder][mempool]")
+{
+    // The initial nomination window is deliberately smaller than the six
+    // high-fee future-sequence heads whose predecessors are absent. They are
+    // valid mempool residents and must not be dropped, but nomination still
+    // has to look past them and fill the ledger with the two lower-fee heads
+    // that are valid now.
+    constexpr uint32_t kMaxOps = 2;
+    constexpr uint32_t kBlocked = 6;
+    constexpr uint32_t kReady = 2;
+
+    auto ms = makeMempoolSim([](Config& cfg) {
+        cfg.TESTING_UPGRADE_MAX_TX_SET_SIZE = kMaxOps;
+        cfg.GENESIS_TEST_ACCOUNT_COUNT = kBlocked + kReady;
+        cfg.TESTING_SOROBAN_HIGH_LIMIT_OVERRIDE = true;
+    });
+    auto& node0 = *ms.nodes[0];
+    upgradeSorobanNetworkConfig(
+        [](SorobanNetworkConfig& cfg) { cfg.mLedgerMaxTxCount = 1; }, ms.sim);
+
+    auto rootPk = txtest::getRoot(node0.getNetworkID()).getPublicKey();
+    auto const startLedger =
+        node0.getLedgerManager().getLastClosedLedgerNum();
+    std::vector<Hash> blocked;
+    std::vector<Hash> ready;
+    for (uint32_t i = 0; i < kBlocked + kReady; ++i)
+    {
+        auto account = getGenesisAccount(node0, i);
+        if (i < kBlocked)
+        {
+            auto const futureSeq = account.nextSequenceNumber() + 1;
+            auto tx = transactionFromOperations(
+                node0, account.getSecretKey(), futureSeq,
+                {payment(rootPk, 1)}, 200);
+            REQUIRE(submitTx(node0, tx) == TxSubmitStatus::TX_STATUS_PENDING);
+            blocked.push_back(tx->getFullHash());
+        }
+        else
+        {
+            auto tx = transactionFromOperations(
+                node0, account.getSecretKey(), account.nextSequenceNumber(),
+                {payment(rootPk, 1)}, 100);
+            REQUIRE(submitTx(node0, tx) == TxSubmitStatus::TX_STATUS_PENDING);
+            ready.push_back(tx->getFullHash());
+        }
+    }
+
+    // SUBMIT_TX and GET_TOP_TXS share the ordered IPC stream, so this also
+    // establishes that every submission has reached node0's mempool before
+    // we start observing the next nomination.
+    REQUIRE(mempoolHeads(node0).size() == kBlocked + kReady);
+
+    ExternalizedTxSetObserver observer(node0);
+    crankUntilEveryTick(
+        *ms.sim,
+        [&]() {
+            observer.poll();
+            return node0.getLedgerManager().getLastClosedLedgerNum() >
+                   startLedger;
+        },
+        ms.ledgers(5));
+
+    auto const& first = observer.ledgers().front();
+    requireOneTxPerSourceAccount(first);
+    REQUIRE(countIn(first, ready) == kReady);
+    REQUIRE(countIn(first, blocked) == 0);
+    // Future-sequence transactions are deferred, not discarded to make room.
+    auto heads = mempoolHeads(node0);
+    for (auto const& hash : blocked)
+    {
+        REQUIRE(containsHash(heads, hash));
+    }
+}
+
+TEST_CASE("classic and soroban from the same account", "[herder][mempool]")
+{
+    // Invariant (design §0.1, §2.2 cross-phase heads, §4.1, §5.3): an account
+    // with a classic and a soroban tx pending at consecutive seqnums yields
+    // exactly one tx per set across BOTH phases (a per-phase selection would
+    // make nomination throw MULTIPLE_TXS_PER_SOURCE_ACCOUNT or remove the
+    // second tx as txBAD_SEQ), the waiting tx is kept, and both apply in
+    // (nearly) consecutive ledgers in either order.
+    auto ms = makeMempoolSim([](Config& cfg) {
+        cfg.GENESIS_TEST_ACCOUNT_COUNT = 2;
+        cfg.TESTING_SOROBAN_HIGH_LIMIT_OVERRIDE = true;
+    });
+    auto& node0 = *ms.nodes[0];
+    auto rootPk = txtest::getRoot(node0.getNetworkID()).getPublicKey();
+    REQUIRE(protocolVersionStartsFrom(node0.getLedgerManager()
+                                          .getLastClosedLedgerHeader()
+                                          .header.ledgerVersion,
+                                      SOROBAN_PROTOCOL_VERSION));
+
+    auto a = getGenesisAccount(node0, 0);
+    auto b = getGenesisAccount(node0, 1);
+    auto aStart = a.getLastSequenceNumber();
+    auto bStart = b.getLastSequenceNumber();
+
+    // A: classic (n+1) then soroban (n+2); B: soroban (m+1) then classic (m+2)
+    auto aClassic = a.tx({payment(rootPk, 1)});
+    auto aSoroban = makeUploadWasmTx(node0, a, 100, 0);
+    auto bSoroban = makeUploadWasmTx(node0, b, 100, 0);
+    auto bClassic = b.tx({payment(rootPk, 1)});
+    REQUIRE(aClassic->getSeqNum() == aStart + 1);
+    REQUIRE(aSoroban->getSeqNum() == aStart + 2);
+    REQUIRE(aSoroban->isSoroban());
+    REQUIRE(bSoroban->getSeqNum() == bStart + 1);
+    REQUIRE(bClassic->getSeqNum() == bStart + 2);
+
+    // Submit the *second* tx of each chain first: arrival order must not
+    // matter.
+    for (auto const& tx : {aSoroban, aClassic, bClassic, bSoroban})
+    {
+        REQUIRE(submitTx(node0, tx) == TxSubmitStatus::TX_STATUS_PENDING);
+    }
+    std::vector<Hash> all = {aClassic->getFullHash(), aSoroban->getFullHash(),
+                             bSoroban->getFullHash(),
+                             bClassic->getFullHash()};
+
+    ExternalizedTxSetObserver observer(node0);
+    crankUntilEveryTick(
+        *ms.sim,
+        [&]() {
+            observer.poll();
+            return observer.countExternalized(all) == all.size();
+        },
+        ms.ledgers(15));
+
+    for (auto const& ledger : observer.ledgers())
+    {
+        requireOneTxPerSourceAccount(ledger);
+    }
+    auto lAClassic = observer.ledgerOf(aClassic->getFullHash());
+    auto lASoroban = observer.ledgerOf(aSoroban->getFullHash());
+    auto lBSoroban = observer.ledgerOf(bSoroban->getFullHash());
+    auto lBClassic = observer.ledgerOf(bClassic->getFullHash());
+    INFO(fmt::format("A: classic@{} soroban@{}; B: soroban@{} classic@{}",
+                     lAClassic, lASoroban, lBSoroban, lBClassic));
+    REQUIRE(lASoroban > lAClassic);
+    REQUIRE(lBClassic > lBSoroban);
+    // The head that lost is promoted as soon as the winner externalizes, so
+    // it lands in the very next ledger (one ledger of slack for flood/timing).
+    REQUIRE(lASoroban - lAClassic <= 2);
+    REQUIRE(lBClassic - lBSoroban <= 2);
+
+    ms.sim->crankUntil(
+        [&]() {
+            return std::all_of(
+                ms.nodes.begin(), ms.nodes.end(),
+                [&](Application::pointer const& n) {
+                    return ledgerSeqNumOf(*n, a.getPublicKey()) ==
+                               aStart + 2 &&
+                           ledgerSeqNumOf(*n, b.getPublicKey()) == bStart + 2;
+                });
+        },
+        ms.ledgers(5), false);
+    auto heads = mempoolHeads(node0);
+    for (auto const& h : all)
+    {
+        REQUIRE(!containsHash(heads, h));
+    }
+}
+
+TEST_CASE("invalid tx feedback and cleanup", "[herder][mempool]")
+{
+    // Invariant (design §0.2, §0.5, §4.3, §5.4):
+    //  * submission of a permanently invalid tx returns ERROR with the tx's
+    //    own result code and the tx reaches no mempool (nothing is flooded);
+    //  * a tx that is merely too early (minTime in the future) is PENDING,
+    //    survives every nomination while it is too early, and is included
+    //    once the close time passes minTime;
+    //  * a tx that becomes permanently invalid while waiting in the mempool
+    //    (chained behind an account merge -> txNO_ACCOUNT) is removed at
+    //    nomination and banned: re-submitting it is TRY_AGAIN_LATER.
+    auto ms = makeMempoolSim(
+        [](Config& cfg) { cfg.GENESIS_TEST_ACCOUNT_COUNT = 5; });
+    auto& node0 = *ms.nodes[0];
+    auto& node1 = *ms.nodes[1];
+    auto networkID = node0.getNetworkID();
+    auto rootPk = txtest::getRoot(networkID).getPublicKey();
+
+    auto a0 = getGenesisAccount(node0, 0);
+    auto a1 = getGenesisAccount(node0, 1);
+    auto a2 = getGenesisAccount(node0, 2);
+    auto a3 = getGenesisAccount(node0, 3);
+    auto a4 = getGenesisAccount(node0, 4);
+    auto a0Start = a0.getLastSequenceNumber();
+    auto a1Start = a1.getLastSequenceNumber();
+    auto a2Start = a2.getLastSequenceNumber();
+    auto a3Start = a3.getLastSequenceNumber();
+
+    // (a) stale seqnum (the account's current seqnum; genesis accounts sit at
+    // seqnum 0, which TestAccount::tx would treat as "auto-increment")
+    auto stale = transactionFromOperations(node0, a0.getSecretKey(), a0Start,
+                                           {payment(rootPk, 1)});
+    REQUIRE(submitTx(node0, stale) == TxSubmitStatus::TX_STATUS_ERROR);
+    REQUIRE(stale->getResultCode() == txBAD_SEQ);
+
+    // (b) unsigned
+    auto signedTx = a1.tx({payment(rootPk, 1)});
+    auto env = signedTx->getEnvelope();
+    env.v1().signatures.clear();
+    auto unsignedTx = TransactionTestFrame::fromTxFrame(
+        TransactionFrameBase::makeTransactionFromWire(networkID, env));
+    REQUIRE(submitTx(node0, unsignedTx) == TxSubmitStatus::TX_STATUS_ERROR);
+    REQUIRE(unsignedTx->getResultCode() == txBAD_AUTH);
+
+    // (c) inclusion fee below the base fee
+    auto cheap = transactionFromOperations(node0, a2.getSecretKey(),
+                                           a2.nextSequenceNumber(),
+                                           {payment(rootPk, 1)}, /*fee*/ 1);
+    REQUIRE(submitTx(node0, cheap) == TxSubmitStatus::TX_STATUS_ERROR);
+    REQUIRE(cheap->getResultCode() == txINSUFFICIENT_FEE);
+
+    std::vector<Hash> rejected = {stale->getFullHash(),
+                                  unsignedTx->getFullHash(),
+                                  cheap->getFullHash()};
+
+    // (d) too early: minTime a few ledgers in the future
+    auto const lclAtSubmit =
+        node0.getLedgerManager().getLastClosedLedgerHeader().header;
+    uint64_t const minTime = lclAtSubmit.scpValue.closeTime + 4;
+    PreconditionsV2 cond;
+    cond.timeBounds.activate().minTime = minTime;
+    cond.timeBounds->maxTime = 0;
+    auto early = transactionFromOperationsV1(node0, a3.getSecretKey(),
+                                             a3.nextSequenceNumber(),
+                                             {payment(rootPk, 1)}, 0, cond);
+    REQUIRE(submitTx(node0, early) == TxSubmitStatus::TX_STATUS_PENDING);
+
+    // (e) chained tx that becomes permanently invalid once its predecessor
+    // (an account merge) applies
+    auto merge = a4.tx({accountMerge(rootPk)});
+    auto orphan = a4.tx({payment(rootPk, 1)});
+    REQUIRE(orphan->getSeqNum() == merge->getSeqNum() + 1);
+    REQUIRE(submitTx(node0, merge) == TxSubmitStatus::TX_STATUS_PENDING);
+    REQUIRE(submitTx(node0, orphan) == TxSubmitStatus::TX_STATUS_PENDING);
+
+    ExternalizedTxSetObserver observer(node0);
+
+    // Phase 1: a ledger later nothing rejected has reached any mempool, while
+    // the too-early tx is still offered by the submitting node.
+    crankUntilEveryTick(
+        *ms.sim,
+        [&]() {
+            observer.poll();
+            return ms.allNodesAtLeast(lclAtSubmit.ledgerSeq + 1);
+        },
+        ms.ledgers(8));
+    for (auto const& node : ms.nodes)
+    {
+        auto heads = mempoolHeads(*node);
+        for (auto const& h : rejected)
+        {
+            REQUIRE(!containsHash(heads, h));
+        }
+    }
+    {
+        auto heads = mempoolHeads(node0);
+        REQUIRE(containsHash(heads, early->getFullHash()));
+        // node1 learned about it through flooding
+        REQUIRE(containsHash(mempoolHeads(node1), early->getFullHash()));
+    }
+
+    // Phase 2: the merge applies, the orphan becomes the account's head, is
+    // found permanently invalid (txNO_ACCOUNT) at the next nomination and is
+    // removed + banned.
+    crankUntilEveryTick(
+        *ms.sim,
+        [&]() {
+            if (!observer.poll())
+            {
+                return false;
+            }
+            return !accountExistsOn(node0, a4.getPublicKey()) &&
+                   !containsHash(mempoolHeads(node0), orphan->getFullHash());
+        },
+        ms.ledgers(10));
+    REQUIRE(observer.ledgerOf(merge->getFullHash()) != 0);
+    REQUIRE(observer.ledgerOf(orphan->getFullHash()) == 0);
+    REQUIRE(submitTx(node0, orphan) ==
+            TxSubmitStatus::TX_STATUS_TRY_AGAIN_LATER);
+
+    // Phase 3: the too-early tx is never dropped while it is too early and
+    // applies once the close time reaches minTime.
+    crankUntilEveryTick(
+        *ms.sim,
+        [&]() {
+            if (!observer.poll())
+            {
+                return false;
+            }
+            auto const& lcl =
+                node0.getLedgerManager().getLastClosedLedgerHeader().header;
+            if (lcl.scpValue.closeTime < minTime)
+            {
+                INFO(fmt::format("ledger {} closeTime {} < minTime {}",
+                                 lcl.ledgerSeq, lcl.scpValue.closeTime,
+                                 minTime));
+                REQUIRE(
+                    containsHash(mempoolHeads(node0), early->getFullHash()));
+                return false;
+            }
+            return observer.ledgerOf(early->getFullHash()) != 0;
+        },
+        ms.ledgers(15));
+    for (auto const& ledger : observer.ledgers())
+    {
+        requireOneTxPerSourceAccount(ledger);
+    }
+
+    ms.sim->crankUntil(
+        [&]() {
+            return std::all_of(
+                ms.nodes.begin(), ms.nodes.end(),
+                [&](Application::pointer const& n) {
+                    return ledgerSeqNumOf(*n, a3.getPublicKey()) ==
+                               a3Start + 1 &&
+                           !accountExistsOn(*n, a4.getPublicKey());
+                });
+        },
+        ms.ledgers(5), false);
+    // The rejected txs never applied.
+    REQUIRE(ledgerSeqNumOf(node0, a0.getPublicKey()) == a0Start);
+    REQUIRE(ledgerSeqNumOf(node0, a1.getPublicKey()) == a1Start);
+    REQUIRE(ledgerSeqNumOf(node0, a2.getPublicKey()) == a2Start);
+}
+
+TEST_CASE("fee ordering by inclusion fee", "[herder][mempool]")
+{
+    // Invariant (design §0.4, §2.1 inclusion_fee, §5.5): candidates are
+    // ordered by inclusion fee per op; a Soroban tx's declared resource fee
+    // (which dominates its full fee) buys no priority. With
+    // ledgerMaxTxCount = 1 the soroban candidate window is 2 heads, so an
+    // ordering by full fee would surface the huge-resource-fee txs first;
+    // the externalized order must instead follow the inclusion fee.
+    auto ms = makeMempoolSim([](Config& cfg) {
+        cfg.GENESIS_TEST_ACCOUNT_COUNT = 4;
+        cfg.TESTING_SOROBAN_HIGH_LIMIT_OVERRIDE = true;
+    });
+    auto& node0 = *ms.nodes[0];
+    upgradeSorobanNetworkConfig(
+        [](SorobanNetworkConfig& cfg) { cfg.mLedgerMaxTxCount = 1; }, ms.sim);
+    for (auto const& node : ms.nodes)
+    {
+        REQUIRE(node->getLedgerManager()
+                    .getLastClosedSorobanNetworkConfig()
+                    .ledgerMaxTxCount() == 1);
+    }
+
+    auto g0 = getGenesisAccount(node0, 0);
+    auto g1 = getGenesisAccount(node0, 1);
+    auto g2 = getGenesisAccount(node0, 2);
+    auto g3 = getGenesisAccount(node0, 3);
+    // Huge declared resource fee (refundable) but base inclusion fee.
+    int64_t constexpr kHugeResourceFee = 100'000'000;
+    auto x1 = makeUploadWasmTx(node0, g0, 100, kHugeResourceFee);
+    auto x2 = makeUploadWasmTx(node0, g1, 100, kHugeResourceFee);
+    auto y = makeUploadWasmTx(node0, g2, 200, 0);
+    auto z = makeUploadWasmTx(node0, g3, 300, 0);
+    REQUIRE(x1->getFullFee() > z->getFullFee());
+    REQUIRE(x1->getInclusionFee() < y->getInclusionFee());
+    REQUIRE(y->getInclusionFee() < z->getInclusionFee());
+
+    // Submit the cheap-inclusion txs first so arrival order cannot help.
+    for (auto const& tx : {x1, x2, y, z})
+    {
+        REQUIRE(submitTx(node0, tx) == TxSubmitStatus::TX_STATUS_PENDING);
+    }
+    std::vector<Hash> all = {x1->getFullHash(), x2->getFullHash(),
+                             y->getFullHash(), z->getFullHash()};
+
+    ExternalizedTxSetObserver observer(node0);
+    crankUntilEveryTick(
+        *ms.sim,
+        [&]() {
+            observer.poll();
+            return observer.countExternalized(all) == all.size();
+        },
+        ms.ledgers(15));
+
+    std::vector<Hash> order;
+    for (auto const& ledger : observer.ledgers())
+    {
+        requireOneTxPerSourceAccount(ledger);
+        for (auto const& tx : ledger.txs)
+        {
+            if (containsHash(all, tx->getFullHash()))
+            {
+                order.push_back(tx->getFullHash());
+            }
+        }
+    }
+    REQUIRE(order.size() == 4);
+    REQUIRE(order[0] == z->getFullHash());
+    REQUIRE(order[1] == y->getFullHash());
+    REQUIRE(observer.ledgerOf(z->getFullHash()) <
+            observer.ledgerOf(y->getFullHash()));
+    REQUIRE(observer.ledgerOf(y->getFullHash()) <
+            observer.ledgerOf(x1->getFullHash()));
+    REQUIRE(observer.ledgerOf(y->getFullHash()) <
+            observer.ledgerOf(x2->getFullHash()));
+}
+
+TEST_CASE("chained same-account txs apply in order and applied txs are banned",
+          "[herder][mempool]")
+{
+    // Port of master "tx queue source account limit" (HerderTests.cpp:3846 @
+    // 100cc3816c; spec-master-txqueue.md I1/I2/I11) to the mempool design:
+    //  * the second tx of an account is no longer refused at submission
+    //    (master: TRY_AGAIN_LATER) but PENDING; it waits in the mempool and
+    //    applies right after the first one (design §0.2);
+    //  * externalized txs are removed and banned (design §1
+    //    TX_SET_EXTERNALIZED, §4.3 ban ring): re-submitting an applied tx on
+    //    any node is TRY_AGAIN_LATER (not ERROR/txBAD_SEQ) and it does not
+    //    re-enter the mempool.
+    auto ms = makeMempoolSim([](Config&) {});
+    auto& node0 = *ms.nodes[0];
+    auto root = TestAccount{node0, txtest::getRoot(node0.getNetworkID())};
+    auto const minBalance2 = node0.getLedgerManager().getLastMinBalance(2);
+    auto a1 = getAccount("mempool-account-A");
+    auto b1 = getAccount("mempool-account-B");
+
+    auto tx1 = root.tx({createAccount(a1.getPublicKey(), minBalance2)});
+    auto tx2 = root.tx({createAccount(b1.getPublicKey(), minBalance2)});
+    REQUIRE(tx2->getSeqNum() == tx1->getSeqNum() + 1);
+    REQUIRE(submitTx(node0, tx1) == TxSubmitStatus::TX_STATUS_PENDING);
+    REQUIRE(submitTx(node0, tx2) == TxSubmitStatus::TX_STATUS_PENDING);
+    std::vector<Hash> both = {tx1->getFullHash(), tx2->getFullHash()};
+
+    ExternalizedTxSetObserver observer(node0);
+    crankUntilEveryTick(
+        *ms.sim,
+        [&]() {
+            observer.poll();
+            return observer.countExternalized(both) == both.size();
+        },
+        ms.ledgers(10));
+    for (auto const& ledger : observer.ledgers())
+    {
+        requireOneTxPerSourceAccount(ledger);
+    }
+    auto l1 = observer.ledgerOf(tx1->getFullHash());
+    auto l2 = observer.ledgerOf(tx2->getFullHash());
+    INFO(fmt::format("tx1 externalized in {}, tx2 in {}", l1, l2));
+    REQUIRE(l2 > l1);
+    REQUIRE(l2 - l1 <= 2);
+
+    ms.sim->crankUntil(
+        [&]() {
+            return std::all_of(ms.nodes.begin(), ms.nodes.end(),
+                               [&](Application::pointer const& n) {
+                                   return accountExistsOn(
+                                              *n, a1.getPublicKey()) &&
+                                          accountExistsOn(*n,
+                                                          b1.getPublicKey());
+                               });
+        },
+        ms.ledgers(5), false);
+
+    for (auto const& node : ms.nodes)
+    {
+        REQUIRE(submitTx(*node, tx1) ==
+                TxSubmitStatus::TX_STATUS_TRY_AGAIN_LATER);
+        REQUIRE(submitTx(*node, tx2) ==
+                TxSubmitStatus::TX_STATUS_TRY_AGAIN_LATER);
+    }
+    // Give a wrongly accepted re-submission time to flood, then make sure
+    // nothing came back.
+    auto const postResubmitLedger =
+        node0.getLedgerManager().getLastClosedLedgerNum() + 1;
+    ms.sim->crankUntil(
+        [&]() { return ms.allNodesAtLeast(postResubmitLedger); },
+        ms.ledgers(5), false);
+    for (auto const& node : ms.nodes)
+    {
+        auto heads = mempoolHeads(*node);
+        for (auto const& h : both)
+        {
+            REQUIRE(!containsHash(heads, h));
+        }
     }
 }

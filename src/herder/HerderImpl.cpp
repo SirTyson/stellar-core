@@ -53,6 +53,7 @@
 #include "util/GlobalChecks.h"
 #include <algorithm>
 #include <ctime>
+#include <limits>
 #include <fmt/format.h>
 #include <unistd.h>
 
@@ -88,6 +89,19 @@ HerderImpl::SCPMetrics::SCPMetrics(Application& app)
 {
 }
 
+HerderImpl::MempoolMetrics::MempoolMetrics(Application& app)
+    : mCandidates(
+          app.getMetrics().NewCounter({"herder", "mempool", "candidates"}))
+    , mSelected(app.getMetrics().NewCounter({"herder", "mempool", "selected"}))
+    , mStaleRemoved(
+          app.getMetrics().NewCounter({"herder", "mempool", "stale-removed"}))
+    , mInvalidRemoved(app.getMetrics().NewCounter(
+          {"herder", "mempool", "invalid-removed"}))
+    , mTransientKept(
+          app.getMetrics().NewCounter({"herder", "mempool", "transient-kept"}))
+{
+}
+
 HerderImpl::HerderImpl(Application& app)
     : mPendingEnvelopes(app, *this)
     , mHerderSCPDriver(app, *this, mUpgrades, mPendingEnvelopes)
@@ -104,6 +118,8 @@ HerderImpl::HerderImpl(Application& app)
     , mLastQuorumMapIntersectionState(
           std::make_shared<QuorumMapIntersectionState>(app))
     , mState(Herder::HERDER_BOOTING_STATE)
+    , mBannedTxs(TX_BAN_LEDGERS)
+    , mMempoolMetrics(app)
 {
     auto ln = getSCP().getLocalNode();
 
@@ -358,6 +374,8 @@ HerderImpl::processExternalized(uint64 slotIndex, StellarValue const& value,
 #endif
     }
     mApp.getOverlayManager().notifyTxSetExternalized(value.txSetHash, txHashes);
+    // Applied txs are stale from now on; refuse re-submissions for a while.
+    banTxs(txHashes);
 
     {
         ZoneNamedN(updateSCPHistoryZone, "update SCP history", true);
@@ -658,6 +676,24 @@ HerderImpl::recvTransaction(TransactionFrameBasePtr tx, bool submittedFromSelf,
 #endif
 )
 {
+    return recvTransactionWithResult(tx, submittedFromSelf, force
+#ifdef BUILD_TESTS
+                                     ,
+                                     isLoadgenTx
+#endif
+                                     )
+        .first;
+}
+
+std::pair<TxSubmitStatus, MutableTxResultPtr>
+HerderImpl::recvTransactionWithResult(TransactionFrameBasePtr tx,
+                                      bool submittedFromSelf, bool force
+#ifdef BUILD_TESTS
+                                      ,
+                                      bool isLoadgenTx
+#endif
+)
+{
     ZoneScoped;
 #ifdef BUILD_TESTS
     if (submittedFromSelf)
@@ -665,14 +701,177 @@ HerderImpl::recvTransaction(TransactionFrameBasePtr tx, bool submittedFromSelf,
         mLedgerManager.recordTxSubmission(tx->getContentsHash());
     }
 #endif
-    CLOG_TRACE(Herder, "recv transaction {} for {}",
-               hexAbbrev(tx->getFullHash()),
+    auto const& hash = tx->getFullHash();
+    auto reject = [&](TransactionResultCode code) {
+        CLOG_DEBUG(Herder, "recv transaction {} for {} rejected: {}",
+                   hexAbbrev(hash), KeyUtils::toShortString(tx->getSourceID()),
+                   static_cast<int32_t>(code));
+        return std::make_pair(TxSubmitStatus::TX_STATUS_ERROR,
+                              tx->createTxErrorResult(code));
+    };
+
+    // Recently applied or dropped as invalid: don't let it back in for a
+    // while.
+    if (isBannedTx(hash))
+    {
+        CLOG_DEBUG(Herder, "recv transaction {} for {}: banned",
+                   hexAbbrev(hash),
+                   KeyUtils::toShortString(tx->getSourceID()));
+        return {TxSubmitStatus::TX_STATUS_TRY_AGAIN_LATER, nullptr};
+    }
+
+    auto const& lcl = mLedgerManager.getLastClosedLedgerHeader().header;
+    if (tx->isSoroban() &&
+        protocolVersionIsBefore(lcl.ledgerVersion, SOROBAN_PROTOCOL_VERSION))
+    {
+        return reject(txNOT_SUPPORTED);
+    }
+    // Reject malformed fees before doing any fee arithmetic.
+    if (!tx->XDRProvidesValidFee())
+    {
+        return reject(txMALFORMED);
+    }
+
+    MutableTxResultPtr result;
+    bool validate = true;
+#ifdef BUILD_TESTS
+    // Pre-generated loadgen txs were produced by this node against synthetic
+    // state; they skip validation (as they did in TransactionQueue).
+    validate = !isLoadgenTx;
+#endif
+    if (validate)
+    {
+        // Validate against the last closed ledger, the way a peer receiving
+        // this tx would. The mempool does no stateful validation, so this is
+        // what keeps invalid txs from being flooded.
+        CheckValidLedgerViewWrapper ledgerView(mApp);
+#ifdef BUILD_TESTS
+        // See TxSetUtils::getInvalidTxListWithErrors for the
+        // overlay-only-mode rationale.
+        ledgerView.mSkipSeqNumCheck = mApp.getRunInOverlayOnlyMode();
+#endif
+        std::optional<uint32_t> validationLedgerSeq;
+        if (protocolVersionStartsFrom(lcl.ledgerVersion,
+                                      ProtocolVersion::V_19))
+        {
+            validationLedgerSeq = lcl.ledgerSeq + 1;
+        }
+        auto const upperBoundCloseTimeOffset =
+            getUpperBoundCloseTimeOffset(mApp, lcl.scpValue.closeTime);
+        // The queue deliberately retains up to MAX_PENDING_SEQ_GAP future
+        // ledgers for an account. Give time bounds the same bounded admission
+        // horizon so a near-future tx can wait for a subsequent ledger rather
+        // than being rejected at the door. Close times have one-second
+        // granularity, so accelerated tests (whose expected close duration is
+        // sub-second) still need at least one timestamp second per ledger.
+        auto const oneSecond = std::chrono::milliseconds{1000};
+        auto const pendingTimeHorizon =
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::max(oneSecond,
+                         mLedgerManager.getExpectedLedgerCloseTime()) *
+                MAX_PENDING_SEQ_GAP)
+                .count();
+        auto diagnostics = DiagnosticEventManager::createDisabled();
+        result = tx->checkValidForOverlay(mApp.getAppConnector(), ledgerView,
+                                          0, 0, upperBoundCloseTimeOffset,
+                                          diagnostics, validationLedgerSeq);
+        if (!result->isSuccess() &&
+            result->getInnermostResultCode() == txTOO_EARLY)
+        {
+            // The ordinary overlay check requires validity throughout its
+            // close-time uncertainty window. For queueing, accept a tx whose
+            // time bounds overlap our bounded pending horizon: test minTime
+            // at the far edge and maxTime at the current edge, while still
+            // running every other admission check.
+            result = tx->checkValidForOverlay(
+                mApp.getAppConnector(), ledgerView, 0,
+                static_cast<uint64_t>(pendingTimeHorizon), 0, diagnostics,
+                validationLedgerSeq);
+        }
+        if (!result->isSuccess() &&
+            result->getInnermostResultCode() == txBAD_SEQ)
+        {
+            // The mempool keeps a short chain of txs per account, so a tx
+            // with a future sequence number is acceptable as long as the gap
+            // is small: it will be nominated once its predecessors apply.
+            auto acc = ledgerView.getAccount(tx->getSourceID());
+            if (acc)
+            {
+                auto const accountSeq = acc.current().data.account().seqNum;
+                auto const txSeq = tx->getSeqNum();
+                if (accountSeq < std::numeric_limits<SequenceNumber>::max() &&
+                    txSeq > accountSeq + 1)
+                {
+                    if (txSeq - accountSeq - 1 > MAX_PENDING_SEQ_GAP)
+                    {
+                        CLOG_DEBUG(Herder,
+                                   "recv transaction {} for {}: seq {} too "
+                                   "far ahead of account seq {}",
+                                   hexAbbrev(hash),
+                                   KeyUtils::toShortString(tx->getSourceID()),
+                                   txSeq, accountSeq);
+                        return {TxSubmitStatus::TX_STATUS_TRY_AGAIN_LATER,
+                                nullptr};
+                    }
+                    // Validate everything else (signatures, fee, balance,
+                    // bounds) as if the predecessor had already applied.
+                    result = tx->checkValidForOverlay(
+                        mApp.getAppConnector(), ledgerView, txSeq - 1, 0,
+                        upperBoundCloseTimeOffset, diagnostics,
+                        validationLedgerSeq);
+                    if (!result->isSuccess() &&
+                        result->getInnermostResultCode() ==
+                            txBAD_MIN_SEQ_AGE_OR_GAP)
+                    {
+                        // Age/gap preconditions are relative to the ledger
+                        // in which the predecessor applies, which is not
+                        // known yet; let the tx wait in the mempool.
+                        result = tx->createValidationSuccessResult();
+                    }
+                }
+            }
+        }
+        if (!result->isSuccess())
+        {
+            CLOG_DEBUG(Herder, "recv transaction {} for {} rejected: {}",
+                       hexAbbrev(hash),
+                       KeyUtils::toShortString(tx->getSourceID()),
+                       static_cast<int32_t>(result->getInnermostResultCode()));
+            return {TxSubmitStatus::TX_STATUS_ERROR, std::move(result)};
+        }
+    }
+
+    CLOG_TRACE(Herder, "recv transaction {} for {}", hexAbbrev(hash),
                KeyUtils::toShortString(tx->getSourceID()));
 
-    auto const& env = tx->getEnvelope();
-    mApp.getOverlayManager().broadcastTransaction(env, tx->getFullFee(),
-                                                  tx->getNumOperations());
-    return TxSubmitStatus::TX_STATUS_PENDING;
+    mApp.getOverlayManager().broadcastTransaction(
+        tx->getEnvelope(), tx->getFullFee(), tx->getNumOperations());
+    return {TxSubmitStatus::TX_STATUS_PENDING, std::move(result)};
+}
+
+void
+HerderImpl::banTxs(std::vector<Hash> const& hashes)
+{
+    releaseAssert(!mBannedTxs.empty());
+    mBannedTxs.front().insert(hashes.begin(), hashes.end());
+}
+
+bool
+HerderImpl::isBannedTx(Hash const& hash) const
+{
+    return std::any_of(
+        mBannedTxs.begin(), mBannedTxs.end(),
+        [&hash](auto const& banned) { return banned.count(hash) != 0; });
+}
+
+void
+HerderImpl::shiftBannedTxs()
+{
+    mBannedTxs.emplace_front();
+    while (mBannedTxs.size() > TX_BAN_LEDGERS)
+    {
+        mBannedTxs.pop_back();
+    }
 }
 
 bool
@@ -1150,6 +1349,13 @@ HerderImpl::lastClosedLedgerIncreased(bool latest, TxSetXDRFrameConstPtr txSet,
 {
     releaseAssert(threadIsMain());
 
+    // One more ledger closed: age the tx ban ring.
+    shiftBannedTxs();
+    // TODO(IPC-FLOW): this is the apply-path ledger-close hook; send
+    // LEDGER_CLOSED{mLedgerManager.getLastClosedLedgerNum()} to the overlay
+    // from here (mempool expiry and ban pruning) instead of from slot
+    // purging.
+
     // Ensure potential upgrades are handled in overlay
     maybeHandleUpgrade();
 
@@ -1626,131 +1832,208 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
     ApplicableTxSetFrameConstPtr applicableProposedSet;
     Hash txSetHash;
 
-    // Build TX set from Rust overlay's mempool (not local TransactionQueue)
-    // The Rust overlay maintains the mempool via TX flooding
-    PerPhaseTransactionList txPhases;
-
-    // Get TXs from Rust overlay
+    // Build the tx set from the overlay mempool's candidates. The mempool is
+    // fee-ordered and does no stateful validation, so it can hand us several
+    // txs per source account (chained sequence numbers, same-seq competitors,
+    // one classic and one Soroban tx) as well as stale or otherwise invalid
+    // txs. Reduce the candidates to one tx per source account here, validate
+    // them while building the set, and drop from the mempool only what can
+    // never become valid.
     auto& overlayMgr = mApp.getOverlayManager();
     auto& lm = mApp.getLedgerManager();
-    size_t maxCandidates = lm.getLastMaxTxSetSizeOps();
-    if (lm.hasLastClosedSorobanNetworkConfig())
-    {
-        maxCandidates +=
-            lm.getLastClosedSorobanNetworkConfig().ledgerMaxTxCount();
-    }
-    auto txEnvelopes = overlayMgr.getTopTransactions(maxCandidates * 2);
-
-    CLOG_INFO(Herder, "Got {} transactions from Rust overlay mempool",
-              txEnvelopes.size());
-
-    // Convert TransactionEnvelopes to TransactionFrameBasePtrs and place them
-    // into the phase expected by TxSetFrame.
-    TxFrameList classicTxs;
-    TxFrameList sorobanTxs;
-    Hash const& networkID = mApp.getNetworkID();
     bool const supportsSoroban = protocolVersionStartsFrom(
         lcl.header.ledgerVersion, SOROBAN_PROTOCOL_VERSION);
-    for (auto const& env : txEnvelopes)
+
+    // Start with twice the ledger capacity per phase, then grow each phase's
+    // window independently until that phase is full or all of its account
+    // heads have been examined. A fixed window can be exhausted by transient
+    // invalids or resource-heavy transactions and hide lower-fee fillers.
+    size_t const classicCapacity = lm.getLastMaxTxSetSizeOps();
+    size_t classicRequest = 2 * classicCapacity;
+    size_t sorobanCapacity = 0;
+    if (supportsSoroban && lm.hasLastClosedSorobanNetworkConfig())
     {
-        auto txFrame =
-            TransactionFrameBase::makeTransactionFromWire(networkID, env);
-        if (txFrame->isSoroban())
-        {
-            if (supportsSoroban)
+        sorobanCapacity =
+            lm.getLastClosedSorobanNetworkConfig().ledgerMaxTxCount();
+    }
+    size_t sorobanRequest = 2 * sorobanCapacity;
+
+    Hash const& networkID = mApp.getNetworkID();
+    auto accountSeqLookup = [](CheckValidLedgerViewWrapper const& ledgerView) {
+        return [&ledgerView](
+                   AccountID const& id) -> std::optional<SequenceNumber> {
+            auto acc = ledgerView.getAccount(id);
+            if (!acc)
             {
-                sorobanTxs.push_back(txFrame);
+                return std::nullopt;
+            }
+            return acc.current().data.account().seqNum;
+        };
+    };
+    auto growRequest = [](size_t count) {
+        auto const max =
+            static_cast<size_t>(std::numeric_limits<uint32_t>::max());
+        return count >= max / 2 ? max : std::max<size_t>(1, count * 2);
+    };
+
+    size_t pass = 0;
+    while (true)
+    {
+        ++pass;
+        auto txEnvelopes = overlayMgr.getTopTransactions(
+            classicRequest, supportsSoroban ? sorobanRequest : 0);
+
+        TxFrameList candidates;
+        candidates.reserve(txEnvelopes.size());
+        size_t returnedClassic = 0;
+        size_t returnedSoroban = 0;
+        for (auto const& env : txEnvelopes)
+        {
+            auto tx = TransactionFrameBase::makeTransactionFromWire(networkID,
+                                                                     env);
+            if (tx->isSoroban())
+            {
+                ++returnedSoroban;
             }
             else
             {
-                CLOG_DEBUG(Herder,
-                           "Ignoring Soroban transaction before Soroban "
-                           "protocol support");
+                ++returnedClassic;
             }
+            candidates.emplace_back(std::move(tx));
         }
-        else
+
+        TxSetUtils::TxSetCandidates selected;
         {
-            classicTxs.push_back(txFrame);
+            // Scoped: tx set construction opens its own ledger view.
+            CheckValidLedgerViewWrapper ledgerView(mApp);
+            selected = TxSetUtils::selectTxSetCandidates(
+                candidates, supportsSoroban, accountSeqLookup(ledgerView));
         }
-    }
-    // The mempool is fee-ordered and sequence-number-oblivious, so it can
-    // hand us several transactions from one source account (e.g. a chained
-    // pair). A tx set may only contain one tx per source account, so keep
-    // the lowest sequence number per account and let the others wait for a
-    // later ledger.
-    auto onePerSourceAccount = [](TxFrameList& txs) {
-        std::unordered_map<AccountID, size_t> firstBySource;
-        TxFrameList kept;
-        for (auto const& tx : txs)
+        size_t numSelected = 0;
+        for (auto const& phase : selected.phases)
         {
-            auto [it, inserted] =
-                firstBySource.emplace(tx->getSourceID(), kept.size());
-            if (inserted)
-            {
-                kept.push_back(tx);
-            }
-            else if (tx->getSeqNum() < kept[it->second]->getSeqNum())
-            {
-                kept[it->second] = tx;
-            }
+            numSelected += phase.size();
         }
-        txs = std::move(kept);
-    };
-    onePerSourceAccount(classicTxs);
-    onePerSourceAccount(sorobanTxs);
 
-    txPhases.emplace_back(std::move(classicTxs));
-    if (supportsSoroban)
-    {
-        txPhases.emplace_back(std::move(sorobanTxs));
-    }
+        PerPhaseTransactionList invalidTxPhases(selected.phases.size());
+        std::tie(proposedSet, applicableProposedSet) =
+            makeTxSetFromTransactions(selected.phases, mApp,
+                                      lowerBoundCloseTimeOffset,
+                                      upperBoundCloseTimeOffset,
+                                      invalidTxPhases);
 
-    PerPhaseTransactionList invalidTxPhases;
-    invalidTxPhases.resize(txPhases.size());
-
-    std::tie(proposedSet, applicableProposedSet) =
-        makeTxSetFromTransactions(txPhases, mApp, lowerBoundCloseTimeOffset,
-                                  upperBoundCloseTimeOffset, invalidTxPhases);
-    CLOG_INFO(Herder, "Proposed TX set has {} transactions",
-              proposedSet->sizeTxTotal());
-
-    // The mempool does no stateful validation, so it would keep handing us the
-    // transactions that just failed validation (stale sequence number, can't
-    // pay fee, expired, ...) on every nomination, crowding out valid ones.
-    // Drop them, except for transactions with a *future* sequence number:
-    // those are chained behind a pending transaction from the same account
-    // and become valid once it applies.
-    std::vector<Hash> invalidTxHashes;
-    if (!invalidTxPhases.empty())
-    {
-        CheckValidLedgerViewWrapper ledgerView(mApp);
+        // Classify the txs that failed validation: permanently invalid ones
+        // are dropped and account heads promoted immediately; transient
+        // failures remain while the candidate window grows past them.
+        size_t numInvalid = 0;
         for (auto const& phase : invalidTxPhases)
         {
-            for (auto const& tx : phase)
+            numInvalid += phase.size();
+        }
+        std::vector<Hash> permanentlyInvalid;
+        if (numInvalid != 0)
+        {
+            CheckValidLedgerViewWrapper ledgerView(mApp);
+#ifdef BUILD_TESTS
+            // See TxSetUtils::getInvalidTxListWithErrors for the
+            // overlay-only-mode rationale.
+            ledgerView.mSkipSeqNumCheck = mApp.getRunInOverlayOnlyMode();
+#endif
+            std::optional<uint32_t> validationLedgerSeq;
+            if (protocolVersionStartsFrom(lcl.header.ledgerVersion,
+                                          ProtocolVersion::V_19))
             {
-                auto acc = ledgerView.getAccount(tx->getSourceID());
-                if (acc &&
-                    tx->getSeqNum() > acc.current().data.account().seqNum + 1)
-                {
-                    continue;
-                }
-                CLOG_DEBUG(Herder,
-                           "Dropping invalid tx {} from mempool: seq {} "
-                           "(account seq {})",
-                           hexAbbrev(tx->getFullHash()), tx->getSeqNum(),
-                           acc ? acc.current().data.account().seqNum : -1);
-                invalidTxHashes.push_back(tx->getFullHash());
+                validationLedgerSeq = lcl.header.ledgerSeq + 1;
             }
+            auto codeOf = [&](TransactionFrameBaseConstPtr const& tx) {
+                auto diagnostics = DiagnosticEventManager::createDisabled();
+                auto res = tx->checkValid(
+                    mApp.getAppConnector(), ledgerView, 0,
+                    lowerBoundCloseTimeOffset, upperBoundCloseTimeOffset,
+                    diagnostics, validationLedgerSeq);
+                return res->getInnermostResultCode();
+            };
+            permanentlyInvalid = TxSetUtils::permanentlyInvalidTxHashes(
+                invalidTxPhases, codeOf, accountSeqLookup(ledgerView));
+        }
+
+        auto toRemove = std::move(selected.toRemove);
+        size_t const numStale = toRemove.size();
+        size_t const numTransient = numInvalid - permanentlyInvalid.size();
+        toRemove.insert(toRemove.end(), permanentlyInvalid.begin(),
+                        permanentlyInvalid.end());
+
+        mMempoolMetrics.mCandidates.inc(candidates.size());
+        mMempoolMetrics.mSelected.inc(numSelected);
+        mMempoolMetrics.mStaleRemoved.inc(numStale);
+        mMempoolMetrics.mInvalidRemoved.inc(permanentlyInvalid.size());
+        mMempoolMetrics.mTransientKept.inc(numTransient);
+
+        CLOG_DEBUG(Herder,
+                   "Mempool candidate pass {}: {} txs/{} accounts, {} "
+                   "selected, {} stale and {} invalid removed, {} transient "
+                   "kept",
+                   pass, candidates.size(), selected.numSourceAccounts,
+                   numSelected, numStale, permanentlyInvalid.size(),
+                   numTransient);
+
+        if (!toRemove.empty())
+        {
+            CLOG_DEBUG(Herder,
+                       "Removing {} transactions from the mempool and "
+                       "refilling the candidate window",
+                       toRemove.size());
+            banTxs(toRemove);
+            overlayMgr.removeTransactions(toRemove);
+            // The ordered IPC stream makes the following request observe the
+            // removal, including promotion of the account's next tx.
+            continue;
+        }
+
+        bool const classicFull =
+            classicCapacity == 0 ||
+            (applicableProposedSet &&
+             applicableProposedSet->sizeOp(TxSetPhase::CLASSIC) >=
+                 classicCapacity);
+        bool const classicExhausted = returnedClassic < classicRequest;
+        bool const sorobanFull =
+            !supportsSoroban || sorobanCapacity == 0 ||
+            (applicableProposedSet &&
+             applicableProposedSet->sizeTx(TxSetPhase::SOROBAN) >=
+                 sorobanCapacity);
+        bool const sorobanExhausted =
+            !supportsSoroban || returnedSoroban < sorobanRequest;
+
+        if ((classicFull || classicExhausted) &&
+            (sorobanFull || sorobanExhausted))
+        {
+            break;
+        }
+
+        bool grew = false;
+        if (!classicFull && !classicExhausted)
+        {
+            auto next = growRequest(classicRequest);
+            grew = grew || next != classicRequest;
+            classicRequest = next;
+        }
+        if (!sorobanFull && !sorobanExhausted)
+        {
+            auto next = growRequest(sorobanRequest);
+            grew = grew || next != sorobanRequest;
+            sorobanRequest = next;
+        }
+        if (!grew)
+        {
+            CLOG_WARNING(Herder,
+                         "Candidate request reached its maximum before all "
+                         "transactions were examined");
+            break;
         }
     }
-    if (!invalidTxHashes.empty())
-    {
-        CLOG_DEBUG(Herder,
-                   "Removing {} transactions that failed tx set validation "
-                   "from the mempool",
-                   invalidTxHashes.size());
-        overlayMgr.removeTransactions(invalidTxHashes);
-    }
+
+    CLOG_INFO(Herder, "Proposed TX set has {} transactions after {} pass(es)",
+              proposedSet->sizeTxTotal(), pass);
 
     if (!applicableProposedSet)
     {

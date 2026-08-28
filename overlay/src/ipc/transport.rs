@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
 use super::messages::{Message, MessageCodec, MessageType};
+use super::payloads;
 
 /// Error type for IPC operations
 #[derive(Debug)]
@@ -64,22 +65,32 @@ impl CoreSender {
         self.send(Message::new(MessageType::ScpReceived, envelope))
     }
 
-    /// Convenience: send top transactions response
-    /// Payload: [count:4][len1:4][tx1:len1][len2:4][tx2:len2]...
+    /// Convenience: send a legacy-layout top transactions response
+    /// `[count:u32]{[len:u32][xdr]}*` (answer to a 4-byte GET_TOP_TXS).
     pub fn send_top_txs_response(&self, txs: &[&[u8]]) -> Result<(), IpcError> {
-        let total_size: usize = 4 + txs.iter().map(|tx| 4 + tx.len()).sum::<usize>();
-        let mut payload = Vec::with_capacity(total_size);
+        self.send(Message::new(
+            MessageType::TopTxsResponse,
+            payloads::encode_top_txs_response(None, txs),
+        ))
+    }
 
-        // Count
-        payload.extend_from_slice(&(txs.len() as u32).to_le_bytes());
+    /// Convenience: send a v2 top transactions response
+    /// `[req_id:u64][count:u32]{[len:u32][xdr]}*` (answer to a 16-byte
+    /// GET_TOP_TXS carrying `req_id`).
+    pub fn send_top_txs_response_v2(&self, req_id: u64, txs: &[&[u8]]) -> Result<(), IpcError> {
+        self.send(Message::new(
+            MessageType::TopTxsResponse,
+            payloads::encode_top_txs_response(Some(req_id), txs),
+        ))
+    }
 
-        // Each TX: [len:4][data:len]
-        for tx in txs {
-            payload.extend_from_slice(&(tx.len() as u32).to_le_bytes());
-            payload.extend_from_slice(tx);
-        }
-
-        self.send(Message::new(MessageType::TopTxsResponse, payload))
+    /// Convenience: report a peer-received tx for validation
+    /// (`TX_RECEIVED`, `[hash:32][len:u32][xdr]`).
+    pub fn send_tx_received(&self, hash: &[u8; 32], xdr: &[u8]) -> Result<(), IpcError> {
+        self.send(Message::new(
+            MessageType::TxReceived,
+            payloads::encode_tx_received(hash, xdr),
+        ))
     }
 
     /// Convenience: send TX set available notification

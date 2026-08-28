@@ -16,14 +16,12 @@ use xdr::{
 #[derive(Debug)]
 pub enum XdrError {
     Malformed(String),
-    UnsupportedFeeBump,
 }
 
 impl fmt::Display for XdrError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             XdrError::Malformed(e) => write!(f, "malformed XDR: {e}"),
-            XdrError::UnsupportedFeeBump => write!(f, "fee-bump transactions are unsupported"),
         }
     }
 }
@@ -152,23 +150,130 @@ fn collect_stellar_value_hash(hashes: &mut Vec<[u8; 32]>, value: &[u8]) {
 pub(crate) mod tests {
     use super::*;
     use xdr::{
-        DecoratedSignature, GeneralizedTransactionSet, Hash, Limits, Operation, ScpNomination,
-        ScpStatementPledges, SequenceNumber, StellarValueExt, TimePoint, Transaction,
-        TransactionEnvelope, TransactionV1Envelope, Uint256, Value, VecM, WriteXdr,
+        DecoratedSignature, FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt,
+        FeeBumpTransactionInnerTx, GeneralizedTransactionSet, Hash, Limits, MuxedAccount,
+        MuxedAccountMed25519, Operation, ScpNomination, ScpStatementPledges, SequenceNumber,
+        SorobanResources, SorobanTransactionData, SorobanTransactionDataExt, StellarValueExt,
+        TimePoint, Transaction, TransactionEnvelope, TransactionExt, TransactionV0,
+        TransactionV0Envelope, TransactionV0Ext, TransactionV1Envelope, Uint256, Value, VecM,
+        WriteXdr,
     };
 
+    // --- Fake transaction builders ------------------------------------------
+    //
+    // Every builder returns canonical `TransactionEnvelope` XDR. The source
+    // account is `[source; 32]`, so distinct `source` bytes are distinct
+    // accounts and distinct `(source, seq, fee, num_ops)` tuples are distinct
+    // hashes. Nothing is signed: the Rust side never checks signatures.
+
+    /// Unsigned `TransactionEnvelope::Tx` from account `[source; 32]`.
+    pub(crate) fn transaction_xdr(source: u8, fee: u32, seq: i64, num_ops: usize) -> Vec<u8> {
+        transaction_envelope(source, fee, seq, num_ops)
+            .to_xdr(Limits::none())
+            .unwrap()
+    }
+
+    /// Legacy `valid_transaction_xdr` — plain tx from the all-zero account.
     pub(crate) fn valid_transaction_xdr(fee: u32, sequence: i64, num_ops: usize) -> Vec<u8> {
+        transaction_xdr(0, fee, sequence, num_ops)
+    }
+
+    /// Typed v1 envelope (unsigned) so callers can tweak fields before encoding.
+    pub(crate) fn transaction_envelope(
+        source: u8,
+        fee: u32,
+        seq: i64,
+        num_ops: usize,
+    ) -> TransactionEnvelope {
         let mut tx = Transaction {
+            source_account: MuxedAccount::Ed25519(Uint256([source; 32])),
             fee,
-            seq_num: SequenceNumber(sequence),
+            seq_num: SequenceNumber(seq),
             ..Transaction::default()
         };
         tx.operations = VecM::try_from(vec![Operation::default(); num_ops]).unwrap();
-        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        TransactionEnvelope::Tx(TransactionV1Envelope {
             tx,
             signatures: VecM::<DecoratedSignature, 20>::default(),
+        })
+    }
+
+    /// `TransactionEnvelope::TxV0` from account `[source; 32]`.
+    pub(crate) fn v0_transaction_xdr(source: u8, fee: u32, seq: i64, num_ops: usize) -> Vec<u8> {
+        let mut tx = TransactionV0 {
+            source_account_ed25519: Uint256([source; 32]),
+            fee,
+            seq_num: SequenceNumber(seq),
+            time_bounds: None,
+            memo: Default::default(),
+            operations: VecM::default(),
+            ext: TransactionV0Ext::V0,
+        };
+        tx.operations = VecM::try_from(vec![Operation::default(); num_ops]).unwrap();
+        TransactionEnvelope::TxV0(TransactionV0Envelope {
+            tx,
+            signatures: VecM::<DecoratedSignature, 20>::default(),
+        })
+        .to_xdr(Limits::none())
+        .unwrap()
+    }
+
+    /// v1 envelope whose source is `MuxedEd25519 { id: mux_id, ed25519: [source; 32] }`.
+    pub(crate) fn muxed_transaction_xdr(
+        source: u8,
+        mux_id: u64,
+        fee: u32,
+        seq: i64,
+        num_ops: usize,
+    ) -> Vec<u8> {
+        let mut envelope = transaction_envelope(source, fee, seq, num_ops);
+        let TransactionEnvelope::Tx(v1) = &mut envelope else {
+            unreachable!()
+        };
+        v1.tx.source_account = MuxedAccount::MuxedEd25519(MuxedAccountMed25519 {
+            id: mux_id,
+            ed25519: Uint256([source; 32]),
         });
         envelope.to_xdr(Limits::none()).unwrap()
+    }
+
+    /// Soroban v1 envelope (`ext.v1.resourceFee = resource_fee`), one op.
+    pub(crate) fn soroban_transaction_xdr(
+        source: u8,
+        fee: u32,
+        seq: i64,
+        resource_fee: i64,
+    ) -> Vec<u8> {
+        let mut envelope = transaction_envelope(source, fee, seq, 1);
+        let TransactionEnvelope::Tx(v1) = &mut envelope else {
+            unreachable!()
+        };
+        v1.tx.ext = TransactionExt::V1(SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources::default(),
+            resource_fee,
+        });
+        envelope.to_xdr(Limits::none()).unwrap()
+    }
+
+    /// Fee-bump of `inner` (must be a `Tx` v1 envelope) paid by `[fee_source; 32]`.
+    pub(crate) fn fee_bump_xdr(fee_source: u8, fee: i64, inner: &[u8]) -> Vec<u8> {
+        let TransactionEnvelope::Tx(inner_v1) =
+            TransactionEnvelope::from_xdr(inner, Limits::none()).unwrap()
+        else {
+            panic!("fee_bump_xdr: inner must be a v1 envelope")
+        };
+        TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+            tx: FeeBumpTransaction {
+                fee_source: MuxedAccount::Ed25519(Uint256([fee_source; 32])),
+                fee,
+                inner_tx: FeeBumpTransactionInnerTx::Tx(inner_v1),
+                ext: FeeBumpTransactionExt::V0,
+            },
+            signatures: VecM::<DecoratedSignature, 20>::default(),
+        })
+        .to_xdr(Limits::none())
+        .unwrap()
     }
 
     fn scp_envelope_xdr() -> Vec<u8> {

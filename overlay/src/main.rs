@@ -22,6 +22,7 @@ use libp2p::{Multiaddr, PeerId};
 use stellar_overlay::config::Config;
 use stellar_overlay::flood::{CachedTxSet, Hash256, TxSetCache};
 use stellar_overlay::integrated::{Overlay, OverlayHandle};
+use stellar_overlay::ipc::payloads::{parse_get_top_txs, GetTopTxsRequest};
 use stellar_overlay::ipc::{CoreIpc, Message, MessageType};
 use stellar_overlay::libp2p_overlay::{
     create_overlay, OverlayEvent as LibP2pOverlayEvent, OverlayHandle as LibP2pOverlayHandle,
@@ -433,6 +434,26 @@ struct ConfiguredPeers {
     resolved: HashMap<SocketAddr, String>,
 }
 
+async fn query_top_txs(
+    overlay_handle: &OverlayHandle,
+    request: GetTopTxsRequest,
+) -> Option<(Option<u64>, Vec<Arc<ValidatedTx>>)> {
+    match request {
+        GetTopTxsRequest::Legacy { count } => overlay_handle
+            .get_top_txs(count as usize)
+            .await
+            .map(|txs| (None, txs)),
+        GetTopTxsRequest::PerPhase {
+            req_id,
+            classic_n,
+            soroban_n,
+        } => overlay_handle
+            .get_top_heads(classic_n as usize, soroban_n as usize)
+            .await
+            .map(|txs| (Some(req_id), txs)),
+    }
+}
+
 impl App {
     async fn new(config: Config, listen_mode: bool) -> Result<Self, Box<dyn std::error::Error>> {
         // Connect to Core (or listen for connection)
@@ -444,9 +465,10 @@ impl App {
 
         // Create channels for mempool manager communication
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let metrics = Arc::new(OverlayMetrics::new());
 
         // Create mempool manager (no network - libp2p handles all P2P)
-        let mempool_manager = Overlay::new(cmd_rx);
+        let mempool_manager = Overlay::with_metrics(cmd_rx, Arc::clone(&metrics));
         let overlay_handle = OverlayHandle::new(cmd_tx);
 
         // Spawn mempool manager task
@@ -458,7 +480,6 @@ impl App {
 
         // Create libp2p QUIC overlay for SCP + TX + TxSet (unified, independent streams)
         let libp2p_keypair = Libp2pKeypair::generate_ed25519();
-        let metrics = Arc::new(OverlayMetrics::new());
         let (libp2p_handle, libp2p_event_rx, tx_event_rx, libp2p_overlay) =
             create_overlay(libp2p_keypair, Arc::clone(&metrics))
                 .map_err(|e| format!("Failed to create libp2p overlay: {}", e))?;
@@ -969,24 +990,40 @@ impl App {
             }
 
             MessageType::GetTopTxs => {
-                // Parse payload: [count:4]
-                if msg.payload.len() < 4 {
-                    warn!("GetTopTxs payload too short: {} bytes", msg.payload.len());
-                    // Send empty response
+                let Some(request) = parse_get_top_txs(&msg.payload) else {
+                    warn!(
+                        "GetTopTxs payload has invalid length: {} bytes",
+                        msg.payload.len()
+                    );
+                    // Unknown layouts cannot safely carry a request id, so use
+                    // the backward-compatible empty response.
                     if let Err(e) = self.core_ipc.sender.send_top_txs_response(&[]) {
                         error!("Failed to send empty top txs response: {}", e);
                     }
                     return true;
-                }
+                };
 
-                let count = u32::from_le_bytes(msg.payload[0..4].try_into().unwrap()) as usize;
-                debug!("Core requesting top {} transactions", count);
+                match request {
+                    GetTopTxsRequest::Legacy { count } => {
+                        debug!("Core requesting top {} transactions", count);
+                    }
+                    GetTopTxsRequest::PerPhase {
+                        req_id,
+                        classic_n,
+                        soroban_n,
+                    } => {
+                        debug!(
+                            "Core request {} asks for {} classic and {} Soroban heads",
+                            req_id, classic_n, soroban_n
+                        );
+                    }
+                }
 
                 let core_sender = self.core_ipc.sender.clone();
                 let overlay_handle = self.overlay_handle.clone();
 
                 tokio::spawn(async move {
-                    let Some(txs) = overlay_handle.get_top_txs(count).await else {
+                    let Some((req_id, txs)) = query_top_txs(&overlay_handle, request).await else {
                         warn!("GetTopTxs: mempool manager gone (shutting down); not responding");
                         return;
                     };
@@ -997,7 +1034,11 @@ impl App {
                     // copy happens inside the IPC frame encoding.
                     let tx_data: Vec<&[u8]> = txs.iter().map(|tx| tx.bytes()).collect();
 
-                    if let Err(e) = core_sender.send_top_txs_response(&tx_data) {
+                    let send_result = match req_id {
+                        Some(req_id) => core_sender.send_top_txs_response_v2(req_id, &tx_data),
+                        None => core_sender.send_top_txs_response(&tx_data),
+                    };
+                    if let Err(e) = send_result {
                         error!("Failed to send top txs response: {}", e);
                     }
                 });
@@ -1137,6 +1178,7 @@ impl App {
 
                     // Update current ledger
                     self.current_ledger_seq = ledger_seq;
+                    self.overlay_handle.ledger_closed(ledger_seq);
 
                     // Evict old TX sets from cache
                     self.tx_set_cache
@@ -1493,7 +1535,12 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{Limits, ScpEnvelope, WriteXdr};
+    use stellar_overlay::flood::Mempool;
+    use stellar_xdr::curr::{
+        DecoratedSignature, Limits, MuxedAccount, Operation, ScpEnvelope, SequenceNumber,
+        SorobanResources, SorobanTransactionData, SorobanTransactionDataExt, Transaction,
+        TransactionEnvelope, TransactionExt, TransactionV1Envelope, Uint256, VecM, WriteXdr,
+    };
 
     fn test_scp_envelope_xdr(slot_index: u64) -> Vec<u8> {
         let mut envelope = ScpEnvelope::default();
@@ -1905,18 +1952,21 @@ mod tests {
     /// network. Returns the core-side stream for driving and observing IPC.
     /// The libp2p overlay object is dropped (not run), so cache-miss fetches
     /// just log a warning — these tests only exercise the cache paths.
-    fn test_app() -> (App, StdUnixStream) {
+    fn test_app_with_mempool(mempool: Option<Mempool>) -> (App, StdUnixStream) {
         let (overlay_side, core_side) = StdUnixStream::pair().unwrap();
         let core_ipc = CoreIpc::from_stream(overlay_side).unwrap();
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        let mempool_manager = Overlay::new(cmd_rx);
+        let metrics = Arc::new(OverlayMetrics::new());
+        let mempool_manager = match mempool {
+            Some(mempool) => Overlay::with_mempool(cmd_rx, mempool),
+            None => Overlay::with_metrics(cmd_rx, Arc::clone(&metrics)),
+        };
         tokio::spawn(async move {
             let _ = mempool_manager.run().await;
         });
         let overlay_handle = OverlayHandle::new(cmd_tx);
 
-        let metrics = Arc::new(OverlayMetrics::new());
         let (libp2p_handle, libp2p_events, tx_events, _overlay) =
             create_overlay(Libp2pKeypair::generate_ed25519(), Arc::clone(&metrics)).unwrap();
 
@@ -1943,6 +1993,42 @@ mod tests {
         (app, core_side)
     }
 
+    fn test_app() -> (App, StdUnixStream) {
+        test_app_with_mempool(None)
+    }
+
+    fn transaction_xdr(source: u8, fee: u32, seq: i64, num_ops: usize, soroban: bool) -> Vec<u8> {
+        let mut tx = Transaction {
+            source_account: MuxedAccount::Ed25519(Uint256([source; 32])),
+            fee,
+            seq_num: SequenceNumber(seq),
+            ..Transaction::default()
+        };
+        tx.operations = VecM::try_from(vec![Operation::default(); num_ops]).unwrap();
+        if soroban {
+            tx.ext = TransactionExt::V1(SorobanTransactionData {
+                ext: SorobanTransactionDataExt::V0,
+                resources: SorobanResources::default(),
+                resource_fee: 0,
+            });
+        }
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: VecM::<DecoratedSignature, 20>::default(),
+        })
+        .to_xdr(Limits::none())
+        .unwrap()
+    }
+
+    fn validated_tx(source: u8, fee: u32, soroban: bool) -> Arc<ValidatedTx> {
+        ValidatedTx::from_core_trusted(
+            transaction_xdr(source, fee, 1, 1, soroban),
+            i64::from(fee),
+            1,
+        )
+        .unwrap()
+    }
+
     /// A minimal valid GeneralizedTransactionSet whose content hash matches,
     /// so it passes the CacheTxSet hash guard.
     fn test_txset_xdr(seed: u8) -> ([u8; 32], Vec<u8>) {
@@ -1966,6 +2052,67 @@ mod tests {
         let mut payload = seq.to_le_bytes().to_vec();
         payload.extend_from_slice(&[0u8; 32]);
         payload
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_get_top_txs_v2_uses_per_phase_quotas_and_echoes_request_id() {
+        let (app, _core) = test_app();
+        let classic_low = validated_tx(1, 100, false);
+        let classic_high = validated_tx(2, 300, false);
+        let soroban_low = validated_tx(3, 200, true);
+        let soroban_high = validated_tx(4, 400, true);
+        for tx in [&classic_low, &classic_high, &soroban_low, &soroban_high] {
+            let mut outcome = app.overlay_handle.submit_tx_with_outcome(Arc::clone(tx));
+            assert!(outcome.recv().await.is_some());
+        }
+
+        let req_id = 0x0102_0304_0506_0708;
+        let payload = stellar_overlay::ipc::payloads::encode_get_top_txs(req_id, 1, 1);
+        let request = stellar_overlay::ipc::payloads::parse_get_top_txs(&payload).unwrap();
+        let (response_req_id, txs) = query_top_txs(&app.overlay_handle, request).await.unwrap();
+        assert_eq!(response_req_id, Some(req_id));
+        assert_eq!(
+            txs.iter().map(|tx| tx.bytes().to_vec()).collect::<Vec<_>>(),
+            vec![classic_high.bytes().to_vec(), soroban_high.bytes().to_vec()]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_get_top_txs_legacy_keeps_merged_fee_order() {
+        let (app, _core) = test_app();
+        let classic = validated_tx(1, 100, false);
+        let soroban = validated_tx(2, 300, true);
+        for tx in [&classic, &soroban] {
+            let mut outcome = app.overlay_handle.submit_tx_with_outcome(Arc::clone(tx));
+            assert!(outcome.recv().await.is_some());
+        }
+
+        let payload = stellar_overlay::ipc::payloads::encode_get_top_txs_legacy(1);
+        let request = stellar_overlay::ipc::payloads::parse_get_top_txs(&payload).unwrap();
+        let (response_req_id, txs) = query_top_txs(&app.overlay_handle, request).await.unwrap();
+        assert_eq!(response_req_id, None);
+        assert_eq!(txs.len(), 1);
+        assert_eq!(txs[0].bytes(), soroban.bytes());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_ledger_closed_runs_mempool_maintenance() {
+        let mempool = Mempool::new(100, Duration::ZERO);
+        let (mut app, _core) = test_app_with_mempool(Some(mempool));
+        let mut outcome = app
+            .overlay_handle
+            .submit_tx_with_outcome(validated_tx(1, 100, false));
+        assert!(outcome.recv().await.is_some());
+
+        assert!(
+            app.handle_core_message(Message::new(
+                MessageType::LedgerClosed,
+                ledger_closed_payload(1)
+            ))
+            .await
+        );
+        let txs = app.overlay_handle.get_top_txs(1).await.unwrap();
+        assert!(txs.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

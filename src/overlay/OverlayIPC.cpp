@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <limits>
 #include <signal.h>
 #include <sstream>
 #include <sys/syscall.h>
@@ -42,6 +43,13 @@ absoluteIfExecutable(std::string const& path)
         return std::filesystem::absolute(path).string();
     }
     return std::nullopt;
+}
+
+uint32_t
+saturatingUint32(size_t value)
+{
+    constexpr auto max = std::numeric_limits<uint32_t>::max();
+    return value > max ? max : static_cast<uint32_t>(value);
 }
 
 } // namespace
@@ -381,8 +389,38 @@ OverlayIPC::handleMessage(IPCMessage const& msg)
 
     case IPCMessageType::TOP_TXS_RESPONSE:
     {
-        // Response to getTopTransactions - wake up waiting thread
         std::lock_guard<std::mutex> lock(mRequestMutex);
+
+        if (!mRequestPending)
+        {
+            CLOG_WARNING(Overlay,
+                         "Dropping unsolicited top transactions response");
+            break;
+        }
+
+        if (mPendingRequestId)
+        {
+            // V2 response: [requestId:u64][count:u32]...
+            if (msg.payload.size() < 12)
+            {
+                CLOG_WARNING(
+                    Overlay,
+                    "Dropping truncated v2 top transactions response");
+                break;
+            }
+
+            uint64_t responseId;
+            std::memcpy(&responseId, msg.payload.data(), 8);
+            if (responseId != *mPendingRequestId)
+            {
+                CLOG_WARNING(Overlay,
+                             "Dropping top transactions response for request "
+                             "{} while waiting for request {}",
+                             responseId, *mPendingRequestId);
+                break;
+            }
+        }
+
         mPendingResponse = msg;
         mRequestCv.notify_one();
         break;
@@ -551,29 +589,62 @@ OverlayIPC::removeTransactions(std::vector<Hash> const& txHashes)
 std::vector<TransactionEnvelope>
 OverlayIPC::getTopTransactions(size_t count)
 {
+    IPCMessage req;
+    req.type = IPCMessageType::GET_TOP_TXS;
+    uint32_t countU32 = saturatingUint32(count);
+    req.payload.resize(4);
+    std::memcpy(req.payload.data(), &countU32, 4);
+
+    return requestTopTransactions(std::move(req), std::nullopt);
+}
+
+std::vector<TransactionEnvelope>
+OverlayIPC::getTopTransactions(size_t classicCount, size_t sorobanCount)
+{
+    auto const requestId = mNextTxRequestId.fetch_add(1);
+
+    IPCMessage req;
+    req.type = IPCMessageType::GET_TOP_TXS;
+    req.payload.resize(16);
+    auto const classicCountU32 = saturatingUint32(classicCount);
+    auto const sorobanCountU32 = saturatingUint32(sorobanCount);
+    std::memcpy(req.payload.data(), &requestId, 8);
+    std::memcpy(req.payload.data() + 8, &classicCountU32, 4);
+    std::memcpy(req.payload.data() + 12, &sorobanCountU32, 4);
+
+    return requestTopTransactions(std::move(req), requestId);
+}
+
+std::vector<TransactionEnvelope>
+OverlayIPC::requestTopTransactions(IPCMessage request,
+                                   std::optional<uint64_t> requestId)
+{
     std::vector<TransactionEnvelope> result;
+
+    // A legacy response carries no request ID, so all legacy and v2 requests
+    // must share one in-flight slot. This also makes response ownership
+    // deterministic for callers from multiple threads.
+    std::unique_lock<std::mutex> requestLock(mTopTxRequestMutex);
 
     if (!mChannel || !mChannel->isConnected())
     {
         return result;
     }
 
-    // Send request
-    IPCMessage req;
-    req.type = IPCMessageType::GET_TOP_TXS;
-    uint32_t countU32 = static_cast<uint32_t>(count);
-    req.payload.resize(4);
-    std::memcpy(req.payload.data(), &countU32, 4);
-
     {
         std::lock_guard<std::mutex> lock(mRequestMutex);
+        mRequestPending = true;
+        mPendingRequestId = requestId;
         mPendingResponse.reset();
     }
 
     {
         std::lock_guard<std::mutex> sendLock(mSendMutex);
-        if (!mChannel->send(req))
+        if (!mChannel->send(request))
         {
+            std::lock_guard<std::mutex> lock(mRequestMutex);
+            mRequestPending = false;
+            mPendingRequestId.reset();
             return result;
         }
     }
@@ -587,34 +658,37 @@ OverlayIPC::getTopTransactions(size_t count)
             return mPendingResponse.has_value() || !mRunning || !mReaderAlive;
         });
 
-    if (!gotResponse || !mPendingResponse.has_value())
+    if (!gotResponse || !mPendingResponse)
     {
         CLOG_WARNING(Overlay,
                      "Overlay IPC {} while waiting for top transactions",
                      !gotResponse ? "timed out"
                                   : (mRunning ? "disconnected" : "shut down"));
+        mRequestPending = false;
+        mPendingRequestId.reset();
+        mPendingResponse.reset();
         return result;
     }
 
-    auto& response = *mPendingResponse;
-    if (response.type != IPCMessageType::TOP_TXS_RESPONSE)
-    {
-        CLOG_WARNING(Overlay,
-                     "Unexpected response type for getTopTransactions");
-        return result;
-    }
+    auto response = std::move(*mPendingResponse);
+    mRequestPending = false;
+    mPendingRequestId.reset();
+    mPendingResponse.reset();
+    lock.unlock();
 
     // Parse response: list of XDR-encoded TransactionEnvelopes
-    // Format: [count:4][len1:4][tx1:len1][len2:4][tx2:len2]...
-    if (response.payload.size() < 4)
+    // Legacy: [count:u32][len1:u32][tx1:len1]...
+    // V2: [requestId:u64][count:u32][len1:u32][tx1:len1]...
+    size_t offset = requestId ? 8 : 0;
+    if (response.payload.size() < offset + 4)
     {
         return result;
     }
 
     uint32_t txCount;
-    std::memcpy(&txCount, response.payload.data(), 4);
+    std::memcpy(&txCount, response.payload.data() + offset, 4);
 
-    size_t offset = 4;
+    offset += 4;
     for (uint32_t i = 0; i < txCount && offset + 4 <= response.payload.size();
          ++i)
     {

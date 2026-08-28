@@ -29,6 +29,20 @@ pub struct OverlayMetrics {
     /// overlay.memory.flood-known — entries in the TX dedup cache
     pub memory_flood_known: AtomicI64,
 
+    // Mempool gauges
+    /// overlay.mempool.size — transactions in the mempool
+    pub mempool_size: AtomicI64,
+    /// overlay.mempool.accounts — accounts with pending transactions
+    pub mempool_accounts: AtomicI64,
+    /// overlay.mempool.heads-classic — classic account heads (nomination candidates)
+    pub mempool_heads_classic: AtomicI64,
+    /// overlay.mempool.heads-soroban — Soroban account heads
+    pub mempool_heads_soroban: AtomicI64,
+    /// overlay.mempool.banned-size — banned tx hashes
+    pub mempool_banned_size: AtomicI64,
+    /// overlay.tx-validation.pending — peer txs parked awaiting Core's verdict
+    pub tx_validation_pending: AtomicI64,
+
     // recv-transaction SimpleTimer equivalents
     /// overlay.recv-transaction.sum — cumulative microseconds processing TXs
     pub recv_transaction_sum_us: AtomicU64,
@@ -74,6 +88,36 @@ pub struct OverlayMetrics {
     pub flood_abandoned_demands: AtomicU64,
     /// overlay.demand.timeout — pull mode peer timeouts
     pub demand_timeout: AtomicU64,
+
+    // Mempool counters
+    /// overlay.mempool.inserts — transactions stored as new entries
+    pub mempool_inserts: AtomicU64,
+    /// overlay.mempool.replaced — same-(account, seq) replacements by fee
+    pub mempool_replaced: AtomicU64,
+    /// overlay.mempool.rejected-banned — inserts refused: hash banned
+    pub mempool_rejected_banned: AtomicU64,
+    /// overlay.mempool.rejected-lower-fee — inserts refused: did not beat resident rate
+    pub mempool_rejected_lower_fee: AtomicU64,
+    /// overlay.mempool.rejected-account-full — inserts refused: per-account cap
+    pub mempool_rejected_account_full: AtomicU64,
+    /// overlay.mempool.rejected-duplicate — inserts refused: already present
+    pub mempool_rejected_duplicate: AtomicU64,
+    /// overlay.mempool.evicted-capacity — txs dropped to make room (pool or account cap)
+    pub mempool_evicted_capacity: AtomicU64,
+    /// overlay.mempool.evicted-expired — txs dropped by age
+    pub mempool_evicted_expired: AtomicU64,
+    /// overlay.mempool.top-txs-requests — nomination candidate requests served
+    pub mempool_top_txs_requests: AtomicU64,
+    /// overlay.mempool.top-txs-returned — candidates returned in total
+    pub mempool_top_txs_returned: AtomicU64,
+    /// overlay.tx-validation.accepted — peer txs Core accepted (inserted + flooded)
+    pub tx_validation_accepted: AtomicU64,
+    /// overlay.tx-validation.rejected — peer txs Core rejected (banned, not flooded)
+    pub tx_validation_rejected: AtomicU64,
+    /// overlay.tx-validation.timeout — peer txs dropped: no verdict in time
+    pub tx_validation_timeout: AtomicU64,
+    /// overlay.tx-validation.dropped-full — peer txs dropped: pending map full
+    pub tx_validation_dropped_full: AtomicU64,
 
     // Connection lifecycle
     /// overlay.inbound.attempt — inbound connection attempts
@@ -123,6 +167,12 @@ impl Default for OverlayMetrics {
             connection_pending: AtomicI64::new(0),
             inbound_live: AtomicI64::new(0),
             memory_flood_known: AtomicI64::new(0),
+            mempool_size: AtomicI64::new(0),
+            mempool_accounts: AtomicI64::new(0),
+            mempool_heads_classic: AtomicI64::new(0),
+            mempool_heads_soroban: AtomicI64::new(0),
+            mempool_banned_size: AtomicI64::new(0),
+            tx_validation_pending: AtomicI64::new(0),
             recv_transaction_sum_us: AtomicU64::new(0),
             recv_transaction_count: AtomicU64::new(0),
             recv_transaction_max_us: AtomicU64::new(0),
@@ -143,6 +193,20 @@ impl Default for OverlayMetrics {
             flood_broadcast: AtomicU64::new(0),
             flood_abandoned_demands: AtomicU64::new(0),
             demand_timeout: AtomicU64::new(0),
+            mempool_inserts: AtomicU64::new(0),
+            mempool_replaced: AtomicU64::new(0),
+            mempool_rejected_banned: AtomicU64::new(0),
+            mempool_rejected_lower_fee: AtomicU64::new(0),
+            mempool_rejected_account_full: AtomicU64::new(0),
+            mempool_rejected_duplicate: AtomicU64::new(0),
+            mempool_evicted_capacity: AtomicU64::new(0),
+            mempool_evicted_expired: AtomicU64::new(0),
+            mempool_top_txs_requests: AtomicU64::new(0),
+            mempool_top_txs_returned: AtomicU64::new(0),
+            tx_validation_accepted: AtomicU64::new(0),
+            tx_validation_rejected: AtomicU64::new(0),
+            tx_validation_timeout: AtomicU64::new(0),
+            tx_validation_dropped_full: AtomicU64::new(0),
             inbound_attempt: AtomicU64::new(0),
             inbound_establish: AtomicU64::new(0),
             inbound_drop: AtomicU64::new(0),
@@ -180,6 +244,12 @@ impl OverlayMetrics {
             connection_pending: self.connection_pending.load(ORD),
             inbound_live: self.inbound_live.load(ORD),
             memory_flood_known: self.memory_flood_known.load(ORD),
+            mempool_size: self.mempool_size.load(ORD),
+            mempool_accounts: self.mempool_accounts.load(ORD),
+            mempool_heads_classic: self.mempool_heads_classic.load(ORD),
+            mempool_heads_soroban: self.mempool_heads_soroban.load(ORD),
+            mempool_banned_size: self.mempool_banned_size.load(ORD),
+            tx_validation_pending: self.tx_validation_pending.load(ORD),
 
             // recv-transaction SimpleTimer
             recv_transaction_sum_us: self.recv_transaction_sum_us.load(ORD),
@@ -204,6 +274,20 @@ impl OverlayMetrics {
             flood_broadcast: self.flood_broadcast.load(ORD),
             flood_abandoned_demands: self.flood_abandoned_demands.load(ORD),
             demand_timeout: self.demand_timeout.load(ORD),
+            mempool_inserts: self.mempool_inserts.load(ORD),
+            mempool_replaced: self.mempool_replaced.load(ORD),
+            mempool_rejected_banned: self.mempool_rejected_banned.load(ORD),
+            mempool_rejected_lower_fee: self.mempool_rejected_lower_fee.load(ORD),
+            mempool_rejected_account_full: self.mempool_rejected_account_full.load(ORD),
+            mempool_rejected_duplicate: self.mempool_rejected_duplicate.load(ORD),
+            mempool_evicted_capacity: self.mempool_evicted_capacity.load(ORD),
+            mempool_evicted_expired: self.mempool_evicted_expired.load(ORD),
+            mempool_top_txs_requests: self.mempool_top_txs_requests.load(ORD),
+            mempool_top_txs_returned: self.mempool_top_txs_returned.load(ORD),
+            tx_validation_accepted: self.tx_validation_accepted.load(ORD),
+            tx_validation_rejected: self.tx_validation_rejected.load(ORD),
+            tx_validation_timeout: self.tx_validation_timeout.load(ORD),
+            tx_validation_dropped_full: self.tx_validation_dropped_full.load(ORD),
             inbound_attempt: self.inbound_attempt.load(ORD),
             inbound_establish: self.inbound_establish.load(ORD),
             inbound_drop: self.inbound_drop.load(ORD),
@@ -249,6 +333,12 @@ pub struct MetricsSnapshot {
     pub connection_pending: i64,
     pub inbound_live: i64,
     pub memory_flood_known: i64,
+    pub mempool_size: i64,
+    pub mempool_accounts: i64,
+    pub mempool_heads_classic: i64,
+    pub mempool_heads_soroban: i64,
+    pub mempool_banned_size: i64,
+    pub tx_validation_pending: i64,
 
     // recv-transaction SimpleTimer
     pub recv_transaction_sum_us: u64,
@@ -273,6 +363,20 @@ pub struct MetricsSnapshot {
     pub flood_broadcast: u64,
     pub flood_abandoned_demands: u64,
     pub demand_timeout: u64,
+    pub mempool_inserts: u64,
+    pub mempool_replaced: u64,
+    pub mempool_rejected_banned: u64,
+    pub mempool_rejected_lower_fee: u64,
+    pub mempool_rejected_account_full: u64,
+    pub mempool_rejected_duplicate: u64,
+    pub mempool_evicted_capacity: u64,
+    pub mempool_evicted_expired: u64,
+    pub mempool_top_txs_requests: u64,
+    pub mempool_top_txs_returned: u64,
+    pub tx_validation_accepted: u64,
+    pub tx_validation_rejected: u64,
+    pub tx_validation_timeout: u64,
+    pub tx_validation_dropped_full: u64,
     pub inbound_attempt: u64,
     pub inbound_establish: u64,
     pub inbound_drop: u64,
@@ -342,5 +446,37 @@ mod tests {
         let json = serde_json::to_string(&snap).unwrap();
         assert!(json.contains("\"connection_authenticated\":5"));
         assert!(json.contains("\"byte_read\":2048"));
+    }
+
+    #[test]
+    fn test_mempool_metrics_in_snapshot() {
+        let m = OverlayMetrics::new();
+        m.mempool_size.store(7, ORD);
+        m.mempool_inserts.fetch_add(9, ORD);
+        let snap = m.snapshot();
+        assert_eq!(snap.mempool_size, 7);
+        assert_eq!(snap.mempool_inserts, 9);
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(json.contains("\"mempool_size\":7"));
+        assert!(json.contains("\"mempool_heads_classic\":0"));
+    }
+
+    #[test]
+    fn test_tx_validation_metrics_in_snapshot() {
+        let m = OverlayMetrics::new();
+        m.tx_validation_pending.store(3, ORD);
+        m.tx_validation_accepted.fetch_add(4, ORD);
+        m.tx_validation_rejected.fetch_add(5, ORD);
+        m.tx_validation_timeout.fetch_add(6, ORD);
+        m.tx_validation_dropped_full.fetch_add(7, ORD);
+        let snap = m.snapshot();
+        assert_eq!(snap.tx_validation_pending, 3);
+        assert_eq!(snap.tx_validation_accepted, 4);
+        assert_eq!(snap.tx_validation_rejected, 5);
+        assert_eq!(snap.tx_validation_timeout, 6);
+        assert_eq!(snap.tx_validation_dropped_full, 7);
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(json.contains("\"tx_validation_pending\":3"));
+        assert!(json.contains("\"tx_validation_dropped_full\":7"));
     }
 }

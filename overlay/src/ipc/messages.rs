@@ -17,18 +17,28 @@ pub enum MessageType {
     /// Broadcast this SCP envelope to all peers
     BroadcastScp = 1,
 
-    /// Request top N transactions from mempool for nomination
-    /// Payload: [count:4]
+    /// Request nomination candidates from the mempool. Two payload layouts
+    /// are accepted (selected by payload length, see
+    /// [`super::payloads::parse_get_top_txs`]):
+    /// - legacy, 4 bytes: `[count:u32]` — `count` account heads across both
+    ///   phases merged in inclusion-fee order; answered with the legacy
+    ///   [`MessageType::TopTxsResponse`] layout (no request id).
+    /// - v2, 16 bytes: `[req_id:u64][classic_n:u32][soroban_n:u32]` — up to
+    ///   `classic_n` classic and `soroban_n` Soroban account heads; answered
+    ///   with the v2 response layout that echoes `req_id` so Core can drop
+    ///   late answers to a timed-out request.
     GetTopTxs = 2,
 
     /// Request current SCP state (peer asked via GET_SCP_STATE)
     RequestScpState = 3,
 
     // ═══ Core → Overlay (Non-Critical) ═══
-    /// Ledger closed, here's the new state
+    /// A ledger was applied. Payload: `[ledgerSeq:u32][ledgerHash:32]`.
+    /// Drives mempool expiry + ban pruning and tx-set-cache eviction.
     LedgerClosed = 4,
 
-    /// We externalized this hash, drop related data
+    /// We externalized this tx set: remove + ban the listed txs.
+    /// Payload: `[txSetHash:32][count:u32][txHash:32]*`
     TxSetExternalized = 5,
 
     /// Response: here's the SCP state you requested
@@ -56,12 +66,26 @@ pub enum MessageType {
     /// Request overlay metrics snapshot (empty payload)
     RequestOverlayMetrics = 13,
 
+    /// Remove the listed txs from the mempool and ban their hashes for the
+    /// default horizon (last closed ledger + BAN_LEDGERS). Replaces the
+    /// zero-txSetHash pun on [`MessageType::TxSetExternalized`].
+    /// Payload: `[count:u32][txHash:32]*`
+    RemoveTxs = 14,
+
+    /// Core's verdict on a peer-received tx previously reported with
+    /// [`MessageType::TxReceived`]. `accept != 0` → insert into the mempool
+    /// and flood; `accept == 0` → ban the hash, do not flood. `code` is the
+    /// `TransactionResultCode` (informational).
+    /// Payload: `[hash:32][accept:u8][code:i32]`
+    TxVerdict = 15,
+
     // ═══ Overlay → Core (Critical Path) ═══
     /// Received SCP envelope from network
     ScpReceived = 100,
 
-    /// Response to GET_TOP_TXS request
-    /// Payload: [count:4][len1:4][tx1:len1][len2:4][tx2:len2]...
+    /// Response to GET_TOP_TXS. Layout follows the request layout:
+    /// - legacy: `[count:u32]{[len:u32][xdr]}*`
+    /// - v2:     `[req_id:u64][count:u32]{[len:u32][xdr]}*`
     TopTxsResponse = 101,
 
     /// Peer requested SCP state
@@ -74,6 +98,13 @@ pub enum MessageType {
 
     /// Overlay metrics snapshot response (JSON payload)
     OverlayMetricsResponse = 105,
+
+    /// A tx arrived from a peer and is parked pending Core's validation.
+    /// Core validates it against its LCL view (+ ban ring) and answers with
+    /// [`MessageType::TxVerdict`]; no answer within the overlay's timeout
+    /// (10 s) drops the tx.
+    /// Payload: `[hash:32][len:u32][txEnvelope XDR:len]`
+    TxReceived = 106,
 }
 
 impl TryFrom<u32> for MessageType {
@@ -93,11 +124,14 @@ impl TryFrom<u32> for MessageType {
             11 => Ok(MessageType::RequestTxSet),
             12 => Ok(MessageType::CacheTxSet),
             13 => Ok(MessageType::RequestOverlayMetrics),
+            14 => Ok(MessageType::RemoveTxs),
+            15 => Ok(MessageType::TxVerdict),
             100 => Ok(MessageType::ScpReceived),
             101 => Ok(MessageType::TopTxsResponse),
             102 => Ok(MessageType::PeerRequestsScpState),
             103 => Ok(MessageType::TxSetAvailable),
             105 => Ok(MessageType::OverlayMetricsResponse),
+            106 => Ok(MessageType::TxReceived),
             _ => Err(InvalidMessageType(value)),
         }
     }
@@ -289,11 +323,14 @@ mod tests {
             MessageType::RequestTxSet,
             MessageType::CacheTxSet,
             MessageType::RequestOverlayMetrics,
+            MessageType::RemoveTxs,
+            MessageType::TxVerdict,
             MessageType::ScpReceived,
             MessageType::TopTxsResponse,
             MessageType::PeerRequestsScpState,
             MessageType::TxSetAvailable,
             MessageType::OverlayMetricsResponse,
+            MessageType::TxReceived,
         ];
 
         for msg_type in types {
@@ -379,6 +416,9 @@ mod tests {
             MessageType::try_from(105).unwrap(),
             MessageType::OverlayMetricsResponse
         );
+        assert_eq!(MessageType::try_from(14).unwrap(), MessageType::RemoveTxs);
+        assert_eq!(MessageType::try_from(15).unwrap(), MessageType::TxVerdict);
+        assert_eq!(MessageType::try_from(106).unwrap(), MessageType::TxReceived);
     }
 
     #[test]
@@ -386,8 +426,9 @@ mod tests {
         assert!(MessageType::try_from(0).is_err());
         assert!(MessageType::try_from(9).is_err()); // gap between 8 and 10
         assert!(MessageType::try_from(99).is_err());
+        assert!(MessageType::try_from(16).is_err());
         assert!(MessageType::try_from(104).is_err());
-        assert!(MessageType::try_from(106).is_err());
+        assert!(MessageType::try_from(107).is_err());
         assert!(MessageType::try_from(u32::MAX).is_err());
     }
 }

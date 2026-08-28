@@ -89,6 +89,10 @@ pub enum OverlayCommand {
     BroadcastScp(Vec<u8>),
     /// Broadcast a validated TX to all peers
     BroadcastTx(Arc<ValidatedTx>),
+    /// INV-announce a peer-received TX (already in `tx_seen`/`tx_buffer`) to
+    /// every peer except `from` and peers that already advertised it. Used
+    /// once Core has accepted the tx when `relay_on_receive` is off.
+    RelayTx { tx: Arc<ValidatedTx>, from: PeerId },
     /// Request TX set from a peer (picks best peer)
     FetchTxSet { hash: [u8; 32], slot: u32 },
     /// Send TX set to a specific peer (response to their request)
@@ -183,6 +187,17 @@ impl OverlayHandle {
         if let Err(e) = self.cmd_tx.send(OverlayCommand::BroadcastTx(tx)).await {
             warn!(
                 "Overlay command channel closed, failed to send BroadcastTx: {}",
+                e
+            );
+        }
+    }
+
+    /// Relay a peer-received TX to the other peers (see
+    /// [`OverlayCommand::RelayTx`]).
+    pub async fn relay_tx(&self, tx: Arc<ValidatedTx>, from: PeerId) {
+        if let Err(e) = self.cmd_tx.send(OverlayCommand::RelayTx { tx, from }).await {
+            warn!(
+                "Overlay command channel closed, failed to send RelayTx: {}",
                 e
             );
         }
@@ -335,6 +350,8 @@ struct SharedState {
     tx_buffer: RwLock<TxBuffer>,
     /// Overlay metrics (shared with App for IPC reporting)
     metrics: Arc<OverlayMetrics>,
+    /// See [`OverlayOptions::relay_on_receive`].
+    relay_on_receive: bool,
 }
 
 impl SharedState {
@@ -343,6 +360,7 @@ impl SharedState {
         tx_event_tx: mpsc::Sender<OverlayEvent>,
         control: Control,
         metrics: Arc<OverlayMetrics>,
+        options: OverlayOptions,
     ) -> Self {
         Self {
             peer_streams: RwLock::new(HashMap::new()),
@@ -369,6 +387,27 @@ impl SharedState {
             pending_getdata: RwLock::new(PendingRequests::new()),
             tx_buffer: RwLock::new(TxBuffer::new()),
             metrics,
+            relay_on_receive: options.relay_on_receive,
+        }
+    }
+}
+
+/// Behavioural knobs for [`create_overlay_with_options`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverlayOptions {
+    /// `true` (default, [`create_overlay`]): a TX pulled from a peer is
+    /// INV-relayed to the other peers as soon as it is handed to the
+    /// application — the pre-validation ("trust peer txs") behaviour.
+    /// `false`: nothing is relayed until the application calls
+    /// [`OverlayHandle::relay_tx`], i.e. after Core has validated the tx, so
+    /// invalid txs are never re-flooded.
+    pub relay_on_receive: bool,
+}
+
+impl Default for OverlayOptions {
+    fn default() -> Self {
+        Self {
+            relay_on_receive: true,
         }
     }
 }
@@ -391,6 +430,23 @@ pub struct StellarOverlay {
 pub fn create_overlay(
     keypair: Keypair,
     metrics: Arc<OverlayMetrics>,
+) -> Result<
+    (
+        OverlayHandle,
+        mpsc::UnboundedReceiver<OverlayEvent>,
+        mpsc::Receiver<OverlayEvent>,
+        StellarOverlay,
+    ),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    create_overlay_with_options(keypair, metrics, OverlayOptions::default())
+}
+
+/// [`create_overlay`] with explicit [`OverlayOptions`].
+pub fn create_overlay_with_options(
+    keypair: Keypair,
+    metrics: Arc<OverlayMetrics>,
+    options: OverlayOptions,
 ) -> Result<
     (
         OverlayHandle,
@@ -441,6 +497,7 @@ pub fn create_overlay(
         tx_event_tx,
         control.clone(),
         metrics,
+        options,
     ));
 
     let overlay = StellarOverlay {
@@ -527,6 +584,9 @@ impl StellarOverlay {
                         }
                         OverlayCommand::BroadcastTx(tx) => {
                             self.broadcast_tx(tx).await;
+                        }
+                        OverlayCommand::RelayTx { tx, from } => {
+                            relay_tx_to_peers(&self.state, &tx, &from).await;
                         }
                         OverlayCommand::FetchTxSet { hash, slot } => {
                             self.fetch_txset(hash, slot).await;
@@ -1759,11 +1819,58 @@ async fn handle_getdata(
     }
 }
 
+/// INV-announce a peer-received TX to every connected peer except `from`
+/// and the peers that already advertised it to us.
+async fn relay_tx_to_peers(state: &Arc<SharedState>, tx: &Arc<ValidatedTx>, from: &PeerId) {
+    let hash = *tx.hash();
+    let peers_to_announce: Vec<PeerId> = {
+        let streams = state.peer_streams.read().await;
+        let tracker = state.inv_tracker.read().await;
+
+        // Get peers who already know about this TX (INV'd us)
+        let known_sources: HashSet<PeerId> = tracker
+            .peek_sources(&hash)
+            .map(|v| v.iter().cloned().collect())
+            .unwrap_or_default();
+
+        streams
+            .keys()
+            .filter(|p| **p != *from && !known_sources.contains(p))
+            .cloned()
+            .collect()
+    };
+
+    if peers_to_announce.is_empty() {
+        return;
+    }
+
+    debug!(
+        "TX_RELAY: Announcing TX {:02x?}... to {} peers via INV",
+        &hash[..4],
+        peers_to_announce.len()
+    );
+
+    let inv_entry = InvEntry {
+        hash,
+        fee_per_op: tx.fee_per_op(),
+    };
+
+    // Add to batcher for each peer, send batch immediately when full
+    for peer in &peers_to_announce {
+        let batch_to_send = {
+            let mut batcher = state.inv_batcher.write().await;
+            batcher.add(*peer, inv_entry.clone())
+        };
+        if let Some(batch) = batch_to_send {
+            send_inv_batch(state, *peer, batch).await;
+        }
+    }
+}
+
 /// Handle TX response (from GETDATA request)
 async fn handle_tx_response(state: &Arc<SharedState>, peer_id: &PeerId, tx: Arc<ValidatedTx>) {
     // `tx` was validated in the stream reader's single decode.
     let hash = *tx.hash();
-    let fee_per_op = tx.fee_per_op();
     let recv_start = std::time::Instant::now();
     let tx_len = tx.bytes().len() as u64;
 
@@ -1818,11 +1925,28 @@ async fn handle_tx_response(state: &Arc<SharedState>, peer_id: &PeerId, tx: Arc<
         peer_id
     );
 
-    // Forward to Core via bounded TX channel
-    if let Err(_) = state.tx_event_tx.try_send(OverlayEvent::TxReceived {
-        tx: Arc::clone(&tx),
-        from: peer_id.clone(),
-    }) {
+    // Forward to the application via the bounded TX channel. If the channel
+    // is full the tx is dropped here and never reaches the mempool, so it
+    // must not stay in `tx_seen` (that would make us ignore every later INV
+    // for it) and must not be relayed (we would advertise something we do
+    // not hold). Forgetting the hash lets a later INV from any peer
+    // re-request it once the backlog has drained.
+    let delivered = state
+        .tx_event_tx
+        .try_send(OverlayEvent::TxReceived {
+            tx: Arc::clone(&tx),
+            from: peer_id.clone(),
+        })
+        .is_ok();
+    if !delivered {
+        {
+            let mut seen = state.tx_seen.write().await;
+            seen.pop(&hash);
+            state
+                .metrics
+                .memory_flood_known
+                .store(seen.len() as i64, Ordering::Relaxed);
+        }
         state.metrics.message_drop.fetch_add(1, Ordering::Relaxed);
         let dropped = state.tx_dropped_count.fetch_add(1, Ordering::Relaxed) + 1;
         if dropped % 1000 == 1 {
@@ -1834,43 +1958,11 @@ async fn handle_tx_response(state: &Arc<SharedState>, peer_id: &PeerId, tx: Arc<
         }
     }
 
-    // RELAY: Announce to other peers via INV
-    let peers_to_announce: Vec<PeerId> = {
-        let streams = state.peer_streams.read().await;
-        let tracker = state.inv_tracker.read().await;
-
-        // Get peers who already know about this TX (INV'd us)
-        let known_sources: HashSet<PeerId> = tracker
-            .peek_sources(&hash)
-            .map(|v| v.iter().cloned().collect())
-            .unwrap_or_default();
-
-        streams
-            .keys()
-            .filter(|p| **p != *peer_id && !known_sources.contains(p))
-            .cloned()
-            .collect()
-    };
-
-    if !peers_to_announce.is_empty() {
-        debug!(
-            "TX_RELAY: Announcing TX {:02x?}... to {} peers via INV",
-            &hash[..4],
-            peers_to_announce.len()
-        );
-
-        let inv_entry = InvEntry { hash, fee_per_op };
-
-        // Add to batcher for each peer, send batch immediately when full
-        for peer in &peers_to_announce {
-            let batch_to_send = {
-                let mut batcher = state.inv_batcher.write().await;
-                batcher.add(*peer, inv_entry.clone())
-            };
-            if let Some(batch) = batch_to_send {
-                send_inv_batch(state, *peer, batch).await;
-            }
-        }
+    // RELAY: with `relay_on_receive` the tx is announced right away;
+    // otherwise the application relays it (`OverlayCommand::RelayTx`) once
+    // Core has accepted it.
+    if delivered && state.relay_on_receive {
+        relay_tx_to_peers(state, &tx, peer_id).await;
     }
 
     // Record recv-transaction timing
@@ -4353,6 +4445,112 @@ async fn test_inv_getdata_three_node_relay() {
 ///
 /// Before the fix, Node2's relay request was silently dropped because
 /// the message was already in `scp_seen` from the initial receive.
+
+/// With `relay_on_receive == false` a peer-received TX must not be
+/// INV-relayed until the application explicitly calls `relay_tx` (after Core
+/// has validated it); with the default options the relay is immediate.
+/// Topology: Node1 - Node2 - Node3 (no 1-3 link); Node2 runs deferred relay.
+#[tokio::test]
+async fn test_relay_is_deferred_until_relay_tx_when_configured() {
+    let keypair1 = Keypair::generate_ed25519();
+    let keypair2 = Keypair::generate_ed25519();
+    let keypair3 = Keypair::generate_ed25519();
+
+    let (handle1, _events1, _tx_events1, overlay1) =
+        create_overlay(keypair1.clone(), Arc::new(OverlayMetrics::new())).unwrap();
+    let (handle2, _events2, mut tx_events2, overlay2) = create_overlay_with_options(
+        keypair2.clone(),
+        Arc::new(OverlayMetrics::new()),
+        OverlayOptions {
+            relay_on_receive: false,
+        },
+    )
+    .unwrap();
+    let (handle3, _events3, mut tx_events3, overlay3) =
+        create_overlay(keypair3, Arc::new(OverlayMetrics::new())).unwrap();
+
+    let peer1_id = PeerId::from_public_key(&keypair1.public());
+    let peer2_id = PeerId::from_public_key(&keypair2.public());
+
+    let base_port = 19271;
+    let overlay1_task = tokio::spawn(async move { overlay1.run("127.0.0.1", base_port).await });
+    let overlay2_task = tokio::spawn(async move { overlay2.run("127.0.0.1", base_port + 1).await });
+    let overlay3_task = tokio::spawn(async move { overlay3.run("127.0.0.1", base_port + 2).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let addr1: Multiaddr = format!("/ip4/127.0.0.1/udp/{}/quic-v1/p2p/{}", base_port, peer1_id)
+        .parse()
+        .unwrap();
+    handle2.dial(addr1).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let addr2: Multiaddr = format!(
+        "/ip4/127.0.0.1/udp/{}/quic-v1/p2p/{}",
+        base_port + 1,
+        peer2_id
+    )
+    .parse()
+    .unwrap();
+    handle3.dial(addr2).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let tx_msg = test_tx(70_000);
+    handle1.broadcast_tx(Arc::clone(&tx_msg)).await;
+
+    // Node2 receives it from Node1 ...
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut node2_received = false;
+    while tokio::time::Instant::now() < deadline && !node2_received {
+        tokio::select! {
+            Some(event) = tx_events2.recv() => {
+                if let OverlayEvent::TxReceived { tx, from } = event {
+                    if tx.bytes() == tx_msg.bytes() && from == peer1_id {
+                        node2_received = true;
+                    }
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+    }
+    assert!(node2_received, "Node2 should receive TX from Node1");
+
+    // ... but Node3 must not: Node2 has not relayed it yet.
+    let quiet = tokio::time::timeout(Duration::from_millis(800), tx_events3.recv()).await;
+    assert!(
+        quiet.is_err(),
+        "Node3 must not receive the TX before Node2 relays it (got {:?})",
+        quiet
+    );
+
+    // Application (after Core's accept) relays it.
+    handle2.relay_tx(Arc::clone(&tx_msg), peer1_id).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut node3_received = false;
+    while tokio::time::Instant::now() < deadline && !node3_received {
+        tokio::select! {
+            Some(event) = tx_events3.recv() => {
+                if let OverlayEvent::TxReceived { tx, from } = event {
+                    if tx.bytes() == tx_msg.bytes() && from == peer2_id {
+                        node3_received = true;
+                    }
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+    }
+    assert!(
+        node3_received,
+        "Node3 should receive the TX once Node2 relays it"
+    );
+
+    handle1.shutdown().await;
+    handle2.shutdown().await;
+    handle3.shutdown().await;
+    let _ = tokio::time::timeout(Duration::from_secs(1), overlay1_task).await;
+    let _ = tokio::time::timeout(Duration::from_secs(1), overlay2_task).await;
+    let _ = tokio::time::timeout(Duration::from_secs(1), overlay3_task).await;
+}
+
 #[tokio::test]
 async fn test_scp_relay_three_nodes() {
     let keypair1 = Keypair::generate_ed25519();
