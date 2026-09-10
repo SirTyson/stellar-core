@@ -15,6 +15,7 @@
 #include "invariant/InvariantDoesNotHold.h"
 #include "invariant/InvariantManager.h"
 #include "ledger/LedgerEntryScope.h"
+#include "ledger/LedgerHeaderUtils.h"
 #include "ledger/LedgerTxn.h"
 #include "ledger/LedgerTxnEntry.h"
 #include "ledger/LedgerTxnHeader.h"
@@ -1175,7 +1176,7 @@ TransactionFrame::computePreApplySorobanResourceFee(
 }
 
 bool
-TransactionFrame::isTooEarly(uint32_t ledgerVersion, uint64_t closeTime,
+TransactionFrame::isTooEarly(uint32_t ledgerVersion, ApplyTime closeTime,
                              uint32_t ledgerSeq,
                              uint64_t lowerBoundCloseTimeOffset) const
 {
@@ -1183,7 +1184,7 @@ TransactionFrame::isTooEarly(uint32_t ledgerVersion, uint64_t closeTime,
     if (tb)
     {
         if (tb->minTime &&
-            (tb->minTime > (closeTime + lowerBoundCloseTimeOffset)))
+            (tb->minTime > (closeTime.timePoint() + lowerBoundCloseTimeOffset)))
         {
             return true;
         }
@@ -1199,7 +1200,7 @@ TransactionFrame::isTooEarly(uint32_t ledgerVersion, uint64_t closeTime,
 }
 
 bool
-TransactionFrame::isTooLate(uint32_t ledgerVersion, uint64_t closeTime,
+TransactionFrame::isTooLate(uint32_t ledgerVersion, ApplyTime closeTime,
                             uint32_t ledgerSeq,
                             uint64_t upperBoundCloseTimeOffset) const
 {
@@ -1210,7 +1211,7 @@ TransactionFrame::isTooLate(uint32_t ledgerVersion, uint64_t closeTime,
         // expect the ledger to close so we don't accept transactions that will
         // expire by the time they are applied
         if (tb->maxTime &&
-            (tb->maxTime < (closeTime + upperBoundCloseTimeOffset)))
+            (tb->maxTime < (closeTime.timePoint() + upperBoundCloseTimeOffset)))
         {
             return true;
         }
@@ -1226,7 +1227,7 @@ TransactionFrame::isTooLate(uint32_t ledgerVersion, uint64_t closeTime,
 
 bool
 TransactionFrame::isTooEarlyForAccount(uint32_t ledgerVersion,
-                                       uint64_t closeTime, uint32_t ledgerSeq,
+                                       ApplyTime closeTime, uint32_t ledgerSeq,
                                        LedgerEntryWrapper const& sourceAccount,
                                        uint64_t lowerBoundCloseTimeOffset) const
 {
@@ -1244,7 +1245,8 @@ TransactionFrame::isTooEarlyForAccount(uint32_t ledgerVersion,
                           : 0;
     auto minSeqAge = getMinSeqAge();
 
-    auto lowerBoundCloseTime = closeTime + lowerBoundCloseTimeOffset;
+    auto lowerBoundCloseTime =
+        closeTime.timePoint() + lowerBoundCloseTimeOffset;
     if (minSeqAge > lowerBoundCloseTime ||
         lowerBoundCloseTime - minSeqAge < accSeqTime)
     {
@@ -1471,7 +1473,7 @@ TransactionFrame::commonValidPreSeqNum(
     // queue is accepting TXs for the next ledger), use that for time-based
     // checks instead of the ledgerSeq from the header.
     auto ledgerSeq = validationLedgerSeq.value_or(header.current().ledgerSeq);
-    auto closeTime = header.current().scpValue.closeTime;
+    auto closeTime = getApplyTime(header.current().scpValue);
 
     if (isTooEarly(ledgerVersion, closeTime, ledgerSeq,
                    lowerBoundCloseTimeOffset))
@@ -1692,7 +1694,7 @@ TransactionFrame::commonValid(
 
         auto ledgerSeq =
             validationLedgerSeq.value_or(header.current().ledgerSeq);
-        auto closeTime = header.current().scpValue.closeTime;
+        auto closeTime = getApplyTime(header.current().scpValue);
         if (isTooEarlyForAccount(header.current().ledgerVersion, closeTime,
                                  ledgerSeq, *sourceAccount,
                                  lowerBoundCloseTimeOffset))
