@@ -90,6 +90,13 @@ class FeeBumpTransactionFrame : public TransactionFrameBase
 
     ~FeeBumpTransactionFrame() override = default;
 
+    // Preserve serial validation and signer-removal ordering before
+    // protocol 26.
+    void preParallelApplyLegacy(
+        AppConnector& app, AbstractLedgerTxn& ltx, TransactionMetaBuilder& meta,
+        MutableTransactionResultBase& txResult,
+        SorobanNetworkConfig const& sorobanConfig) const override;
+
     void preParallelApplyReadOnly(
         AppConnector& app, CheckValidLedgerViewWrapper const& ls,
         TransactionMetaBuilder& meta, MutableTransactionResultBase& txResult,

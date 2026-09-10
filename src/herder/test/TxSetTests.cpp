@@ -3500,6 +3500,15 @@ TEST_CASE("parallel tx set validation matches sequential", "[txset]")
             root->create("account" + std::to_string(i), minBalance * 100));
     }
 
+    bool soroban = false;
+    SECTION("classic")
+    {
+    }
+    SECTION("Soroban")
+    {
+        soroban = true;
+    }
+
     auto makeTxs = [&](size_t count, TxFrameList& invalidTxs) {
         TxFrameList txs;
         for (size_t i = 0; i < count; ++i)
@@ -3512,10 +3521,31 @@ TEST_CASE("parallel tx set validation matches sequential", "[txset]")
                 seq += 1000;
                 valid = false;
             }
-            auto tx = transactionFromOperations(
-                *app, account.getSecretKey(), seq,
-                {payment(account.getPublicKey(), static_cast<int64_t>(i) + 1)},
-                100);
+            TransactionTestFramePtr tx;
+            if (soroban)
+            {
+                SorobanResources resources;
+                resources.instructions = 1'000'000;
+                resources.diskReadBytes = 1000;
+                resources.writeBytes = 1000;
+                tx = createUploadWasmTx(*app, account, 100,
+                                        DEFAULT_TEST_RESOURCE_FEE, resources,
+                                        std::nullopt, 0, std::nullopt, seq);
+            }
+            else
+            {
+                tx = transactionFromOperations(
+                    *app, account.getSecretKey(), seq,
+                    {payment(account.getPublicKey(),
+                             static_cast<int64_t>(i) + 1)},
+                    100);
+            }
+            if (i % 5 == 0)
+            {
+                tx->getMutableEnvelope().v1().signatures.clear();
+                tx->clearCached();
+                valid = false;
+            }
             txs.emplace_back(tx);
             if (!valid)
             {

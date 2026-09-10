@@ -2381,6 +2381,10 @@
 		"q1W0Fxx9Nxw=",
 		"0u+ay1fNNYE="
 	],
+	"Soroban pre-apply preserves historical reserve release|protocol version 23" : [ "+cR3oq2qY0I=", "SiGiNs1FlNU=", "gQnNT4I+/As=", "1wPU6KM4I9M=" ],
+	"Soroban pre-apply preserves historical reserve release|protocol version 24" : [ "+cR3oq2qY0I=", "SiGiNs1FlNU=", "gQnNT4I+/As=", "1wPU6KM4I9M=" ],
+	"Soroban pre-apply preserves historical reserve release|protocol version 25" : [ "+cR3oq2qY0I=", "SiGiNs1FlNU=", "gQnNT4I+/As=", "1wPU6KM4I9M=" ],
+	"Soroban pre-apply preserves historical reserve release|protocol version 26" : [ "+cR3oq2qY0I=", "KBaBzT0569k=", "Xvfjd2j82OM=", "8/5nalLFDvU=" ],
 	"Soroban pre-apply removes pre-auth tx signers|protocol version 20" : 
 	[
 		"bKDF6V5IzTo=",

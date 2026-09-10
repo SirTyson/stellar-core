@@ -1588,6 +1588,27 @@ runPreApplyScenario(int64_t seed, int multiplier, size_t preApplyTaskCount)
     return res;
 }
 
+TEST_CASE("Soroban pre-apply preserves results across workers",
+          "[soroban][preapply]")
+{
+    // Keep a bounded version of the acceptance test in the normal CI suite.
+    auto seed = Catch::rng()();
+    CAPTURE(seed);
+    for (int scenario : {1, 5})
+    {
+        CAPTURE(scenario);
+        auto expected = runPreApplyScenario(seed, scenario, 1);
+        for (size_t workers : {2, 4})
+        {
+            CAPTURE(workers);
+            auto actual = runPreApplyScenario(seed, scenario, workers);
+            REQUIRE(actual.mResults == expected.mResults);
+            REQUIRE(actual.mMeta == expected.mMeta);
+            REQUIRE(actual.mEntries == expected.mEntries);
+        }
+    }
+}
+
 TEST_CASE("Soroban pre-apply results are independent of the worker count",
           "[soroban][preapply][acceptance]")
 {

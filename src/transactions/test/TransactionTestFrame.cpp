@@ -373,6 +373,16 @@ TransactionTestFrame::insertKeysForTxApply(UnorderedSet<LedgerKey>& keys) const
 }
 
 void
+TransactionTestFrame::preParallelApplyLegacy(
+    AppConnector& app, AbstractLedgerTxn& ltx, TransactionMetaBuilder& meta,
+    MutableTransactionResultBase& txResult,
+    SorobanNetworkConfig const& sorobanConfig) const
+{
+    mTransactionFrame->preParallelApplyLegacy(app, ltx, meta, txResult,
+                                              sorobanConfig);
+}
+
+void
 TransactionTestFrame::preParallelApplyReadOnly(
     AppConnector& app, CheckValidLedgerViewWrapper const& ls,
     TransactionMetaBuilder& meta, MutableTransactionResultBase& resPayload,

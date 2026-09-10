@@ -109,8 +109,8 @@ getNumDiskReadEntries(SorobanResources const& resources,
 //   in the same ledger deleting the source account)
 // - The sequence number is bad (due to another transaction in the same ledger
 //   performing a sequence bump)
-// In any other scenario we should update the sequence number, and its highly
-// unlikely that there would be any new reasons in the future.
+// In the other supported scenarios we should update the sequence number.
+// Keep this classification in sync with commonValid's state-dependent checks.
 // Note, that this logic makes sense for the apply step only where the
 // transactions are already expected to be valid w.r.t LCL (so that they can
 // only be invalidated by the other transactions in the same ledger).
@@ -2139,6 +2139,78 @@ TransactionFrame::commonPreApply(bool chargeFee, AppConnector& app,
     else
     {
         return nullptr;
+    }
+}
+
+void
+TransactionFrame::preParallelApplyLegacy(
+    AppConnector& app, AbstractLedgerTxn& ltx, TransactionMetaBuilder& meta,
+    MutableTransactionResultBase& resPayload,
+    SorobanNetworkConfig const& sorobanConfig) const
+{
+    preParallelApplyLegacy(true, app, ltx, meta, resPayload, sorobanConfig,
+                           getContentsHash());
+}
+
+void
+TransactionFrame::preParallelApplyLegacy(
+    bool chargeFee, AppConnector& app, AbstractLedgerTxn& ltx,
+    TransactionMetaBuilder& meta, MutableTransactionResultBase& txResult,
+    SorobanNetworkConfig const& sorobanConfig,
+    Hash const& envelopeContentsHash) const
+{
+    ZoneScoped;
+    releaseAssert(threadIsMain() ||
+                  app.threadIsType(Application::ThreadType::APPLY));
+    try
+    {
+        releaseAssertOrThrow(isSoroban());
+
+        auto signatureChecker = [&] {
+            LedgerTxn ltxTx(ltx);
+            CheckValidLedgerViewWrapper ledgerView(ltxTx);
+            auto checker =
+                commonPreApply(chargeFee, app, ledgerView, meta, txResult,
+                               &sorobanConfig, envelopeContentsHash, &ltxTx);
+            meta.pushTxChangesBefore(ltxTx);
+            ltxTx.commit();
+            return checker;
+        }();
+        bool ok = signatureChecker != nullptr;
+        if (ok)
+        {
+            updateSorobanMetrics(app);
+
+            auto& opResult = txResult.getOpResultAt(0);
+
+            // Pre parallel soroban, OperationFrame::checkValid is called
+            // right before OperationFrame::doApply, but we do it here
+            // instead to avoid making OperationFrame::checkValid thread
+            // safe.
+            ok = mOperations.front()->checkValid(
+                app, *signatureChecker, &sorobanConfig,
+                CheckValidLedgerViewWrapper(ltx), true, opResult,
+                meta.getDiagnosticEventManager());
+            if (!ok)
+            {
+                txResult.setInnermostError(txFAILED);
+            }
+        }
+
+        // If validation fails, we check the result code in the parallel
+        // step to make sure we don't apply the transaction.
+        releaseAssertOrThrow(ok == txResult.isSuccess());
+    }
+    catch (std::exception& e)
+    {
+        printErrorAndAbort("Exception after processing fees but before "
+                           "processing sequence number: ",
+                           e.what());
+    }
+    catch (...)
+    {
+        printErrorAndAbort("Unknown exception after processing fees but before "
+                           "processing sequence number");
     }
 }
 

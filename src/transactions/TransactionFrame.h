@@ -310,8 +310,8 @@ class TransactionFrame : public TransactionFrameBase
     //
     // If all of this succeeds, it returns a non-nullptr pointer to the
     // signature checker, to be used elsewhere in the txn. If anything
-    // fails it returns nullptr. It does all of its work in a sub-ltx
-    // so the passed `ltxForWrites` is unchanged on failure.
+    // fails it returns nullptr. The caller owns the sub-ltx and commits its
+    // sequence-number and signer changes even when validation fails.
     std::unique_ptr<SignatureChecker>
     commonPreApply(bool chargeFee, AppConnector& app,
                    CheckValidLedgerViewWrapper const& ledgerView,
@@ -327,6 +327,20 @@ class TransactionFrame : public TransactionFrameBase
         MutableTransactionResultBase& txResult,
         SorobanNetworkConfig const& sorobanConfig,
         Hash const& envelopeContentsHash) const;
+
+    // Preserve serial validation and signer-removal ordering before
+    // protocol 26.
+    void preParallelApplyLegacy(
+        AppConnector& app, AbstractLedgerTxn& ltx, TransactionMetaBuilder& meta,
+        MutableTransactionResultBase& txResult,
+        SorobanNetworkConfig const& sorobanConfig) const override;
+
+    void preParallelApplyLegacy(bool chargeFee, AppConnector& app,
+                                AbstractLedgerTxn& ltx,
+                                TransactionMetaBuilder& meta,
+                                MutableTransactionResultBase& txResult,
+                                SorobanNetworkConfig const& sorobanConfig,
+                                Hash const& envelopeContentsHash) const;
 
     void preParallelApplyReadOnly(
         AppConnector& app, CheckValidLedgerViewWrapper const& ls,

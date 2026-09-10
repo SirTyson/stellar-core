@@ -156,6 +156,14 @@ class TransactionFrameBase
           std::optional<SorobanNetworkConfig const> const& sorobanConfig,
           Hash const& sorobanBasePrngSeed) const = 0;
 
+    // Preserve serial validation and signer-removal ordering before
+    // protocol 26.
+    virtual void
+    preParallelApplyLegacy(AppConnector& app, AbstractLedgerTxn& ltx,
+                           TransactionMetaBuilder& meta,
+                           MutableTransactionResultBase& txResult,
+                           SorobanNetworkConfig const& sorobanConfig) const = 0;
+
     // The read-only half of the Soroban pre-apply: validation, signature checks
     // and the operation's checkValid. Performs no writes. Safe to run
     // concurrently for distinct transactions, provided `ls` supports concurrent

@@ -388,21 +388,35 @@ GlobalParallelApplyLedgerState::preApplyAndCollectModifiedClassicEntries(
     // where the transactions are validated, and a serial write phase where the
     // writes are committed to the ledger.
     //
-    // This phase separatation hinges on the fact that the validation outcome
-    // of any Soroban transaction can't be influenced by the pre-apply writes
-    // performed by another Soroban transaction. Specifically, pre-apply writes
-    // only include:
+    // From protocol 26 onward, this phase separation hinges on the fact that
+    // the validation outcome of any Soroban transaction can't be influenced by
+    // the pre-apply writes performed by another Soroban transaction.
+    // Specifically, pre-apply writes only include:
     // - The source account sequence number bumps - this is fine because we
     //   have only a single transaction per source account per ledger
-    // - The removal of one-time pre-authorized tx signers - this is also fine
-    //   because any given transaction in a ledger is unique, and increasing the
-    //   sub-entry count of a source/sponsor account is not relevant at that
-    //   point, as the fees have already been successfully charged.
+    // - The removal of one-time pre-authorized tx signers - each transaction
+    //   is unique. Releasing signer reserves only increases available balance,
+    //   which is already nonnegative after fee charging and the classic phase.
 
     auto header =
         std::make_shared<LedgerHeader const>(ltx.loadHeader().current());
-    readOnlyParallelPreApply(app, txBundles, header, ltx);
-    commitPreParallelApplyWrites(app, ltx, txBundles);
+    if (protocolVersionIsBefore(header->ledgerVersion, ProtocolVersion::V_26))
+    {
+        // Before protocol 26, cross-phase fee charging could leave a payer
+        // below reserve. A preceding transaction's signer removal can restore
+        // that reserve and affect validation of a later transaction.
+        for (auto const* txBundle : txBundles)
+        {
+            txBundle->getTx()->preParallelApplyLegacy(
+                app, ltx, txBundle->getEffects().getMeta(),
+                txBundle->getResPayload(), mSorobanConfig);
+        }
+    }
+    else
+    {
+        readOnlyParallelPreApply(app, txBundles, header, ltx);
+        commitPreParallelApplyWrites(app, ltx, txBundles);
+    }
 
     for (auto const& txBundle : txBundles)
     {
@@ -424,7 +438,7 @@ GlobalParallelApplyLedgerState::readOnlyParallelPreApply(
     }
 
     // Run pre-apply for [begin, end) transaction indices.
-    auto runRange = [&](size_t begin, size_t end) {
+    auto runRange = [&](size_t begin, size_t end, size_t) {
         // NB: mLCLApplyView is not thread-safe, so we need to copy it into a
         // thread-local view.
         CheckValidLedgerViewWrapper ledgerView(
@@ -439,29 +453,9 @@ GlobalParallelApplyLedgerState::readOnlyParallelPreApply(
         }
     };
 
-    size_t taskCount = app.getBatchExecutor().preferredTaskCount();
-    if (taskCount <= 1)
-    {
-        runRange(0, txBundles.size());
-        return;
-    }
-
-    std::vector<std::function<int()>> tasks;
-    tasks.reserve(taskCount);
-    size_t begin = 0;
-    size_t baseChunk = txBundles.size() / taskCount;
-    size_t remainder = txBundles.size() % taskCount;
-    for (size_t i = 0; i < taskCount; ++i)
-    {
-        size_t end = begin + baseChunk + (i < remainder ? 1 : 0);
-        tasks.emplace_back([runRange, begin, end]() {
-            runRange(begin, end);
-            return 0;
-        });
-        begin = end;
-    }
-    releaseAssert(begin == txBundles.size());
-    app.getBatchExecutor().executeBatch(std::move(tasks));
+    auto& executor = app.getBatchExecutor();
+    executor.executeBatchOverRanges(txBundles.size(),
+                                    executor.preferredTaskCount(), runRange);
 }
 
 void

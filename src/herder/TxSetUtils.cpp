@@ -174,10 +174,14 @@ TxSetUtils::getInvalidTxListWithErrors(
     ZoneScoped;
     releaseAssert(threadIsMain());
     TxFrameList txs(inTxs.begin(), inTxs.end());
+    if (txs.empty())
+    {
+        return {{}, TxSetValidationResult::VALID};
+    }
 
     auto ledgerView = std::make_unique<CheckValidLedgerViewWrapper>(app);
 #ifdef BUILD_TESTS
-    // See TransactionQueue::canAdd for the overlay-only-mode rationale.
+    // Overlay-only simulations do not advance transaction sequence numbers.
     ledgerView->mSkipSeqNumCheck = app.getRunInOverlayOnlyMode();
 #endif
     // Validate minSeqLedgerGap and LedgerBounds against the next ledgerSeq,
@@ -195,16 +199,9 @@ TxSetUtils::getInvalidTxListWithErrors(
     // `taskCount` batches.
     auto taskCount = app.getBatchExecutor().preferredTaskCount();
 
-    // In some cases we might process a transaction set for ledger N while
-    // applying ledger N, in which case we won't be able to re-use the batch
-    // executor and thus need to fall back to single-threaded execution.
-    // This is really an edge case: it requires several tx sets to exist for the
-    // same ledger (which is rare), and the timing must be very specific for
-    // processing to happen after the vote and application start. Thus in
-    // practice we may consider this rare enough to not worry about the
-    // performance impact.
-    // NB: Both this method and `isApplying` must happen on the main thread,
-    // so there is no race condition risk.
+    // Ledger application also uses this executor. While it is applying, run
+    // validation on the calling thread so that the two batches cannot overlap.
+    // Applying-state transitions and this check all run on the main thread.
     if (app.getLedgerManager().isApplying())
     {
         taskCount = 1;
@@ -220,6 +217,12 @@ TxSetUtils::getInvalidTxListWithErrors(
     }
 #endif
 
+    // Match executeBatchOverRanges' serial fallback before allocating views.
+    if (txs.size() < taskCount)
+    {
+        taskCount = 1;
+    }
+
     std::vector<std::unique_ptr<CheckValidLedgerViewWrapper>> ledgerViews;
     ledgerViews.emplace_back(std::move(ledgerView));
 
@@ -228,8 +231,7 @@ TxSetUtils::getInvalidTxListWithErrors(
         ledgerViews.emplace_back(
             std::make_unique<CheckValidLedgerViewWrapper>(app));
 #ifdef BUILD_TESTS
-        // See TransactionQueue::canAdd for the overlay-only-mode
-        // rationale.
+        // Overlay-only simulations do not advance transaction sequence numbers.
         ledgerViews.back()->mSkipSeqNumCheck = app.getRunInOverlayOnlyMode();
 #endif
     }
@@ -270,10 +272,12 @@ TxSetUtils::getInvalidTxListWithErrors(
     auto& [invalidTxs, errorCode] = invalidTxsWithError;
     errorCode = TxSetValidationResult::VALID;
 
+    // Preserve the existing trimming policy: accumulate all individually valid
+    // fees before checking affordability, including fees from earlier phases.
     for (size_t i = 0; i < txs.size(); ++i)
     {
         auto const& tx = txs[i];
-        auto const& [txIsValid, feeSourceBalance] = txValidationResult[i];
+        auto const txIsValid = txValidationResult[i].first;
         if (!txIsValid)
         {
             invalidTxs.emplace_back(tx);
@@ -289,6 +293,16 @@ TxSetUtils::getInvalidTxListWithErrors(
         {
             accFee += tx->getFullFee();
         }
+    }
+
+    for (size_t i = 0; i < txs.size(); ++i)
+    {
+        auto const& tx = txs[i];
+        auto const& [txIsValid, feeSourceBalance] = txValidationResult[i];
+        if (!txIsValid)
+        {
+            continue;
+        }
         // `feeSourceBalance` should exist as transaction must be valid, log
         // an internal error and skip the transaction otherwise.
         if (!feeSourceBalance)
@@ -300,7 +314,7 @@ TxSetUtils::getInvalidTxListWithErrors(
             errorCode = TxSetValidationResult::TX_VALIDATION_FAILED;
             continue;
         }
-        if (*feeSourceBalance < accFee)
+        if (*feeSourceBalance < accountFeeMap.at(tx->getFeeSourceID()))
         {
             invalidTxs.push_back(tx);
             // Only override the error code if it wasn't already set.

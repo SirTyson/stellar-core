@@ -215,6 +215,10 @@ BatchExecutor::executeBatchOverRanges(
     size_t count, size_t numTasks,
     std::function<void(size_t, size_t, size_t)> const& work)
 {
+    if (count == 0)
+    {
+        return;
+    }
     if (numTasks <= 1 || count < numTasks)
     {
         work(0, count, 0);

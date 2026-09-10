@@ -83,6 +83,45 @@ FeeBumpTransactionFrame::FeeBumpTransactionFrame(
 #endif
 
 void
+FeeBumpTransactionFrame::preParallelApplyLegacy(
+    AppConnector& app, AbstractLedgerTxn& ltx, TransactionMetaBuilder& meta,
+    MutableTransactionResultBase& txResult,
+    SorobanNetworkConfig const& sorobanConfig) const
+{
+    try
+    {
+        LedgerTxn ltxTx(ltx);
+        removeOneTimeSignerKeyFromFeeSource(ltxTx);
+        meta.pushTxChangesBefore(ltxTx);
+        ltxTx.commit();
+    }
+    catch (std::exception& e)
+    {
+        printErrorAndAbort("Exception in preParallelApplyLegacy ", e.what());
+    }
+    catch (...)
+    {
+        printErrorAndAbort("Unknown exception in preParallelApplyLegacy");
+    }
+
+    try
+    {
+        mInnerTx->preParallelApplyLegacy(/*chargeFee=*/false, app, ltx, meta,
+                                         txResult, sorobanConfig,
+                                         getContentsHash());
+    }
+    catch (std::exception& e)
+    {
+        printErrorAndAbort("Exception during preParallelApplyLegacy: ",
+                           e.what());
+    }
+    catch (...)
+    {
+        printErrorAndAbort("Unknown exception during preParallelApplyLegacy");
+    }
+}
+
+void
 FeeBumpTransactionFrame::preParallelApplyReadOnly(
     AppConnector& app, CheckValidLedgerViewWrapper const& ls,
     TransactionMetaBuilder& meta, MutableTransactionResultBase& txResult,

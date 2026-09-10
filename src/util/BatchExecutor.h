@@ -60,7 +60,7 @@ class BatchExecutor : private NonMovableOrCopyable
 
     // Splits [0, count) into contiguous ranges and executes
     // `work(begin, end, rangeIndex)` for every range in parallel, using
-    // `numTasks` ranges.
+    // at most `numTasks` ranges. An empty input does no work.
     // `rangeIndex` is the index of the range within the batch. Runs the whole
     // range on the calling thread if there are fewer elements than the
     // `numTasks` - prefer using `executeBatch` for a small number of

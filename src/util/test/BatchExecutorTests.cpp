@@ -129,3 +129,75 @@ TEST_CASE("BatchExecutor runs many successive batches", "[batchexecutor]")
         }
     }
 }
+
+TEST_CASE("BatchExecutor ranges cover the input exactly once",
+          "[batchexecutor]")
+{
+    BatchExecutor exec;
+    for (size_t count : {0, 1, 2, 7, 8, 9, 31})
+    {
+        for (size_t tasks : {0, 1, 2, 4, 8})
+        {
+            CAPTURE(count, tasks);
+            std::vector<std::atomic<int>> visits(count);
+            std::vector<std::pair<size_t, size_t>> ranges(
+                std::max(tasks, size_t{1}));
+            std::atomic<bool> valid{true};
+            std::atomic<size_t> calls{0};
+            auto caller = std::this_thread::get_id();
+            exec.executeBatchOverRanges(
+                count, tasks, [&](size_t begin, size_t end, size_t index) {
+                    ++calls;
+                    if (begin >= end || end > count || index >= ranges.size())
+                    {
+                        valid = false;
+                        return;
+                    }
+                    ranges[index] = {begin, end};
+                    if ((tasks <= 1 || count < tasks) &&
+                        std::this_thread::get_id() != caller)
+                    {
+                        valid = false;
+                    }
+                    for (auto i = begin; i < end; ++i)
+                    {
+                        ++visits[i];
+                    }
+                });
+            REQUIRE(valid);
+            REQUIRE((calls == 0) == (count == 0));
+            size_t end = 0;
+            for (size_t i = 0; i < calls; ++i)
+            {
+                REQUIRE(ranges[i].first == end);
+                end = ranges[i].second;
+            }
+            REQUIRE(end == count);
+            for (auto const& visited : visits)
+            {
+                REQUIRE(visited == 1);
+            }
+        }
+    }
+}
+
+TEST_CASE("BatchExecutor range exceptions join workers and allow reuse",
+          "[batchexecutor]")
+{
+    BatchExecutor exec;
+    std::atomic<int> completed{0};
+    REQUIRE_THROWS_AS(exec.executeBatchOverRanges(
+                          8, 4,
+                          [&](size_t, size_t, size_t index) {
+                              if (index == 0)
+                              {
+                                  throw std::logic_error("range failed");
+                              }
+                              ++completed;
+                          }),
+                      std::logic_error);
+    REQUIRE(completed == 3);
+    exec.executeBatchOverRanges(8, 4,
+                                [&](size_t, size_t, size_t) { ++completed; });
+    REQUIRE(completed == 7);
+}

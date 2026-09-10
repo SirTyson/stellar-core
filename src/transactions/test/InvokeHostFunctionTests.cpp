@@ -11195,6 +11195,75 @@ TEST_CASE("create and invoke external ref contract", "[tx][soroban]")
     REQUIRE(invocation.getReturnValue().i32() == 7);
 }
 
+TEST_CASE_VERSIONS("Soroban pre-apply preserves historical reserve release",
+                   "[tx][soroban][preapply][preapply-reserve]")
+{
+    VirtualClock clock;
+    auto app = createTestApplication(clock, getTestConfig());
+    for_versions(23, 26, *app, [&] {
+        SorobanTest test(app);
+        auto& root = test.getRoot();
+        auto& contract =
+            test.deployWasmContract(rust_bridge::get_test_wasm_add_i32());
+        auto balance = app->getLedgerManager().getLastMinBalance(1) + 600'400;
+        auto payer = root.create("payer", balance);
+        auto innerSource = root.create("innerSource", balance);
+        auto classicSource = root.create("classicSource", balance);
+        auto spec = SorobanInvocationSpec()
+                        .setInstructions(1'000'000)
+                        .setReadBytes(10'000)
+                        .setInclusionFee(100)
+                        .setNonRefundableResourceFee(100'000)
+                        .setRefundableResourceFee(200'000);
+        auto inner =
+            contract.prepareInvocation("add", {makeI32(1), makeI32(2)}, spec)
+                .createTx(&innerSource);
+        auto first = feeBump(*app, payer, inner, 300'200, true);
+        auto second =
+            contract.prepareInvocation("add", {makeI32(1), makeI32(2)}, spec)
+                .createTx(&payer);
+
+        SignerKey signer(SIGNER_KEY_TYPE_PRE_AUTH_TX);
+        signer.preAuthTx() = first->getContentsHash();
+        auto op = setOptions(setSigner(Signer{signer, 1}));
+        op.sourceAccount.activate() = toMuxedAccount(payer);
+        auto addSigner = root.tx({op});
+        addSigner->addSignature(payer.getSecretKey());
+        REQUIRE(isSuccessResult(
+            closeLedger(*app, {addSigner}).results.front().result));
+
+        auto classic =
+            feeBump(*app, payer, classicSource.tx({payment(root, 1)}), 200);
+        // Before protocol 26 the two phases checked fee affordability
+        // independently. Charging both phases can leave this payer below
+        // reserve until the first Soroban transaction removes its signer.
+        REQUIRE(first->getFullFee() + second->getFullFee() <=
+                payer.getAvailableBalance());
+        REQUIRE(classic->getFullFee() <= payer.getAvailableBalance());
+        REQUIRE(classic->getFullFee() + first->getFullFee() +
+                    second->getFullFee() >
+                payer.getAvailableBalance());
+
+        auto results = closeLedger(*app, {classic, first, second}, true);
+        REQUIRE(isSuccessResult(resultFor(results, first)));
+        if (protocolVersionIsBefore(app->getLedgerManager()
+                                        .getLastClosedLedgerHeader()
+                                        .header.ledgerVersion,
+                                    ProtocolVersion::V_26))
+        {
+            REQUIRE(isSuccessResult(resultFor(results, second)));
+        }
+        else
+        {
+            // Such a set is rejected by protocol 26's cross-phase fee check.
+            // Forcing it through apply gives a negative control: the parallel
+            // read phase sees the payer below reserve, before signer removal.
+            REQUIRE(resultFor(results, second).result.code() ==
+                    txINSUFFICIENT_BALANCE);
+        }
+    });
+}
+
 TEST_CASE_VERSIONS("Soroban pre-apply removes pre-auth tx signers",
                    "[tx][soroban][preapply]")
 {
