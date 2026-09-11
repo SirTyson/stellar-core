@@ -28,6 +28,10 @@ use futures::{AsyncRead, AsyncWrite};
 
 /// A single stream on a connection
 pub struct Stream {
+    /// Connection statistics for diagnosing large queued writes.
+    connection: quinn::Connection,
+    /// Bound diagnostic output even when flow control permits tiny writes.
+    bytes_until_large_write_stats: usize,
     /// A send part of the stream
     send: quinn::SendStream,
     /// A receive part of the stream
@@ -51,8 +55,14 @@ impl Stream {
             .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))
     }
 
-    pub(super) fn new(send: quinn::SendStream, recv: quinn::RecvStream) -> Self {
+    pub(super) fn new(
+        send: quinn::SendStream,
+        recv: quinn::RecvStream,
+        connection: quinn::Connection,
+    ) -> Self {
         Self {
+            connection,
+            bytes_until_large_write_stats: 0,
             send,
             recv,
             close_result: None,
@@ -81,9 +91,38 @@ impl AsyncWrite for Stream {
         cx: &mut Context,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.send)
+        let result = Pin::new(&mut self.send)
             .poll_write(cx, buf)
-            .map_err(Into::into)
+            .map_err(Into::into);
+        // A successful write only queues bytes in QUIC. It does not establish
+        // delivery to the peer. Snapshot the connection for large writes so a
+        // later slow receive can be correlated with congestion and RTT here.
+        // Do not log pending polls or small control/flood messages.
+        if buf.len() >= 1024 * 1024 {
+            if let Poll::Ready(Ok(queued_bytes)) = &result {
+                if *queued_bytes != 0 && *queued_bytes >= self.bytes_until_large_write_stats {
+                    self.bytes_until_large_write_stats = 1024 * 1024;
+                    let stats = self.connection.stats();
+                    tracing::info!(
+                        remote_addr = %self.connection.remote_address(),
+                        stream_id = %self.send.id(),
+                        stream_priority = ?self.send.priority().ok(),
+                        queued_bytes,
+                        remaining_bytes = buf.len() - queued_bytes,
+                        rtt_us = stats.path.rtt.as_micros() as u64,
+                        congestion_window_bytes = stats.path.cwnd,
+                        congestion_events = stats.path.congestion_events,
+                        lost_packets = stats.path.lost_packets,
+                        sent_packets = stats.path.sent_packets,
+                        sent_udp_bytes = stats.udp_tx.bytes,
+                        "QUIC_LARGE_WRITE: bytes queued, not yet acknowledged"
+                    );
+                } else {
+                    self.bytes_until_large_write_stats -= queued_bytes;
+                }
+            }
+        }
+        result
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {

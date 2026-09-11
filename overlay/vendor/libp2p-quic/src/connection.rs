@@ -89,7 +89,7 @@ impl StreamMuxer for Connection {
 
         let (send, recv) = futures::ready!(incoming.poll_unpin(cx)).map_err(ConnectionError)?;
         this.incoming.take();
-        let stream = Stream::new(send, recv);
+        let stream = Stream::new(send, recv, this.connection.clone());
         Poll::Ready(Ok(stream))
     }
 
@@ -106,7 +106,7 @@ impl StreamMuxer for Connection {
 
         let (send, recv) = futures::ready!(outgoing.poll_unpin(cx)).map_err(ConnectionError)?;
         this.outgoing.take();
-        let stream = Stream::new(send, recv);
+        let stream = Stream::new(send, recv, this.connection.clone());
         Poll::Ready(Ok(stream))
     }
 
