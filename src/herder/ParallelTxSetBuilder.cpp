@@ -539,7 +539,13 @@ buildSurgePricedParallelSorobanPhaseWithStageCount(
                 binToStageCluster[binId] = resStage.size();
                 resStage.emplace_back();
             }
-            totalInclusionFee += txFrames[txId]->getInclusionFee();
+            // Selection may precede validation. An unaffordable fee bump can
+            // bid up to INT64_MAX, so bound the provisional fee total until
+            // validation removes it and selection is repeated.
+            auto fee = txFrames[txId]->getInclusionFee();
+            totalInclusionFee = fee > INT64_MAX - totalInclusionFee
+                                    ? INT64_MAX
+                                    : totalInclusionFee + fee;
             resStage[binToStageCluster[binId]].push_back(txFrames[txId]);
         });
         // Algorithm ensures that clusters are populated from first to last and

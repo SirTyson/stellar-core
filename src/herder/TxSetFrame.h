@@ -107,8 +107,10 @@ using PerPhaseTransactionList = std::vector<TxFrameList>;
 // from the provided transactions.
 //
 // Not all the transactions will be included in the result: invalid
-// transactions are trimmed and optionally returned via `invalidTxs` and if
-// there are too many remaining transactions surge pricing is applied.
+// transactions encountered during selection are trimmed and optionally
+// returned via `invalidTxs`; surge pricing selects among the remaining
+// candidates. Soroban candidates that selection does not need may remain
+// unvalidated and are not reported as invalid.
 // `closeTimeOffset` is how far ahead of the last closed ledger's apply time the
 // ledger this set is built for applies. Transaction time bounds are
 // whole-second quantities checked against that apply time (used as both the

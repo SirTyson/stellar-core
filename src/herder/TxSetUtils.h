@@ -17,6 +17,43 @@ namespace stellar
 // validation result for that set.
 using TxFrameListWithErrors = std::pair<TxFrameList, TxSetValidationResult>;
 
+// Validation state for one Soroban nomination, against one immutable ledger.
+// Validates requested candidates in parallel and remembers the results across
+// refills. Shared fee payers retain trimInvalid's aggregate affordability
+// policy, including fees already examined in the Classic phase.
+class TxSetCandidateValidator
+{
+  public:
+    TxSetCandidateValidator(TxFrameList const& candidates, Application& app,
+                            UnorderedMap<AccountID, int64_t> const& priorFees,
+                            uint64_t lowerBoundCloseTimeOffset,
+                            uint64_t upperBoundCloseTimeOffset);
+
+    void validate(TxFrameList const& candidates);
+    bool isChecked(TransactionFrameBasePtr const& tx) const;
+    bool isValid(TransactionFrameBasePtr const& tx) const;
+    bool isInvalid(TransactionFrameBasePtr const& tx) const;
+
+  private:
+    struct FeeSource
+    {
+        TxFrameList candidates;
+        int64_t priorFees{0};
+        int64_t maximumFees{0};
+        std::optional<int64_t> availableBalance;
+        bool resolved{false};
+        bool affordable{false};
+    };
+
+    void checkTransactions(TxFrameList const& candidates);
+
+    Application& mApp;
+    uint64_t mLowerBoundCloseTimeOffset;
+    uint64_t mUpperBoundCloseTimeOffset;
+    UnorderedMap<AccountID, FeeSource> mFeeSources;
+    UnorderedMap<TransactionFrameBasePtr, bool> mIndividualValidity;
+};
+
 class AccountTransactionQueue
 {
   public:

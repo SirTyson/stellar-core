@@ -164,19 +164,20 @@ TxSetUtils::buildAccountTxQueues(TxFrameList const& txs)
     return queues;
 }
 
-template <typename T>
-TxFrameListWithErrors
-TxSetUtils::getInvalidTxListWithErrors(
-    T const& inTxs, Application& app,
-    UnorderedMap<AccountID, int64_t>& accountFeeMap,
-    uint64_t lowerBoundCloseTimeOffset, uint64_t upperBoundCloseTimeOffset)
+namespace
+{
+using IndividualValidationResult = std::pair<bool, std::optional<int64_t>>;
+
+std::vector<IndividualValidationResult>
+checkTransactionsInParallel(TxFrameList const& txs, Application& app,
+                            uint64_t lowerBoundCloseTimeOffset,
+                            uint64_t upperBoundCloseTimeOffset)
 {
     ZoneScoped;
     releaseAssert(threadIsMain());
-    TxFrameList txs(inTxs.begin(), inTxs.end());
     if (txs.empty())
     {
-        return {{}, TxSetValidationResult::VALID};
+        return {};
     }
 
     auto ledgerView = std::make_unique<CheckValidLedgerViewWrapper>(app);
@@ -236,8 +237,7 @@ TxSetUtils::getInvalidTxListWithErrors(
 #endif
     }
 
-    std::vector<std::pair<bool, std::optional<int64_t>>> txValidationResult(
-        txs.size());
+    std::vector<IndividualValidationResult> txValidationResult(txs.size());
     auto& appConnector = app.getAppConnector();
 
     app.getBatchExecutor().executeBatchOverRanges(
@@ -267,6 +267,35 @@ TxSetUtils::getInvalidTxListWithErrors(
                 }
             }
         });
+
+    return txValidationResult;
+}
+
+int64_t
+addFees(int64_t total, int64_t fee)
+{
+    releaseAssert(total >= 0 && fee >= 0);
+    return fee > INT64_MAX - total ? INT64_MAX : total + fee;
+}
+} // namespace
+
+template <typename T>
+TxFrameListWithErrors
+TxSetUtils::getInvalidTxListWithErrors(
+    T const& inTxs, Application& app,
+    UnorderedMap<AccountID, int64_t>& accountFeeMap,
+    uint64_t lowerBoundCloseTimeOffset, uint64_t upperBoundCloseTimeOffset)
+{
+    ZoneScoped;
+    releaseAssert(threadIsMain());
+    TxFrameList txs(inTxs.begin(), inTxs.end());
+    if (txs.empty())
+    {
+        return {{}, TxSetValidationResult::VALID};
+    }
+
+    auto txValidationResult = checkTransactionsInParallel(
+        txs, app, lowerBoundCloseTimeOffset, upperBoundCloseTimeOffset);
 
     TxFrameListWithErrors invalidTxsWithError;
     auto& [invalidTxs, errorCode] = invalidTxsWithError;
@@ -342,6 +371,140 @@ TxSetUtils::getInvalidTxListWithErrors<TxSetPhaseFrame>(
     TxSetPhaseFrame const& txs, Application& app,
     UnorderedMap<AccountID, int64_t>& accountFeeMap,
     uint64_t lowerBoundCloseTimeOffset, uint64_t upperBoundCloseTimeOffset);
+
+TxSetCandidateValidator::TxSetCandidateValidator(
+    TxFrameList const& candidates, Application& app,
+    UnorderedMap<AccountID, int64_t> const& priorFees,
+    uint64_t lowerBoundCloseTimeOffset, uint64_t upperBoundCloseTimeOffset)
+    : mApp(app)
+    , mLowerBoundCloseTimeOffset(lowerBoundCloseTimeOffset)
+    , mUpperBoundCloseTimeOffset(upperBoundCloseTimeOffset)
+{
+    mFeeSources.reserve(candidates.size());
+    mIndividualValidity.reserve(candidates.size());
+    for (auto const& tx : candidates)
+    {
+        auto const id = tx->getFeeSourceID();
+        auto [it, inserted] = mFeeSources.try_emplace(id);
+        auto& source = it->second;
+        if (inserted)
+        {
+            auto prior = priorFees.find(id);
+            source.priorFees = prior == priorFees.end() ? 0 : prior->second;
+            source.maximumFees = source.priorFees;
+        }
+        source.candidates.push_back(tx);
+        source.maximumFees = addFees(source.maximumFees, tx->getFullFee());
+    }
+}
+
+void
+TxSetCandidateValidator::checkTransactions(TxFrameList const& candidates)
+{
+    TxFrameList unchecked;
+    unchecked.reserve(candidates.size());
+    for (auto const& tx : candidates)
+    {
+        // Reserve the entry now so repeated pointers in a request cannot be
+        // checked concurrently (transaction frames contain mutable caches).
+        if (mIndividualValidity.try_emplace(tx, false).second)
+        {
+            unchecked.push_back(tx);
+        }
+    }
+    auto results =
+        checkTransactionsInParallel(unchecked, mApp, mLowerBoundCloseTimeOffset,
+                                    mUpperBoundCloseTimeOffset);
+    for (size_t i = 0; i < unchecked.size(); ++i)
+    {
+        auto const& [valid, balance] = results[i];
+        auto const& tx = unchecked[i];
+        mIndividualValidity.at(tx) = valid && balance.has_value();
+        if (valid && !balance)
+        {
+            CLOG_ERROR(Herder,
+                       "Account not found when checking TxSet validity");
+            CLOG_ERROR(Herder, "{}", REPORT_INTERNAL_BUG);
+        }
+        if (valid && balance)
+        {
+            mFeeSources.at(tx->getFeeSourceID()).availableBalance = balance;
+        }
+    }
+}
+
+void
+TxSetCandidateValidator::validate(TxFrameList const& candidates)
+{
+    checkTransactions(candidates);
+    UnorderedSet<AccountID> incompleteSources;
+    TxFrameList feeDependencies;
+    for (auto const& tx : candidates)
+    {
+        if (!mIndividualValidity.at(tx))
+        {
+            continue;
+        }
+        auto const id = tx->getFeeSourceID();
+        auto& source = mFeeSources.at(id);
+        if (source.resolved)
+        {
+            continue;
+        }
+        releaseAssert(source.availableBalance);
+        if (source.maximumFees <= *source.availableBalance)
+        {
+            // Even if every remaining candidate is valid, this payer can
+            // afford the aggregate. No unrelated signatures need checking.
+            source.resolved = true;
+            source.affordable = true;
+        }
+        else if (incompleteSources.insert(id).second)
+        {
+            // An invalid transaction does not contribute to aggregate fees.
+            // Resolve the whole group before keeping or rejecting any member.
+            feeDependencies.insert(feeDependencies.end(),
+                                   source.candidates.begin(),
+                                   source.candidates.end());
+        }
+    }
+    checkTransactions(feeDependencies);
+    for (auto const& id : incompleteSources)
+    {
+        auto& source = mFeeSources.at(id);
+        int64_t total = source.priorFees;
+        for (auto const& tx : source.candidates)
+        {
+            if (mIndividualValidity.at(tx))
+            {
+                total = addFees(total, tx->getFullFee());
+            }
+        }
+        source.affordable = total <= *source.availableBalance;
+        source.resolved = true;
+    }
+}
+
+bool
+TxSetCandidateValidator::isChecked(TransactionFrameBasePtr const& tx) const
+{
+    return mIndividualValidity.find(tx) != mIndividualValidity.end();
+}
+
+bool
+TxSetCandidateValidator::isValid(TransactionFrameBasePtr const& tx) const
+{
+    auto it = mIndividualValidity.find(tx);
+    auto const& source = mFeeSources.at(tx->getFeeSourceID());
+    return it != mIndividualValidity.end() && it->second && source.resolved &&
+           source.affordable;
+}
+
+bool
+TxSetCandidateValidator::isInvalid(TransactionFrameBasePtr const& tx) const
+{
+    return isChecked(tx) && !isValid(tx);
+}
 
 TxFrameList
 TxSetUtils::trimInvalid(TxFrameList const& txs, Application& app,
