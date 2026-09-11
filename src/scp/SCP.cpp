@@ -49,6 +49,28 @@ SCP::predictNominationLeaders(uint64 slotIndex, Value const& previousValue,
     return NominationProtocol::predictLeaders(preview, previousValue, rounds);
 }
 
+bool
+SCP::provideNominationValue(uint64 slotIndex, ValueWrapperPtr value)
+{
+    dbgAssert(isValidator());
+    auto slot = getSlot(slotIndex, false);
+    return slot && slot->provideNominationValue(std::move(value));
+}
+
+bool
+SCP::needsNominationValue(uint64 slotIndex)
+{
+    auto slot = getSlot(slotIndex, false);
+    return slot && slot->needsNominationValue();
+}
+
+std::set<NodeID>
+SCP::getNextNominationLeaders(uint64 slotIndex)
+{
+    auto slot = getSlot(slotIndex, false);
+    return slot ? slot->getNextNominationLeaders() : std::set<NodeID>{};
+}
+
 void
 SCP::stopNomination(uint64 slotIndex)
 {

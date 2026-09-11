@@ -326,6 +326,65 @@ TEST_CASE("nomination leader preview preserves ties and zero weights",
     REQUIRE(driver.mSCP.getKnownSlotsCount() == 0);
 }
 
+TEST_CASE("followers defer their value until elected without restarting SCP",
+          "[scp][early-nomination]")
+{
+    SIMULATION_CREATE_NODE(0);
+    SIMULATION_CREATE_NODE(1);
+    SIMULATION_CREATE_NODE(2);
+    SCPQuorumSet qset;
+    qset.threshold = 3;
+    qset.validators = {v0NodeID, v1NodeID, v2NodeID};
+    LeaderPreviewTestDriver driver(v1NodeID, qset);
+    auto& scp = driver.mSCP;
+    Value previous{42}, value{43};
+    auto wrapped = driver.wrapValue(value);
+    REQUIRE(!scp.provideNominationValue(7, wrapped));
+    REQUIRE(scp.getNextNominationLeaders(7).empty());
+    REQUIRE(scp.getKnownSlotsCount() == 0);
+    REQUIRE(!scp.nominate(7, nullptr, previous));
+    REQUIRE(!scp.needsNominationValue(7));
+    REQUIRE(scp.getNextNominationLeaders(7) ==
+            std::set<NodeID>{v0NodeID, v1NodeID});
+    REQUIRE(scp.getNominationLeaders(7) == std::set<NodeID>{v0NodeID});
+    REQUIRE(!scp.provideNominationValue(7, wrapped));
+    REQUIRE(driver.emitted == 0);
+    REQUIRE(driver.timers == 1);
+
+    // The next live round fast-forwards past a repeated winner.
+    auto timeout = std::move(driver.nominationTimeout);
+    timeout();
+    REQUIRE(scp.getNominationLeaders(7) ==
+            std::set<NodeID>{v0NodeID, v1NodeID});
+    REQUIRE(scp.needsNominationValue(7));
+    REQUIRE(driver.emitted == 0);
+    REQUIRE(driver.timers == 2);
+
+    SECTION("supplying the value does not advance rounds or reset timers")
+    {
+        REQUIRE(scp.provideNominationValue(7, wrapped));
+        REQUIRE(!scp.needsNominationValue(7));
+        REQUIRE(driver.emitted == 1);
+        REQUIRE(driver.timers == 2);
+        REQUIRE(scp.getNominationLeaders(7) ==
+                std::set<NodeID>{v0NodeID, v1NodeID});
+        REQUIRE(!scp.provideNominationValue(7, wrapped));
+        REQUIRE(driver.emitted == 1);
+        REQUIRE(driver.timers == 2);
+    }
+    SECTION("a cancelled slot rejects a late value")
+    {
+        scp.stopNomination(7);
+        REQUIRE(!scp.needsNominationValue(7));
+        REQUIRE(scp.getNextNominationLeaders(7).empty());
+        REQUIRE(!scp.provideNominationValue(7, wrapped));
+        auto pendingTimeout = std::move(driver.nominationTimeout);
+        pendingTimeout();
+        REQUIRE(driver.emitted == 0);
+        REQUIRE(driver.timers == 2);
+    }
+}
+
 TEST_CASE("nomination weight", "[scp]")
 {
     SIMULATION_CREATE_NODE(0);

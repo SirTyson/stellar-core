@@ -230,6 +230,24 @@ Slot::nominate(ValueWrapperPtr value, Value const& previousValue, bool timedout)
     return mNominationProtocol.nominate(value, previousValue, timedout);
 }
 
+bool
+Slot::provideNominationValue(ValueWrapperPtr value)
+{
+    return mNominationProtocol.provideLocalValue(std::move(value));
+}
+
+bool
+Slot::needsNominationValue() const
+{
+    return mNominationProtocol.needsLocalValue();
+}
+
+std::set<NodeID>
+Slot::getNextNominationLeaders() const
+{
+    return mNominationProtocol.getNextLeaders();
+}
+
 void
 Slot::stopNomination()
 {

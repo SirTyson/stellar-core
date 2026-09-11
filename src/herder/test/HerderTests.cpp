@@ -6490,6 +6490,15 @@ class EarlyNominationTestAccess
     {
         herder.setupTriggerNextLedger();
     }
+
+    static uint64_t
+    meter(HerderImpl& herder, std::string const& name)
+    {
+        auto metrics = herder.mApp.getMetrics().GetAllMetrics();
+        return dynamic_cast<medida::Meter const&>(
+                   *metrics.at({"scp", "txset", name}))
+            .count();
+    }
 };
 }
 
@@ -6697,6 +6706,9 @@ TEST_CASE("prepare nomination before trigger", "[herder][early-nomination]")
     REQUIRE(clock.now() < trigger);
     REQUIRE(pulls == 1);
     auto prepared = EarlyNominationTestAccess::prepared(herder);
+    REQUIRE(EarlyNominationTestAccess::meter(herder, "prepared") == 1);
+    REQUIRE(EarlyNominationTestAccess::meter(herder, "prepared-discarded") ==
+            0);
     auto const preparedCloseTime = EarlyNominationTestAccess::closeTime(herder);
     REQUIRE(prepared);
     REQUIRE(prepared->sizeTxTotal() == 1);
@@ -6712,13 +6724,13 @@ TEST_CASE("prepare nomination before trigger", "[herder][early-nomination]")
         // used to validate time bounds, not acquire the new wall-clock time.
         clock.setCurrentVirtualTime(trigger + std::chrono::seconds(1));
         testutil::crankUntil(
-            app,
-            [&]() {
-                return !herder.getSCP().getNominationLeaders(seq).empty();
-            },
-            std::chrono::seconds(1));
+            app, [&]() { return !EarlyNominationTestAccess::prepared(herder); },
+            std::chrono::seconds(15));
         REQUIRE(pulls == 1);
         REQUIRE(!EarlyNominationTestAccess::prepared(herder));
+        REQUIRE(EarlyNominationTestAccess::meter(herder, "prepared-used") == 1);
+        REQUIRE(EarlyNominationTestAccess::meter(herder,
+                                                 "prepared-discarded") == 0);
         REQUIRE(std::get<TxSetXDRFrameConstPtr>(
                     herder.getTxSet(prepared->getContentsHash())) == prepared);
         // The value can be checked independently of the production cache.
@@ -6752,7 +6764,12 @@ TEST_CASE("prepare nomination before trigger", "[herder][early-nomination]")
         // The fallback builds with today's valid close time, and must not
         // claim that our time-bound transaction is valid for that time.
         herder.triggerNextLedger(seq, true);
+        testutil::crankUntil(
+            app, [&]() { return pulls == 2; }, std::chrono::seconds(15));
         REQUIRE(pulls == 2);
+        REQUIRE(EarlyNominationTestAccess::meter(herder,
+                                                 "prepared-discarded") == 1);
+        REQUIRE(EarlyNominationTestAccess::meter(herder, "prepared-used") == 0);
         REQUIRE(!EarlyNominationTestAccess::prepared(herder));
         REQUIRE(std::get<TxSetXDRFrameConstPtr>(
                     herder.getTxSet(prepared->getContentsHash())) == nullptr);
@@ -6762,6 +6779,8 @@ TEST_CASE("prepare nomination before trigger", "[herder][early-nomination]")
         herder.externalizeValue(TxSetXDRFrame::makeEmpty(lcl), seq,
                                 preparedCloseTime, {}, cfg.NODE_SEED);
         REQUIRE(EarlyNominationTestAccess::prepared(herder) != prepared);
+        REQUIRE(EarlyNominationTestAccess::meter(herder,
+                                                 "prepared-discarded") == 1);
         auto const pullsAfterClose = pulls;
         // A stale timer/caller cannot nominate the old slot or pull again.
         herder.triggerNextLedger(seq, true);
@@ -6771,6 +6790,8 @@ TEST_CASE("prepare nomination before trigger", "[herder][early-nomination]")
     {
         herder.lostSync();
         REQUIRE(!EarlyNominationTestAccess::prepared(herder));
+        REQUIRE(EarlyNominationTestAccess::meter(herder,
+                                                 "prepared-discarded") == 1);
         herder.triggerNextLedger(seq, true);
         REQUIRE(pulls == 1);
     }
@@ -6778,20 +6799,19 @@ TEST_CASE("prepare nomination before trigger", "[herder][early-nomination]")
     {
         herder.shutdown();
         REQUIRE(!EarlyNominationTestAccess::prepared(herder));
+        REQUIRE(EarlyNominationTestAccess::meter(herder,
+                                                 "prepared-discarded") == 1);
     }
     herder.mGetTopTransactionsForTesting = nullptr;
 }
 
-TEST_CASE("only the first two nomination leaders prepare early",
+TEST_CASE("validators prepare only when their nomination role approaches",
           "[herder][early-nomination]")
 {
-    // A fixed, unanimous quorum gives all three nodes the same weights and
-    // leader ordering. Exercise each member as the local node, rather than
-    // hoping random peers cover every role for one fixed local priority.
     std::vector<SecretKey> keys;
     SCPQuorumSet qset;
-    qset.threshold = 3;
-    for (int i = 0; i < 3; ++i)
+    qset.threshold = 4;
+    for (int i = 0; i < 4; ++i)
     {
         keys.push_back(SecretKey::fromSeed(
             sha256(fmt::format("early-nomination-node-{}", i))));
@@ -6800,9 +6820,132 @@ TEST_CASE("only the first two nomination leaders prepare early",
 
     std::set<int> checkedRoles;
     std::optional<Value> previous;
-    std::optional<std::set<NodeID>> expectedFirst;
-    std::optional<std::set<NodeID>> expectedFirstTwo;
-    for (int i = 0; i < 3; ++i)
+    std::optional<std::vector<std::set<NodeID>>> expectedLeaders;
+    for (int i = 0; i < 4; ++i)
+    {
+        VirtualClock clock;
+        clock.setCurrentVirtualTime(VirtualClock::from_time_t(1000));
+        auto cfg = getTestConfig(i);
+        cfg.HTTP_PORT = 0;
+        cfg.MANUAL_CLOSE = false;
+        cfg.ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING = false;
+        cfg.FORCE_OLD_STYLE_PREPARE_START_TRIGGER_TIMER = true;
+        cfg.NODE_SEED = keys[i];
+        cfg.QUORUM_SET = qset;
+        cfg.GENESIS_TEST_ACCOUNT_COUNT = 10;
+        cfg.TESTING_UPGRADE_MAX_TX_SET_SIZE = 1;
+        auto app = createTestApplication(clock, cfg);
+        auto& herder = static_cast<HerderImpl&>(app->getHerder());
+        auto& scp = herder.getSCP();
+        auto& driver = herder.getHerderSCPDriver();
+        auto const lcl = app->getLedgerManager().getLastClosedLedgerHeader();
+        auto const seq = lcl.header.ledgerSeq + 1;
+        auto const value = xdr::xdr_to_opaque(lcl.header.scpValue);
+        if (!previous)
+        {
+            previous = value;
+        }
+        REQUIRE(value == *previous);
+        driver.recordSCPEvent(lcl.header.ledgerSeq, false);
+        auto alice = txtest::getGenesisAccount(*app, 0);
+        auto bob = txtest::getGenesisAccount(*app, 1);
+        auto tx = alice.tx({payment(bob, 100)});
+        auto extra = bob.tx({payment(alice, 100)});
+        size_t pulls = 0;
+        herder.mGetTopTransactionsForTesting = [&](size_t) {
+            ++pulls;
+            return std::vector<TransactionEnvelope>{tx->getEnvelope(),
+                                                    extra->getEnvelope()};
+        };
+        std::vector<std::set<NodeID>> leaders;
+        int role = -1;
+        for (int round = 0; round < 4; ++round)
+        {
+            leaders.push_back(
+                scp.predictNominationLeaders(seq, value, round + 1));
+            REQUIRE(leaders.back().size() == round + 1);
+            if (role == -1 && leaders.back().count(scp.getLocalNodeID()))
+            {
+                role = round;
+            }
+        }
+        if (!expectedLeaders)
+        {
+            expectedLeaders = leaders;
+        }
+        REQUIRE(leaders == *expectedLeaders);
+        REQUIRE(checkedRoles.insert(role).second);
+        CAPTURE(role);
+        EarlyNominationTestAccess::schedule(herder);
+        REQUIRE(EarlyNominationTestAccess::scheduled(herder) == (role < 2));
+        auto drainPostedWork = [&]() {
+            bool done = false;
+            VirtualTimer stop(clock);
+            stop.expires_from_now(std::chrono::milliseconds(1));
+            stop.async_wait([&]() { done = true; },
+                            &VirtualTimer::onFailureNoop);
+            testutil::crankUntil(
+                app, [&]() { return done; }, std::chrono::seconds(1));
+        };
+        drainPostedWork();
+        REQUIRE(clock.now() < herder.getTriggerTimer().expiry_time());
+        REQUIRE(pulls == (role < 2 ? 1 : 0));
+        REQUIRE(bool(EarlyNominationTestAccess::prepared(herder)) ==
+                (role < 2));
+        REQUIRE(scp.getNominationLeaders(seq).empty());
+        REQUIRE(scp.getLatestMessagesSend(seq).empty());
+
+        clock.setCurrentVirtualTime(herder.getTriggerTimer().expiry_time());
+        for (int round = 0; round < 4; ++round)
+        {
+            CAPTURE(round);
+            testutil::crankUntil(
+                app,
+                [&]() {
+                    return scp.getNominationLeaders(seq) == leaders[round];
+                },
+                std::chrono::seconds(30));
+            drainPostedWork();
+            // User round 0 and 1 prepare after close. Round 2 prepares at
+            // round 1's start; round 3 at round 2's start. No other pulls.
+            REQUIRE(pulls == (role <= round + 1 ? 1 : 0));
+            REQUIRE(EarlyNominationTestAccess::meter(herder, "prepared") ==
+                    pulls);
+            REQUIRE(EarlyNominationTestAccess::meter(herder, "prepared-used") ==
+                    (role <= round ? 1 : 0));
+            REQUIRE(EarlyNominationTestAccess::meter(
+                        herder, "prepared-discarded") == 0);
+            REQUIRE(bool(EarlyNominationTestAccess::prepared(herder)) ==
+                    (role == round + 1));
+            REQUIRE(scp.getLatestMessagesSend(seq).empty() == (role > round));
+            REQUIRE(driver.getNominationTimeouts(seq).value() == round);
+            if (round < 3)
+            {
+                auto const hashRound =
+                    scp.getJsonInfo(
+                           1)[std::to_string(seq)]["nomination"]["roundnumber"]
+                        .asUInt();
+                clock.setCurrentVirtualTime(
+                    clock.now() + driver.computeTimeout(hashRound, true));
+            }
+        }
+        REQUIRE(pulls == 1);
+        herder.mGetTopTransactionsForTesting = nullptr;
+    }
+    REQUIRE(checkedRoles == std::set<int>{0, 1, 2, 3});
+}
+
+TEST_CASE("a deferred leader can supply its value after losing tracking",
+          "[herder][early-nomination]")
+{
+    std::vector<SecretKey> keys = {
+        SecretKey::fromSeed(sha256("deferred-recovery-node-0")),
+        SecretKey::fromSeed(sha256("deferred-recovery-node-1"))};
+    SCPQuorumSet qset;
+    qset.threshold = 2;
+    qset.validators = {keys[0].getPublicKey(), keys[1].getPublicKey()};
+    bool testedBackup = false;
+    for (int i = 0; i < 2; ++i)
     {
         VirtualClock clock;
         clock.setCurrentVirtualTime(VirtualClock::from_time_t(1000));
@@ -6818,55 +6961,50 @@ TEST_CASE("only the first two nomination leaders prepare early",
         auto& scp = herder.getSCP();
         auto const lcl = app->getLedgerManager().getLastClosedLedgerHeader();
         auto const seq = lcl.header.ledgerSeq + 1;
-        auto const value = xdr::xdr_to_opaque(lcl.header.scpValue);
-        if (!previous)
+        auto const first = scp.predictNominationLeaders(
+            seq, xdr::xdr_to_opaque(lcl.header.scpValue), 1);
+        REQUIRE(first.size() == 1);
+        if (first.count(scp.getLocalNodeID()))
         {
-            previous = value;
+            continue;
         }
-        REQUIRE(value == *previous);
+        REQUIRE(!testedBackup);
+        testedBackup = true;
         herder.getHerderSCPDriver().recordSCPEvent(lcl.header.ledgerSeq, false);
         size_t pulls = 0;
         herder.mGetTopTransactionsForTesting = [&](size_t) {
             ++pulls;
             return std::vector<TransactionEnvelope>{};
         };
-        auto first = scp.predictNominationLeaders(seq, value, 1);
-        auto firstTwo = scp.predictNominationLeaders(seq, value, 2);
-        REQUIRE(first.size() == 1);
-        REQUIRE(firstTwo.size() == 2);
-        if (!expectedFirst)
-        {
-            expectedFirst = first;
-            expectedFirstTwo = firstTwo;
-        }
-        REQUIRE(first == *expectedFirst);
-        REQUIRE(firstTwo == *expectedFirstTwo);
-        int role = first.count(scp.getLocalNodeID())      ? 0
-                   : firstTwo.count(scp.getLocalNodeID()) ? 1
-                                                          : 2;
-        REQUIRE(checkedRoles.insert(role).second);
-        CAPTURE(role);
         EarlyNominationTestAccess::schedule(herder);
-        REQUIRE(EarlyNominationTestAccess::scheduled(herder) == (role < 2));
-        bool done = false;
-        VirtualTimer stop(clock);
-        stop.expires_from_now(std::chrono::milliseconds(1));
-        stop.async_wait([&]() { done = true; }, &VirtualTimer::onFailureNoop);
         testutil::crankUntil(
-            app, [&]() { return done; }, std::chrono::seconds(1));
-        REQUIRE(done);
-        REQUIRE(clock.now() < herder.getTriggerTimer().expiry_time());
-        REQUIRE(pulls == (role < 2 ? 1 : 0));
-        REQUIRE(bool(EarlyNominationTestAccess::prepared(herder)) ==
-                (role < 2));
-        REQUIRE(scp.getNominationLeaders(seq).empty());
+            app, [&]() { return pulls == 1; }, std::chrono::seconds(1));
+        clock.setCurrentVirtualTime(herder.getTriggerTimer().expiry_time());
+        testutil::crankUntil(
+            app, [&]() { return scp.getNominationLeaders(seq) == first; },
+            std::chrono::seconds(1));
         REQUIRE(scp.getLatestMessagesSend(seq).empty());
+
+        // Losing tracking discards speculation, but SCP's active slot keeps
+        // running. The ledger read view is still usable for that same slot.
+        herder.lostSync();
+        REQUIRE(app->getLedgerManager().isSynced());
+        REQUIRE(!EarlyNominationTestAccess::prepared(herder));
+        REQUIRE(EarlyNominationTestAccess::meter(herder,
+                                                 "prepared-discarded") == 1);
+        testutil::crankUntil(
+            app, [&]() { return !scp.getLatestMessagesSend(seq).empty(); },
+            std::chrono::seconds(15));
+        REQUIRE(!herder.isTracking());
+        REQUIRE(pulls == 2);
+        REQUIRE(!scp.needsNominationValue(seq));
+        REQUIRE(scp.getNominationLeaders(seq).count(scp.getLocalNodeID()) == 1);
         herder.mGetTopTransactionsForTesting = nullptr;
     }
-    REQUIRE(checkedRoles == std::set<int>{0, 1, 2});
+    REQUIRE(testedBackup);
 }
 
-TEST_CASE("early underfilled proposals refresh at the trigger",
+TEST_CASE("early underfilled proposals refresh when needed",
           "[herder][early-nomination]")
 {
     auto const invalidFirst = GENERATE(false, true);
@@ -6917,10 +7055,13 @@ TEST_CASE("early underfilled proposals refresh at the trigger",
     mempool = {tx->getEnvelope(), extra->getEnvelope()};
     clock.setCurrentVirtualTime(herder.getTriggerTimer().expiry_time());
     testutil::crankUntil(
-        app,
-        [&]() { return !herder.getSCP().getNominationLeaders(seq).empty(); },
-        std::chrono::seconds(1));
+        app, [&]() { return pulls == 2; }, std::chrono::seconds(15));
     REQUIRE(pulls == 2);
+    REQUIRE(herder.getSCP().getNominationLeaders(seq).count(
+                herder.getSCP().getLocalNodeID()) == 1);
+    REQUIRE(EarlyNominationTestAccess::meter(herder, "prepared-discarded") ==
+            1);
+    REQUIRE(EarlyNominationTestAccess::meter(herder, "prepared-used") == 0);
     // Check the actual set cached for nomination, independently of benchmark
     // instrumentation. Both newly arrived transactions must be present.
     auto expected = makeTxSetFromTransactions(TxFrameList{tx, extra}, *app,

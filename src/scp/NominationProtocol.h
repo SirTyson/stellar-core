@@ -40,6 +40,12 @@ class NominationProtocol
     // the value from the previous slot
     Value mPreviousValue;
 
+    // Followers can participate without constructing their own value. Keep
+    // a supplied local value across rounds, including upgrade stripping.
+    ValueWrapperPtr mLocalValue;
+    bool shouldVoteForLocalValue() const;
+    bool voteForLocalValue();
+
     bool isNewerStatement(NodeID const& nodeID, SCPNomination const& st);
 
     // returns true if 'p' is a subset of 'v'
@@ -92,6 +98,10 @@ class NominationProtocol
     // starting nomination, arming timers, or emitting statements.
     static std::set<NodeID>
     predictLeaders(Slot& slot, Value const& previousValue, uint32_t rounds);
+
+    std::set<NodeID> getNextLeaders() const;
+    bool needsLocalValue() const;
+    bool provideLocalValue(ValueWrapperPtr value);
 
     SCP::EnvelopeState processEnvelope(SCPEnvelopeWrapperPtr envelope);
 

@@ -51,10 +51,16 @@ class SCP
     // invokes the appropriate methods
     EnvelopeState receiveEnvelope(SCPEnvelopeWrapperPtr envelope);
 
-    // Submit a value to consider for slotIndex
+    // Submit a value to consider for slotIndex. A null value starts
+    // participation using peers' values without constructing a local value.
     // previousValue is the value from slotIndex-1
     bool nominate(uint64 slotIndex, ValueWrapperPtr value,
                   Value const& previousValue);
+
+    // Supply a local value without advancing the round or restarting timers.
+    bool provideNominationValue(uint64 slotIndex, ValueWrapperPtr value);
+    bool needsNominationValue(uint64 slotIndex);
+    std::set<NodeID> getNextNominationLeaders(uint64 slotIndex);
 
     // stops nomination for a slot
     void stopNomination(uint64 slotIndex);

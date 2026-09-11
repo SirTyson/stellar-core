@@ -128,6 +128,10 @@ class Slot : public std::enable_shared_from_this<Slot>
     bool nominate(ValueWrapperPtr value, Value const& previousValue,
                   bool timedout);
 
+    bool provideNominationValue(ValueWrapperPtr value);
+    bool needsNominationValue() const;
+    std::set<NodeID> getNextNominationLeaders() const;
+
     void stopNomination();
 
     // returns the current nomination leaders

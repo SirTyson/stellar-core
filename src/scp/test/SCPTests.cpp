@@ -2890,6 +2890,44 @@ TEST_CASE("ballot protocol core3", "[scp][ballotprotocol]")
     testTimeouts(scp, test);
 }
 
+TEST_CASE("nomination can accept a candidate without any local proposal",
+          "[scp][nominationprotocol][early-nomination]")
+{
+    setupValues();
+    SIMULATION_CREATE_NODE(0);
+    SIMULATION_CREATE_NODE(1);
+    SIMULATION_CREATE_NODE(2);
+    SIMULATION_CREATE_NODE(3);
+    SIMULATION_CREATE_NODE(4);
+    SCPQuorumSet qset;
+    qset.threshold = 4;
+    qset.validators = {v0NodeID, v1NodeID, v2NodeID, v3NodeID, v4NodeID};
+    TestSCP driver(v0NodeID, qset);
+    driver.storeQuorumSet(std::make_shared<SCPQuorumSet>(qset));
+    auto& scp = driver.mSCP;
+    auto const hash = sha256(xdr::xdr_to_opaque(qset));
+    driver.mExpectedCandidates = {xValue};
+    driver.mCompositeValue = xValue;
+    REQUIRE(!scp.nominate(1, nullptr, zValue));
+    REQUIRE(scp.needsNominationValue(1));
+    REQUIRE(driver.mEnvs.empty());
+    for (auto const& peer : {v1SecretKey, v2SecretKey, v3SecretKey})
+    {
+        REQUIRE(driver.receiveEnvelope(
+                    makeNominate(peer, hash, 1, {xValue}, {xValue})) ==
+                SCP::EnvelopeState::VALID);
+    }
+    REQUIRE(!scp.needsNominationValue(1));
+    REQUIRE(scp.getNextNominationLeaders(1).empty());
+    auto const before = driver.mEnvs.size();
+    REQUIRE(!scp.provideNominationValue(1, driver.wrapValue(yValue)));
+    REQUIRE(driver.mEnvs.size() == before);
+    REQUIRE(!driver.mEnvs.empty());
+    REQUIRE(driver.mEnvs.back().statement.pledges.type() == SCP_ST_PREPARE);
+    REQUIRE(driver.mEnvs.back().statement.pledges.prepare().ballot.value ==
+            xValue);
+}
+
 TEST_CASE("nomination tests core5", "[scp][nominationprotocol]")
 {
     setupValues();

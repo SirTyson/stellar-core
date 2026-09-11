@@ -86,6 +86,12 @@ HerderImpl::SCPMetrics::SCPMetrics(Application& app)
           {"scp", "envelope", "invalidsig"}, "envelope"))
     , mTriggerPrepareStartFallback(app.getMetrics().NewMeter(
           {"scp", "trigger", "prepare-start-fallback"}, "trigger"))
+    , mTxSetPrepared(
+          app.getMetrics().NewMeter({"scp", "txset", "prepared"}, "txset"))
+    , mPreparedTxSetUsed(
+          app.getMetrics().NewMeter({"scp", "txset", "prepared-used"}, "txset"))
+    , mPreparedTxSetDiscarded(app.getMetrics().NewMeter(
+          {"scp", "txset", "prepared-discarded"}, "txset"))
 {
 }
 
@@ -208,7 +214,7 @@ HerderImpl::setState(State st)
 void
 HerderImpl::lostSync()
 {
-    discardPreparedTxSet();
+    discardPreparedTxSet("lost sync");
     mHerderSCPDriver.stateChanged();
     setState(Herder::State::HERDER_SYNCING_STATE);
 }
@@ -299,7 +305,7 @@ HerderImpl::purgeOldSlots()
 void
 HerderImpl::shutdown()
 {
-    discardPreparedTxSet();
+    discardPreparedTxSet("shutdown");
     mTrackingTimer.cancel();
     mOutOfSyncTimer.cancel();
     mTriggerTimer.cancel();
@@ -525,7 +531,7 @@ HerderImpl::valueExternalized(uint64 slotIndex, StellarValue const& value,
         // we do not want it to trigger while downloading the current set
         // and there is no point in taking a position after the round is over
         mTriggerTimer.cancel();
-        discardPreparedTxSet();
+        discardPreparedTxSet("slot externalized");
 
         // This call may cause LedgerManager to trigger ledger close
         processExternalized(slotIndex, value, isLatestSlot);
@@ -1165,7 +1171,7 @@ HerderImpl::lastClosedLedgerIncreased(bool latest, TxSetXDRFrameConstPtr txSet,
                                       bool upgradeApplied)
 {
     releaseAssert(threadIsMain());
-    discardPreparedTxSet();
+    discardPreparedTxSet("ledger advanced");
 
     // Ensure potential upgrades are handled in overlay
     maybeHandleUpgrade();
@@ -1349,7 +1355,7 @@ HerderImpl::triggerAnchorFromConsensusCloseTime(
 void
 HerderImpl::setupTriggerNextLedger()
 {
-    discardPreparedTxSet();
+    discardPreparedTxSet("trigger rescheduled");
     // Invariant: core proceeds to vote for the next ledger only when it's _not_
     // applying to ensure block production does not conflict with ledger close.
     releaseAssert(!mLedgerManager.isApplying());
@@ -1586,9 +1592,15 @@ HerderImpl::setInSyncAndTriggerNextLedger()
 }
 
 void
-HerderImpl::discardPreparedTxSet()
+HerderImpl::discardPreparedTxSet(char const* reason)
 {
     mPrepareTxSetTimer.cancel();
+    if (mPreparedTxSet)
+    {
+        mSCPMetrics.mPreparedTxSetDiscarded.Mark();
+        CLOG_INFO(Herder, "Discarded prepared TX set for ledger {}: {}",
+                  mPreparedTxSet->ledgerSeq, reason);
+    }
     mPreparedTxSet.reset();
 }
 
@@ -1601,12 +1613,19 @@ HerderImpl::prepareTxSet(uint32_t ledgerSeq, ConsensusTime closeTime)
     {
         return;
     }
+    if (mPreparedTxSet)
+    {
+        // Keep a snapshot across rounds until it is consumed or the ledger
+        // changes. Round notifications must not repeatedly rebuild it.
+        return;
+    }
     mPreparedTxSet = buildTxSet(ledgerSeq, closeTime);
-    CLOG_INFO(Herder,
-              "Prepared TX set for ledger {} before trigger: {} transactions, "
-              "close time {}",
-              ledgerSeq, mPreparedTxSet->txSet->sizeTxTotal(),
-              closeTime.toString());
+    mSCPMetrics.mTxSetPrepared.Mark();
+    CLOG_INFO(
+        Herder,
+        "Prepared TX set for ledger {} before nomination: {} transactions, "
+        "close time {}",
+        ledgerSeq, mPreparedTxSet->txSet->sizeTxTotal(), closeTime.toString());
 }
 
 HerderImpl::PreparedTxSet
@@ -1849,22 +1868,130 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
         return;
     }
 
+    if (!getSCP().isValidator() ||
+        mHerderSCPDriver.isNominating(ledgerSeqToTrigger))
+    {
+        return;
+    }
+
+    auto const firstLeaders = getSCP().predictNominationLeaders(
+        ledgerSeqToTrigger, xdr::xdr_to_opaque(lcl.header.scpValue), 1);
+    if (firstLeaders.count(getSCP().getLocalNodeID()))
+    {
+        publishNominationValue(ledgerSeqToTrigger, nextCloseTime);
+    }
+    else
+    {
+        // Followers vote for peers' proposals and run the same nomination
+        // timers without pulling or validating an unused local proposal.
+        mHerderSCPDriver.recordSCPEvent(ledgerSeqToTrigger, true);
+        mHerderSCPDriver.startNomination(ledgerSeqToTrigger,
+                                         lcl.header.scpValue);
+    }
+}
+
+void
+HerderImpl::nominationRoundStarted(uint64 slotIndex,
+                                   std::chrono::milliseconds timeout)
+{
+    if (!mHerderSCPDriver.isNominating(slotIndex) ||
+        !mLedgerManager.isSynced() || mLedgerManager.isApplying() ||
+        !getSCP().isValidator() ||
+        slotIndex != mLedgerManager.getLastClosedLedgerNum() + 1)
+    {
+        return;
+    }
+    auto const& local = getSCP().getLocalNodeID();
+    auto const leaders = getSCP().getNominationLeaders(slotIndex);
+    bool const needsValue = getSCP().needsNominationValue(slotIndex);
+    bool const nextLeader =
+        isTracking() && !leaders.count(local) &&
+        getSCP().getNextNominationLeaders(slotIndex).count(local);
+    if (!needsValue && (!nextLeader || mPreparedTxSet))
+    {
+        return;
+    }
+
+    auto const& lcl = mLedgerManager.getLastClosedLedgerHeader();
+    auto const closeTime = std::max(
+        getConsensusTime(lcl.header.scpValue).next(lcl.header.ledgerVersion),
+        ConsensusTime::fromSystemTime(mApp.getClock().system_now() + timeout,
+                                      lcl.header.ledgerVersion));
+    // Never perform construction or publish into SCP while it is in the
+    // middle of a round transition. The callback rechecks the live slot.
+    mPrepareTxSetTimer.cancel();
+    mPrepareTxSetTimer.expires_at(mApp.getClock().now());
+    mPrepareTxSetTimer.async_wait(
+        [this, slotIndex, closeTime]() {
+            if (!mHerderSCPDriver.isNominating(slotIndex) ||
+                !mLedgerManager.isSynced() || mLedgerManager.isApplying() ||
+                slotIndex != mLedgerManager.getLastClosedLedgerNum() + 1)
+            {
+                return;
+            }
+            if (getSCP().needsNominationValue(slotIndex))
+            {
+                // An active slot must be able to recover after tracking is
+                // lost. A usable LCL still lets its elected leader supply
+                // a value, just as a previously supplied value could be used.
+                auto const& lcl = mLedgerManager.getLastClosedLedgerHeader();
+                auto now = std::max(
+                    getConsensusTime(lcl.header.scpValue)
+                        .next(lcl.header.ledgerVersion),
+                    ConsensusTime::fromSystemTime(mApp.getClock().system_now(),
+                                                  lcl.header.ledgerVersion));
+                if (ctValidityOffset(now) == std::chrono::milliseconds::zero())
+                {
+                    publishNominationValue(static_cast<uint32_t>(slotIndex),
+                                           now);
+                }
+            }
+            else if (isTracking() &&
+                     getSCP().getNextNominationLeaders(slotIndex).count(
+                         getSCP().getLocalNodeID()) &&
+                     !getSCP().getNominationLeaders(slotIndex).count(
+                         getSCP().getLocalNodeID()))
+            {
+                prepareTxSet(static_cast<uint32_t>(slotIndex), closeTime);
+            }
+        },
+        &VirtualTimer::onFailureNoop);
+}
+
+void
+HerderImpl::publishNominationValue(uint32_t ledgerSeqToTrigger,
+                                   ConsensusTime nextCloseTime)
+{
+    auto lcl = mLedgerManager.getLastClosedLedgerHeader();
+    if (!mLedgerManager.isSynced() || mLedgerManager.isApplying() ||
+        ledgerSeqToTrigger != lcl.header.ledgerSeq + 1)
+    {
+        return;
+    }
+
     // Consume the private snapshot only for the ledger it was built against.
     // Keep its close time: changing it would invalidate time-bound transactions
     // and the cached validation result.
+    mPrepareTxSetTimer.cancel();
+    if (mPreparedTxSet && (!mPreparedTxSet->capacityLimited ||
+                           mPreparedTxSet->ledgerSeq != ledgerSeqToTrigger ||
+                           mPreparedTxSet->previousLedgerHash != lcl.hash ||
+                           ctValidityOffset(mPreparedTxSet->closeTime) !=
+                               std::chrono::milliseconds::zero()))
+    {
+        discardPreparedTxSet(!mPreparedTxSet->capacityLimited
+                                 ? "refreshing an unsaturated snapshot"
+                                 : "snapshot no longer valid for this ledger");
+    }
     auto prepared = std::move(mPreparedTxSet);
     mPreparedTxSet.reset();
-    mPrepareTxSetTimer.cancel();
-    if (!prepared || !prepared->capacityLimited ||
-        prepared->ledgerSeq != ledgerSeqToTrigger ||
-        prepared->previousLedgerHash != lcl.hash ||
-        ctValidityOffset(prepared->closeTime) !=
-            std::chrono::milliseconds::zero())
+    if (!prepared)
     {
         prepared = buildTxSet(ledgerSeqToTrigger, nextCloseTime);
     }
     else
     {
+        mSCPMetrics.mPreparedTxSetUsed.Mark();
         CLOG_INFO(Herder, "Using prepared TX set for ledger {}",
                   ledgerSeqToTrigger);
     }
@@ -1983,8 +2110,15 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
 
     StellarValue newProposedValue = makeStellarValue(
         txSetHash, nextCloseTime, newUpgrades, mApp.getConfig().NODE_SEED);
-    mHerderSCPDriver.nominate(slotIndex, newProposedValue, proposedSet,
-                              lcl.header.scpValue);
+    if (mHerderSCPDriver.isNominating(slotIndex))
+    {
+        mHerderSCPDriver.provideNominationValue(slotIndex, newProposedValue);
+    }
+    else
+    {
+        mHerderSCPDriver.nominate(slotIndex, newProposedValue, proposedSet,
+                                  lcl.header.scpValue);
+    }
 }
 
 void

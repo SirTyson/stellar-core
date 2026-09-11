@@ -1255,7 +1255,7 @@ HerderSCPDriver::valueExternalized(uint64_t slotIndex, Value const& value)
             logQuorumInformationAndUpdateMetrics(slotIndex - 2);
         }
 
-        if (mCurrentValue)
+        if (mLedgerSeqNominating != 0)
         {
             // stop nomination
             // this may or may not be the ledger that is currently externalizing
@@ -1264,6 +1264,7 @@ HerderSCPDriver::valueExternalized(uint64_t slotIndex, Value const& value)
             // or we're going to trigger catchup from history
             mSCP.stopNomination(mLedgerSeqNominating);
             mCurrentValue.reset();
+            mLedgerSeqNominating = 0;
         }
 
         if (!mHerder.isTracking())
@@ -1357,6 +1358,39 @@ HerderSCPDriver::nominate(uint64_t slotIndex, StellarValue const& value,
 
     auto prevValue = xdr::xdr_to_opaque(previousValue);
     mSCP.nominate(slotIndex, mCurrentValue, prevValue);
+}
+
+void
+HerderSCPDriver::startNomination(uint64 slotIndex,
+                                 StellarValue const& previousValue)
+{
+    mCurrentValue.reset();
+    mLedgerSeqNominating = static_cast<uint32_t>(slotIndex);
+    mSCP.nominate(slotIndex, nullptr, xdr::xdr_to_opaque(previousValue));
+}
+
+void
+HerderSCPDriver::provideNominationValue(uint64 slotIndex,
+                                        StellarValue const& value)
+{
+    if (isNominating(slotIndex) && mSCP.needsNominationValue(slotIndex))
+    {
+        mCurrentValue = wrapStellarValue(value);
+        mSCP.provideNominationValue(slotIndex, mCurrentValue);
+    }
+}
+
+bool
+HerderSCPDriver::isNominating(uint64 slotIndex) const
+{
+    return mLedgerSeqNominating == slotIndex;
+}
+
+void
+HerderSCPDriver::nominationRoundStarted(uint64 slotIndex,
+                                        std::chrono::milliseconds timeout)
+{
+    mHerder.nominationRoundStarted(slotIndex, timeout);
 }
 
 SCPQuorumSetPtr

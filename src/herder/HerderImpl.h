@@ -238,6 +238,9 @@ class HerderImpl : public Herder
 
     void maybeHandleUpgrade() override;
 
+    void nominationRoundStarted(uint64 slotIndex,
+                                std::chrono::milliseconds timeout);
+
   private:
     // return true if values referenced by envelope have a valid close time:
     // * it's within the allowed range (using lcl if possible)
@@ -266,7 +269,8 @@ class HerderImpl : public Herder
     std::optional<PreparedTxSet> mPreparedTxSet;
     PreparedTxSet buildTxSet(uint32_t ledgerSeq, ConsensusTime closeTime);
     void prepareTxSet(uint32_t ledgerSeq, ConsensusTime closeTime);
-    void discardPreparedTxSet();
+    void publishNominationValue(uint32_t ledgerSeq, ConsensusTime closeTime);
+    void discardPreparedTxSet(char const* reason);
 
     // Compute the trigger-timer anchor point using the local node's
     // prepare-start timestamp for the previous slot. Returns a pessimistic
@@ -365,6 +369,10 @@ class HerderImpl : public Herder
         // Marked when the trigger timer falls back from the
         // network-close-time anchor to the local prepare-start anchor.
         medida::Meter& mTriggerPrepareStartFallback;
+
+        medida::Meter& mTxSetPrepared;
+        medida::Meter& mPreparedTxSetUsed;
+        medida::Meter& mPreparedTxSetDiscarded;
 
         SCPMetrics(Application& app);
     };

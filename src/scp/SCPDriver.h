@@ -286,6 +286,13 @@ class SCPDriver
     {
     }
 
+    // Called after arming a new nomination round. Applications may schedule
+    // preparation for the next leaders; do not mutate SCP from this callback.
+    virtual void
+    nominationRoundStarted(uint64 slotIndex, std::chrono::milliseconds timeout)
+    {
+    }
+
     // the following methods are used for monitoring of the SCP subsystem
     // most implementation don't really need to do anything with these
 

@@ -141,6 +141,12 @@ class HerderSCPDriver : public SCPDriver
     void ballotDidHearFromQuorum(uint64_t slotIndex,
                                  SCPBallot const& ballot) override;
     void nominatingValue(uint64_t slotIndex, Value const& value) override;
+    void nominationRoundStarted(uint64 slotIndex,
+                                std::chrono::milliseconds timeout) override;
+
+    void startNomination(uint64 slotIndex, StellarValue const& previousValue);
+    void provideNominationValue(uint64 slotIndex, StellarValue const& value);
+    bool isNominating(uint64 slotIndex) const;
     void updatedCandidateValue(uint64_t slotIndex, Value const& value) override;
     void startedBallotProtocol(uint64_t slotIndex,
                                SCPBallot const& ballot) override;

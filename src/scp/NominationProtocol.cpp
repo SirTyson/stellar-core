@@ -40,6 +40,85 @@ NominationProtocol::predictLeaders(Slot& slot, Value const& previousValue,
     return preview.mRoundLeaders;
 }
 
+std::set<NodeID>
+NominationProtocol::getNextLeaders() const
+{
+    if (!mNominationStarted || !mCandidates.empty())
+    {
+        return {};
+    }
+    NominationProtocol preview(mSlot);
+    preview.mPreviousValue = mPreviousValue;
+    preview.mRoundNumber = mRoundNumber + 1;
+    preview.mRoundLeaders = mRoundLeaders;
+    preview.updateRoundLeaders();
+    return preview.mRoundLeaders;
+}
+
+bool
+NominationProtocol::shouldVoteForLocalValue() const
+{
+    if (!mNominationStarted || !mCandidates.empty() ||
+        !mRoundLeaders.count(mSlot.getLocalNode()->getNodeID()))
+    {
+        return false;
+    }
+    // After repeated timeouts, a leader can also supply an upgrade-free
+    // alternative. This only helps if every existing vote has upgrades;
+    // otherwise another local proposal would add unnecessary network work.
+    return mVotes.empty() ||
+           (mTimerExpCount >=
+                mSlot.getSCPDriver().getUpgradeNominationTimeoutLimit() &&
+            std::all_of(
+                mVotes.begin(), mVotes.end(), [&](ValueWrapperPtr const& v) {
+                    return mSlot.getSCPDriver().hasUpgrades(v->getValue());
+                }));
+}
+
+bool
+NominationProtocol::needsLocalValue() const
+{
+    return !mLocalValue && shouldVoteForLocalValue();
+}
+
+bool
+NominationProtocol::voteForLocalValue()
+{
+    if (!mLocalValue || !shouldVoteForLocalValue())
+    {
+        return false;
+    }
+    if (mTimerExpCount >=
+        mSlot.getSCPDriver().getUpgradeNominationTimeoutLimit())
+    {
+        stripUpgrades(mLocalValue);
+    }
+    if (mVotes.insert(mLocalValue).second)
+    {
+        mSlot.getSCPDriver().nominatingValue(mSlot.getSlotIndex(),
+                                             mLocalValue->getValue());
+        return true;
+    }
+    return false;
+}
+
+bool
+NominationProtocol::provideLocalValue(ValueWrapperPtr value)
+{
+    releaseAssert(value);
+    if (!needsLocalValue())
+    {
+        return false;
+    }
+    mLocalValue = std::move(value);
+    if (voteForLocalValue())
+    {
+        emitNomination();
+        return true;
+    }
+    return false;
+}
+
 bool
 NominationProtocol::isNewerStatement(NodeID const& nodeID,
                                      SCPNomination const& st)
@@ -582,8 +661,14 @@ NominationProtocol::nominate(ValueWrapperPtr value, Value const& previousValue,
         return false;
     }
 
+    if (value)
+    {
+        mLocalValue = std::move(value);
+    }
     CLOG_DEBUG(SCP, "NominationProtocol::nominate ({}) {}", mRoundNumber,
-               mSlot.getSCP().getValueString(value->getValue()));
+               mLocalValue
+                   ? mSlot.getSCP().getValueString(mLocalValue->getValue())
+                   : "awaiting local value");
 
     bool updated = false;
 
@@ -626,69 +711,15 @@ NominationProtocol::nominate(ValueWrapperPtr value, Value const& previousValue,
         }
     }
 
-    // Check if we are a leader for this round
-    if (mRoundLeaders.find(mSlot.getLocalNode()->getNodeID()) !=
-        mRoundLeaders.end())
-    {
-        // Check whether we've exceeded the upgrade timeout limit for this slot
-        bool const overUpgradeTimeoutLimit =
-            mTimerExpCount >=
-            mSlot.getSCPDriver().getUpgradeNominationTimeoutLimit();
-
-        bool shouldVoteForValue = false;
-        // Add our value if we haven't added any votes yet.
-        if (mVotes.empty())
-        {
-            shouldVoteForValue = true;
-        }
-
-        if (overUpgradeTimeoutLimit)
-        {
-            // We've exceeded the upgrade timeout limit.  First, check whether
-            // all of our votes have upgrades. We only want to add a new value
-            // with stripped upgrades if there's a chance that it will help
-            // alleviate timeouts due to contentious upgrades.  If we're already
-            // voting for a value without upgrades, then adding another is
-            // unlikely to help, as we are likely in one of the two following
-            // scenarios:
-            // 1. The current timeout situation is unrelated to upgrades
-            // 2. We just happened to add a value without upgrades earlier in
-            //    this function
-            // In either case, adding a new value without upgrades will not
-            // help, and may make things worse by putting more strain on the
-            // network.
-            bool const allVotesHaveUpgrades = std::all_of(
-                mVotes.begin(), mVotes.end(), [&](ValueWrapperPtr const& v) {
-                    return mSlot.getSCPDriver().hasUpgrades(v->getValue());
-                });
-
-            if (allVotesHaveUpgrades)
-            {
-                // All votes have upgrades, so strip upgrades from `value` and
-                // vote for it.
-                stripUpgrades(value);
-                shouldVoteForValue = true;
-            }
-        }
-
-        if (shouldVoteForValue)
-        {
-            auto ins = mVotes.insert(value);
-            if (ins.second)
-            {
-                updated = true;
-                mSlot.getSCPDriver().nominatingValue(mSlot.getSlotIndex(),
-                                                     value->getValue());
-            }
-        }
-    }
+    updated = voteForLocalValue() || updated;
 
     std::shared_ptr<Slot> slot = mSlot.shared_from_this();
     mSlot.getSCPDriver().setupTimer(
         mSlot.getSlotIndex(), Slot::NOMINATION_TIMER, timeout,
-        [slot, value, previousValue]() {
-            slot->nominate(value, previousValue, true);
+        [slot, previousValue]() {
+            slot->nominate(nullptr, previousValue, true);
         });
+    mSlot.getSCPDriver().nominationRoundStarted(mSlot.getSlotIndex(), timeout);
 
 #ifdef BUILD_TESTS
     // If a nomination-emit delay is configured, defer the emit by
