@@ -57,6 +57,7 @@ class HerderSCPDriver : public SCPDriver
     }
 
     void recordSCPExecutionMetrics(uint64_t slotIndex);
+    void recordNominationTrigger(uint64_t slotIndex);
     void recordSCPEvent(uint64_t slotIndex, bool isNomination);
     void recordSCPExternalizeEvent(uint64_t slotIndex, NodeID const& id,
                                    bool forceUpdateSelf);
@@ -218,6 +219,11 @@ class HerderSCPDriver : public SCPDriver
     // Get the number of nomination timeouts that occurred for a given slot
     std::optional<int64_t> getNominationTimeouts(uint64_t slotIndex) const;
 
+    // Local work before nomination arms its timer, measured on the steady
+    // clock. Missing timing history does not establish any allowance.
+    std::chrono::milliseconds
+    getTriggerToNominationDuration(uint64_t slotIndex) const;
+
 #ifdef BUILD_TESTS
     RandomEvictionCache<TxSetValidityKey, bool, TxSetValidityKeyHash>&
     getTxSetValidityCache()
@@ -298,6 +304,7 @@ class HerderSCPDriver : public SCPDriver
 
     struct SCPTiming
     {
+        std::optional<VirtualClock::time_point> mTriggerStart;
         std::optional<VirtualClock::time_point> mNominationStart;
         std::optional<VirtualClock::time_point> mPrepareStart;
 

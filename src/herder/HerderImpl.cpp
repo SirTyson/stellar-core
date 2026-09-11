@@ -1235,7 +1235,9 @@ HerderImpl::triggerAnchorFromPrepareStart(
 //
 //   To get a better sense of which, we also take into account
 //   nomination time, so the check becomes timeSinceNetworkLedgerStart > target
-//   + nominationBudget, where nomination budget scales with timeouts.
+//   + nominationBudget. The budget includes measured trigger-to-nomination
+//   work and completed nomination timeouts. Time within an unfinished
+//   nomination round is still not included.
 //
 //   If we think we're drifting ahead after taking nomination into account, we
 //   fall back to prepare-start anchor, which is based on our local clock and
@@ -1322,11 +1324,12 @@ HerderImpl::triggerAnchorFromConsensusCloseTime(
         return fallbackToPrepareStart();
     }
 
-    // Scenario 1: widen the ahead-drift bound by the slow nomination we can
-    // explain from the previous slot's timeout count.
+    // Proposal construction runs before the nomination timer is armed. Credit
+    // that measured local work in addition to completed nomination timeouts.
     auto nominationTimeouts =
         mHerderSCPDriver.getNominationTimeouts(lastIndex).value_or(0);
-    auto nominationBudget = std::chrono::milliseconds::zero();
+    auto nominationBudget =
+        mHerderSCPDriver.getTriggerToNominationDuration(lastIndex);
     for (int64_t round = 1; round <= nominationTimeouts; ++round)
     {
         nominationBudget += mHerderSCPDriver.computeTimeout(
@@ -1797,6 +1800,8 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
     {
         return;
     }
+
+    mHerderSCPDriver.recordNominationTrigger(ledgerSeqToTrigger);
 
     // We pick as next close time the current time unless it's before the last
     // close time. We don't know how much time it will take to reach consensus
