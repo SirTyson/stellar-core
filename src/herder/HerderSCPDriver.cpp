@@ -2089,24 +2089,19 @@ HerderSCPDriver::getNominationTimeouts(uint64_t slotIndex) const
 }
 
 std::chrono::milliseconds
-HerderSCPDriver::getTriggerToNominationDuration(uint64_t slotIndex) const
+HerderSCPDriver::getTriggerToBallotDuration(uint64_t slotIndex) const
 {
     auto it = mSCPExecutionTimes.find(slotIndex);
     if (it != mSCPExecutionTimes.end())
     {
         auto const& timing = it->second;
-        if (timing.mTriggerStart && timing.mNominationStart)
+        if (timing.mTriggerStart && timing.mPrepareStart &&
+            *timing.mPrepareStart > *timing.mTriggerStart)
         {
-            // SCP can enter ballot from peers before we finish our own
-            // proposal. Do not credit work already covered by ballot time.
-            auto end = timing.mPrepareStart ? std::min(*timing.mNominationStart,
-                                                       *timing.mPrepareStart)
-                                            : *timing.mNominationStart;
-            if (end > *timing.mTriggerStart)
-            {
-                return std::chrono::duration_cast<std::chrono::milliseconds>(
-                    end - *timing.mTriggerStart);
-            }
+            // Stop at ballot even if a local proposal is still being built.
+            // Ballot and apply are already covered by the fallback anchor.
+            return std::chrono::duration_cast<std::chrono::milliseconds>(
+                *timing.mPrepareStart - *timing.mTriggerStart);
         }
     }
     return std::chrono::milliseconds::zero();

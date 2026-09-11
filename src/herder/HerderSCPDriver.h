@@ -225,10 +225,11 @@ class HerderSCPDriver : public SCPDriver
     // Get the number of nomination timeouts that occurred for a given slot
     std::optional<int64_t> getNominationTimeouts(uint64_t slotIndex) const;
 
-    // Local work before nomination arms its timer, measured on the steady
-    // clock. Missing timing history does not establish any allowance.
+    // Elapsed local time from the trigger through entry into ballot, measured
+    // on the steady clock. Includes construction and incomplete nomination
+    // rounds. Missing timing history does not establish any allowance.
     std::chrono::milliseconds
-    getTriggerToNominationDuration(uint64_t slotIndex) const;
+    getTriggerToBallotDuration(uint64_t slotIndex) const;
 
 #ifdef BUILD_TESTS
     RandomEvictionCache<TxSetValidityKey, bool, TxSetValidityKeyHash>&

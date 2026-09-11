@@ -1241,9 +1241,10 @@ HerderImpl::triggerAnchorFromPrepareStart(
 //
 //   To get a better sense of which, we also take into account
 //   nomination time, so the check becomes timeSinceNetworkLedgerStart > target
-//   + nominationBudget. The budget includes measured trigger-to-nomination
-//   work and completed nomination timeouts. Time within an unfinished
-//   nomination round is still not included.
+//   + nominationBudget. The budget is measured on the steady clock from the
+//   local trigger to entry into ballot. This includes proposal construction
+//   and all nomination time, including unfinished rounds and delayed timer
+//   callbacks.
 //
 //   If we think we're drifting ahead after taking nomination into account, we
 //   fall back to prepare-start anchor, which is based on our local clock and
@@ -1280,8 +1281,8 @@ HerderImpl::triggerAnchorFromPrepareStart(
 //    not because our system clock drifted. The goal is to avoid falling back to
 //    a conservative timer and snowballing the real delay.
 //
-//    See scenario 1, but TL;DR we can look at the nomination timeouts and see
-//    if the network is slow vs. the node drifting. If nomination is slow, we
+//    See scenario 1: measured elapsed time accounts for slow nomination
+//    independently of system clock drift. If nomination is slow, we
 //    can't fall back to the prepare-apply timer because it would compound the
 //    delay. If apply is slow, it doesn't matter which timer we use, they both
 //    will result in triggering immediately.
@@ -1303,14 +1304,9 @@ HerderImpl::triggerAnchorFromConsensusCloseTime(
         return fallbackToPrepareStart();
     }
 
-    // Compare elapsed time on the externalized closeTime timeline with elapsed
-    // time on our local prepare-start timeline.
-    // Relation, with drift > 0 meaning our clock is ahead of network time:
-    //
-    //   timeSinceNetworkLedgerStart
-    //     = nominationBudget + timeSinceLocalBallotStart + drift
-    //
-    // where nominationBudget is the slow-nomination allowance described above.
+    // Compare elapsed time since the externalized closeTime with local steady
+    // time. Their difference includes clock drift and how early or late our
+    // trigger fired relative to the proposer's close time.
     auto externalizedSystemTime = consensusCloseTime.toSystemTime();
     auto currentSystemTime = mApp.getClock().system_now();
     auto timeSinceNetworkLedgerStart =
@@ -1323,30 +1319,39 @@ HerderImpl::triggerAnchorFromConsensusCloseTime(
         std::chrono::duration_cast<std::chrono::milliseconds>(now -
                                                               localBallotStart);
 
+    auto nominationBudget =
+        mHerderSCPDriver.getTriggerToBallotDuration(lastIndex);
+    auto logFallback = [&](char const* reason) {
+        auto zero = std::chrono::milliseconds::zero();
+        CLOG_INFO(
+            Herder,
+            "Trigger fallback after ledger {}: {}, network elapsed {} "
+            "ms, trigger-to-ballot {} ms, ballot elapsed {} ms, local "
+            "wait {} ms, network wait {} ms",
+            lastIndex, reason, timeSinceNetworkLedgerStart.count(),
+            nominationBudget.count(), timeSinceLocalBallotStart.count(),
+            std::max(zero, expectedClose - timeSinceLocalBallotStart).count(),
+            std::max(zero, expectedClose - timeSinceNetworkLedgerStart)
+                .count());
+        return fallbackToPrepareStart();
+    };
+
     // Scenario 2: if system time is behind the local prepare-start timer, the
     // network-based anchor can wedge the node, so use the local fallback.
     if (timeSinceLocalBallotStart > timeSinceNetworkLedgerStart)
     {
-        return fallbackToPrepareStart();
+        return logFallback("clock behind");
     }
 
-    // Proposal construction runs before the nomination timer is armed. Credit
-    // that measured local work in addition to completed nomination timeouts.
-    auto nominationTimeouts =
-        mHerderSCPDriver.getNominationTimeouts(lastIndex).value_or(0);
-    auto nominationBudget =
-        mHerderSCPDriver.getTriggerToNominationDuration(lastIndex);
-    for (int64_t round = 1; round <= nominationTimeouts; ++round)
-    {
-        nominationBudget += mHerderSCPDriver.computeTimeout(
-            static_cast<uint32_t>(round), /*isNomination=*/true);
-    }
-
+    // A timeout counts only after its callback runs, and none are counted
+    // after entry into ballot. A slow fetch or busy main thread can therefore
+    // delay nomination without increasing the count. Measure elapsed time
+    // directly instead of approximating it with completed timeout durations.
     // Scenario 1: if elapsed system time exceeds target plus explainable
     // nomination delay, treat it as clock-ahead drift and use the fallback.
     if (timeSinceNetworkLedgerStart > expectedClose + nominationBudget)
     {
-        return fallbackToPrepareStart();
+        return logFallback("clock ahead or slow ballot/apply");
     }
 
     return now - timeSinceNetworkLedgerStart;
