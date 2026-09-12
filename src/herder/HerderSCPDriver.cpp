@@ -1096,8 +1096,17 @@ HerderSCPDriver::combineCandidates(uint64_t slotIndex,
     }
 
     StellarValue comp;
-    // take the txSet with the biggest size, highest xored hash that we have
+    if (candidateValues.size() == 1)
     {
+        // No transaction-set comparison is needed for a single candidate.
+        // Avoid reconstructing all its transactions just to select it. Keep
+        // the common upgrade normalization below.
+        comp = candidateValues.front();
+    }
+    else
+    {
+        // Take the txSet with the biggest size, highest xored hash that we
+        // have.
         auto highest = candidateValues.cend();
         TxSetXDRFrameConstPtr highestTxSet;
         ApplicableTxSetFrameConstPtr highestApplicableTxSet;

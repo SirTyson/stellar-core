@@ -2749,6 +2749,12 @@ testSCPDriver(uint32 protocolVersion, uint32_t maxTxSetSize, size_t expectedOps)
                     Herder::ENVELOPE_STATUS_FETCHING);
             REQUIRE(herder.recvTxSet(p.second->getContentsHash(), p.second));
             auto v = herder.getHerderSCPDriver().wrapValue(p.first);
+            // Selecting this value alone must preserve its set hash, signed
+            // close time (including milliseconds), and upgrades. Exercise
+            // both single- and multiple-candidate selection for every set.
+            auto single = herder.getHerderSCPDriver().combineCandidates(
+                herder.trackingConsensusLedgerIndex() + 1, {v});
+            REQUIRE(single->getValue() == v->getValue());
             candidates.emplace(v);
         };
 
