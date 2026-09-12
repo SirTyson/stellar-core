@@ -201,3 +201,106 @@ TEST_CASE("BatchExecutor range exceptions join workers and allow reuse",
                                 [&](size_t, size_t, size_t) { ++completed; });
     REQUIRE(completed == 7);
 }
+
+TEST_CASE("BatchExecutor chunks cover input with private worker state",
+          "[batchexecutor]")
+{
+    BatchExecutor exec;
+    for (size_t count : {0, 1, 2, 7, 8, 9, 31, 257})
+    {
+        for (size_t workers : {0, 1, 2, 4, 8})
+        {
+            for (size_t chunkSize : {1, 3, 64, 512})
+            {
+                CAPTURE(count, workers, chunkSize);
+                std::vector<std::atomic<int>> visits(count);
+                std::vector<std::atomic<int>> active(
+                    std::max(workers, size_t{1}));
+                std::atomic<bool> valid{true};
+                std::atomic<size_t> calls{0};
+                auto caller = std::this_thread::get_id();
+                exec.executeBatchOverChunks(
+                    count, workers, chunkSize,
+                    [&](size_t begin, size_t end, size_t worker) {
+                        ++calls;
+                        if (begin >= end || end > count ||
+                            end - begin > chunkSize || worker >= active.size())
+                        {
+                            valid = false;
+                            return;
+                        }
+                        if (active[worker].fetch_add(1) != 0)
+                        {
+                            valid = false;
+                        }
+                        if ((workers <= 1 || count <= chunkSize) &&
+                            std::this_thread::get_id() != caller)
+                        {
+                            valid = false;
+                        }
+                        for (auto i = begin; i < end; ++i)
+                        {
+                            ++visits[i];
+                        }
+                        --active[worker];
+                    });
+                REQUIRE(valid);
+                REQUIRE(calls ==
+                        (count == 0 ? 0 : 1 + (count - 1) / chunkSize));
+                for (auto const& visited : visits)
+                {
+                    REQUIRE(visited == 1);
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE("BatchExecutor keeps processing chunks while one worker is blocked",
+          "[batchexecutor]")
+{
+    BatchExecutor exec;
+    std::mutex mutex;
+    std::condition_variable condition;
+    size_t completed = 0;
+    bool finishedWhileBlocked = false;
+    exec.executeBatchOverChunks(65, 2, 1, [&](size_t begin, size_t, size_t) {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (begin == 0)
+        {
+            // A fixed partition cannot finish all
+            // the other items while this one waits.
+            finishedWhileBlocked =
+                condition.wait_for(lock, std::chrono::seconds(10),
+                                   [&] { return completed == 64; });
+        }
+        else
+        {
+            ++completed;
+            condition.notify_one();
+        }
+    });
+    REQUIRE(finishedWhileBlocked);
+    REQUIRE(completed == 64);
+}
+
+TEST_CASE("BatchExecutor chunk exceptions join workers and allow reuse",
+          "[batchexecutor]")
+{
+    BatchExecutor exec;
+    std::atomic<int> completed{0};
+    REQUIRE_THROWS_AS(exec.executeBatchOverChunks(
+                          32, 2, 1,
+                          [&](size_t begin, size_t, size_t) {
+                              if (begin == 0)
+                              {
+                                  throw std::logic_error("chunk failed");
+                              }
+                              ++completed;
+                          }),
+                      std::logic_error);
+    REQUIRE(completed == 31);
+    exec.executeBatchOverChunks(32, 2, 1,
+                                [&](size_t, size_t, size_t) { ++completed; });
+    REQUIRE(completed == 63);
+}

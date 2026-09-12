@@ -239,6 +239,53 @@ BatchExecutor::executeBatchOverRanges(
     executeBatch(std::move(tasks));
 }
 
+void
+BatchExecutor::executeBatchOverChunks(
+    size_t count, size_t numTasks, size_t chunkSize,
+    std::function<void(size_t, size_t, size_t)> const& work)
+{
+    releaseAssert(chunkSize > 0);
+    if (count == 0)
+    {
+        return;
+    }
+    auto chunkCount = 1 + (count - 1) / chunkSize;
+    auto workerCount = std::min(numTasks, chunkCount);
+    if (workerCount <= 1)
+    {
+        for (size_t begin = 0; begin < count;)
+        {
+            auto end = begin + std::min(chunkSize, count - begin);
+            work(begin, end, 0);
+            begin = end;
+        }
+        return;
+    }
+
+    std::atomic<size_t> nextChunk{0};
+    std::vector<std::function<int()>> tasks;
+    tasks.reserve(workerCount);
+    for (size_t worker = 0; worker < workerCount; ++worker)
+    {
+        tasks.emplace_back([&, worker]() {
+            auto chunk = nextChunk.load(std::memory_order_relaxed);
+            while (chunk < chunkCount)
+            {
+                if (!nextChunk.compare_exchange_weak(chunk, chunk + 1,
+                                                     std::memory_order_relaxed))
+                {
+                    continue;
+                }
+                auto begin = chunk * chunkSize;
+                work(begin, begin + std::min(chunkSize, count - begin), worker);
+                chunk = nextChunk.load(std::memory_order_relaxed);
+            }
+            return 0;
+        });
+    }
+    executeBatch(std::move(tasks));
+}
+
 size_t
 BatchExecutor::preferredTaskCount() const
 {

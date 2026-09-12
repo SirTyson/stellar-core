@@ -75,6 +75,21 @@ class BatchExecutor : private NonMovableOrCopyable
         size_t count, size_t numTasks,
         std::function<void(size_t, size_t, size_t)> const& work);
 
+    // Splits [0, count) into chunks of at most `chunkSize` elements. Each
+    // worker takes another chunk as soon as it finishes, so uneven work does
+    // not leave the other workers idle. `work(begin, end, workerIndex)` may
+    // be called repeatedly for a worker, but never concurrently for the same
+    // workerIndex. This allows callers to keep per-worker state.
+    //
+    // Uses at most `numTasks` workers. A single chunk or worker runs on the
+    // calling thread. Empty input does no work; chunkSize must be positive.
+    // Like executeBatch, only one batch may run at a time. Exceptions join
+    // the workers before being rethrown; remaining chunks may be processed
+    // by the other workers.
+    void executeBatchOverChunks(
+        size_t count, size_t numTasks, size_t chunkSize,
+        std::function<void(size_t, size_t, size_t)> const& work);
+
     // Returns the maximum number of tasks to use in `executeBatch` without
     // oversubscribing physical cores.
     // Use this many tasks whenever possible to maximize parallelism and avoid

@@ -218,7 +218,7 @@ checkTransactionsInParallel(TxFrameList const& txs, Application& app,
     }
 #endif
 
-    // Match executeBatchOverRanges' serial fallback before allocating views.
+    // Avoid allocating more views than the input can use.
     if (txs.size() < taskCount)
     {
         taskCount = 1;
@@ -240,12 +240,18 @@ checkTransactionsInParallel(TxFrameList const& txs, Application& app,
     std::vector<IndividualValidationResult> txValidationResult(txs.size());
     auto& appConnector = app.getAppConnector();
 
-    app.getBatchExecutor().executeBatchOverRanges(
-        txs.size(), taskCount,
+    // Signature-cache hits and transaction complexity can vary substantially.
+    // Let workers take more work when ready instead of waiting for the slowest
+    // fixed range, while retaining a private ledger view for each worker.
+    auto chunkSize =
+        taskCount == 1 ? txs.size()
+                       : std::min<size_t>(64, 1 + (txs.size() - 1) / taskCount);
+    app.getBatchExecutor().executeBatchOverChunks(
+        txs.size(), taskCount, chunkSize,
         [&appConnector, &txs, &ledgerViews, &txValidationResult,
          lowerBoundCloseTimeOffset, upperBoundCloseTimeOffset,
-         validationLedgerSeq](size_t begin, size_t end, size_t rangeIndex) {
-            auto const& view = *ledgerViews.at(rangeIndex);
+         validationLedgerSeq](size_t begin, size_t end, size_t workerIndex) {
+            auto const& view = *ledgerViews.at(workerIndex);
             auto const header = view.getLedgerHeader().current();
             auto diagnostics = DiagnosticEventManager::createDisabled();
             for (size_t i = begin; i < end; ++i)
