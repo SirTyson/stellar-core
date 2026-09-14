@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <iterator>
 #include <lib/util/basen.h>
 #include <string>
@@ -38,10 +39,38 @@ template <class T>
 inline std::string
 encode_b64(T const& v)
 {
-    // The encoded length is known, including padding. Write into that storage
-    // directly instead of updating the string's size for every output byte.
-    std::string res(encoded_size64(v.size()), '\0');
-    bn::encode_b64(v.begin(), v.end(), res.begin());
+    // Encode complete three-byte groups directly. The generic bit-stream
+    // encoder does extra bookkeeping for every output character, which is
+    // costly when persisting large transaction sets.
+    static constexpr char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string res(encoded_size64(v.size()), '=');
+    auto input = v.begin();
+    auto output = res.data();
+    auto remaining = v.size();
+    while (remaining >= 3)
+    {
+        auto a = static_cast<uint8_t>(*input++);
+        auto b = static_cast<uint8_t>(*input++);
+        auto c = static_cast<uint8_t>(*input++);
+        output[0] = alphabet[a >> 2];
+        output[1] = alphabet[((a & 3) << 4) | (b >> 4)];
+        output[2] = alphabet[((b & 15) << 2) | (c >> 6)];
+        output[3] = alphabet[c & 63];
+        output += 4;
+        remaining -= 3;
+    }
+    if (remaining != 0)
+    {
+        auto a = static_cast<uint8_t>(*input++);
+        auto b = remaining == 2 ? static_cast<uint8_t>(*input++) : uint8_t(0);
+        output[0] = alphabet[a >> 2];
+        output[1] = alphabet[((a & 3) << 4) | (b >> 4)];
+        if (remaining == 2)
+        {
+            output[2] = alphabet[(b & 15) << 2];
+        }
+    }
     return res;
 }
 

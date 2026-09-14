@@ -105,6 +105,30 @@ TEST_CASE("base64 preserves binary storage encoding",
     }
 }
 
+TEST_CASE("base64 block encoding preserves all two-byte tails",
+          "[decoder][base64-storage]")
+{
+    // Compare against the independent generic encoder, including signed char
+    // input. Prefixes exercise the same tails after a complete three-byte group.
+    for (uint32_t value = 0; value <= 0xffff; ++value)
+    {
+        std::string input;
+        input.push_back(static_cast<char>(value >> 8));
+        input.push_back(static_cast<char>(value & 0xff));
+        for (bool prefixed : {false, true})
+        {
+            if (prefixed)
+            {
+                input.insert(0, "\x80\xff\x01", 3);
+            }
+            std::string expected;
+            bn::encode_b64(input.begin(), input.end(),
+                           std::back_inserter(expected));
+            REQUIRE(decoder::encode_b64(input) == expected);
+        }
+    }
+}
+
 TEST_CASE("encoded_size32", "[decoder]")
 {
     for (auto const& item : b32_data)
