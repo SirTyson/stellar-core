@@ -28,12 +28,209 @@
 #include "util/XDRCereal.h"
 #include <algorithm>
 #include <atomic>
+#include <future>
 #include <map>
 namespace stellar
 {
 namespace
 {
 using namespace txtest;
+
+TEST_CASE("transaction set preparation preserves wire order across workers",
+          "[txset][txset-preparation]")
+{
+    VirtualClock clock;
+    auto app = createTestApplication(clock, getTestConfig());
+    auto const lcl = app->getLedgerManager().getLastClosedLedgerHeader();
+    auto& executor = app->getBatchExecutor();
+    GeneralizedTransactionSet wire(1);
+    wire.v1TxSet().previousLedgerHash = lcl.hash;
+    wire.v1TxSet().phases.resize(2);
+    auto& classic = wire.v1TxSet().phases[0].v0Components();
+    classic.emplace_back(TXSET_COMP_TXS_MAYBE_DISCOUNTED_FEE);
+    classic[0].txsMaybeDiscountedFee().baseFee.activate() = 100;
+    auto& soroban = wire.v1TxSet().phases[1];
+    soroban.v(1);
+    soroban.parallelTxsComponent().baseFee.activate() = 100;
+    auto& stages = soroban.parallelTxsComponent().executionStages;
+    stages.resize(2);
+    uint32_t sequence = 0;
+    auto makeEnvelope = [&](bool isSoroban) {
+        TransactionEnvelope env(ENVELOPE_TYPE_TX);
+        auto& tx = env.v1().tx;
+        tx.seqNum = ++sequence;
+        tx.fee = isSoroban ? 1200 : 100;
+        tx.operations.resize(1);
+        if (isSoroban)
+        {
+            tx.ext.v(1);
+            tx.ext.sorobanData().resourceFee = 1000;
+            tx.operations[0].body.type(INVOKE_HOST_FUNCTION);
+            tx.operations[0].body.invokeHostFunctionOp().hostFunction.type(
+                HOST_FUNCTION_TYPE_UPLOAD_CONTRACT_WASM);
+        }
+        if (sequence % 3 == 0)
+        {
+            TransactionEnvelope bump(ENVELOPE_TYPE_TX_FEE_BUMP);
+            bump.feeBump().tx.fee = isSoroban ? 1400 : 200;
+            bump.feeBump().tx.innerTx.type(ENVELOPE_TYPE_TX);
+            bump.feeBump().tx.innerTx.v1() = env.v1();
+            return bump;
+        }
+        return env;
+    };
+    auto byHash = [](auto const& a, auto const& b) {
+        return xdrSha256(a) < xdrSha256(b);
+    };
+    auto& classicTxs = classic[0].txsMaybeDiscountedFee().txs;
+    for (size_t i = 0; i < 129; ++i)
+    {
+        classicTxs.push_back(makeEnvelope(false));
+    }
+    std::sort(classicTxs.begin(), classicTxs.end(), byHash);
+    for (auto& stage : stages)
+    {
+        stage.resize(2);
+        for (auto& cluster : stage)
+        {
+            for (size_t i = 0; i < 129; ++i)
+            {
+                cluster.push_back(makeEnvelope(true));
+            }
+            std::sort(cluster.begin(), cluster.end(), byHash);
+        }
+        std::sort(stage.begin(), stage.end(),
+                  [&](auto const& a, auto const& b) {
+                      return byHash(a.front(), b.front());
+                  });
+    }
+    std::sort(stages.begin(), stages.end(), [&](auto const& a, auto const& b) {
+        return byHash(a.front().front(), b.front().front());
+    });
+    auto verify = [&](ApplicableTxSetFrameConstPtr const& prepared) {
+        REQUIRE(prepared);
+        REQUIRE(prepared->sizeTxTotal() == 645);
+        // Check the internal order as well: serialization sorts its input and
+        // could otherwise conceal a permutation introduced by the workers.
+        auto verifyTxs = [&](auto const& frames, auto const& envelopes) {
+            REQUIRE(frames.size() == envelopes.size());
+            for (size_t i = 0; i < frames.size(); ++i)
+            {
+                REQUIRE(frames[i]->getEnvelope() == envelopes[i]);
+                REQUIRE(frames[i]->getFullHash() == xdrSha256(envelopes[i]));
+                REQUIRE(prepared->getTxBaseFee(frames[i]) == 100);
+            }
+        };
+        verifyTxs(prepared->getPhase(TxSetPhase::CLASSIC).getSequentialTxs(),
+                  classicTxs);
+        auto const& preparedStages =
+            prepared->getPhase(TxSetPhase::SOROBAN).getParallelStages();
+        REQUIRE(preparedStages.size() == stages.size());
+        for (size_t i = 0; i < stages.size(); ++i)
+        {
+            REQUIRE(preparedStages[i].size() == stages[i].size());
+            for (size_t j = 0; j < stages[i].size(); ++j)
+            {
+                verifyTxs(preparedStages[i][j], stages[i][j]);
+            }
+        }
+        GeneralizedTransactionSet roundtrip;
+        prepared->toWireTxSetFrame()->toXDR(roundtrip);
+        REQUIRE(roundtrip == wire);
+    };
+
+    SECTION("same frames and fees regardless of worker count")
+    {
+        for (size_t workers : {1, 2, 7})
+        {
+            CAPTURE(workers);
+            executor.setPreferredTaskCountForTesting(workers);
+            auto set = TxSetXDRFrame::makeFromWire(wire);
+            auto prepared = set->prepareForApply(*app, lcl.header);
+            verify(prepared);
+            REQUIRE(prepared->getContentsHash() == set->getContentsHash());
+        }
+    }
+    SECTION("invalid fee or order is rejected regardless of worker count")
+    {
+        for (bool invalidFee : {false, true})
+        {
+            auto bad = wire;
+            auto& txs = bad.v1TxSet()
+                            .phases[1]
+                            .parallelTxsComponent()
+                            .executionStages[0][0];
+            if (invalidFee)
+            {
+                // Keep the transaction hashes sorted to isolate the fee check.
+                TransactionEnvelope zeroFee(ENVELOPE_TYPE_TX);
+                zeroFee.v1().tx.operations.resize(1);
+                txs.back() = zeroFee;
+                std::sort(txs.begin(), txs.end(), byHash);
+                auto& badStages = bad.v1TxSet()
+                                      .phases[1]
+                                      .parallelTxsComponent()
+                                      .executionStages;
+                for (auto& stage : badStages)
+                {
+                    std::sort(stage.begin(), stage.end(),
+                              [&](auto const& a, auto const& b) {
+                                  return byHash(a.front(), b.front());
+                              });
+                }
+                std::sort(badStages.begin(), badStages.end(),
+                          [&](auto const& a, auto const& b) {
+                              return byHash(a.front().front(),
+                                            b.front().front());
+                          });
+            }
+            else
+            {
+                std::swap(txs.front(), txs.back());
+            }
+            for (size_t workers : {1, 2, 7})
+            {
+                CAPTURE(invalidFee, workers);
+                executor.setPreferredTaskCountForTesting(workers);
+                REQUIRE(!TxSetXDRFrame::makeFromWire(bad)->prepareForApply(
+                    *app, lcl.header));
+            }
+        }
+    }
+    SECTION("main thread prepares while apply owns the executor")
+    {
+        executor.setPreferredTaskCountForTesting(7);
+        app->getLedgerManager().beginApply();
+        std::promise<void> started;
+        std::promise<void> release;
+        auto released = release.get_future().share();
+        auto applying = std::async(std::launch::async, [&] {
+            executor.executeBatch<int>({[&] {
+                started.set_value();
+                released.wait();
+                return 0;
+            }});
+        });
+        auto finish = gsl::finally([&] {
+            release.set_value();
+            applying.get();
+        });
+        REQUIRE(started.get_future().wait_for(std::chrono::seconds(5)) ==
+                std::future_status::ready);
+        verify(TxSetXDRFrame::makeFromWire(wire)->prepareForApply(*app,
+                                                                  lcl.header));
+    }
+    SECTION("apply thread prepares using its executor")
+    {
+        executor.setPreferredTaskCountForTesting(7);
+        app->getLedgerManager().beginApply();
+        auto set = TxSetXDRFrame::makeFromWire(wire);
+        auto applying = std::async(std::launch::async, [&] {
+            return set->prepareForApply(*app, lcl.header);
+        });
+        verify(applying.get());
+    }
+}
 
 TEST_CASE("externalization reads envelopes without transaction frames",
           "[txset][txset-externalization]")

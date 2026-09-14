@@ -23,6 +23,7 @@
 namespace stellar
 {
 class Application;
+class BatchExecutor;
 class TxSetXDRFrame;
 class ApplicableTxSetFrame;
 using TxSetXDRFrameConstPtr = std::shared_ptr<TxSetXDRFrame const>;
@@ -406,13 +407,15 @@ class TxSetPhaseFrame
     // `GeneralizedTransactionSet`.
     static std::optional<TxSetPhaseFrame>
     makeFromWire(TxSetPhase phase, Hash const& networkID,
-                 TransactionPhase const& xdrPhase);
+                 TransactionPhase const& xdrPhase, BatchExecutor& executor,
+                 size_t taskCount);
 
     // Creates a new phase from all the transactions in the legacy
     // `TransactionSet` XDR.
     static std::optional<TxSetPhaseFrame>
     makeFromWireLegacy(LedgerHeader const& lclHeader, Hash const& networkID,
-                       xdr::xvector<TransactionEnvelope> const& xdrTxs);
+                       xdr::xvector<TransactionEnvelope> const& xdrTxs,
+                       BatchExecutor& executor, size_t taskCount);
 
     // Creates a valid empty phase with given `isParallel` flag.
     static TxSetPhaseFrame makeEmpty(TxSetPhase phase, bool isParallel);

@@ -17,6 +17,7 @@
 #include "main/Config.h"
 #include "transactions/MutableTransactionResult.h"
 #include "transactions/TransactionUtils.h"
+#include "util/BatchExecutor.h"
 #include "util/GlobalChecks.h"
 #include "util/Logging.h"
 #include "util/ProtocolVersion.h"
@@ -413,7 +414,7 @@ sortedForApplyParallel(TxStageFrameList const& stages, Hash const& txSetHash)
 bool
 addWireTxsToList(Hash const& networkID,
                  xdr::xvector<TransactionEnvelope> const& xdrTxs,
-                 TxFrameList& txList)
+                 TxFrameList& txList, BatchExecutor& executor, size_t taskCount)
 {
     auto prevSize = txList.size();
     txList.reserve(prevSize + xdrTxs.size());
@@ -424,8 +425,18 @@ addWireTxsToList(Hash const& networkID,
         {
             return false;
         }
-        txList.push_back(tx);
+        txList.push_back(std::move(tx));
     }
+    // Keep frame allocation on the calling thread. Each worker
+    // primes hashes on distinct new frames; ordering checks only read them
+    // after every worker has joined.
+    executor.executeBatchOverChunks(
+        xdrTxs.size(), taskCount, 64, [&](size_t begin, size_t end, size_t) {
+            for (size_t i = begin; i < end; ++i)
+            {
+                txList[prevSize + i]->getFullHash();
+            }
+        });
     if (!std::is_sorted(txList.begin() + prevSize, txList.end(),
                         &TxSetUtils::hashTxSorter))
     {
@@ -1308,6 +1319,13 @@ TxSetXDRFrame::prepareForApply(Application& app,
     }
 #endif
     ZoneScoped;
+    auto& executor = app.getBatchExecutor();
+    // Apply owns the shared executor until it finishes. Main-thread
+    // preparation follows the same ownership rule as transaction validation;
+    // the apply thread itself may use the pool between its other batches.
+    auto taskCount = threadIsMain() && app.getLedgerManager().isApplying()
+                         ? size_t{1}
+                         : executor.preferredTaskCount();
     std::vector<TxSetPhaseFrame> phaseFrames;
     if (isGeneralizedTxSet())
     {
@@ -1324,7 +1342,7 @@ TxSetXDRFrame::prepareForApply(Application& app,
         {
             auto maybePhase = TxSetPhaseFrame::makeFromWire(
                 static_cast<TxSetPhase>(phaseId), app.getNetworkID(),
-                xdrPhases[phaseId]);
+                xdrPhases[phaseId], executor, taskCount);
             if (!maybePhase)
             {
                 return nullptr;
@@ -1336,7 +1354,7 @@ TxSetXDRFrame::prepareForApply(Application& app,
     {
         auto const& xdrTxSet = std::get<TransactionSet>(mXDRTxSet);
         auto maybePhase = TxSetPhaseFrame::makeFromWireLegacy(
-            lclHeader, app.getNetworkID(), xdrTxSet.txs);
+            lclHeader, app.getNetworkID(), xdrTxSet.txs, executor, taskCount);
         if (!maybePhase)
         {
             return nullptr;
@@ -1635,7 +1653,8 @@ TxSetPhaseFrame::Iterator::operator!=(Iterator const& other) const
 
 std::optional<TxSetPhaseFrame>
 TxSetPhaseFrame::makeFromWire(TxSetPhase phase, Hash const& networkID,
-                              TransactionPhase const& xdrPhase)
+                              TransactionPhase const& xdrPhase,
+                              BatchExecutor& executor, size_t taskCount)
 {
     auto inclusionFeeMapPtr = std::make_shared<InclusionFeeMap>();
     auto& inclusionFeeMap = *inclusionFeeMapPtr;
@@ -1666,7 +1685,7 @@ TxSetPhaseFrame::makeFromWire(TxSetPhase phase, Hash const& networkID,
                 size_t prevSize = txList.size();
                 if (!addWireTxsToList(networkID,
                                       component.txsMaybeDiscountedFee().txs,
-                                      txList))
+                                      txList, executor, taskCount))
                 {
                     CLOG_DEBUG(Herder,
                                "Got bad generalized txSet: transactions "
@@ -1709,27 +1728,17 @@ TxSetPhaseFrame::makeFromWire(TxSetPhase phase, Hash const& networkID,
             for (auto const& xdrCluster : xdrStage)
             {
                 auto& cluster = stage.emplace_back();
-                cluster.reserve(xdrCluster.size());
-                for (auto const& env : xdrCluster)
+                if (!addWireTxsToList(networkID, xdrCluster, cluster, executor,
+                                      taskCount))
                 {
-                    auto tx = TransactionFrameBase::makeTransactionFromWire(
-                        networkID, env);
-                    if (!tx->XDRProvidesValidFee() ||
-                        tx->getInclusionFee() <= 0)
-                    {
-                        CLOG_DEBUG(Herder, "Got bad generalized txSet: "
-                                           "transaction has invalid XDR");
-                        return std::nullopt;
-                    }
-                    cluster.push_back(tx);
-                    inclusionFeeMap[tx] = baseFee;
-                }
-                if (!std::is_sorted(cluster.begin(), cluster.end(),
-                                    &TxSetUtils::hashTxSorter))
-                {
-                    CLOG_DEBUG(Herder, "Got bad generalized txSet: "
-                                       "cluster is not sorted");
+                    CLOG_DEBUG(Herder,
+                               "Got bad generalized txSet: cluster is not "
+                               "sorted or contains invalid transactions");
                     return std::nullopt;
+                }
+                for (auto const& tx : cluster)
+                {
+                    inclusionFeeMap[tx] = baseFee;
                 }
             }
             if (!std::is_sorted(stage.begin(), stage.end(),
@@ -1769,10 +1778,11 @@ TxSetPhaseFrame::makeFromWire(TxSetPhase phase, Hash const& networkID,
 std::optional<TxSetPhaseFrame>
 TxSetPhaseFrame::makeFromWireLegacy(
     LedgerHeader const& lclHeader, Hash const& networkID,
-    xdr::xvector<TransactionEnvelope> const& xdrTxs)
+    xdr::xvector<TransactionEnvelope> const& xdrTxs, BatchExecutor& executor,
+    size_t taskCount)
 {
     TxFrameList txList;
-    if (!addWireTxsToList(networkID, xdrTxs, txList))
+    if (!addWireTxsToList(networkID, xdrTxs, txList, executor, taskCount))
     {
         CLOG_DEBUG(
             Herder,
