@@ -2625,6 +2625,7 @@ HerderImpl::persistSCPState(uint64 slot)
         return;
     }
 
+    auto started = std::chrono::steady_clock::now();
     mLastSlotSaved = slot;
     // saves SCP messages and related data (transaction sets, quorum sets)
     PersistedSCPState scpState;
@@ -2667,6 +2668,7 @@ HerderImpl::persistSCPState(uint64 slot)
 
     stellar::Value latestSCPData;
 
+    auto gathered = std::chrono::steady_clock::now();
     std::unordered_map<Hash, std::string> txSetsToPersist;
     for (auto it : txSets)
     {
@@ -2680,8 +2682,35 @@ HerderImpl::persistSCPState(uint64 slot)
 
     std::string encodedScpState = decoder::encode_b64(latestSCPData);
 
+    auto encoded = std::chrono::steady_clock::now();
     mApp.getPersistentState().setSCPStateV1ForSlot(slot, encodedScpState,
                                                    txSetsToPersist);
+    auto saved = std::chrono::steady_clock::now();
+    // Persistence precedes broadcasting our SCP statement. Separate the
+    // serialization work from the durable write when tracing nomination
+    // latency; the validation timer does not include either of them.
+    if (!txSetsToPersist.empty() ||
+        saved - started >= std::chrono::milliseconds(10))
+    {
+        size_t bytes = encodedScpState.size();
+        for (auto const& [hash, txSet] : txSetsToPersist)
+        {
+            bytes += txSet.size();
+        }
+        auto micros = [](auto duration) {
+            return std::chrono::duration_cast<std::chrono::microseconds>(
+                       duration)
+                .count();
+        };
+        CLOG_INFO(Herder,
+                  "CONSENSUS_TRACE stage=scp_persist slot={} txsets={} "
+                  "encoded_bytes={} gather_us={} encode_us={} save_us={} "
+                  "work_us={} steady_us={}",
+                  slot, txSetsToPersist.size(), bytes,
+                  micros(gathered - started), micros(encoded - gathered),
+                  micros(saved - encoded), micros(saved - started),
+                  micros(saved.time_since_epoch()));
+    }
 }
 
 void
