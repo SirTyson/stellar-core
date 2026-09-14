@@ -38,9 +38,10 @@ template <class T>
 inline std::string
 encode_b64(T const& v)
 {
-    std::string res;
-    res.reserve(encoded_size64(v.size() * sizeof(typename T::value_type)) + 1);
-    bn::encode_b64(v.begin(), v.end(), std::back_inserter(res));
+    // The encoded length is known, including padding. Write into that storage
+    // directly instead of updating the string's size for every output byte.
+    std::string res(encoded_size64(v.size()), '\0');
+    bn::encode_b64(v.begin(), v.end(), res.begin());
     return res;
 }
 

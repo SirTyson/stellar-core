@@ -74,6 +74,37 @@ TEST_CASE("encode_b64", "[decoder]")
     }
 }
 
+TEST_CASE("base64 preserves binary storage encoding",
+          "[decoder][base64-storage]")
+{
+    auto check = [](size_t length) {
+        std::vector<uint8_t> input(length);
+        for (size_t i = 0; i < length; ++i)
+        {
+            input[i] = static_cast<uint8_t>(i);
+        }
+        std::string original;
+        bn::encode_b64(input.begin(), input.end(),
+                       std::back_inserter(original));
+        auto encoded = decoder::encode_b64(input);
+        REQUIRE(encoded == original);
+        REQUIRE(encoded.size() == decoder::encoded_size64(length));
+        std::vector<uint8_t> restored;
+        decoder::decode_b64(encoded, restored);
+        REQUIRE(restored == input);
+    };
+    // Exercise every byte value and all three padding cases, including empty
+    // input and large buffers used when persisting transaction sets.
+    for (size_t length = 0; length <= 260; ++length)
+    {
+        check(length);
+    }
+    for (size_t extra = 0; extra < 3; ++extra)
+    {
+        check((1u << 20) + extra);
+    }
+}
+
 TEST_CASE("encoded_size32", "[decoder]")
 {
     for (auto const& item : b32_data)
