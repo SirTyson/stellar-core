@@ -6586,19 +6586,25 @@ TEST_CASE("trigger work is recorded by the proposal path",
           "[herder][trigger-construction]")
 {
     using namespace std::chrono;
+    auto const local = GENERATE(0, 1);
+    std::array<SecretKey, 2> keys = {
+        SecretKey::fromSeed(sha256("trigger-work-node-0")),
+        SecretKey::fromSeed(sha256("trigger-work-node-1"))};
     VirtualClock clock;
     auto cfg = getTestConfig();
     cfg.HTTP_PORT = 0;
     cfg.MANUAL_CLOSE = true;
+    cfg.NODE_SEED = keys[local];
     cfg.QUORUM_SET.threshold = 2;
-    cfg.QUORUM_SET.validators = {
-        cfg.NODE_SEED.getPublicKey(),
-        SecretKey::pseudoRandomForTesting().getPublicKey()};
+    cfg.QUORUM_SET.validators = {keys[0].getPublicKey(),
+                                 keys[1].getPublicKey()};
     auto app = createTestApplication(clock, cfg);
     auto& herder = static_cast<HerderImpl&>(app->getHerder());
     auto& driver = herder.getHerderSCPDriver();
     auto const slot = app->getLedgerManager().getLastClosedLedgerNum() + 1;
+    size_t pulls = 0;
     herder.mGetTopTransactionsForTesting = [&](size_t) {
+        ++pulls;
         // A wall-clock adjustment must not change the measured construction
         // duration or replace it with a negative interval.
         clock.setCurrentVirtualTime(clock.now() + milliseconds(400));
@@ -6606,15 +6612,22 @@ TEST_CASE("trigger work is recorded by the proposal path",
         return std::vector<TransactionEnvelope>{};
     };
     herder.triggerNextLedger(slot, true);
+    auto const leaders = herder.getSCP().getNominationLeaders(slot);
+    REQUIRE(leaders.size() == 1);
+    bool const isLeader = leaders.count(cfg.NODE_SEED.getPublicKey()) != 0;
+    REQUIRE(pulls == (isLeader ? 1u : 0u));
+    // Exercise both members of the same quorum: only the leader incurs the
+    // injected construction work; followers enter nomination without a pull.
+    auto const expected = milliseconds(isLeader ? 500 : 100);
     // Until ballot starts there is no completed interval to credit.
     REQUIRE(driver.getTriggerToBallotDuration(slot) == milliseconds::zero());
     clock.setCurrentVirtualTime(clock.now() + milliseconds(100));
     driver.recordSCPEvent(slot, false);
-    REQUIRE(driver.getTriggerToBallotDuration(slot) == milliseconds(500));
+    REQUIRE(driver.getTriggerToBallotDuration(slot) == expected);
     clock.setCurrentVirtualTime(clock.now() + seconds(1));
     driver.recordNominationTrigger(slot);
     driver.recordSCPEvent(slot, true);
-    REQUIRE(driver.getTriggerToBallotDuration(slot) == milliseconds(500));
+    REQUIRE(driver.getTriggerToBallotDuration(slot) == expected);
     herder.mGetTopTransactionsForTesting = nullptr;
 }
 
@@ -7151,16 +7164,20 @@ TEST_CASE("early preparation respects manual and immediately due triggers",
           "[herder][early-nomination]")
 {
     auto const manual = GENERATE(false, true);
+    auto const local = GENERATE(0, 1);
+    std::array<SecretKey, 2> keys = {
+        SecretKey::fromSeed(sha256("immediate-trigger-node-0")),
+        SecretKey::fromSeed(sha256("immediate-trigger-node-1"))};
     VirtualClock clock;
     auto cfg = getTestConfig();
     cfg.HTTP_PORT = 0;
     cfg.MANUAL_CLOSE = manual;
     cfg.ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING = false;
     cfg.FORCE_OLD_STYLE_PREPARE_START_TRIGGER_TIMER = true;
+    cfg.NODE_SEED = keys[local];
     cfg.QUORUM_SET.threshold = 2;
-    cfg.QUORUM_SET.validators = {
-        cfg.NODE_SEED.getPublicKey(),
-        SecretKey::pseudoRandomForTesting().getPublicKey()};
+    cfg.QUORUM_SET.validators = {keys[0].getPublicKey(),
+                                 keys[1].getPublicKey()};
     auto app = createTestApplication(clock, cfg);
     auto& herder = static_cast<HerderImpl&>(app->getHerder());
     auto const seq = app->getLedgerManager().getLastClosedLedgerNum() + 1;
@@ -7186,10 +7203,14 @@ TEST_CASE("early preparation respects manual and immediately due triggers",
             },
             std::chrono::seconds(1));
     }
-    REQUIRE(pulls == 1);
+    auto const leaders = herder.getSCP().getNominationLeaders(seq);
+    REQUIRE(leaders.size() == 1);
+    bool const isLeader = leaders.count(cfg.NODE_SEED.getPublicKey());
+    REQUIRE(pulls == (isLeader ? 1u : 0u));
     REQUIRE(!EarlyNominationTestAccess::prepared(herder));
-    REQUIRE(!EarlyNominationTestAccess::scheduled(herder));
-    REQUIRE(!herder.getSCP().getNominationLeaders(seq).empty());
+    // Starting nomination schedules the other validator's preparation for
+    // the next round, even when the initial trigger fires immediately.
+    REQUIRE(EarlyNominationTestAccess::scheduled(herder) == !isLeader);
     herder.mGetTopTransactionsForTesting = nullptr;
 }
 
