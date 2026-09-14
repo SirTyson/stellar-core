@@ -21,6 +21,7 @@
 #include "util/GlobalChecks.h"
 #include "util/Logging.h"
 #include "util/ProtocolVersion.h"
+#include "util/RandHasher.h"
 #include "util/XDRCereal.h"
 #include "util/XDROperators.h"
 #include "xdrpp/marshal.h"
@@ -30,6 +31,7 @@
 #include <list>
 #include <numeric>
 #include <queue>
+#include <unordered_set>
 #include <variant>
 
 namespace stellar
@@ -2153,12 +2155,35 @@ TxSetPhaseFrame::checkValidSoroban(
         return TxSetValidationResult::SOROBAN_INSTRUCTIONS_EXCEED_LIMIT;
     }
 
+    // The frames own immutable footprints throughout this check. Borrow keys
+    // while retaining content-based hashing and equality, including the
+    // randomized hash mixing used by the owning sets.
+    struct KeyHash
+    {
+        size_t
+        operator()(LedgerKey const* key) const
+        {
+            return std::hash<LedgerKey>{}(*key);
+        }
+    };
+    struct KeyEqual
+    {
+        bool
+        operator()(LedgerKey const* a, LedgerKey const* b) const
+        {
+            return *a == *b;
+        }
+    };
+    using Keys =
+        std::unordered_set<LedgerKey const*,
+                           RandHasher<LedgerKey const*, KeyHash>, KeyEqual>;
+
     // Verify that there are no read-write conflicts between clusters within
     // every stage.
     for (auto const& stage : stages)
     {
-        UnorderedSet<LedgerKey> stageReadOnlyKeys;
-        UnorderedSet<LedgerKey> stageReadWriteKeys;
+        Keys stageReadOnlyKeys;
+        Keys stageReadWriteKeys;
         for (auto const& cluster : stage)
         {
             for (auto const& tx : cluster)
@@ -2167,7 +2192,7 @@ TxSetPhaseFrame::checkValidSoroban(
 
                 for (auto const& key : footprint.readOnly)
                 {
-                    if (stageReadWriteKeys.count(key) > 0)
+                    if (stageReadWriteKeys.count(&key) > 0)
                     {
                         CLOG_DEBUG(
                             Herder,
@@ -2178,8 +2203,8 @@ TxSetPhaseFrame::checkValidSoroban(
                 }
                 for (auto const& key : footprint.readWrite)
                 {
-                    if (stageReadOnlyKeys.count(key) > 0 ||
-                        stageReadWriteKeys.count(key) > 0)
+                    if (stageReadOnlyKeys.count(&key) > 0 ||
+                        stageReadWriteKeys.count(&key) > 0)
                     {
                         CLOG_DEBUG(
                             Herder,
@@ -2195,10 +2220,14 @@ TxSetPhaseFrame::checkValidSoroban(
             for (auto const& tx : cluster)
             {
                 auto const& footprint = tx->sorobanResources().footprint;
-                stageReadOnlyKeys.insert(footprint.readOnly.begin(),
-                                        footprint.readOnly.end());
-                stageReadWriteKeys.insert(footprint.readWrite.begin(),
-                                         footprint.readWrite.end());
+                for (auto const& key : footprint.readOnly)
+                {
+                    stageReadOnlyKeys.insert(&key);
+                }
+                for (auto const& key : footprint.readWrite)
+                {
+                    stageReadWriteKeys.insert(&key);
+                }
             }
         }
     }

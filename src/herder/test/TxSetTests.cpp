@@ -2059,10 +2059,17 @@ TEST_CASE("applicable txset validation - Soroban resources", "[txset][soroban]")
 
         int accountId = 0;
         int footprintId = 0;
+        bool nestedFootprintKeys = false;
         auto ledgerKey = [&](int id) {
             LedgerKey key(LedgerEntryType::CONTRACT_DATA);
             key.contractData().key.type(SCValType::SCV_I32);
             key.contractData().key.i32() = id;
+            if (nestedFootprintKeys)
+            {
+                key.contractData().key =
+                    makeVecSCVal({makeSymbolSCVal("Balance"),
+                                  makeVecSCVal({key.contractData().key})});
+            }
             return key;
         };
 
@@ -2327,7 +2334,10 @@ TEST_CASE("applicable txset validation - Soroban resources", "[txset][soroban]")
         {
             SECTION("data dependency validation")
             {
-
+                // Exercise independently allocated copies of both scalar and
+                // nested keys: dependency checks must compare key contents.
+                nestedFootprintKeys = GENERATE(false, true);
+                CAPTURE(nestedFootprintKeys);
                 auto buildAndValidate = [&](TxStageFrameList txsPerStage) {
                     auto ledgerHash = app->getLedgerManager()
                                           .getLastClosedLedgerHeader()
@@ -2397,6 +2407,14 @@ TEST_CASE("applicable txset validation - Soroban resources", "[txset][soroban]")
                         {createTx({}, {1})},
                         {createTx({}, {1})},
                     }};
+                    auto const& first = txsPerStage[0][0][0]
+                                            ->sorobanResources()
+                                            .footprint.readWrite.back();
+                    auto const& second = txsPerStage[0][1][0]
+                                             ->sorobanResources()
+                                             .footprint.readWrite.back();
+                    REQUIRE(&first != &second);
+                    REQUIRE(first == second);
                     REQUIRE(buildAndValidate(txsPerStage) ==
                             TxSetValidationResult::TX_ORDERING_INVALID);
                 }
