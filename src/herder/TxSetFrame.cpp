@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <list>
 #include <numeric>
+#include <queue>
 #include <variant>
 
 namespace stellar
@@ -545,10 +546,17 @@ buildSurgePricedSequentialPhase(
         txs, surgePricingLaneConfig, hadTxNotFittingLane, ledgerVersion);
 }
 
+struct SelectionTimings
+{
+    std::chrono::steady_clock::duration packing{};
+    std::chrono::steady_clock::duration validation{};
+    std::chrono::steady_clock::duration feeQueue{};
+};
+
 std::pair<std::variant<TxFrameList, TxStageFrameList>,
           std::shared_ptr<InclusionFeeMap>>
 applySurgePricing(TxSetPhase phase, TxFrameList const& txs, Application& app,
-                  TxSetCandidateValidator* validator
+                  TxSetCandidateValidator* validator, SelectionTimings& timings
 #ifdef BUILD_TESTS
                   ,
                   bool enforceTxsApplyOrder,
@@ -660,44 +668,74 @@ applySurgePricing(TxSetPhase phase, TxFrameList const& txs, Application& app,
         };
 
     TxFrameList remaining = txs;
-    TxFrameList priorityOrder;
     if (validator)
     {
         // Soroban has a single fee lane. Classic keeps its existing trimming
         // and multi-lane surge-pricing policy.
         releaseAssert(phase == TxSetPhase::SOROBAN);
-        priorityOrder = txs;
-        std::sort(priorityOrder.begin(), priorityOrder.end(),
-                  TxFeeComparator(true, 0));
     }
-    size_t nextUnchecked = 0;
+    using PriorityQueue =
+        std::priority_queue<TransactionFrameBasePtr, TxFrameList,
+                            TxFeeComparator>;
+    std::optional<PriorityQueue> uncheckedPriority;
+    auto validateBatch = [&](TxFrameList const& batch) {
+        auto const started = std::chrono::steady_clock::now();
+        validator->validate(batch);
+        timings.validation += std::chrono::steady_clock::now() - started;
+    };
     auto validateMore = [&](size_t count) {
-        TxFrameList batch;
-        while (nextUnchecked < priorityOrder.size() && batch.size() < count)
+        auto const started = std::chrono::steady_clock::now();
+        if (!uncheckedPriority)
         {
-            auto const& tx = priorityOrder[nextUnchecked++];
+            // Selection already ordered and checked its chosen transactions.
+            // Build a heap only if refill or demand probing needs more, and
+            // leave out candidates whose validity is already known. This
+            // preserves fee order without sorting the whole pull a second time.
+            TxFrameList unchecked;
+            unchecked.reserve(txs.size());
+            for (auto const& tx : txs)
+            {
+                if (!validator->isChecked(tx))
+                {
+                    unchecked.push_back(tx);
+                }
+            }
+            // priority_queue puts the greatest element first with a less-than
+            // comparator, matching the previous descending fee order.
+            uncheckedPriority.emplace(TxFeeComparator(false, 0),
+                                      std::move(unchecked));
+        }
+        TxFrameList batch;
+        while (!uncheckedPriority->empty() && batch.size() < count)
+        {
+            auto tx = uncheckedPriority->top();
+            uncheckedPriority->pop();
+            // Resolving a fee payer can also check other queued candidates.
             if (!validator->isChecked(tx))
             {
                 batch.push_back(tx);
             }
         }
-        validator->validate(batch);
+        timings.feeQueue += std::chrono::steady_clock::now() - started;
+        validateBatch(batch);
         return batch;
     };
     auto growBatch = [&](size_t size) {
-        return size + std::min(size, priorityOrder.size() - size);
+        return size + std::min(size, txs.size() - size);
     };
-    size_t refillBatchSize = std::min<size_t>(64, priorityOrder.size());
+    size_t refillBatchSize = std::min<size_t>(64, txs.size());
     while (true)
     {
+        auto const packingStarted = std::chrono::steady_clock::now();
         select(remaining);
+        timings.packing += std::chrono::steady_clock::now() - packingStarted;
         if (!validator)
         {
             break;
         }
         TxFrameList selected;
         visitIncludedTxs([&](auto const& tx) { selected.push_back(tx); });
-        validator->validate(selected);
+        validateBatch(selected);
         size_t invalidSelected = std::count_if(
             selected.begin(), selected.end(),
             [&](auto const& tx) { return validator->isInvalid(tx); });
@@ -726,9 +764,11 @@ applySurgePricing(TxSetPhase phase, TxFrameList const& txs, Application& app,
                 return included.find(tx) == included.end() &&
                        validator->isValid(tx);
             };
-            hadTxNotFittingLane[0] = std::any_of(
-                priorityOrder.begin(), priorityOrder.end(), validExcluded);
-            size_t probeBatchSize = std::min<size_t>(1, priorityOrder.size());
+            // Fee-payer dependencies may already have validated excluded
+            // transactions; they remain demand even though absent from the heap.
+            hadTxNotFittingLane[0] =
+                std::any_of(txs.begin(), txs.end(), validExcluded);
+            size_t probeBatchSize = std::min<size_t>(1, txs.size());
             while (!hadTxNotFittingLane[0])
             {
                 auto probes = validateMore(probeBatchSize);
@@ -926,6 +966,7 @@ makeTxSetFromTransactions(
     auto const started = std::chrono::steady_clock::now();
     std::chrono::steady_clock::duration preflightTime{};
     std::chrono::steady_clock::duration selectionTime{};
+    SelectionTimings selectionTimings;
     std::vector<TxSetPhaseFrame> validatedPhases;
     UnorderedMap<AccountID, int64_t> accountFeeMap;
     for (size_t i = 0; i < txPhases.size(); ++i)
@@ -995,7 +1036,7 @@ makeTxSetFromTransactions(
         auto const selectionStarted = std::chrono::steady_clock::now();
         preflightTime += selectionStarted - phaseStarted;
         auto [includedTxs, inclusionFeeMapBinding] = applySurgePricing(
-            phaseType, candidates, app, candidateValidator.get()
+            phaseType, candidates, app, candidateValidator.get(), selectionTimings
 #ifdef BUILD_TESTS
                                             ,
             skipValidation, parallelSorobanOrder
@@ -1110,11 +1151,14 @@ makeTxSetFromTransactions(
     CLOG_INFO(
         Herder,
         "CONSENSUS_TRACE stage=txset_assemble slot={} hash={} included={} "
-        "preflight_us={} selection_us={} phases_us={} wire_us={} "
+        "preflight_us={} selection_us={} packing_us={} "
+        "candidate_validation_us={} fee_queue_us={} phases_us={} wire_us={} "
         "prepare_us={} invariants_us={} work_us={} steady_us={}",
         lclHeader.header.ledgerSeq + 1,
         binToHex(outputTxSet->getContentsHash()), outputTxSet->sizeTxTotal(),
         micros(preflightTime), micros(selectionTime),
+        micros(selectionTimings.packing), micros(selectionTimings.validation),
+        micros(selectionTimings.feeQueue),
         micros(phasesReady - started), micros(wireReady - phasesReady),
         micros(prepared - wireReady), micros(checked - prepared),
         micros(checked - started), micros(checked.time_since_epoch()));

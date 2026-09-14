@@ -519,6 +519,7 @@ TEST_CASE("Soroban selection preserves shared fee payer affordability",
     bool invalidSibling = false;
     bool crossPhase = false;
     bool extremeFees = false;
+    bool checkedExcluded = false;
     SECTION("unselected sibling makes the group unaffordable")
     {
     }
@@ -529,6 +530,11 @@ TEST_CASE("Soroban selection preserves shared fee payer affordability",
     SECTION("funded shared payer does not require validating the whole group")
     {
         funded = true;
+    }
+    SECTION("checked excluded fee dependency still establishes surge demand")
+    {
+        invalidSibling = true;
+        checkedExcluded = true;
     }
     SECTION("Classic fees also consume the shared budget")
     {
@@ -546,7 +552,7 @@ TEST_CASE("Soroban selection preserves shared fee payer affordability",
     std::vector<
         std::shared_ptr<CountedValidationFrame<FeeBumpTransactionFrame>>>
         bumps;
-    for (size_t i = 0; i < (funded ? 20 : 2); ++i)
+    for (size_t i = 0; i < (funded ? 20 : checkedExcluded ? 3 : 2); ++i)
     {
         auto source = getGenesisAccount(*app, i);
         SorobanResources resources;
@@ -555,6 +561,13 @@ TEST_CASE("Soroban selection preserves shared fee payer affordability",
                                         DEFAULT_TEST_RESOURCE_FEE, resources);
         int64_t fullFee = funded ? 2 * DEFAULT_TEST_RESOURCE_FEE + 2000 + i
                                  : (crossPhase ? balance / 3 : balance / 2 + 1);
+        if (checkedExcluded)
+        {
+            // The provisional total exceeds the balance, forcing validation
+            // of all three siblings. Dropping the cheapest invalid sibling
+            // leaves two affordable transactions, only one of which fits.
+            fullFee = balance / 3 + 3 - i;
+        }
         if (extremeFees)
         {
             fullFee = INT64_MAX;
@@ -562,7 +575,7 @@ TEST_CASE("Soroban selection preserves shared fee payer affordability",
         auto tx = feeBump(*app, payer, inner, fullFee,
                           /* useInclusionAsFullFee */ true);
         auto env = tx->getEnvelope();
-        if (invalidSibling && i == 1)
+        if (invalidSibling && i == (checkedExcluded ? 2 : 1))
         {
             env.feeBump().signatures[0].signature[0] ^= 1;
         }
@@ -573,7 +586,7 @@ TEST_CASE("Soroban selection preserves shared fee payer affordability",
         phases[1].push_back(frame);
     }
     // Lower fee transactions from unrelated sources can fill any vacancies.
-    for (size_t i = 30; i < 34; ++i)
+    for (size_t i = 30; i < (checkedExcluded ? 30 : 34); ++i)
     {
         auto source = getGenesisAccount(*app, i);
         SorobanResources resources;
@@ -593,7 +606,7 @@ TEST_CASE("Soroban selection preserves shared fee payer affordability",
     PerPhaseTransactionList invalid(2);
     auto [wire, applicable] =
         makeTxSetFromTransactions(phases, *app, ApplyTimeOffset{}, invalid);
-    CAPTURE(funded, invalidSibling, crossPhase, extremeFees);
+    CAPTURE(funded, invalidSibling, crossPhase, extremeFees, checkedExcluded);
     auto expectedIncluded = extremeFees ? 4 : funded || invalidSibling ? 1 : 2;
     REQUIRE(applicable->sizeTx(TxSetPhase::SOROBAN) == expectedIncluded);
     REQUIRE(invalid[0].empty());
@@ -605,8 +618,15 @@ TEST_CASE("Soroban selection preserves shared fee payer affordability",
         checks += tx->checks;
     }
     // Either two selected/probe transactions from a funded group, or the
-    // complete two-transaction group needed to resolve affordability.
-    REQUIRE(checks == 2);
+    // complete group needed to resolve affordability.
+    REQUIRE(checks == (checkedExcluded ? 3 : 2));
+    if (checkedExcluded)
+    {
+        // All candidates are already checked. No unchecked probe is available,
+        // but the valid excluded sibling must still raise the base fee.
+        auto const& phase = applicable->getPhase(TxSetPhase::SOROBAN);
+        REQUIRE(*applicable->getTxBaseFee(*phase.begin()) > 100);
+    }
     REQUIRE(applicable->checkValid(*app, 0, 0));
 }
 
