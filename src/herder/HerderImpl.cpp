@@ -1629,6 +1629,7 @@ HerderImpl::prepareTxSet(uint32_t ledgerSeq, ConsensusTime closeTime)
 HerderImpl::PreparedTxSet
 HerderImpl::buildTxSet(uint32_t ledgerSeq, ConsensusTime closeTime)
 {
+    auto const started = std::chrono::steady_clock::now();
     auto const lcl = mLedgerManager.getLastClosedLedgerHeader();
     releaseAssert(ledgerSeq == lcl.header.ledgerSeq + 1);
     releaseAssert(closeTime > getConsensusTime(lcl.header.scpValue));
@@ -1657,6 +1658,7 @@ HerderImpl::buildTxSet(uint32_t ledgerSeq, ConsensusTime closeTime)
             :
 #endif
             overlayMgr.getTopTransactions(maxCandidates * 2);
+    auto const pulled = std::chrono::steady_clock::now();
 
     CLOG_INFO(Herder, "Got {} transactions from Rust overlay mempool",
               txEnvelopes.size());
@@ -1690,6 +1692,7 @@ HerderImpl::buildTxSet(uint32_t ledgerSeq, ConsensusTime closeTime)
             classicTxs.push_back(txFrame);
         }
     }
+    auto const converted = std::chrono::steady_clock::now();
     // The mempool is fee-ordered and sequence-number-oblivious, so it can
     // hand us several transactions from one source account (e.g. a chained
     // pair). A tx set may only contain one tx per source account, so keep
@@ -1715,6 +1718,7 @@ HerderImpl::buildTxSet(uint32_t ledgerSeq, ConsensusTime closeTime)
     };
     onePerSourceAccount(classicTxs);
     onePerSourceAccount(sorobanTxs);
+    auto const filtered = std::chrono::steady_clock::now();
 
     txPhases.emplace_back(std::move(classicTxs));
     if (supportsSoroban)
@@ -1727,6 +1731,7 @@ HerderImpl::buildTxSet(uint32_t ledgerSeq, ConsensusTime closeTime)
 
     std::tie(proposedSet, applicableProposedSet) = makeTxSetFromTransactions(
         txPhases, mApp, closeTimeOffset, invalidTxPhases);
+    auto const assembled = std::chrono::steady_clock::now();
     CLOG_INFO(Herder, "Proposed TX set has {} transactions",
               proposedSet->sizeTxTotal());
 
@@ -1770,6 +1775,24 @@ HerderImpl::buildTxSet(uint32_t ledgerSeq, ConsensusTime closeTime)
         validCandidates += txPhases[i].size() - invalidTxPhases[i].size();
     }
     bool capacityLimited = validCandidates > proposedSet->sizeTxTotal();
+    auto const ready = std::chrono::steady_clock::now();
+    auto micros = [](auto duration) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(duration)
+            .count();
+    };
+    // Spans end before local candidates are destroyed on return. The outer
+    // close-to-publication timing includes that remaining teardown work.
+    CLOG_INFO(
+        Herder,
+        "CONSENSUS_TRACE stage=proposal_build slot={} hash={} pulled={} "
+        "included={} removed={} pull_us={} frames_us={} source_filter_us={} "
+        "assemble_us={} cleanup_us={} work_us={} steady_us={}",
+        ledgerSeq, binToHex(proposedSet->getContentsHash()), txEnvelopes.size(),
+        proposedSet->sizeTxTotal(), invalidTxHashes.size(),
+        micros(pulled - started), micros(converted - pulled),
+        micros(filtered - converted), micros(assembled - filtered),
+        micros(ready - assembled), micros(ready - started),
+        micros(ready.time_since_epoch()));
     return PreparedTxSet{lcl.hash,
                          ledgerSeq,
                          closeTime,

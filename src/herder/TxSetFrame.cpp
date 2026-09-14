@@ -923,10 +923,14 @@ makeTxSetFromTransactions(
     releaseAssert(txPhases.size() <=
                   static_cast<size_t>(TxSetPhase::PHASE_COUNT));
 
+    auto const started = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::duration preflightTime{};
+    std::chrono::steady_clock::duration selectionTime{};
     std::vector<TxSetPhaseFrame> validatedPhases;
     UnorderedMap<AccountID, int64_t> accountFeeMap;
     for (size_t i = 0; i < txPhases.size(); ++i)
     {
+        auto const phaseStarted = std::chrono::steady_clock::now();
         auto const& phaseTxs = txPhases[i];
         bool expectSoroban = static_cast<TxSetPhase>(i) == TxSetPhase::SOROBAN;
         if (!std::all_of(phaseTxs.begin(), phaseTxs.end(), [&](auto const& tx) {
@@ -988,6 +992,8 @@ makeTxSetFromTransactions(
         }
 #endif
         auto phaseType = static_cast<TxSetPhase>(i);
+        auto const selectionStarted = std::chrono::steady_clock::now();
+        preflightTime += selectionStarted - phaseStarted;
         auto [includedTxs, inclusionFeeMapBinding] = applySurgePricing(
             phaseType, candidates, app, candidateValidator.get()
 #ifdef BUILD_TESTS
@@ -995,6 +1001,7 @@ makeTxSetFromTransactions(
             skipValidation, parallelSorobanOrder
 #endif
         );
+        selectionTime += std::chrono::steady_clock::now() - selectionStarted;
         if (candidateValidator)
         {
             for (auto const& tx : candidates)
@@ -1031,6 +1038,7 @@ makeTxSetFromTransactions(
             includedTxs);
     }
 
+    auto const phasesReady = std::chrono::steady_clock::now();
     auto const& lclHeader = app.getLedgerManager().getLastClosedLedgerHeader();
     // Preliminary applicable frame - we don't know the contents hash yet, but
     // we also don't return this.
@@ -1041,6 +1049,7 @@ makeTxSetFromTransactions(
     // Do the roundtrip through XDR to ensure we never build an incorrect tx set
     // for nomination.
     auto outputTxSet = preliminaryApplicableTxSet->toWireTxSetFrame();
+    auto const wireReady = std::chrono::steady_clock::now();
 #ifdef BUILD_TESTS
     if (skipValidation)
     {
@@ -1055,6 +1064,7 @@ makeTxSetFromTransactions(
 
     ApplicableTxSetFrameConstPtr outputApplicableTxSet =
         outputTxSet->prepareForApply(app, lclHeader.header);
+    auto const prepared = std::chrono::steady_clock::now();
 
     if (!outputApplicableTxSet)
     {
@@ -1092,6 +1102,22 @@ makeTxSetFromTransactions(
             toString(validationResult)));
     }
 
+    auto const checked = std::chrono::steady_clock::now();
+    auto micros = [](auto duration) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(duration)
+            .count();
+    };
+    CLOG_INFO(
+        Herder,
+        "CONSENSUS_TRACE stage=txset_assemble slot={} hash={} included={} "
+        "preflight_us={} selection_us={} phases_us={} wire_us={} "
+        "prepare_us={} invariants_us={} work_us={} steady_us={}",
+        lclHeader.header.ledgerSeq + 1,
+        binToHex(outputTxSet->getContentsHash()), outputTxSet->sizeTxTotal(),
+        micros(preflightTime), micros(selectionTime),
+        micros(phasesReady - started), micros(wireReady - phasesReady),
+        micros(prepared - wireReady), micros(checked - prepared),
+        micros(checked - started), micros(checked.time_since_epoch()));
     return std::make_pair(outputTxSet, std::move(outputApplicableTxSet));
 }
 
