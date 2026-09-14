@@ -126,8 +126,8 @@ using namespace std;
 using namespace stellar::txbridge;
 
 TransactionFrame::TransactionFrame(Hash const& networkID,
-                                   TransactionEnvelope const& envelope)
-    : mEnvelope(envelope), mNetworkID(networkID)
+                                   TransactionEnvelope envelope)
+    : mEnvelope(std::move(envelope)), mNetworkID(networkID)
 {
     auto const& ops = mEnvelope.type() == ENVELOPE_TYPE_TX_V0
                           ? mEnvelope.v0().tx.operations

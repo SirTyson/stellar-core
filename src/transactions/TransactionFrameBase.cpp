@@ -5,21 +5,23 @@
 #include "transactions/TransactionFrameBase.h"
 #include "transactions/FeeBumpTransactionFrame.h"
 #include "transactions/TransactionFrame.h"
+#include <utility>
 
 namespace stellar
 {
 
 TransactionFrameBasePtr
 TransactionFrameBase::makeTransactionFromWire(Hash const& networkID,
-                                              TransactionEnvelope const& env)
+                                              TransactionEnvelope env)
 {
     switch (env.type())
     {
     case ENVELOPE_TYPE_TX_V0:
     case ENVELOPE_TYPE_TX:
-        return std::make_shared<TransactionFrame>(networkID, env);
+        return std::make_shared<TransactionFrame>(networkID, std::move(env));
     case ENVELOPE_TYPE_TX_FEE_BUMP:
-        return std::make_shared<FeeBumpTransactionFrame>(networkID, env);
+        return std::make_shared<FeeBumpTransactionFrame>(networkID,
+                                                         std::move(env));
     default:
         abort();
     }

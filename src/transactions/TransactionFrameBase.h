@@ -147,8 +147,7 @@ class TransactionFrameBase
 {
   public:
     static TransactionFrameBasePtr
-    makeTransactionFromWire(Hash const& networkID,
-                            TransactionEnvelope const& env);
+    makeTransactionFromWire(Hash const& networkID, TransactionEnvelope env);
 
     virtual bool
     apply(AppConnector& app, AbstractLedgerTxn& ltx,

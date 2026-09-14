@@ -39,6 +39,123 @@ using namespace stellar;
 using namespace stellar::txbridge;
 using namespace stellar::txtest;
 
+TEST_CASE("transaction frames copy or take ownership of envelopes",
+          "[tx][envelope][envelope-ownership]")
+{
+    auto const networkID = sha256("envelope ownership");
+    auto const ledgerVersion =
+        getTestConfig().TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION;
+    auto operations =
+        [](TransactionEnvelope const& env) -> std::vector<Operation> const& {
+        if (env.type() == ENVELOPE_TYPE_TX_V0)
+        {
+            return env.v0().tx.operations;
+        }
+        if (env.type() == ENVELOPE_TYPE_TX_FEE_BUMP)
+        {
+            return env.feeBump().tx.innerTx.v1().tx.operations;
+        }
+        return env.v1().tx.operations;
+    };
+
+    for (int kind = 0; kind < 5; ++kind)
+    {
+        INFO("envelope variant " << kind);
+        TransactionEnvelope original(ENVELOPE_TYPE_TX);
+        auto& tx = original.v1().tx;
+        tx.sourceAccount.ed25519() = networkID;
+        tx.seqNum = 123;
+        tx.fee = 1321;
+        tx.memo.type(MEMO_TEXT);
+        tx.memo.text() = "owned envelope";
+        auto& op = tx.operations.emplace_back();
+        bool soroban = kind == 2 || kind == 4;
+        if (soroban)
+        {
+            op.body.type(INVOKE_HOST_FUNCTION);
+            auto& host = op.body.invokeHostFunctionOp().hostFunction;
+            host.type(HOST_FUNCTION_TYPE_UPLOAD_CONTRACT_WASM);
+            host.wasm().resize(257);
+            host.wasm().front() = 42;
+            host.wasm().back() = 43;
+            tx.ext.v(1);
+            auto& data = tx.ext.sorobanData();
+            data.resourceFee = 1000;
+            data.resources.instructions = 100000;
+            data.resources.diskReadBytes = 200;
+            data.resources.writeBytes = 300;
+            LedgerKey code(CONTRACT_CODE);
+            code.contractCode().hash = networkID;
+            data.resources.footprint.readWrite.push_back(code);
+        }
+        else
+        {
+            op.body.type(PAYMENT);
+            op.body.paymentOp().destination.ed25519() = networkID;
+            op.body.paymentOp().asset.type(ASSET_TYPE_NATIVE);
+            op.body.paymentOp().amount = 456;
+        }
+        original.v1().signatures.emplace_back().signature.resize(64);
+        if (kind == 0)
+        {
+            TransactionEnvelope v0(ENVELOPE_TYPE_TX_V0);
+            v0.v0().tx.sourceAccountEd25519 = tx.sourceAccount.ed25519();
+            v0.v0().tx.fee = tx.fee;
+            v0.v0().tx.seqNum = tx.seqNum;
+            v0.v0().tx.memo = tx.memo;
+            v0.v0().tx.operations = tx.operations;
+            v0.v0().signatures = original.v1().signatures;
+            original = std::move(v0);
+        }
+        else if (kind >= 3)
+        {
+            TransactionEnvelope bump(ENVELOPE_TYPE_TX_FEE_BUMP);
+            bump.feeBump().tx.feeSource.ed25519() = networkID;
+            bump.feeBump().tx.fee = 3000;
+            bump.feeBump().tx.innerTx.type(ENVELOPE_TYPE_TX);
+            bump.feeBump().tx.innerTx.v1() = original.v1();
+            bump.feeBump().signatures.emplace_back().signature.resize(64);
+            original = std::move(bump);
+        }
+        auto const bytes = xdr::xdr_to_opaque(original);
+        auto copied =
+            TransactionFrameBase::makeTransactionFromWire(networkID, original);
+        REQUIRE(xdr::xdr_to_opaque(original) == bytes);
+        REQUIRE(operations(copied->getEnvelope()).data() !=
+                operations(original).data());
+        TransactionFrameBasePtr moved;
+        {
+            auto input = original;
+            auto const* storage = operations(input).data();
+            moved = TransactionFrameBase::makeTransactionFromWire(
+                networkID, std::move(input));
+            REQUIRE(operations(moved->getEnvelope()).data() == storage);
+            // Reuse and destroy the source before inspecting any frame helpers.
+            input = TransactionEnvelope(ENVELOPE_TYPE_TX);
+            input.v1().tx.operations.resize(3);
+        }
+        REQUIRE(xdr::xdr_to_opaque(moved->getEnvelope()) == bytes);
+        REQUIRE(moved->getFullHash() == copied->getFullHash());
+        REQUIRE(moved->getContentsHash() == copied->getContentsHash());
+        REQUIRE(moved->getFullFee() == copied->getFullFee());
+        REQUIRE(moved->getInclusionFee() == copied->getInclusionFee());
+        REQUIRE(moved->getSourceID() == copied->getSourceID());
+        REQUIRE(moved->getFeeSourceID() == copied->getFeeSourceID());
+        REQUIRE(moved->getSeqNum() == copied->getSeqNum());
+        REQUIRE(moved->isSoroban() == soroban);
+        REQUIRE(moved->getResources(false, ledgerVersion) ==
+                copied->getResources(false, ledgerVersion));
+        REQUIRE(moved->getRawOperations() == operations(original));
+        REQUIRE(moved->getOperationFrames().size() ==
+                operations(original).size());
+        for (size_t i = 0; i < operations(original).size(); ++i)
+        {
+            REQUIRE(moved->getOperationFrames()[i]->getOperation() ==
+                    operations(original)[i]);
+        }
+    }
+}
+
 TEST_CASE("txset - correct apply order", "[tx][envelope]")
 {
     Config cfg = getTestConfig();

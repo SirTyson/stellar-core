@@ -64,11 +64,11 @@ FeeBumpTransactionFrame::getResourcesExt() const
     return mInnerTx->getResourcesExt();
 }
 
-FeeBumpTransactionFrame::FeeBumpTransactionFrame(
-    Hash const& networkID, TransactionEnvelope const& envelope)
-    : mEnvelope(envelope)
-    , mInnerTx(std::make_shared<TransactionFrame>(networkID,
-                                                  convertInnerTxToV1(envelope)))
+FeeBumpTransactionFrame::FeeBumpTransactionFrame(Hash const& networkID,
+                                                 TransactionEnvelope envelope)
+    : mEnvelope(std::move(envelope))
+    , mInnerTx(std::make_shared<TransactionFrame>(
+          networkID, convertInnerTxToV1(mEnvelope)))
     , mNetworkID(networkID)
 {
 }

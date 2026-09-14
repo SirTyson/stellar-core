@@ -1664,16 +1664,17 @@ HerderImpl::buildTxSet(uint32_t ledgerSeq, ConsensusTime closeTime)
               txEnvelopes.size());
 
     // Convert TransactionEnvelopes to TransactionFrameBasePtrs and place them
-    // into the phase expected by TxSetFrame.
+    // into the phase expected by TxSetFrame. The reply owns these envelopes;
+    // transfer them into the frames instead of copying their nested buffers.
     TxFrameList classicTxs;
     TxFrameList sorobanTxs;
     Hash const& networkID = mApp.getNetworkID();
     bool const supportsSoroban = protocolVersionStartsFrom(
         lcl.header.ledgerVersion, SOROBAN_PROTOCOL_VERSION);
-    for (auto const& env : txEnvelopes)
+    for (auto& env : txEnvelopes)
     {
-        auto txFrame =
-            TransactionFrameBase::makeTransactionFromWire(networkID, env);
+        auto txFrame = TransactionFrameBase::makeTransactionFromWire(
+            networkID, std::move(env));
         if (txFrame->isSoroban())
         {
             if (supportsSoroban)

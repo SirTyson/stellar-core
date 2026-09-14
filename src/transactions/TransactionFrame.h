@@ -177,8 +177,7 @@ class TransactionFrame : public TransactionFrameBase
                                       Config const& cfg) const;
 
   public:
-    TransactionFrame(Hash const& networkID,
-                     TransactionEnvelope const& envelope);
+    TransactionFrame(Hash const& networkID, TransactionEnvelope envelope);
     TransactionFrame(TransactionFrame const&) = delete;
     TransactionFrame() = delete;
 
