@@ -41,11 +41,13 @@ use tokio::task::JoinSet;
 use tracing::{debug, error, info, trace, warn};
 
 mod framed_io;
+mod tx_batch;
 
 // Protocol identifiers for dedicated streams
 pub const SCP_PROTOCOL: StreamProtocol = StreamProtocol::new("/stellar/scp/1.0.0");
 pub const CONTROL_PROTOCOL: StreamProtocol = StreamProtocol::new("/stellar/control/1.0.0");
 pub const TX_PROTOCOL: StreamProtocol = StreamProtocol::new("/stellar/tx/1.0.0");
+pub const COMPRESSED_TX_PROTOCOL: StreamProtocol = StreamProtocol::new("/stellar/tx/zstd/1.0.0");
 pub const TXSET_PROTOCOL: StreamProtocol = StreamProtocol::new("/stellar/txset/1.0.0");
 pub const COMPRESSED_TXSET_PROTOCOL: StreamProtocol =
     StreamProtocol::new("/stellar/txset/zstd/1.0.0");
@@ -393,6 +395,8 @@ struct SharedState {
     pending_getdata: RwLock<PendingRequests>,
     /// TX buffer for responding to GETDATA requests
     tx_buffer: RwLock<TxBuffer>,
+    /// Bounded blocking workers shared by TX batch encoders and decoders.
+    tx_batch_codec: tx_batch::Codec,
     /// Overlay metrics (shared with App for IPC reporting)
     metrics: Arc<OverlayMetrics>,
 }
@@ -428,6 +432,7 @@ impl SharedState {
             inv_tracker: RwLock::new(InvTracker::new()),
             pending_getdata: RwLock::new(PendingRequests::new()),
             tx_buffer: RwLock::new(TxBuffer::new()),
+            tx_batch_codec: tx_batch::Codec::new(),
             metrics,
         }
     }
@@ -547,6 +552,8 @@ impl StellarOverlay {
             true,
             #[cfg(test)]
             true,
+            #[cfg(test)]
+            true,
         )
         .await;
     }
@@ -557,11 +564,14 @@ impl StellarOverlay {
         mut self,
         #[cfg(test)] accept_control: bool,
         #[cfg(test)] accept_compressed: bool,
+        #[cfg(test)] accept_tx_batches: bool,
     ) {
         #[cfg(not(test))]
         let accept_compressed = true;
         #[cfg(not(test))]
         let accept_control = true;
+        #[cfg(not(test))]
+        let accept_tx_batches = true;
         // Accept incoming streams for each protocol
         let scp_incoming = match self.control.accept(SCP_PROTOCOL) {
             Ok(incoming) => incoming,
@@ -618,6 +628,18 @@ impl StellarOverlay {
             None
         };
 
+        let tx_batch_incoming = if accept_tx_batches {
+            match self.control.accept(COMPRESSED_TX_PROTOCOL) {
+                Ok(incoming) => Some(incoming),
+                Err(e) => {
+                    error!("Failed to accept compressed TX protocol: {:?}", e);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
         // Spawn inbound stream handlers
         let state = self.state.clone();
         tokio::spawn(handle_inbound_scp_streams(
@@ -628,7 +650,10 @@ impl StellarOverlay {
         if let Some(incoming) = control_incoming {
             tokio::spawn(handle_inbound_scp_streams(incoming, state.clone(), true));
         }
-        tokio::spawn(handle_inbound_tx_streams(tx_incoming, state.clone()));
+        tokio::spawn(handle_inbound_tx_streams(tx_incoming, state.clone(), false));
+        if let Some(incoming) = tx_batch_incoming {
+            tokio::spawn(handle_inbound_tx_streams(incoming, state.clone(), true));
+        }
         tokio::spawn(handle_inbound_txset_streams(
             txset_incoming,
             state.clone(),
@@ -1201,7 +1226,8 @@ async fn send_txset_response(
     );
 
     match send_peer_frames(&state, peer, StreamType::TxSet, PeerFrames::TxSet(&data)).await {
-        Ok(bytes) => {
+        Ok(written) => {
+            let bytes = written.payload;
             state.metrics.send_txset.fetch_add(1, Ordering::Relaxed);
             state.metrics.message_write.fetch_add(1, Ordering::Relaxed);
             state
@@ -1293,7 +1319,7 @@ impl StreamType {
     fn protocol(&self) -> StreamProtocol {
         match self {
             StreamType::Control | StreamType::TxSetRequest => CONTROL_PROTOCOL,
-            StreamType::Tx => TX_PROTOCOL,
+            StreamType::Tx => COMPRESSED_TX_PROTOCOL,
             StreamType::TxSet => COMPRESSED_TXSET_PROTOCOL,
             StreamType::LegacyTxSetRequest => TXSET_PROTOCOL,
         }
@@ -1322,6 +1348,12 @@ async fn open_peer_stream(
             if protocol == CONTROL_PROTOCOL =>
         {
             protocol = SCP_PROTOCOL;
+            control.open_stream(peer, protocol.clone()).await
+        }
+        Err(libp2p_stream::OpenStreamError::UnsupportedProtocol(_))
+            if protocol == COMPRESSED_TX_PROTOCOL =>
+        {
+            protocol = TX_PROTOCOL;
             control.open_stream(peer, protocol.clone()).await
         }
         Err(libp2p_stream::OpenStreamError::UnsupportedProtocol(_))
@@ -1420,14 +1452,41 @@ async fn send_to_peer_stream_parts(
 enum PeerFrames<'a> {
     Plain(framed_io::Frames<'a>),
     TxSet(&'a Arc<TxSetData>),
+    TxBatch(&'a tx_batch::Batch),
+}
+
+struct WrittenBytes {
+    payload: usize,
+    framed: usize,
 }
 
 impl PeerFrames<'_> {
-    async fn write(self, outbound: &mut OutboundStream) -> io::Result<usize> {
+    async fn write(self, outbound: &mut OutboundStream) -> io::Result<WrittenBytes> {
         match self {
             Self::Plain(frames) => {
                 frames.write(&mut outbound.stream).await?;
-                Ok(0)
+                Ok(WrittenBytes {
+                    payload: 0,
+                    framed: 0,
+                })
+            }
+            Self::TxBatch(batch) => {
+                if outbound.protocol == COMPRESSED_TX_PROTOCOL {
+                    if let Some(frame) = &batch.encoded {
+                        write_framed(&mut outbound.stream, frame).await?;
+                        return Ok(WrittenBytes {
+                            payload: frame.len(),
+                            framed: frame.len() + 4,
+                        });
+                    }
+                }
+                framed_io::Frames::Batch(&batch.raw)
+                    .write(&mut outbound.stream)
+                    .await?;
+                Ok(WrittenBytes {
+                    payload: batch.raw.len() - 4 * batch.messages,
+                    framed: batch.raw.len(),
+                })
             }
             Self::TxSet(data) => {
                 let (header, payload) = if outbound.protocol == COMPRESSED_TXSET_PROTOCOL {
@@ -1439,7 +1498,10 @@ impl PeerFrames<'_> {
                     )
                 };
                 framed_io::write_frame_parts(&mut outbound.stream, &[&header, payload]).await?;
-                Ok(4 + payload.len())
+                Ok(WrittenBytes {
+                    payload: 4 + payload.len(),
+                    framed: 8 + payload.len(),
+                })
             }
         }
     }
@@ -1450,7 +1512,7 @@ async fn send_peer_frames(
     peer_id: PeerId,
     stream_type: StreamType,
     frames: PeerFrames<'_>,
-) -> io::Result<usize> {
+) -> io::Result<WrittenBytes> {
     // Retry up to 2 times (3 attempts total) for reliability
     const MAX_RETRIES: usize = 2;
 
@@ -1792,7 +1854,11 @@ async fn handle_inbound_scp_streams(
 }
 
 /// Handle inbound TX streams from peers
-async fn handle_inbound_tx_streams(mut incoming: IncomingStreams, state: Arc<SharedState>) {
+async fn handle_inbound_tx_streams(
+    mut incoming: IncomingStreams,
+    state: Arc<SharedState>,
+    accepts_batches: bool,
+) {
     while let Some((peer_id, mut stream)) = incoming.next().await {
         info!("TX_STREAM: Accepted inbound TX stream from {}", peer_id);
         state.metrics.inbound_live.fetch_add(1, Ordering::Relaxed);
@@ -1802,11 +1868,34 @@ async fn handle_inbound_tx_streams(mut incoming: IncomingStreams, state: Arc<Sha
             loop {
                 match read_framed(&mut stream).await {
                     Ok(data) => {
-                        state.metrics.message_read.fetch_add(1, Ordering::Relaxed);
                         state
                             .metrics
                             .byte_read
                             .fetch_add(data.len() as u64, Ordering::Relaxed);
+                        if accepts_batches && tx_batch::is_compressed(&data) {
+                            // Await each batch's strict decode before reading
+                            // another frame. Other peer streams run concurrently.
+                            match state.tx_batch_codec.decode(data).await {
+                                Ok(txs) => {
+                                    state
+                                        .metrics
+                                        .message_read
+                                        .fetch_add(txs.len() as u64, Ordering::Relaxed);
+                                    for tx in txs {
+                                        handle_tx_response(&state, &peer_id, tx).await;
+                                    }
+                                }
+                                Err(e) => {
+                                    state.metrics.error_read.fetch_add(1, Ordering::Relaxed);
+                                    warn!(
+                                        "TX_BATCH_PARSE_ERR: Dropping batch from {}: {}",
+                                        peer_id, e
+                                    );
+                                }
+                            }
+                            continue;
+                        }
+                        state.metrics.message_read.fetch_add(1, Ordering::Relaxed);
                         // Parse INV/GETDATA message
                         handle_tx_stream_message(&state, &peer_id, &data, &mut stream).await;
                     }
@@ -1949,9 +2038,8 @@ async fn handle_getdata(
     let peer = *peer_id;
     tokio::spawn(async move {
         // One job per demand, retaining only one bounded batch while a peer
-        // is backpressured. Every TX still has its own wire frame. Batching
-        // avoids one task, stream lock and short QUIC write per transaction.
-        const BATCH_BYTES: usize = 64 * 1024;
+        // is backpressured. Compress the frames already available for this
+        // demand; never wait for more transactions to fill the batch.
         let mut batch = Vec::new();
         let mut messages = 0;
         for hash in getdata.hashes {
@@ -1973,14 +2061,15 @@ async fn handle_getdata(
                 .flood_fulfilled
                 .fetch_add(1, Ordering::Relaxed);
             let encoded = tx.to_flood_frame();
-            if batch.len() + 4 + encoded.len() > BATCH_BYTES && !batch.is_empty() {
-                send_tx_response_batch(&state, peer, &batch, messages).await;
+            if batch.len() + 4 + encoded.len() > tx_batch::MAX_BATCH_BYTES && !batch.is_empty() {
+                batch = send_tx_response_batch(&state, peer, std::mem::take(&mut batch), messages)
+                    .await;
                 batch.clear();
                 messages = 0;
             }
             // A transaction larger than the batch budget retains the existing
             // segmented write, without allocating a second copy of its bytes.
-            if 4 + encoded.len() > BATCH_BYTES {
+            if 4 + encoded.len() > tx_batch::MAX_BATCH_BYTES {
                 let result = send_to_peer_stream(&state, peer, StreamType::Tx, &encoded).await;
                 record_tx_response_write(&state, peer, result, 1, encoded.len());
                 continue;
@@ -1990,21 +2079,36 @@ async fn handle_getdata(
             messages += 1;
         }
         if !batch.is_empty() {
-            send_tx_response_batch(&state, peer, &batch, messages).await;
+            send_tx_response_batch(&state, peer, batch, messages).await;
         }
     });
 }
 
-async fn send_tx_response_batch(state: &SharedState, peer: PeerId, batch: &[u8], messages: usize) {
-    let result = send_peer_frames(
-        state,
-        peer,
-        StreamType::Tx,
-        PeerFrames::Plain(framed_io::Frames::Batch(batch)),
-    )
-    .await
-    .map(|_| ());
-    record_tx_response_write(state, peer, result, messages, batch.len() - 4 * messages);
+async fn send_tx_response_batch(
+    state: &SharedState,
+    peer: PeerId,
+    raw: Vec<u8>,
+    messages: usize,
+) -> Vec<u8> {
+    // Encoding precedes the route lock: it cannot block INV/GETDATA writes to
+    // this peer, and other peers can encode or send at the same time.
+    let batch = match state.tx_batch_codec.encode(raw, messages).await {
+        Ok(batch) => batch,
+        Err(e) => {
+            record_tx_response_write(state, peer, Err(e), messages, 0);
+            return Vec::new();
+        }
+    };
+    let result = send_peer_frames(state, peer, StreamType::Tx, PeerFrames::TxBatch(&batch)).await;
+    let bytes = result.as_ref().map(|written| written.payload).unwrap_or(0);
+    if let Ok(written) = &result {
+        state
+            .tx_batch_codec
+            .record_sent(batch.raw.len(), written.framed, messages);
+    }
+    record_tx_response_write(state, peer, result.map(|_| ()), messages, bytes);
+    // Reuse the original batch allocation while serving the rest of this demand.
+    batch.raw
 }
 
 fn record_tx_response_write(
@@ -2319,9 +2423,14 @@ async fn inv_getdata_housekeeping_task(state: Arc<SharedState>) {
     // Run every 50ms (half the batch timeout for responsiveness)
     let mut interval = tokio::time::interval(Duration::from_millis(50));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_batch_stats = Instant::now();
 
     loop {
         interval.tick().await;
+        if last_batch_stats.elapsed() >= Duration::from_secs(10) {
+            state.tx_batch_codec.log_stats();
+            last_batch_stats = Instant::now();
+        }
 
         // 1. Flush expired INV batches
         let expired_peers = {

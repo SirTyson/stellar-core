@@ -29,7 +29,7 @@ libp2p = { version = "0.54", features = ["tokio", "macros", "identify", "quic"] 
 libp2p-stream = "0.2.0-alpha"
 futures = "0.3"
 
-# TX set response compression
+# TX set and transaction batch compression
 zstd = { version = "0.13.3", default-features = false }
 
 # Logging

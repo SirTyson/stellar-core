@@ -98,6 +98,14 @@ impl TestNode {
     }
 
     async fn start_with_protocols(accept_control: bool, accept_compressed: bool) -> Self {
+        Self::start_with_tx_batches(accept_control, accept_compressed, true).await
+    }
+
+    async fn start_with_tx_batches(
+        accept_control: bool,
+        accept_compressed: bool,
+        accept_tx_batches: bool,
+    ) -> Self {
         let (handle, events, admissions, mut overlay) =
             create_test_overlay(Keypair::generate_ed25519(), Arc::new(OverlayMetrics::new()))
                 .unwrap();
@@ -120,8 +128,11 @@ impl TestNode {
         })
         .await
         .expect("listener did not start");
-        let task =
-            tokio::spawn(overlay.run_event_loop_with_control(accept_control, accept_compressed));
+        let task = tokio::spawn(overlay.run_event_loop_with_control(
+            accept_control,
+            accept_compressed,
+            accept_tx_batches,
+        ));
         Self {
             handle,
             events,
@@ -187,7 +198,7 @@ async fn txset_encoding_negotiates_with_legacy_peers_and_after_reopening() {
             if reopen {
                 streams.txset.lock().await.take();
             }
-            let bytes = send_peer_frames(
+            let written = send_peer_frames(
                 &sender.state,
                 receiver.peer,
                 StreamType::TxSet,
@@ -195,6 +206,7 @@ async fn txset_encoding_negotiates_with_legacy_peers_and_after_reopening() {
             )
             .await
             .unwrap();
+            let bytes = written.payload;
             if compressed {
                 assert!(
                     bytes < xdr.len() / 2,
@@ -290,6 +302,19 @@ async fn getdata_batches_preserve_frames_and_leave_control_responsive() {
     let mut receiver = TestNode::start().await;
     sender.connect(&receiver).await;
 
+    let negotiated = sender.streams_to(receiver.peer).await;
+    assert_eq!(
+        negotiated
+            .tx
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .protocol
+            .as_ref(),
+        "/stellar/tx/zstd/1.0.0"
+    );
+
     let mut transactions = Vec::new();
     for sequence in 0..160 {
         let bytes = crate::xdr::tests::valid_transaction_xdr(1000, sequence, 16);
@@ -380,6 +405,131 @@ async fn getdata_batches_preserve_frames_and_leave_control_responsive() {
             .load(Ordering::Relaxed),
         2
     );
+    sender.stop().await;
+    receiver.stop().await;
+}
+
+#[tokio::test]
+async fn tx_batches_negotiate_compression_and_legacy_after_reopening() {
+    for compressed in [true, false] {
+        let mut sender = TestNode::start().await;
+        let mut receiver = TestNode::start_with_tx_batches(true, true, compressed).await;
+        sender.connect(&receiver).await;
+        let streams = sender.streams_to(receiver.peer).await;
+        for round in 0..3 {
+            if round != 0 {
+                streams.tx.lock().await.take();
+            }
+            let mut raw = Vec::new();
+            let expected: Vec<_> = (0..80)
+                .map(|i| crate::xdr::tests::valid_transaction_xdr(1000, round * 80 + i, 1))
+                .collect();
+            for tx in &expected {
+                let frame = crate::xdr::frame_transaction(tx);
+                raw.extend_from_slice(&(frame.len() as u32).to_be_bytes());
+                raw.extend_from_slice(&frame);
+            }
+            let mut batch = sender
+                .state
+                .tx_batch_codec
+                .encode(raw, expected.len())
+                .await
+                .unwrap();
+            if round == 2 {
+                // Exercise raw framing on the negotiated compressed protocol,
+                // as used when compression would not reduce a batch's size.
+                batch.encoded = None;
+            }
+            let written = send_peer_frames(
+                &sender.state,
+                receiver.peer,
+                StreamType::Tx,
+                PeerFrames::TxBatch(&batch),
+            )
+            .await
+            .unwrap();
+            let guard = streams.tx.lock().await;
+            let outbound = guard.as_ref().unwrap();
+            assert_eq!(
+                outbound.protocol,
+                if compressed {
+                    COMPRESSED_TX_PROTOCOL
+                } else {
+                    TX_PROTOCOL
+                }
+            );
+            assert_eq!(outbound.stream.priority().unwrap(), 0);
+            drop(guard);
+            if compressed && round != 2 {
+                assert!(written.framed < batch.raw.len() / 2);
+            } else {
+                assert_eq!(written.framed, batch.raw.len());
+            }
+            tokio::time::timeout(Duration::from_secs(5), async {
+                for bytes in &expected {
+                    let Some(CoreCommand::SubmitTx { tx, .. }) = receiver._admissions.recv().await
+                    else {
+                        panic!("expected TX");
+                    };
+                    assert_eq!(tx.bytes(), bytes);
+                    assert_eq!(*tx.hash(), crate::xdr::sha256_hash(bytes));
+                }
+            })
+            .await
+            .expect("TX batches must arrive in order on both protocols");
+        }
+        sender.stop().await;
+        receiver.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn malformed_tx_batch_admits_nothing_and_next_frame_still_arrives() {
+    let mut sender = TestNode::start().await;
+    let mut receiver = TestNode::start().await;
+    sender.connect(&receiver).await;
+    let bytes = crate::xdr::tests::valid_transaction_xdr(1000, 999, 1);
+    let tx_frame = crate::xdr::frame_transaction(&bytes);
+    let mut raw = (tx_frame.len() as u32).to_be_bytes().to_vec();
+    raw.extend_from_slice(&tx_frame);
+    // A valid TX followed by a control message must reject the entire batch.
+    let request = crate::xdr::frame_get_scp_state(1);
+    raw.extend_from_slice(&(request.len() as u32).to_be_bytes());
+    raw.extend_from_slice(&request);
+    let malformed = sender.state.tx_batch_codec.encode(raw, 2).await.unwrap();
+    assert!(malformed.encoded.is_some());
+    send_peer_frames(
+        &sender.state,
+        receiver.peer,
+        StreamType::Tx,
+        PeerFrames::TxBatch(&malformed),
+    )
+    .await
+    .unwrap();
+    let good = crate::xdr::tests::valid_transaction_xdr(1000, 1000, 1);
+    send_to_peer_stream(
+        &sender.state,
+        receiver.peer,
+        StreamType::Tx,
+        &crate::xdr::frame_transaction(&good),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let Some(CoreCommand::SubmitTx { tx, .. }) = receiver._admissions.recv().await else {
+            panic!("expected TX");
+        };
+        assert_eq!(tx.bytes(), good);
+    })
+    .await
+    .expect("bad batch prevented the next frame");
+    assert!(receiver._admissions.try_recv().is_err());
+    assert!(!receiver
+        .state
+        .tx_seen
+        .read()
+        .await
+        .contains(&crate::xdr::sha256_hash(&bytes)));
     sender.stop().await;
     receiver.stop().await;
 }
