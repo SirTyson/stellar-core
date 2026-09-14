@@ -841,33 +841,37 @@ checkFeeMap(InclusionFeeMap const& feeMap, LedgerHeader const& lclHeader)
 
 } // namespace
 
-TxSetXDRFrame::TxSetXDRFrame(TransactionSet const& xdrTxSet)
-    : mXDRTxSet(xdrTxSet)
-    , mEncodedSize(xdr::xdr_argpack_size(xdrTxSet))
-    , mHash(computeNonGeneralizedTxSetContentsHash(xdrTxSet))
+TxSetXDRFrame::TxSetXDRFrame(TransactionSet xdrTxSet)
+    : mXDRTxSet(std::move(xdrTxSet))
+    , mEncodedSize(xdr::xdr_argpack_size(std::get<TransactionSet>(mXDRTxSet)))
+    , mHash(computeNonGeneralizedTxSetContentsHash(
+          std::get<TransactionSet>(mXDRTxSet)))
 {
 }
 
-TxSetXDRFrame::TxSetXDRFrame(GeneralizedTransactionSet const& xdrTxSet)
-    : mXDRTxSet(xdrTxSet)
-    , mEncodedSize(xdr::xdr_argpack_size(xdrTxSet))
-    , mHash(xdrSha256(xdrTxSet))
+TxSetXDRFrame::TxSetXDRFrame(GeneralizedTransactionSet xdrTxSet)
+    : mXDRTxSet(std::move(xdrTxSet))
+    , mEncodedSize(
+          xdr::xdr_argpack_size(std::get<GeneralizedTransactionSet>(mXDRTxSet)))
+    , mHash(xdrSha256(std::get<GeneralizedTransactionSet>(mXDRTxSet)))
 {
 }
 
 TxSetXDRFrameConstPtr
-TxSetXDRFrame::makeFromWire(TransactionSet const& xdrTxSet)
+TxSetXDRFrame::makeFromWire(TransactionSet xdrTxSet)
 {
     ZoneScoped;
-    std::shared_ptr<TxSetXDRFrame> txSet(new TxSetXDRFrame(xdrTxSet));
+    std::shared_ptr<TxSetXDRFrame> txSet(
+        new TxSetXDRFrame(std::move(xdrTxSet)));
     return txSet;
 }
 
 TxSetXDRFrameConstPtr
-TxSetXDRFrame::makeFromWire(GeneralizedTransactionSet const& xdrTxSet)
+TxSetXDRFrame::makeFromWire(GeneralizedTransactionSet xdrTxSet)
 {
     ZoneScoped;
-    std::shared_ptr<TxSetXDRFrame> txSet(new TxSetXDRFrame(xdrTxSet));
+    std::shared_ptr<TxSetXDRFrame> txSet(
+        new TxSetXDRFrame(std::move(xdrTxSet)));
     return txSet;
 }
 
@@ -1108,11 +1112,11 @@ TxSetXDRFrame::makeEmpty(Hash const& previousLedgerHash,
         GeneralizedTransactionSet txSet;
         transactionsToGeneralizedTransactionSetXDR(emptyPhases,
                                                    previousLedgerHash, txSet);
-        return TxSetXDRFrame::makeFromWire(txSet);
+        return TxSetXDRFrame::makeFromWire(std::move(txSet));
     }
     TransactionSet txSet;
     transactionsToTransactionSetXDR({}, previousLedgerHash, txSet);
-    return TxSetXDRFrame::makeFromWire(txSet);
+    return TxSetXDRFrame::makeFromWire(std::move(txSet));
 }
 
 TxSetXDRFrameConstPtr
@@ -1127,7 +1131,7 @@ TxSetXDRFrame::makeFromHistoryTransactions(Hash const& previousLedgerHash,
 {
     TransactionSet txSet;
     transactionsToTransactionSetXDR(txs, previousLedgerHash, txSet);
-    return TxSetXDRFrame::makeFromWire(txSet);
+    return TxSetXDRFrame::makeFromWire(std::move(txSet));
 }
 
 #ifdef BUILD_TESTS
@@ -1492,6 +1496,17 @@ TxSetXDRFrame::storeXDR(StoredTransactionSet& txSet) const
         txSet.v(0);
         txSet.txSet() = std::get<TransactionSet>(mXDRTxSet);
     }
+}
+
+xdr::opaque_vec<>
+TxSetXDRFrame::toStoredXDRBytes() const
+{
+    if (isGeneralizedTxSet())
+    {
+        return xdr::xdr_to_opaque(
+            int32_t{1}, std::get<GeneralizedTransactionSet>(mXDRTxSet));
+    }
+    return xdr::xdr_to_opaque(int32_t{0}, std::get<TransactionSet>(mXDRTxSet));
 }
 
 TxSetPhaseFrame::Iterator::Iterator(TxStageFrameList const& txs,
@@ -2525,13 +2540,13 @@ ApplicableTxSetFrame::toWireTxSetFrame() const
     {
         GeneralizedTransactionSet xdrTxSet;
         toXDR(xdrTxSet);
-        outputTxSet = TxSetXDRFrame::makeFromWire(xdrTxSet);
+        outputTxSet = TxSetXDRFrame::makeFromWire(std::move(xdrTxSet));
     }
     else
     {
         TransactionSet xdrTxSet;
         toXDR(xdrTxSet);
-        outputTxSet = TxSetXDRFrame::makeFromWire(xdrTxSet);
+        outputTxSet = TxSetXDRFrame::makeFromWire(std::move(xdrTxSet));
     }
     return outputTxSet;
 }

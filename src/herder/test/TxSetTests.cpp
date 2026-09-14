@@ -34,6 +34,90 @@ namespace
 {
 using namespace txtest;
 
+TEST_CASE("transaction set ownership and stored encoding",
+          "[txset][txset-storage]")
+{
+    TransactionEnvelope envelope(ENVELOPE_TYPE_TX);
+    envelope.v1().tx.seqNum = 123;
+    envelope.v1().tx.operations.resize(1);
+    envelope.v1().signatures.resize(1);
+    auto& signature = envelope.v1().signatures[0].signature;
+    signature.resize(64);
+    std::fill(signature.begin(), signature.end(), 0xab);
+    auto check = [&](auto original, Hash const& expectedHash) {
+        auto input = original;
+        auto copied = TxSetXDRFrame::makeFromWire(input);
+        REQUIRE(input == original);
+        auto moved = TxSetXDRFrame::makeFromWire(std::move(input));
+        // Reusing the input must not change the frame's owned contents.
+        input = decltype(input){};
+        for (auto const& frame : {copied, moved})
+        {
+            frame->toXDR(input);
+            REQUIRE(input == original);
+            REQUIRE(frame->getContentsHash() == expectedHash);
+            REQUIRE(frame->encodedSize() == xdr::xdr_size(original));
+            StoredTransactionSet stored;
+            frame->storeXDR(stored);
+            auto encoded = frame->toStoredXDRBytes();
+            REQUIRE(encoded == xdr::xdr_to_opaque(stored));
+            StoredTransactionSet decoded;
+            xdr::xdr_from_opaque(encoded, decoded);
+            REQUIRE(decoded == stored);
+            auto restored = TxSetXDRFrame::makeFromStoredTxSet(decoded);
+            REQUIRE(restored->getContentsHash() == expectedHash);
+            REQUIRE(restored->sizeTxTotal() == frame->sizeTxTotal());
+        }
+    };
+    SECTION("legacy")
+    {
+        TransactionSet wire;
+        wire.previousLedgerHash.fill(0x12);
+        SECTION("empty")
+        {
+        }
+        SECTION("nonempty")
+        {
+            wire.txs.push_back(envelope);
+        }
+        auto hashInput = xdr::xdr_to_opaque(wire.previousLedgerHash);
+        for (auto const& tx : wire.txs)
+        {
+            auto encoded = xdr::xdr_to_opaque(tx);
+            hashInput.insert(hashInput.end(), encoded.begin(), encoded.end());
+        }
+        check(wire, sha256(hashInput));
+    }
+    SECTION("generalized")
+    {
+        GeneralizedTransactionSet wire(1);
+        wire.v1TxSet().previousLedgerHash.fill(0x34);
+        SECTION("uninterpreted empty phases")
+        {
+        }
+        SECTION("sequential")
+        {
+            wire.v1TxSet().phases.resize(2);
+            auto& components = wire.v1TxSet().phases[1].v0Components();
+            components.emplace_back(TXSET_COMP_TXS_MAYBE_DISCOUNTED_FEE);
+            auto& component = components.back().txsMaybeDiscountedFee();
+            component.baseFee.activate() = 100;
+            component.txs.push_back(envelope);
+        }
+        SECTION("parallel stages and clusters")
+        {
+            wire.v1TxSet().phases.resize(2);
+            auto& phase = wire.v1TxSet().phases[1];
+            phase.v(1);
+            auto& component = phase.parallelTxsComponent();
+            component.baseFee.activate() = 100;
+            component.executionStages = {{{envelope}, {envelope}},
+                                         {{envelope}}};
+        }
+        check(wire, xdrSha256(wire));
+    }
+}
+
 template <typename Frame> class CountedValidationFrame : public Frame
 {
   public:

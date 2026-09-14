@@ -188,9 +188,9 @@ class TxSetXDRFrame : public NonMovableOrCopyable
 
     // `makeFromWire` methods create a TxSetXDRFrame from the XDR messages.
     // These methods don't perform any validation on the XDR.
-    static TxSetXDRFrameConstPtr makeFromWire(TransactionSet const& xdrTxSet);
+    static TxSetXDRFrameConstPtr makeFromWire(TransactionSet xdrTxSet);
     static TxSetXDRFrameConstPtr
-    makeFromWire(GeneralizedTransactionSet const& xdrTxSet);
+    makeFromWire(GeneralizedTransactionSet xdrTxSet);
 
     static TxSetXDRFrameConstPtr
     makeFromStoredTxSet(StoredTransactionSet const& storedSet);
@@ -207,6 +207,9 @@ class TxSetXDRFrame : public NonMovableOrCopyable
     void toXDR(TransactionSet& set) const;
     void toXDR(GeneralizedTransactionSet& generalizedTxSet) const;
     void storeXDR(StoredTransactionSet& txSet) const;
+    // Encode the stored union directly from the owned XDR, without copying
+    // its transactions into a temporary StoredTransactionSet.
+    xdr::opaque_vec<> toStoredXDRBytes() const;
 
     ~TxSetXDRFrame() = default;
 
@@ -262,8 +265,8 @@ class TxSetXDRFrame : public NonMovableOrCopyable
 #endif
 
   private:
-    TxSetXDRFrame(TransactionSet const& xdrTxSet);
-    TxSetXDRFrame(GeneralizedTransactionSet const& xdrTxSet);
+    TxSetXDRFrame(TransactionSet xdrTxSet);
+    TxSetXDRFrame(GeneralizedTransactionSet xdrTxSet);
 
     std::variant<TransactionSet, GeneralizedTransactionSet> mXDRTxSet;
     size_t mEncodedSize{};

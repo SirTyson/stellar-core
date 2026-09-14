@@ -2672,10 +2672,8 @@ HerderImpl::persistSCPState(uint64 slot)
     std::unordered_map<Hash, std::string> txSetsToPersist;
     for (auto it : txSets)
     {
-        StoredTransactionSet tempTxSet;
-        it.second->storeXDR(tempTxSet);
         txSetsToPersist.emplace(
-            it.first, decoder::encode_b64(xdr::xdr_to_opaque(tempTxSet)));
+            it.first, decoder::encode_b64(it.second->toStoredXDRBytes()));
     }
 
     latestSCPData = xdr::xdr_to_opaque(scpState);

@@ -104,10 +104,10 @@ RustOverlayManager::start()
     });
 
     mOverlayIPC->setOnTxSetReceived(
-        [this](Hash const& hash, GeneralizedTransactionSet const& txSet) {
+        [this](Hash const& hash, GeneralizedTransactionSet txSet) {
             // Called from IPC reader thread - post to main thread
             auto start = std::chrono::steady_clock::now();
-            auto frame = TxSetXDRFrame::makeFromWire(txSet);
+            auto frame = TxSetXDRFrame::makeFromWire(std::move(txSet));
             auto framed = std::chrono::steady_clock::now();
             CLOG_INFO(Overlay,
                       "CONSENSUS_TRACE stage=txset_frame hash={} frame_us={} "

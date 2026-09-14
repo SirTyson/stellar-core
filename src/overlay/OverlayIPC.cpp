@@ -433,7 +433,7 @@ OverlayIPC::handleMessage(IPCMessage const& msg)
                         .count());
                 CLOG_INFO(Overlay, "Received TX set {} ({} bytes) from overlay",
                           hexAbbrev(hash), xdrData.size());
-                mOnTxSetReceived(hash, txSet);
+                mOnTxSetReceived(hash, std::move(txSet));
             }
             catch (std::exception const& e)
             {

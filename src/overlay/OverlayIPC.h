@@ -46,8 +46,8 @@ class OverlayIPC
         std::function<std::vector<SCPEnvelope>(uint32_t ledgerSeq)>;
 
     /// Callback when TX set received from peers (async fetch response)
-    using TxSetReceivedCallback = std::function<void(
-        Hash const& hash, GeneralizedTransactionSet const& txSet)>;
+    using TxSetReceivedCallback =
+        std::function<void(Hash const& hash, GeneralizedTransactionSet txSet)>;
 
     /**
      * Create an OverlayIPC instance.
