@@ -259,7 +259,7 @@ TransactionFrame::getResources(bool useByteLimitInClassic,
     auto txSize = static_cast<int64_t>(this->getSize());
     if (isSoroban())
     {
-        auto r = sorobanResources();
+        auto const& r = sorobanResources();
         int64_t const opCount = 1;
 
         // When doing fee calculation, the rust host will include readWrite

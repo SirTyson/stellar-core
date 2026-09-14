@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace stellar
@@ -56,15 +57,14 @@ class Resource
         return "Unknown";
     }
 
-    Resource(std::vector<int64_t> args)
+    Resource(std::vector<int64_t> args) : mResources(std::move(args))
     {
-        if (args.size() != NUM_CLASSIC_TX_RESOURCES &&
-            args.size() != NUM_SOROBAN_TX_RESOURCES &&
-            args.size() != NUM_CLASSIC_TX_BYTES_RESOURCES)
+        if (mResources.size() != NUM_CLASSIC_TX_RESOURCES &&
+            mResources.size() != NUM_SOROBAN_TX_RESOURCES &&
+            mResources.size() != NUM_CLASSIC_TX_BYTES_RESOURCES)
         {
             throw std::runtime_error("Invalid number of resources");
         }
-        mResources = args;
     }
 
     Resource(int64_t arg)
@@ -116,7 +116,7 @@ class Resource
     makeEmpty(size_t numRes)
     {
         std::vector<int64_t> res(numRes, 0);
-        return Resource(res);
+        return Resource(std::move(res));
     }
 
     int64_t

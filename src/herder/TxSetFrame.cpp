@@ -2107,8 +2107,6 @@ TxSetPhaseFrame::checkValidSoroban(
         UnorderedSet<LedgerKey> stageReadWriteKeys;
         for (auto const& cluster : stage)
         {
-            std::vector<LedgerKey> clusterReadOnlyKeys;
-            std::vector<LedgerKey> clusterReadWriteKeys;
             for (auto const& tx : cluster)
             {
                 auto const& footprint = tx->sorobanResources().footprint;
@@ -2123,7 +2121,6 @@ TxSetPhaseFrame::checkValidSoroban(
                             "conflicts with another cluster within stage");
                         return TxSetValidationResult::TX_ORDERING_INVALID;
                     }
-                    clusterReadOnlyKeys.push_back(key);
                 }
                 for (auto const& key : footprint.readWrite)
                 {
@@ -2136,13 +2133,19 @@ TxSetPhaseFrame::checkValidSoroban(
                             "conflicts with another cluster within stage");
                         return TxSetValidationResult::TX_ORDERING_INVALID;
                     }
-                    clusterReadWriteKeys.push_back(key);
                 }
             }
-            stageReadOnlyKeys.insert(clusterReadOnlyKeys.begin(),
-                                     clusterReadOnlyKeys.end());
-            stageReadWriteKeys.insert(clusterReadWriteKeys.begin(),
-                                      clusterReadWriteKeys.end());
+            // Add this cluster's keys only after checking all its transactions:
+            // conflicts within a cluster are allowed. Read directly from the
+            // frames instead of first copying keys into temporary vectors.
+            for (auto const& tx : cluster)
+            {
+                auto const& footprint = tx->sorobanResources().footprint;
+                stageReadOnlyKeys.insert(footprint.readOnly.begin(),
+                                        footprint.readOnly.end());
+                stageReadWriteKeys.insert(footprint.readWrite.begin(),
+                                         footprint.readWrite.end());
+            }
         }
     }
     return TxSetValidationResult::VALID;
@@ -2155,11 +2158,11 @@ TxSetPhaseFrame::getTotalResources(uint32_t ledgerVersion) const
                                                : Resource::makeEmpty(1);
     for (auto const& tx : *this)
     {
-        if (total.canAdd(tx->getResources(/* useByteLimitInClassic */ false,
-                                          ledgerVersion)))
+        auto const resources =
+            tx->getResources(/* useByteLimitInClassic */ false, ledgerVersion);
+        if (total.canAdd(resources))
         {
-            total += tx->getResources(/* useByteLimitInClassic */ false,
-                                      ledgerVersion);
+            total += resources;
         }
         else
         {
