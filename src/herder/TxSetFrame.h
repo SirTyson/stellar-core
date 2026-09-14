@@ -250,13 +250,11 @@ class TxSetXDRFrame : public NonMovableOrCopyable
     // Returns the size of this transaction set when encoded to XDR.
     size_t encodedSize() const;
 
-    // Creates transaction frames for all the transactions in the set, grouped
-    // by phase.
-    // This is only necessary to serve a very specific use case of updating
-    // the transaction queue with wired tx sets. Otherwise, use
-    // getTransactionsForPhase() in `ApplicableTxSetFrame`.
-    PerPhaseTransactionList
-    createTransactionFrames(Hash const& networkID) const;
+    // Visits the owned envelopes in wire order, without constructing
+    // transaction frames or validating the set. References remain owned by this
+    // frame.
+    void forEachTransactionEnvelope(
+        std::function<void(TransactionEnvelope const&)> const& visitor) const;
 
 #ifdef BUILD_TESTS
     mutable ApplicableTxSetFrameConstPtr mApplicableTxSetOverride;

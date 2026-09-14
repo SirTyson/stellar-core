@@ -22,6 +22,10 @@ namespace txbridge
 
 TransactionEnvelope convertForV13(TransactionEnvelope const& input);
 
+// The transaction's source account, excluding any muxed ID. For fee bumps,
+// this is the inner transaction's source, not the outer fee payer.
+AccountID getSourceID(TransactionEnvelope const& env);
+
 xdr::xvector<DecoratedSignature, 20> const&
 getSignatures(TransactionEnvelope const& env);
 xdr::xvector<DecoratedSignature, 20>& getSignatures(TransactionEnvelope& env);

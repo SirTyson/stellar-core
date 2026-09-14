@@ -1405,61 +1405,50 @@ TxSetXDRFrame::sizeOpTotalForLogging() const
     }
 }
 
-PerPhaseTransactionList
-TxSetXDRFrame::createTransactionFrames(Hash const& networkID) const
+void
+TxSetXDRFrame::forEachTransactionEnvelope(
+    std::function<void(TransactionEnvelope const&)> const& visitor) const
 {
-    PerPhaseTransactionList phaseTxs;
-    if (isGeneralizedTxSet())
+    if (!isGeneralizedTxSet())
     {
-        auto const& txSet =
-            std::get<GeneralizedTransactionSet>(mXDRTxSet).v1TxSet();
-        for (auto const& phase : txSet.phases)
+        for (auto const& envelope : std::get<TransactionSet>(mXDRTxSet).txs)
         {
-            auto& txs = phaseTxs.emplace_back();
-            switch (phase.v())
+            visitor(envelope);
+        }
+        return;
+    }
+    for (auto const& phase :
+         std::get<GeneralizedTransactionSet>(mXDRTxSet).v1TxSet().phases)
+    {
+        switch (phase.v())
+        {
+        case 0:
+            for (auto const& component : phase.v0Components())
             {
-            case 0:
-                for (auto const& component : phase.v0Components())
+                for (auto const& envelope :
+                     component.txsMaybeDiscountedFee().txs)
                 {
-                    for (auto const& tx : component.txsMaybeDiscountedFee().txs)
-                    {
-                        txs.emplace_back(
-                            TransactionFrameBase::makeTransactionFromWire(
-                                networkID, tx));
-                    }
+                    visitor(envelope);
                 }
-                break;
-            case 1:
-                for (auto const& stage :
-                     phase.parallelTxsComponent().executionStages)
-                {
-                    for (auto const& cluster : stage)
-                    {
-                        for (auto const& tx : cluster)
-                        {
-                            txs.emplace_back(
-                                TransactionFrameBase::makeTransactionFromWire(
-                                    networkID, tx));
-                        }
-                    }
-                }
-                break;
-            default:
-                break;
             }
+            break;
+        case 1:
+            for (auto const& stage :
+                 phase.parallelTxsComponent().executionStages)
+            {
+                for (auto const& cluster : stage)
+                {
+                    for (auto const& envelope : cluster)
+                    {
+                        visitor(envelope);
+                    }
+                }
+            }
+            break;
+        default:
+            break;
         }
     }
-    else
-    {
-        auto& txs = phaseTxs.emplace_back();
-        auto const& txSet = std::get<TransactionSet>(mXDRTxSet).txs;
-        for (auto const& tx : txSet)
-        {
-            txs.emplace_back(
-                TransactionFrameBase::makeTransactionFromWire(networkID, tx));
-        }
-    }
-    return phaseTxs;
 }
 
 size_t

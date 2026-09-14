@@ -227,8 +227,7 @@ class LoadGenerator
 
     void stop();
 
-    void cleanupAccounts(uint32_t ledgerSeq,
-                         PerPhaseTransactionList const& perPhaseTxs);
+    void cleanupAccounts(uint32_t ledgerSeq, TxSetXDRFrame const& txSet);
 
   private:
     struct TxMetrics

@@ -233,8 +233,7 @@ LoadGenerator::getTxPerStep(uint32_t txRate, std::chrono::seconds spikeInterval,
 }
 
 void
-LoadGenerator::cleanupAccounts(uint32_t ledgerSeq,
-                               PerPhaseTransactionList const& perPhaseTxs)
+LoadGenerator::cleanupAccounts(uint32_t ledgerSeq, TxSetXDRFrame const& txSet)
 {
     ZoneScoped;
     auto const& accounts = mTxGenerator.getAccounts();
@@ -262,13 +261,9 @@ LoadGenerator::cleanupAccounts(uint32_t ledgerSeq,
     // are released once that ledger is applied. Accounts whose transaction is
     // not in it are still pending in the mempool and remain in use.
     UnorderedSet<AccountID> externalized;
-    for (auto const& txs : perPhaseTxs)
-    {
-        for (auto const& tx : txs)
-        {
-            externalized.insert(tx->getSourceID());
-        }
-    }
+    txSet.forEachTransactionEnvelope([&](TransactionEnvelope const& envelope) {
+        externalized.insert(txbridge::getSourceID(envelope));
+    });
 
     for (auto it = mAccountsInUse.begin(); it != mAccountsInUse.end();)
     {

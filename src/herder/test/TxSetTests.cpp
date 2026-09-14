@@ -18,6 +18,7 @@
 #include "test/test.h"
 #include "transactions/FeeBumpTransactionFrame.h"
 #include "transactions/MutableTransactionResult.h"
+#include "transactions/TransactionBridge.h"
 #include "transactions/TransactionFrame.h"
 #include "transactions/TransactionUtils.h"
 #include "transactions/test/SorobanTxTestUtils.h"
@@ -33,6 +34,132 @@ namespace stellar
 namespace
 {
 using namespace txtest;
+
+TEST_CASE("externalization reads envelopes without transaction frames",
+          "[txset][txset-externalization]")
+{
+    Hash networkID = sha256("externalization envelope test");
+    AccountID source(PUBLIC_KEY_TYPE_ED25519);
+    source.ed25519().fill(0x12);
+    std::vector<TransactionEnvelope> envelopes;
+
+    TransactionEnvelope legacy(ENVELOPE_TYPE_TX_V0);
+    legacy.v0().tx.sourceAccountEd25519 = source.ed25519();
+    legacy.v0().tx.seqNum = 1;
+    envelopes.push_back(legacy);
+    for (bool muxed : {false, true})
+    {
+        TransactionEnvelope plain(ENVELOPE_TYPE_TX);
+        auto& account = plain.v1().tx.sourceAccount;
+        if (muxed)
+        {
+            account.type(KEY_TYPE_MUXED_ED25519);
+            account.med25519().ed25519 = source.ed25519();
+            account.med25519().id = 987;
+        }
+        else
+        {
+            account.ed25519() = source.ed25519();
+        }
+        plain.v1().tx.seqNum = 2 + muxed;
+        plain.v1().signatures.resize(1);
+        plain.v1().signatures[0].signature = {1, 2, 3};
+        envelopes.push_back(plain);
+
+        TransactionEnvelope feeBump(ENVELOPE_TYPE_TX_FEE_BUMP);
+        feeBump.feeBump().tx.feeSource.ed25519().fill(0xfe);
+        feeBump.feeBump().tx.innerTx.type(ENVELOPE_TYPE_TX);
+        feeBump.feeBump().tx.innerTx.v1() = plain.v1();
+        feeBump.feeBump().signatures.resize(1);
+        feeBump.feeBump().signatures[0].signature = {4, 5, 6};
+        envelopes.push_back(feeBump);
+    }
+
+    for (auto const& envelope : envelopes)
+    {
+        auto tx =
+            TransactionFrameBase::makeTransactionFromWire(networkID, envelope);
+        REQUIRE(txbridge::getSourceID(envelope) == source);
+        REQUIRE(txbridge::getSourceID(envelope) == tx->getSourceID());
+        REQUIRE(xdrSha256(envelope) == tx->getFullHash());
+        if (envelope.type() == ENVELOPE_TYPE_TX_FEE_BUMP)
+        {
+            TransactionEnvelope inner(ENVELOPE_TYPE_TX);
+            inner.v1() = envelope.feeBump().tx.innerTx.v1();
+            REQUIRE(xdrSha256(envelope) != xdrSha256(inner));
+        }
+    }
+
+    auto check = [&](auto const& wire,
+                     std::vector<TransactionEnvelope> const& expected) {
+        auto set = TxSetXDRFrame::makeFromWire(wire);
+        auto bytes = set->toStoredXDRBytes();
+        std::vector<TransactionEnvelope> visited;
+        std::vector<Hash> hashes;
+        set->forEachTransactionEnvelope(
+            [&](TransactionEnvelope const& envelope) {
+                visited.push_back(envelope);
+                hashes.push_back(xdrSha256(envelope));
+            });
+        REQUIRE(visited == expected);
+        REQUIRE(visited.size() == set->sizeTxTotal());
+        std::vector<Hash> previousHashes;
+        for (auto const& envelope : expected)
+        {
+            previousHashes.push_back(
+                TransactionFrameBase::makeTransactionFromWire(networkID,
+                                                              envelope)
+                    ->getFullHash());
+        }
+        REQUIRE(hashes == previousHashes);
+        REQUIRE(set->toStoredXDRBytes() == bytes);
+    };
+
+    SECTION("legacy wire set")
+    {
+        TransactionSet wire;
+        check(wire, {});
+        wire.txs.assign(envelopes.begin(), envelopes.end());
+        check(wire, envelopes);
+    }
+    SECTION("sequential phases and components")
+    {
+        GeneralizedTransactionSet wire(1);
+        wire.v1TxSet().phases.resize(2);
+        check(wire, {});
+        for (size_t i = 0; i < envelopes.size(); ++i)
+        {
+            auto& component = wire.v1TxSet()
+                                  .phases[i < 2 ? 0 : 1]
+                                  .v0Components()
+                                  .emplace_back();
+            component.txsMaybeDiscountedFee().txs.push_back(envelopes[i]);
+        }
+        check(wire, envelopes);
+    }
+    SECTION("parallel stages and clusters")
+    {
+        GeneralizedTransactionSet wire(1);
+        wire.v1TxSet().phases.resize(2);
+        auto& classic = wire.v1TxSet().phases[0].v0Components();
+        classic.emplace_back().txsMaybeDiscountedFee().txs.push_back(
+            envelopes[0]);
+        auto& soroban = wire.v1TxSet().phases[1];
+        soroban.v(1);
+        auto& stages = soroban.parallelTxsComponent().executionStages;
+        stages.resize(2);
+        stages[0].resize(2);
+        stages[0][0].push_back(envelopes[1]);
+        stages[0][1].push_back(envelopes[2]);
+        stages[1].resize(1);
+        stages[1][0].push_back(envelopes[3]);
+        stages[1][0].push_back(envelopes[4]);
+        check(wire, envelopes);
+        classic.clear();
+        stages.clear();
+        check(wire, {});
+    }
+}
 
 TEST_CASE("transaction set ownership and stored encoding",
           "[txset][txset-storage]")

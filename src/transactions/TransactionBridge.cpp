@@ -4,6 +4,7 @@
 
 #include "transactions/TransactionBridge.h"
 #include "transactions/TransactionFrame.h"
+#include "transactions/TransactionUtils.h"
 #include "util/GlobalChecks.h"
 
 #ifdef BUILD_TESTS
@@ -44,6 +45,26 @@ convertForV13(TransactionEnvelope const& input)
     }
 
     return res;
+}
+
+AccountID
+getSourceID(TransactionEnvelope const& env)
+{
+    switch (env.type())
+    {
+    case ENVELOPE_TYPE_TX_V0:
+    {
+        AccountID account(PUBLIC_KEY_TYPE_ED25519);
+        account.ed25519() = env.v0().tx.sourceAccountEd25519;
+        return account;
+    }
+    case ENVELOPE_TYPE_TX:
+        return toAccountID(env.v1().tx.sourceAccount);
+    case ENVELOPE_TYPE_TX_FEE_BUMP:
+        return toAccountID(env.feeBump().tx.innerTx.v1().tx.sourceAccount);
+    default:
+        abort();
+    }
 }
 
 xdr::xvector<DecoratedSignature, 20> const&

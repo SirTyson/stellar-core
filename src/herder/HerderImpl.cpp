@@ -348,25 +348,18 @@ HerderImpl::processExternalized(uint64 slotIndex, StellarValue const& value,
     }
     releaseAssert(externalizedSet != nullptr);
 
-    // Notify overlay to clear TXs from mempool (for RustOverlayManager)
-    // Extract TX hashes from the externalized set so Rust can remove them
+    // Mempool removal uses full envelope hashes, including the outer envelope
+    // of a fee bump. No transaction frames are needed to compute these.
     std::vector<Hash> txHashes;
-    if (externalizedSet)
-    {
-        auto txFramesList =
-            externalizedSet->createTransactionFrames(mApp.getNetworkID());
-        for (auto const& txPhase : txFramesList)
-        {
-            for (auto const& txFrame : txPhase)
-            {
-                txHashes.push_back(txFrame->getFullHash());
-            }
-        }
+    txHashes.reserve(externalizedSet->sizeTxTotal());
+    externalizedSet->forEachTransactionEnvelope(
+        [&](TransactionEnvelope const& envelope) {
+            txHashes.push_back(xdrSha256(envelope));
+        });
 #ifdef BUILD_TESTS
-        mApp.getLoadGenerator().cleanupAccounts(
-            static_cast<uint32_t>(slotIndex), txFramesList);
+    mApp.getLoadGenerator().cleanupAccounts(static_cast<uint32_t>(slotIndex),
+                                            *externalizedSet);
 #endif
-    }
     mApp.getOverlayManager().notifyTxSetExternalized(value.txSetHash, txHashes);
 
     {
