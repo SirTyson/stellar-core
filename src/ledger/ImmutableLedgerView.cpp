@@ -13,6 +13,7 @@
 #include "transactions/TransactionUtils.h"
 #include "util/ProtocolVersion.h"
 #include "xdr/Stellar-ledger.h"
+#include <array>
 
 namespace stellar
 {
@@ -179,6 +180,51 @@ LedgerTxnReadOnly::executeWithMaybeInnerSnapshot(
     return f(ledgerView);
 }
 
+namespace
+{
+// Transaction, operation-signature and fee checks often read the same
+// accounts repeatedly. Retain two recent accounts within each validation
+// worker's immutable snapshot. This is bounded independently of the number
+// of transactions or distinct fee payers; misses use the normal lookup.
+// Keep this separate from ImmutableLedgerView itself, whose snapshots can
+// be copied by another thread while their owner is reading them.
+class ValidationLedgerView final : public ImmutableLedgerView,
+                                   private NonMovableOrCopyable
+{
+    mutable std::array<std::shared_ptr<LedgerEntry const>, 2> mRecentAccounts;
+    mutable size_t mNextAccount{0};
+
+  public:
+    explicit ValidationLedgerView(ImmutableLedgerView const& snapshot)
+        : ImmutableLedgerView(snapshot)
+    {
+    }
+
+    using ImmutableLedgerView::getAccount;
+
+    LedgerEntryWrapper
+    getAccount(AccountID const& account) const override
+    {
+        for (size_t i = 0; i < mRecentAccounts.size(); ++i)
+        {
+            auto const& entry = mRecentAccounts[i];
+            if (entry && entry->data.account().accountID == account)
+            {
+                mNextAccount = 1 - i;
+                return LedgerEntryWrapper(entry);
+            }
+        }
+        auto entry = loadLiveEntry(accountKey(account));
+        if (entry)
+        {
+            mRecentAccounts[mNextAccount] = entry;
+            mNextAccount = 1 - mNextAccount;
+        }
+        return LedgerEntryWrapper(std::move(entry));
+    }
+};
+} // namespace
+
 CheckValidLedgerViewWrapper::CheckValidLedgerViewWrapper(AbstractLedgerTxn& ltx)
     : mGetter(std::make_unique<LedgerTxnReadOnly>(ltx))
 {
@@ -214,14 +260,14 @@ CheckValidLedgerViewWrapper::CheckValidLedgerViewWrapper(Application& app)
     else
 #endif
     {
-        mGetter = std::make_unique<ImmutableLedgerView>(
+        mGetter = std::make_unique<ValidationLedgerView>(
             app.getLedgerManager().copyImmutableLedgerView());
     }
 }
 
 CheckValidLedgerViewWrapper::CheckValidLedgerViewWrapper(
     ImmutableLedgerView const& ledgerView)
-    : mGetter(std::make_unique<ImmutableLedgerView>(ledgerView))
+    : mGetter(std::make_unique<ValidationLedgerView>(ledgerView))
 {
 }
 

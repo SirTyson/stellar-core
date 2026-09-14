@@ -18,8 +18,10 @@
 #include "main/QueryServer.h"
 #include "test/TestUtils.h"
 #include "test/test.h"
+#include "transactions/TransactionFrame.h"
 #include "util/Logging.h"
 #include "util/Math.h"
+#include "util/MetricsRegistry.h"
 #include "util/ThreadAnnotations.h"
 #include "util/UnorderedMap.h"
 #include "util/UnorderedSet.h"
@@ -897,6 +899,90 @@ requireEntries(ImmutableLedgerView& ledgerView,
 // ===========================================================================
 // TEST CASES
 // ===========================================================================
+
+TEST_CASE("validation account reads remain local to their snapshot",
+          "[snapshot][validation-account-reuse]")
+{
+    VirtualClock clock;
+    auto app =
+        createTestApplication<BucketTestApplication>(clock, getTestConfig());
+    auto& lm = app->getLedgerManager();
+    auto seq = lm.getLastClosedLedgerNum() + 1;
+    auto version = getAppLedgerVersion(*app);
+    auto accounts = LedgerTestUtils::generateValidUniqueLedgerEntriesWithTypes(
+        {ACCOUNT}, 3);
+    for (auto& entry : accounts)
+    {
+        entry.lastModifiedLedgerSeq = seq;
+    }
+    addLiveBatchAndUpdateSnapshot(*app, makeHeader(seq, version), accounts, {},
+                                  {});
+    auto snapshot = lm.copyImmutableLedgerView();
+    CheckValidLedgerViewWrapper view(snapshot);
+    auto const& first = accounts[0].data.account().accountID;
+    auto const& second = accounts[1].data.account().accountID;
+
+    SECTION("transaction, operation and fee checks reuse immutable accounts")
+    {
+        TransactionEnvelope envelope;
+        envelope.type(ENVELOPE_TYPE_TX);
+        envelope.v1().tx.sourceAccount.ed25519() = first.ed25519();
+        TransactionFrame tx(app->getNetworkID(), envelope);
+        auto header = view.getLedgerHeader();
+        auto& reads = app->getMetrics().NewSimpleTimer(
+            {LiveBucket::METRIC_STRING, "ACCOUNT"},
+            std::chrono::microseconds{1});
+        auto before = reads.count();
+        for (int i = 0; i < 3; ++i)
+        {
+            CHECK(view.getAccount(header, tx).current() == accounts[0]);
+            CHECK(view.getAccount(second).current() == accounts[1]);
+            CHECK(view.getAccount(header, tx, first).current() == accounts[0]);
+            CHECK(view.getAccount(second).current() == accounts[1]);
+        }
+        // These are the real BucketList point-read counters, so the test
+        // catches redundant I/O without a timing threshold or mock getter.
+        CHECK(reads.count() - before == 2);
+        CHECK(view.getAccount(accounts[2].data.account().accountID).current() ==
+              accounts[2]);
+        CHECK(view.getAccount(first).current() == accounts[0]);
+        CHECK(view.getAccount(second).current() == accounts[1]);
+    }
+
+    SECTION("updated and deleted accounts do not leak between ledgers")
+    {
+        REQUIRE(view.getAccount(first).current() == accounts[0]);
+        REQUIRE(view.getAccount(second).current() == accounts[1]);
+        auto updated = accounts[0];
+        updated.lastModifiedLedgerSeq = seq + 1;
+        updated.data.account().balance = 12345;
+        addLiveBatchAndUpdateSnapshot(*app, makeHeader(seq + 1, version), {},
+                                      {updated}, {LedgerEntryKey(accounts[1])});
+        CheckValidLedgerViewWrapper fresh(lm.copyImmutableLedgerView());
+        CHECK(fresh.getAccount(first).current() == updated);
+        CHECK_FALSE(fresh.getAccount(second));
+        CHECK(view.getAccount(first).current() == accounts[0]);
+        CHECK(view.getAccount(second).current() == accounts[1]);
+    }
+
+    SECTION("mutable LedgerTxn views observe intervening changes")
+    {
+        auto account = LedgerTestUtils::generateValidLedgerEntryOfType(ACCOUNT);
+        auto const key = LedgerEntryKey(account);
+        LedgerTxn ltx(app->getLedgerTxnRoot());
+        ltx.create(account);
+        CheckValidLedgerViewWrapper legacy(ltx);
+        CHECK(legacy.getAccount(account.data.account().accountID).current() ==
+              account);
+        account.data.account().balance = 23456;
+        {
+            auto entry = ltx.load(key);
+            entry.current() = account;
+        }
+        CHECK(legacy.getAccount(account.data.account().accountID).current() ==
+              account);
+    }
+}
 
 TEST_CASE("basic snapshot copy semantics and isolation", "[snapshot]")
 {
