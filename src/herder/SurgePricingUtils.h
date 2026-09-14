@@ -39,6 +39,10 @@ class TxFeeComparator
                         TransactionFrameBase const& tx2) const;
     bool compareFeeOnly(int64_t tx1Bid, uint32_t tx1Ops, int64_t tx2Bid,
                         uint32_t tx2Ops) const;
+    // Compare identities using the same direction and seed as operator().
+    // Call only after establishing that the fee rates are equal.
+    bool compareTieBreakers(TransactionFrameBasePtr const& tx1,
+                           TransactionFrameBasePtr const& tx2) const;
     bool isGreater() const;
 
   private:

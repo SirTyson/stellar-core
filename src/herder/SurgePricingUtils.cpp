@@ -117,6 +117,13 @@ TxFeeComparator::txLessThan(TransactionFrameBasePtr const& tx1,
     {
         return mIsGreater ? cmp3 > 0 : cmp3 < 0;
     }
+    return compareTieBreakers(tx1, tx2);
+}
+
+bool
+TxFeeComparator::compareTieBreakers(TransactionFrameBasePtr const& tx1,
+                                  TransactionFrameBasePtr const& tx2) const
+{
 #ifndef BUILD_TESTS
     // break tie with pointer arithmetic
     auto lx = reinterpret_cast<size_t>(tx1.get()) ^ mSeed;
@@ -124,8 +131,8 @@ TxFeeComparator::txLessThan(TransactionFrameBasePtr const& tx1,
 #else
     // Sort transactions deterministically in tests in order to ensure
     // reproducibility.
-    auto lx = tx1->getFullHash();
-    auto rx = tx2->getFullHash();
+    auto const& lx = tx1->getFullHash();
+    auto const& rx = tx2->getFullHash();
 #endif
     return mIsGreater ? rx < lx : lx < rx;
 }

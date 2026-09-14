@@ -44,12 +44,17 @@ struct ParallelPartitionConfig
 struct BuilderTx
 {
     size_t mId = 0;
+    int64_t mInclusionFee = 0;
+    uint32_t mNumOperations = 0;
     uint32_t mInstructions = 0;
     // Set of ids of transactions that conflict with this transaction.
     BitSet mConflictTxs;
 
     BuilderTx(size_t txId, TransactionFrameBase const& tx)
-        : mId(txId), mInstructions(tx.sorobanResources().instructions)
+        : mId(txId)
+        , mInclusionFee(tx.getInclusionFee())
+        , mNumOperations(tx.getNumOperations())
+        , mInstructions(tx.sorobanResources().instructions)
     {
     }
 };
@@ -731,8 +736,21 @@ buildSurgePricedParallelSorobanPhase(
     std::vector<size_t> sortedTxOrder(txFrames.size());
     std::iota(sortedTxOrder.begin(), sortedTxOrder.end(), 0);
     std::sort(sortedTxOrder.begin(), sortedTxOrder.end(),
-              [&txFrames, &txComparator](size_t a, size_t b) {
-                  return txComparator(txFrames[a], txFrames[b]);
+              [&builderTxs, &txFrames, &txComparator](size_t a, size_t b) {
+                  // Fee inputs are immutable during construction. Read the
+                  // compact builder records instead of traversing transaction
+                  // envelopes through virtual getters for every comparison.
+                  auto const& left = builderTxs[a];
+                  auto const& right = builderTxs[b];
+                  auto comparison = feeRate3WayCompare(
+                      left.mInclusionFee, left.mNumOperations,
+                      right.mInclusionFee, right.mNumOperations);
+                  if (comparison != 0)
+                  {
+                      return comparison > 0;
+                  }
+                  return txComparator.compareTieBreakers(txFrames[a],
+                                                         txFrames[b]);
               });
 
     // Precompute per-transaction resources to avoid repeated virtual calls
