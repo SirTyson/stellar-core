@@ -70,15 +70,17 @@ struct Cluster
     uint64_t mInstructions = 0;
     // Set of ids of transactions that conflict with this cluster.
     BitSet mConflictTxs;
-    // Set of transaction ids in the cluster.
-    BitSet mTxIds;
+    // Member ids are disjoint across live clusters. Keeping only the ids
+    // avoids allocating a bitmap up to the largest candidate index for
+    // every small cluster.
+    std::vector<size_t> mTxIds;
     // Id of the bin within a stage in which the cluster is packed.
     std::optional<size_t> mutable mBinId = std::nullopt;
 
     explicit Cluster(BuilderTx const& tx) : mInstructions(tx.mInstructions)
     {
         mConflictTxs.inplaceUnion(tx.mConflictTxs);
-        mTxIds.set(tx.mId);
+        mTxIds.push_back(tx.mId);
     }
 
     void
@@ -86,7 +88,7 @@ struct Cluster
     {
         mInstructions += other.mInstructions;
         mConflictTxs.inplaceUnion(other.mConflictTxs);
-        mTxIds.inplaceUnion(other.mTxIds);
+        mTxIds.insert(mTxIds.end(), other.mTxIds.begin(), other.mTxIds.end());
     }
 };
 
@@ -230,11 +232,13 @@ class Stage
     {
         for (auto const& cluster : mClusters)
         {
-            size_t txId = 0;
-            while (cluster->mTxIds.nextSet(txId))
+            // Merges append disjoint members in conflict-discovery order.
+            // Preserve the ascending-id traversal of the original bitmap.
+            auto txIds = cluster->mTxIds;
+            std::sort(txIds.begin(), txIds.end());
+            for (auto txId : txIds)
             {
                 visitor(cluster->mBinId.value(), txId);
-                ++txId;
             }
         }
     }
@@ -270,11 +274,9 @@ class Stage
     updateTxToCluster(Cluster const& cluster)
     {
         auto* clusterPtr = &cluster;
-        size_t txId = 0;
-        while (cluster.mTxIds.nextSet(txId))
+        for (auto txId : cluster.mTxIds)
         {
             mTxToCluster[txId] = clusterPtr;
-            ++txId;
         }
     }
 
@@ -405,10 +407,9 @@ class Stage
     // The `Cluster`s in `mClusters` are groups of transactions that have
     // (transitive) data dependencies between one another. If there is a data
     // dependency between a tx in cluster A and a tx in cluster B, the clusters
-    // A and B are merged. A cluster is just a `BitSet` of ids of transactions
-    // that belong to it and a `BitSet` of ids of transactions that conflict
-    // with transactions inside the cluster. Each of the `BitSet`s grows as
-    // clusters are built from transactions and merged with other clusters.
+    // A and B are merged. A cluster holds its member transaction ids and a
+    // `BitSet` of ids of transactions that conflict with its members. Both
+    // grow as clusters are built and merged.
     //
     // Looked at another way: two clusters that _aren't_ merged by the end of
     // the process of forming clusters _are_ data-independent and _could_
@@ -422,9 +423,9 @@ class Stage
     // guarantees (at least) 8-way parallel execution. In this case we pack the
     // hundreds of clusters into 8 "bins", using a bin-packing heuristic.
     //
-    // The bins are represented as `BitSet`s of transaction ids, just like the
-    // transaction id sets in `Cluster`s, and in fact when forming an XDR
-    // `GeneralizedTransactionSet` a "bin" here is what becomes a single
+    // Each cluster records its assigned bin, and mBinInstructions tracks the
+    // total instructions in each bin. When forming an XDR
+    // `GeneralizedTransactionSet`, a "bin" here becomes a single
     // `DependentTxCluster`. In a sense the bins are just "artificial
     // super-clusters" that do not arise from any logical data-dependence, just
     // the requirement to arrive at a smaller number of final clusters to

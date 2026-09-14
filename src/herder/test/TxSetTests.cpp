@@ -3710,6 +3710,57 @@ runParallelTxSetBuildingTest(bool variableStageCount)
     }
 
     {
+        INFO("failed cluster merge preserves sparse member ids for refill");
+        // Use candidate indices spanning several bitmap words. The cheap
+        // fillers cannot fit after the higher-fee transactions are packed.
+        TxFrameList candidates;
+        for (int i = 0; i < 259; ++i)
+        {
+            candidates.push_back(createTx(100'000'000, {}, {1000 + i}));
+        }
+        auto a = createTx(61'000'000, {}, {3000}, 7000);
+        auto b = createTx(59'000'000, {}, {3001}, 6900);
+        auto c = createTx(29'000'000, {}, {1}, 6800);
+        auto d = createTx(31'000'000, {}, {2}, 6700);
+        auto rejected = createTx(5'000'000, {}, {1, 2}, 6600);
+        auto f = createTx(10'000'000, {}, {1}, 6500);
+        auto g = createTx(10'000'000, {}, {2}, 6400);
+        candidates[0] = a;
+        candidates[64] = b;
+        candidates[128] = c;
+        candidates[256] = d;
+        candidates[3] = rejected;
+        candidates[130] = f;
+        candidates[258] = g;
+
+        auto packingCfg = cfg;
+        packingCfg.SOROBAN_PHASE_MIN_STAGE_COUNT = 1;
+        packingCfg.SOROBAN_PHASE_MAX_STAGE_COUNT = 1;
+        auto networkCfg =
+            app->getLedgerManager().getLastClosedSorobanNetworkConfig();
+        networkCfg.mLedgerMaxInstructions = 100'000'000;
+        networkCfg.mLedgerMaxDependentTxClusters = 2;
+        auto lane = std::make_shared<SorobanGenericLaneConfig>(Resource(
+            std::vector<int64_t>{1000, INT64_MAX, INT64_MAX, INT64_MAX,
+                                 INT64_MAX, INT64_MAX, INT64_MAX}));
+        std::vector<bool> hadTxNotFittingLane;
+        auto stages = buildSurgePricedParallelSorobanPhase(
+            candidates, packingCfg, networkCfg, lane, hadTxNotFittingLane,
+            testLedgerProtocolVersion);
+
+        // Initially the two bins contain A+C and B+D, at 90M each. Merging
+        // C and D with the rejected transaction produces a 65M cluster that
+        // cannot be packed alongside A and B, even after a full repack.
+        // Rollback must leave C and D accessible so F and G can fill both
+        // bins to 100M. The appended members must retain ascending id order.
+        // Removing the rejected merged cluster uses swap-pop after sorting,
+        // so the bin containing B is visited first.
+        TxStageFrameList expected{{{b, d, g}, {a, c, f}}};
+        REQUIRE(stages == expected);
+        REQUIRE(hadTxNotFittingLane == std::vector<bool>{true});
+    }
+
+    {
         INFO("with conflicts");
         {
             INFO("all RW conflicting");
