@@ -5,6 +5,7 @@
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
@@ -50,13 +51,16 @@ impl From<std::io::Error> for IpcError {
 /// Handle for sending messages to Core.
 #[derive(Clone)]
 pub struct CoreSender {
-    tx: mpsc::UnboundedSender<Message>,
+    tx: mpsc::UnboundedSender<(Message, Instant)>,
 }
 
 impl CoreSender {
     /// Send a message to Core. Never blocks.
     pub fn send(&self, msg: Message) -> Result<(), IpcError> {
-        self.tx.send(msg).map_err(|_| IpcError::ChannelClosed)
+        // Timestamp is local scheduling metadata; the wire format is unchanged.
+        self.tx
+            .send((msg, Instant::now()))
+            .map_err(|_| IpcError::ChannelClosed)
     }
 
     /// Convenience: send SCP received notification
@@ -164,7 +168,7 @@ impl CoreIpc {
         let stream = Arc::new(stream);
 
         // Channels for async communication
-        let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Message>();
+        let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<(Message, Instant)>();
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<Message>();
 
         // Spawn reader task
@@ -236,16 +240,40 @@ impl CoreIpc {
     }
 
     /// Writer loop: receive from channel, blocking write.
-    async fn writer_loop(stream: Arc<UnixStream>, mut rx: mpsc::UnboundedReceiver<Message>) {
-        while let Some(msg) = rx.recv().await {
+    async fn writer_loop(
+        stream: Arc<UnixStream>,
+        mut rx: mpsc::UnboundedReceiver<(Message, Instant)>,
+    ) {
+        while let Some((msg, queued)) = rx.recv().await {
             let stream = Arc::clone(&stream);
             let msg_type = msg.msg_type;
             let payload_len = msg.payload.len();
 
             // Write one message (blocking)
             let result = tokio::task::spawn_blocking(move || {
+                let started = Instant::now();
                 let mut writer = &*stream;
-                MessageCodec::write(&mut writer, &msg)
+                MessageCodec::write(&mut writer, &msg)?;
+                let written = Instant::now();
+                if msg.msg_type == MessageType::TxSetAvailable && msg.payload.len() >= 32 {
+                    info!(
+                        "CONSENSUS_TRACE stage=txset_ipc_write hash={:02x?} queued_us={} write_us={}",
+                        &msg.payload[..32],
+                        started.duration_since(queued).as_micros(),
+                        written.duration_since(started).as_micros()
+                    );
+                } else if msg.msg_type == MessageType::ScpReceived
+                    && (started.duration_since(queued).as_millis() >= 10
+                        || written.duration_since(started).as_millis() >= 10)
+                {
+                    info!(
+                        "CONSENSUS_TRACE stage=scp_ipc_write queued_us={} write_us={} bytes={}",
+                        started.duration_since(queued).as_micros(),
+                        written.duration_since(started).as_micros(),
+                        msg.payload.len()
+                    );
+                }
+                Ok::<(), std::io::Error>(())
             })
             .await;
 
@@ -672,6 +700,36 @@ mod tests {
     }
 
     // ═══ Connection Close Detection ═══
+
+    #[tokio::test]
+    async fn test_outbound_timing_preserves_mixed_frame_order() {
+        let (overlay_side, mut core) = StdUnixStream::pair().unwrap();
+        core.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let ipc = CoreIpc::from_stream(overlay_side).unwrap();
+        let hash = [0x42; 32];
+        // Larger than the socket buffer: the writer must retain the timing
+        // metadata and complete this frame before the following SCP frame.
+        let data = vec![0x5a; 1024 * 1024];
+        ipc.sender.send_tx_set_available(hash, &data).unwrap();
+        ipc.sender.send_scp_received(vec![7, 8, 9]).unwrap();
+        ipc.sender.send_tx_set_available(hash, &[]).unwrap();
+
+        let messages = tokio::task::spawn_blocking(move || {
+            (0..3)
+                .map(|_| MessageCodec::read(&mut core).unwrap())
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap();
+        assert_eq!(messages[0].msg_type, MessageType::TxSetAvailable);
+        assert_eq!(&messages[0].payload[..32], &hash);
+        assert_eq!(&messages[0].payload[32..], &data);
+        assert_eq!(messages[1].msg_type, MessageType::ScpReceived);
+        assert_eq!(messages[1].payload, vec![7, 8, 9]);
+        assert_eq!(messages[2].msg_type, MessageType::TxSetAvailable);
+        assert_eq!(messages[2].payload, hash);
+    }
 
     #[tokio::test]
     async fn test_connection_close_detection() {

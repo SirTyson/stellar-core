@@ -3,14 +3,17 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "overlay/RustOverlayManager.h"
+#include "crypto/Hex.h"
 #include "herder/Herder.h"
 #include "herder/TxSetFrame.h"
 #include "lib/json/json.h"
 #include "main/Application.h"
 #include "util/Backtrace.h"
 #include "util/Logging.h"
+#include "util/MetricsRegistry.h"
 #include "xdr/Stellar-overlay.h"
 #include <algorithm>
+#include <chrono>
 #include <medida/counter.h>
 #include <medida/histogram.h>
 #include <medida/meter.h>
@@ -20,7 +23,14 @@ namespace stellar
 {
 
 RustOverlayManager::RustOverlayManager(Application& app)
-    : mApp(app), mOverlayMetrics(app)
+    : mApp(app)
+    , mOverlayMetrics(app)
+    , mScpDispatchDelay(
+          app.getMetrics().NewTimer({"overlay", "ipc", "scp-queue"}))
+    , mScpDispatchWork(
+          app.getMetrics().NewTimer({"overlay", "ipc", "scp-dispatch"}))
+    , mTxSetDispatchDelay(
+          app.getMetrics().NewTimer({"overlay", "ipc", "txset-queue"}))
 {
     auto const& cfg = mApp.getConfig();
 
@@ -53,8 +63,38 @@ RustOverlayManager::start()
     CLOG_INFO(Overlay, "Starting RustOverlayManager");
 
     mOverlayIPC->setOnSCPReceived([this](SCPEnvelope const& env) {
+        auto queued = std::chrono::steady_clock::now();
         mApp.postOnMainThread(
-            [this, env]() { mApp.getHerder().recvSCPEnvelope(env); },
+            [this, env, queued]() {
+                auto start = std::chrono::steady_clock::now();
+                auto delay = start - queued;
+                mScpDispatchDelay.Update(delay);
+                mApp.getHerder().recvSCPEnvelope(env);
+                auto work = std::chrono::steady_clock::now() - start;
+                mScpDispatchWork.Update(work);
+                // Histograms cover every envelope. Log only delayed or costly
+                // dispatches, rather than every flooded SCP message. Work can
+                // include nested validation and ballot transitions.
+                if (delay >= std::chrono::milliseconds(10) ||
+                    work >= std::chrono::milliseconds(10))
+                {
+                    CLOG_INFO(
+                        Overlay,
+                        "CONSENSUS_TRACE stage=scp_dispatch slot={} type={} "
+                        "queue_us={} work_us={} steady_us={}",
+                        env.statement.slotIndex,
+                        static_cast<int>(env.statement.pledges.type()),
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            delay)
+                            .count(),
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            work)
+                            .count(),
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            start.time_since_epoch())
+                            .count());
+                }
+            },
             "RustOverlayManager: SCPReceived");
     });
 
@@ -66,10 +106,49 @@ RustOverlayManager::start()
     mOverlayIPC->setOnTxSetReceived(
         [this](Hash const& hash, GeneralizedTransactionSet const& txSet) {
             // Called from IPC reader thread - post to main thread
+            auto start = std::chrono::steady_clock::now();
             auto frame = TxSetXDRFrame::makeFromWire(txSet);
+            auto framed = std::chrono::steady_clock::now();
+            CLOG_INFO(Overlay,
+                      "CONSENSUS_TRACE stage=txset_frame hash={} frame_us={} "
+                      "steady_us={}",
+                      binToHex(hash),
+                      std::chrono::duration_cast<std::chrono::microseconds>(
+                          framed - start)
+                          .count(),
+                      std::chrono::duration_cast<std::chrono::microseconds>(
+                          framed.time_since_epoch())
+                          .count());
+            auto queued = std::chrono::steady_clock::now();
             mApp.postOnMainThread(
-                [this, hash, frame]() {
+                [this, hash, frame, queued]() {
+                    auto started = std::chrono::steady_clock::now();
+                    mTxSetDispatchDelay.Update(started - queued);
+                    CLOG_INFO(
+                        Overlay,
+                        "CONSENSUS_TRACE stage=txset_main hash={} queue_us={} "
+                        "steady_us={}",
+                        binToHex(hash),
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            started - queued)
+                            .count(),
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            started.time_since_epoch())
+                            .count());
                     mApp.getHerder().recvTxSet(hash, frame);
+                    auto done = std::chrono::steady_clock::now();
+                    CLOG_INFO(
+                        Overlay,
+                        "CONSENSUS_TRACE stage=txset_dispatched hash={} "
+                        "work_us={} "
+                        "steady_us={}",
+                        binToHex(hash),
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            done - started)
+                            .count(),
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            done.time_since_epoch())
+                            .count());
                 },
                 "RustOverlayManager: TxSetReceived");
         });

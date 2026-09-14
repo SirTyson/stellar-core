@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
@@ -721,6 +721,10 @@ impl App {
                 from,
                 slot,
             } => {
+                info!(
+                    "CONSENSUS_TRACE stage=txset_app hash={:02x?} slot={:?}",
+                    hash, slot
+                );
                 // `data` was strict-decoded and its content hash verified in the
                 // reader task, so we cache and forward it as-is.
                 info!(
@@ -925,8 +929,14 @@ impl App {
             return;
         };
         let bytes = data.len();
+        let enqueue_start = Instant::now();
         match self.core_ipc.sender.send_tx_set_available(*hash, data) {
             Ok(()) => {
+                info!(
+                    "CONSENSUS_TRACE stage=txset_core_enqueue hash={:02x?} copy_us={}",
+                    hash,
+                    enqueue_start.elapsed().as_micros()
+                );
                 // This is not a permanent delivered/seen marker. A fresh
                 // explicit request must still work after Core evicts a set.
                 self.pending_core_tx_sets.remove(hash);
@@ -1014,6 +1024,11 @@ impl App {
                 let mut hash = [0u8; 32];
                 hash.copy_from_slice(&msg.payload[0..32]);
                 let slot = u32::from_le_bytes(msg.payload[32..36].try_into().unwrap());
+
+                info!(
+                    "CONSENSUS_TRACE stage=txset_core_request hash={:02x?} slot={}",
+                    hash, slot
+                );
 
                 self.pending_core_tx_sets
                     .entry(hash)

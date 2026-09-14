@@ -103,6 +103,9 @@ class RustOverlayManager
     std::vector<std::string> effectiveKnownPeers() const;
 
     OverlayMetrics mOverlayMetrics;
+    medida::Timer& mScpDispatchDelay;
+    medida::Timer& mScpDispatchWork;
+    medida::Timer& mTxSetDispatchDelay;
 
     // For computing deltas on monotonic counters between syncs.
     // Key: metric name, Value: last synced value.

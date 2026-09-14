@@ -414,10 +414,23 @@ OverlayIPC::handleMessage(IPCMessage const& msg)
         {
             try
             {
+                auto start = std::chrono::steady_clock::now();
                 GeneralizedTransactionSet txSet;
                 std::vector<uint8_t> xdrData(msg.payload.begin() + 32,
                                              msg.payload.end());
                 xdr::xdr_from_opaque(xdrData, txSet);
+                auto decoded = std::chrono::steady_clock::now();
+                CLOG_INFO(
+                    Overlay,
+                    "CONSENSUS_TRACE stage=txset_ipc_decoded hash={} bytes={} "
+                    "decode_us={} steady_us={}",
+                    binToHex(hash), xdrData.size(),
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        decoded - start)
+                        .count(),
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        decoded.time_since_epoch())
+                        .count());
                 CLOG_INFO(Overlay, "Received TX set {} ({} bytes) from overlay",
                           hexAbbrev(hash), xdrData.size());
                 mOnTxSetReceived(hash, txSet);

@@ -2209,6 +2209,12 @@ async fn deliver_txset(state: &SharedState, peer_id: PeerId, txset_data: Vec<u8>
         peer_id,
         slot.is_some()
     );
+    info!(
+        "CONSENSUS_TRACE stage=txset_reader hash={:02x?} slot={:?} bytes={}",
+        hash,
+        slot,
+        txset_data.len()
+    );
     if let Err(e) = state.event_tx.send(OverlayEvent::TxSetReceived {
         hash,
         data: txset_data,

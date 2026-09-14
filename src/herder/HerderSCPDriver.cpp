@@ -25,6 +25,7 @@
 #include "xdr/Stellar-ledger.h"
 #include <Tracy.hpp>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <fmt/format.h>
 #include <numeric>
@@ -34,6 +35,32 @@
 
 namespace stellar
 {
+
+namespace
+{
+// These events identify actual protocol transitions, unlike timeout counts
+// reported later at externalization. Steady timestamps are comparable only
+// within this process; the log timestamp joins Core to its local overlay.
+void
+traceConsensusValue(char const* stage, uint64_t slot, Value const& value,
+                    uint32_t ballot = 0)
+{
+    auto now = std::chrono::steady_clock::now();
+    StellarValue sv;
+    if (toStellarValue(value, sv))
+    {
+        CLOG_INFO(
+            Herder,
+            "CONSENSUS_TRACE stage={} slot={} hash={} value_key={} ballot={} "
+            "steady_us={}",
+            stage, slot, binToHex(sv.txSetHash), binToHex(sha256(value)),
+            ballot,
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                now.time_since_epoch())
+                .count());
+    }
+}
+} // namespace
 
 uint32_t const TXSETVALID_CACHE_SIZE = 1000;
 
@@ -1219,6 +1246,7 @@ void
 HerderSCPDriver::valueExternalized(uint64_t slotIndex, Value const& value)
 {
     ZoneScoped;
+    traceConsensusValue("externalized", slotIndex, value);
     auto it = mSCPTimers.begin(); // cancel all timers below this slot
     while (it != mSCPTimers.end() && it->first <= slotIndex)
     {
@@ -1409,8 +1437,11 @@ HerderSCPDriver::getQSet(Hash const& qSetHash)
 }
 
 void
-HerderSCPDriver::ballotDidHearFromQuorum(uint64_t, SCPBallot const&)
+HerderSCPDriver::ballotDidHearFromQuorum(uint64_t slotIndex,
+                                         SCPBallot const& ballot)
 {
+    traceConsensusValue("ballot_quorum", slotIndex, ballot.value,
+                        ballot.counter);
 }
 
 void
@@ -1451,6 +1482,7 @@ HerderSCPDriver::measureAndRecordBallotBlockedOnTxSet(uint64_t slotIndex,
 void
 HerderSCPDriver::nominatingValue(uint64_t slotIndex, Value const& value)
 {
+    traceConsensusValue("nominating", slotIndex, value);
     CLOG_DEBUG(Herder, "nominatingValue i:{} v: {}", slotIndex,
                getValueString(value));
 }
@@ -1458,29 +1490,36 @@ HerderSCPDriver::nominatingValue(uint64_t slotIndex, Value const& value)
 void
 HerderSCPDriver::updatedCandidateValue(uint64_t slotIndex, Value const& value)
 {
+    traceConsensusValue("candidate", slotIndex, value);
 }
 
 void
 HerderSCPDriver::startedBallotProtocol(uint64_t slotIndex,
                                        SCPBallot const& ballot)
 {
+    traceConsensusValue("ballot_start", slotIndex, ballot.value,
+                        ballot.counter);
     recordSCPEvent(slotIndex, false);
 }
 void
 HerderSCPDriver::acceptedBallotPrepared(uint64_t slotIndex,
                                         SCPBallot const& ballot)
 {
+    traceConsensusValue("prepared", slotIndex, ballot.value, ballot.counter);
 }
 
 void
 HerderSCPDriver::confirmedBallotPrepared(uint64_t slotIndex,
                                          SCPBallot const& ballot)
 {
+    traceConsensusValue("confirmed_prepared", slotIndex, ballot.value,
+                        ballot.counter);
 }
 
 void
 HerderSCPDriver::acceptedCommit(uint64_t slotIndex, SCPBallot const& ballot)
 {
+    traceConsensusValue("commit", slotIndex, ballot.value, ballot.counter);
 }
 
 std::optional<VirtualClock::time_point>
@@ -1943,6 +1982,11 @@ HerderSCPDriver::cacheValidTxSet(ApplicableTxSetFrame const& txSet,
                                        closeTimeOffset.seconds()));
 #endif
         mTxSetValidCache.put(key, true);
+        CLOG_INFO(Herder,
+                  "CONSENSUS_TRACE stage=validated_local slot={} hash={} "
+                  "offset_s={}",
+                  lcl.header.ledgerSeq + 1, binToHex(txSet.getContentsHash()),
+                  closeTimeOffset.seconds());
     }
     else
     {
@@ -1971,6 +2015,16 @@ HerderSCPDriver::checkAndCacheTxSetValid(TxSetXDRFrame const& txSet,
     {
         ZoneNamedN(txSetValidityMissZone, "txset validity cache miss", true);
         auto validationTime = mSCPMetrics.mTxSetValidation.TimeScope();
+        auto started = std::chrono::steady_clock::now();
+        CLOG_INFO(
+            Herder,
+            "CONSENSUS_TRACE stage=validate_begin slot={} hash={} offset_s={} "
+            "steady_us={}",
+            lcl.header.ledgerSeq + 1, binToHex(txSet.getContentsHash()),
+            closeTimeOffset.seconds(),
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                started.time_since_epoch())
+                .count());
 
         // The invariant here is that we only validate tx sets nominated
         // to be applied to the current ledger state. However, in case
@@ -1982,6 +2036,7 @@ HerderSCPDriver::checkAndCacheTxSetValid(TxSetXDRFrame const& txSet,
         {
             applicableTxSet = txSet.prepareForApply(mApp, lcl.header);
         }
+        auto prepared = std::chrono::steady_clock::now();
 
         bool res = true;
         if (applicableTxSet == nullptr)
@@ -1996,6 +2051,23 @@ HerderSCPDriver::checkAndCacheTxSetValid(TxSetXDRFrame const& txSet,
             res = applicableTxSet->checkValid(mApp, closeTimeOffset.seconds(),
                                               closeTimeOffset.seconds());
         }
+        auto checked = std::chrono::steady_clock::now();
+        CLOG_INFO(
+            Herder,
+            "CONSENSUS_TRACE stage=validate_end slot={} hash={} offset_s={} "
+            "prepare_us={} check_us={} valid={} steady_us={}",
+            lcl.header.ledgerSeq + 1, binToHex(txSet.getContentsHash()),
+            closeTimeOffset.seconds(),
+            std::chrono::duration_cast<std::chrono::microseconds>(prepared -
+                                                                  started)
+                .count(),
+            std::chrono::duration_cast<std::chrono::microseconds>(checked -
+                                                                  prepared)
+                .count(),
+            res,
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                checked.time_since_epoch())
+                .count());
 
         mTxSetValidCache.put(key, res);
         return res;
