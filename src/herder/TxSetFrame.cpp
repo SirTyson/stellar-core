@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <list>
 #include <numeric>
+#include <queue>
 #include <variant>
 
 namespace stellar
@@ -547,7 +548,8 @@ buildSurgePricedSequentialPhase(
 
 std::pair<std::variant<TxFrameList, TxStageFrameList>,
           std::shared_ptr<InclusionFeeMap>>
-applySurgePricing(TxSetPhase phase, TxFrameList const& txs, Application& app
+applySurgePricing(TxSetPhase phase, TxFrameList const& txs, Application& app,
+                  TxSetCandidateValidator* validator
 #ifdef BUILD_TESTS
                   ,
                   bool enforceTxsApplyOrder,
@@ -565,57 +567,60 @@ applySurgePricing(TxSetPhase phase, TxFrameList const& txs, Application& app
         protocolVersionStartsFrom(ledgerVersion,
                                   PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION);
     std::variant<TxFrameList, TxStageFrameList> includedTxs;
-    if (isParallelSoroban)
-    {
-#ifdef BUILD_TESTS
-        if (enforceTxsApplyOrder)
+    auto select = [&](TxFrameList const& candidates) {
+        if (isParallelSoroban)
         {
-            TxStageFrameList frameList;
-            if (!txs.empty())
+#ifdef BUILD_TESTS
+            if (enforceTxsApplyOrder)
             {
-                for (auto const& stageIndexes : parallelSorobanOrder)
+                TxStageFrameList frameList;
+                if (!candidates.empty())
                 {
-                    TxStageFrame stage;
-                    for (auto const& threadIndexes : stageIndexes)
+                    for (auto const& stageIndexes : parallelSorobanOrder)
                     {
-                        TxFrameList threadTxs;
-                        for (auto const& txIndex : threadIndexes)
+                        TxStageFrame stage;
+                        for (auto const& threadIndexes : stageIndexes)
                         {
-                            threadTxs.push_back(txs.at(txIndex));
+                            TxFrameList threadTxs;
+                            for (auto const& txIndex : threadIndexes)
+                            {
+                                threadTxs.push_back(candidates.at(txIndex));
+                            }
+                            stage.emplace_back(std::move(threadTxs));
                         }
-                        stage.emplace_back(std::move(threadTxs));
+                        frameList.emplace_back(std::move(stage));
                     }
-                    frameList.emplace_back(std::move(stage));
-                }
 
-                // If the order is empty, we default to a single
-                // thread with all transactions in it.
-                if (parallelSorobanOrder.empty())
-                {
-                    frameList = {{txs}};
+                    // If the order is empty, we default to a single
+                    // thread with all transactions in it.
+                    if (parallelSorobanOrder.empty())
+                    {
+                        frameList = {{candidates}};
+                    }
                 }
+                includedTxs = frameList;
+
+                // soroban only has one fee lane
+                hadTxNotFittingLane.emplace_back(false);
             }
-            includedTxs = frameList;
-
-            // soroban only has one fee lane
-            hadTxNotFittingLane.emplace_back(false);
+            else
+            {
+#endif
+                includedTxs = buildSurgePricedParallelSorobanPhase(
+                    candidates, app.getConfig(),
+                    app.getLedgerManager().getLastClosedSorobanNetworkConfig(),
+                    surgePricingLaneConfig, hadTxNotFittingLane, ledgerVersion);
+#ifdef BUILD_TESTS
+            }
+#endif
         }
         else
         {
-#endif
-            includedTxs = buildSurgePricedParallelSorobanPhase(
-                txs, app.getConfig(),
-                app.getLedgerManager().getLastClosedSorobanNetworkConfig(),
-                surgePricingLaneConfig, hadTxNotFittingLane, ledgerVersion);
-#ifdef BUILD_TESTS
+            includedTxs = buildSurgePricedSequentialPhase(
+                candidates, surgePricingLaneConfig, hadTxNotFittingLane,
+                ledgerVersion);
         }
-#endif
-    }
-    else
-    {
-        includedTxs = buildSurgePricedSequentialPhase(
-            txs, surgePricingLaneConfig, hadTxNotFittingLane, ledgerVersion);
-    }
+    };
 
     auto visitIncludedTxs =
         [&includedTxs](
@@ -654,6 +659,110 @@ applySurgePricing(TxSetPhase phase, TxFrameList const& txs, Application& app
                 },
                 includedTxs);
         };
+
+    TxFrameList remaining = txs;
+    if (validator)
+    {
+        // Soroban has a single fee lane. Classic keeps its existing trimming
+        // and multi-lane surge-pricing policy.
+        releaseAssert(phase == TxSetPhase::SOROBAN);
+    }
+    using PriorityQueue = std::priority_queue<TransactionFrameBasePtr,
+                                              TxFrameList, TxFeeComparator>;
+    std::optional<PriorityQueue> uncheckedPriority;
+    auto validateMore = [&](size_t count) {
+        if (!uncheckedPriority)
+        {
+            // Packing already ordered its candidates. Only build an additional
+            // fee heap if refill or demand probing needs unchecked
+            // transactions.
+            TxFrameList unchecked;
+            unchecked.reserve(txs.size());
+            for (auto const& tx : txs)
+            {
+                if (!validator->isChecked(tx))
+                {
+                    unchecked.push_back(tx);
+                }
+            }
+            uncheckedPriority.emplace(TxFeeComparator(false, 0),
+                                      std::move(unchecked));
+        }
+        TxFrameList batch;
+        while (!uncheckedPriority->empty() && batch.size() < count)
+        {
+            auto tx = uncheckedPriority->top();
+            uncheckedPriority->pop();
+            // A previous request may have checked this payer's dependencies.
+            if (!validator->isChecked(tx))
+            {
+                batch.push_back(tx);
+            }
+        }
+        validator->validate(batch);
+        return batch;
+    };
+    auto growBatch = [&](size_t size) {
+        return size + std::min(size, txs.size() - size);
+    };
+    size_t refillBatchSize = std::min<size_t>(64, txs.size());
+    while (true)
+    {
+        select(remaining);
+        if (!validator)
+        {
+            break;
+        }
+        TxFrameList selected;
+        visitIncludedTxs([&](auto const& tx) { selected.push_back(tx); });
+        validator->validate(selected);
+        size_t invalidSelected = std::count_if(
+            selected.begin(), selected.end(),
+            [&](auto const& tx) { return validator->isInvalid(tx); });
+        if (invalidSelected != 0)
+        {
+            // Refill in growing parallel batches. This bounds repacking even
+            // when each next candidate is invalid, and never checks a
+            // transaction twice. A valid initial packing needs no refill.
+            refillBatchSize = std::max(refillBatchSize, invalidSelected);
+            validateMore(refillBatchSize);
+            refillBatchSize = growBatch(refillBatchSize);
+            std::erase_if(remaining, [&](auto const& tx) {
+                return validator->isInvalid(tx);
+            });
+            continue;
+        }
+
+        releaseAssert(hadTxNotFittingLane.size() == 1);
+        if (hadTxNotFittingLane[0])
+        {
+            // Unchecked transactions cannot establish surge demand. Check one
+            // excluded candidate first; batch further probes only if it fails.
+            UnorderedSet<TransactionFrameBasePtr> included(selected.begin(),
+                                                           selected.end());
+            auto validExcluded = [&](auto const& tx) {
+                return included.find(tx) == included.end() &&
+                       validator->isValid(tx);
+            };
+            hadTxNotFittingLane[0] =
+                std::any_of(txs.begin(), txs.end(), validExcluded);
+            size_t probeBatchSize = std::min<size_t>(1, txs.size());
+            while (!hadTxNotFittingLane[0])
+            {
+                auto probes = validateMore(probeBatchSize);
+                if (probes.empty())
+                {
+                    break;
+                }
+                // Resolving a probe's fee payer can also validate excluded
+                // dependencies. Those transactions count as demand too.
+                hadTxNotFittingLane[0] =
+                    std::any_of(txs.begin(), txs.end(), validExcluded);
+                probeBatchSize = growBatch(probeBatchSize);
+            }
+        }
+        break;
+    }
 
     std::vector<int64_t> lowestLaneFee;
     auto const& lclHeader =
@@ -845,29 +954,73 @@ makeTxSetFromTransactions(
         }
 
         auto& invalid = invalidTxs[i];
-        TxFrameList validatedTxs;
+        TxFrameList candidates;
+        std::unique_ptr<TxSetCandidateValidator> candidateValidator;
 #ifdef BUILD_TESTS
         if (skipValidation)
         {
-            validatedTxs = phaseTxs;
+            candidates = phaseTxs;
         }
         else
         {
 #endif
-            validatedTxs = TxSetUtils::trimInvalid(
-                phaseTxs, app, accountFeeMap, closeTimeOffset.seconds(),
-                closeTimeOffset.seconds(), invalid);
+            if (expectSoroban)
+            {
+                // Packing inspects fees and resources before signatures and
+                // ledger state. Use the existing inexpensive checks to keep
+                // malformed envelopes and footprints out of that code.
+                invalid.clear();
+                candidates.reserve(phaseTxs.size());
+                auto const& lm = app.getLedgerManager();
+                auto const& config = lm.getLastClosedSorobanNetworkConfig();
+                auto version =
+                    lm.getLastClosedLedgerHeader().header.ledgerVersion;
+                auto diagnostics = DiagnosticEventManager::createDisabled();
+                for (auto const& tx : phaseTxs)
+                {
+                    if (!tx->XDRProvidesValidFee() ||
+                        tx->getInclusionFee() < 0 ||
+                        !tx->checkSorobanResources(config, version,
+                                                   diagnostics))
+                    {
+                        invalid.push_back(tx);
+                    }
+                    else
+                    {
+                        candidates.push_back(tx);
+                    }
+                }
+                candidateValidator = std::make_unique<TxSetCandidateValidator>(
+                    candidates, app, accountFeeMap, closeTimeOffset.seconds(),
+                    closeTimeOffset.seconds());
+            }
+            else
+            {
+                candidates = TxSetUtils::trimInvalid(
+                    phaseTxs, app, accountFeeMap, closeTimeOffset.seconds(),
+                    closeTimeOffset.seconds(), invalid);
+            }
 #ifdef BUILD_TESTS
         }
 #endif
         auto phaseType = static_cast<TxSetPhase>(i);
-        auto [includedTxs, inclusionFeeMapBinding] =
-            applySurgePricing(phaseType, validatedTxs, app
+        auto [includedTxs, inclusionFeeMapBinding] = applySurgePricing(
+            phaseType, candidates, app, candidateValidator.get()
 #ifdef BUILD_TESTS
-                              ,
-                              skipValidation, parallelSorobanOrder
+                                            ,
+            skipValidation, parallelSorobanOrder
 #endif
-            );
+        );
+        if (candidateValidator)
+        {
+            for (auto const& tx : candidates)
+            {
+                if (candidateValidator->isInvalid(tx))
+                {
+                    invalid.push_back(tx);
+                }
+            }
+        }
         auto inclusionFeeMap = inclusionFeeMapBinding;
         std::visit(
             [&validatedPhases, phaseType, inclusionFeeMap](auto&& txs) {
@@ -944,8 +1097,8 @@ makeTxSetFromTransactions(
         throw std::runtime_error("Created invalid tx set frame - shape is "
                                  "mismatched after roundtrip.");
     }
-    // We already trimmed invalid transactions in an earlier call to
-    // `trimInvalid`, so skip transaction validation here
+    // Every included transaction has already been validated during selection,
+    // so skip transaction validation here.
     auto validationResult = outputApplicableTxSet->checkValidInternalWithResult(
         app, closeTimeOffset.seconds(), closeTimeOffset.seconds(), true);
     if (validationResult != TxSetValidationResult::VALID)

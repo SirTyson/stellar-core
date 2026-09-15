@@ -16,7 +16,9 @@
 #include "test/TestUtils.h"
 #include "test/TxTests.h"
 #include "test/test.h"
+#include "transactions/FeeBumpTransactionFrame.h"
 #include "transactions/MutableTransactionResult.h"
+#include "transactions/TransactionFrame.h"
 #include "transactions/TransactionUtils.h"
 #include "transactions/test/SorobanTxTestUtils.h"
 #include "util/BatchExecutor.h"
@@ -24,12 +26,588 @@
 #include "util/ProtocolVersion.h"
 #include "util/XDRCereal.h"
 #include <algorithm>
+#include <atomic>
 #include <map>
 namespace stellar
 {
 namespace
 {
 using namespace txtest;
+
+template <typename Frame> class CountedValidationFrame : public Frame
+{
+  public:
+    mutable std::atomic<size_t> checks{0};
+
+    CountedValidationFrame(Hash const& networkID,
+                           TransactionEnvelope const& envelope)
+        : Frame(networkID, envelope)
+    {
+    }
+
+    MutableTxResultPtr
+    checkValid(AppConnector& app, CheckValidLedgerViewWrapper const& view,
+               SequenceNumber current, uint64_t lower, uint64_t upper,
+               DiagnosticEventManager& diagnostics,
+               std::optional<uint32_t> ledgerSeq) const override
+    {
+        ++checks;
+        return Frame::checkValid(app, view, current, lower, upper, diagnostics,
+                                 ledgerSeq);
+    }
+};
+
+TEST_CASE("Soroban construction validates only selected candidates",
+          "[txset][soroban][candidate-validation]")
+{
+    VirtualClock clock;
+    auto cfg = getTestConfig();
+    cfg.LEDGER_PROTOCOL_VERSION = Config::CURRENT_LEDGER_PROTOCOL_VERSION;
+    cfg.TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION =
+        Config::CURRENT_LEDGER_PROTOCOL_VERSION;
+    cfg.GENESIS_TEST_ACCOUNT_COUNT = 64;
+    auto app = createTestApplication(clock, cfg);
+    overrideSorobanNetworkConfigForTest(*app);
+    modifySorobanNetworkConfig(*app, [](SorobanNetworkConfig& config) {
+        config.mLedgerMaxTxCount = 8;
+    });
+    bool divergentPacking = false;
+    SECTION("uniform resources")
+    {
+    }
+    SECTION("different stage counts choose different candidates")
+    {
+        divergentPacking = true;
+        modifySorobanNetworkConfig(*app, [](SorobanNetworkConfig& config) {
+            config.mLedgerMaxInstructions = 8'000'000;
+            config.mTxMaxInstructions = 4'000'000;
+            config.mLedgerMaxDependentTxClusters = 8;
+        });
+    }
+
+    PerPhaseTransactionList phases(2);
+    std::vector<std::shared_ptr<CountedValidationFrame<TransactionFrame>>>
+        counted;
+    for (size_t i = 0; i < 40; ++i)
+    {
+        auto source = getGenesisAccount(*app, i);
+        SorobanResources resources;
+        resources.instructions =
+            divergentPacking ? 1'000'000 * (1 + i % 4) : 1000;
+        auto tx = createUploadWasmTx(*app, source, 1000 + i,
+                                     DEFAULT_TEST_RESOURCE_FEE, resources);
+        auto frame = std::make_shared<CountedValidationFrame<TransactionFrame>>(
+            app->getNetworkID(), tx->getEnvelope());
+        counted.push_back(frame);
+        phases[1].push_back(frame);
+    }
+
+    PerPhaseTransactionList invalid(2);
+    // The output replaces any result from a previous construction attempt.
+    invalid[1].push_back(phases[1].front());
+    auto [wire, applicable] =
+        makeTxSetFromTransactions(phases, *app, ApplyTimeOffset{}, invalid);
+    REQUIRE(wire->sizeTxTotal() == 8);
+    REQUIRE(invalid[1].empty());
+    size_t checks = 0;
+    for (auto const& tx : counted)
+    {
+        REQUIRE(tx->checks <= 1);
+        checks += tx->checks;
+    }
+    // Eight included transactions and one valid excluded transaction establish
+    // demand. Unselected packing variants must not trigger validation.
+    REQUIRE(checks == 9);
+    REQUIRE(applicable->checkValid(*app, 0, 0));
+}
+
+TEST_CASE("Soroban candidate validation refills and prices valid demand",
+          "[txset][soroban][candidate-validation]")
+{
+    VirtualClock clock;
+    auto cfg = getTestConfig();
+    cfg.LEDGER_PROTOCOL_VERSION =
+        GENERATE(uint32_t{23}, Config::CURRENT_LEDGER_PROTOCOL_VERSION);
+    cfg.TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION = cfg.LEDGER_PROTOCOL_VERSION;
+    cfg.GENESIS_TEST_ACCOUNT_COUNT = 256;
+    auto app = createTestApplication(clock, cfg);
+    overrideSorobanNetworkConfigForTest(*app);
+    app->getBatchExecutor().setPreferredTaskCountForTesting(4);
+    modifySorobanNetworkConfig(*app, [](SorobanNetworkConfig& config) {
+        config.mLedgerMaxTxCount = 8;
+    });
+
+    size_t count = 40;
+    size_t expectedIncluded = 8;
+    size_t expectedInvalid = 0;
+    bool surge = true;
+    bool byteBound = false;
+    bool instructionBound = false;
+    bool malformed = false;
+    std::set<size_t> bad;
+    SECTION("all fit")
+    {
+        count = expectedIncluded = 5;
+        surge = false;
+    }
+    SECTION("invalid high fee candidates")
+    {
+        bad = {36, 37, 38, 39};
+        expectedInvalid = bad.size();
+    }
+    SECTION("byte bound with large invalid candidates")
+    {
+        byteBound = true;
+        bad = {36, 37, 38, 39};
+        expectedInvalid = bad.size();
+    }
+    SECTION("instruction bound with conflicting candidates")
+    {
+        instructionBound = true;
+        bad = {36, 37, 38, 39};
+        expectedInvalid = bad.size();
+    }
+    SECTION("invalid tail does not establish surge demand")
+    {
+        for (size_t i = 0; i < 32; ++i)
+        {
+            bad.insert(i);
+        }
+        expectedInvalid = bad.size();
+        surge = false;
+    }
+    SECTION("unvisited invalid candidates are not reported")
+    {
+        bad = {0};
+    }
+    SECTION("all invalid")
+    {
+        for (size_t i = 0; i < count; ++i)
+        {
+            bad.insert(i);
+        }
+        expectedInvalid = count;
+        expectedIncluded = 0;
+        surge = false;
+    }
+    SECTION("successive failures refill without revalidating survivors")
+    {
+        count = 200;
+        for (size_t i = 10; i < 193; ++i)
+        {
+            bad.insert(i);
+        }
+        expectedInvalid = bad.size();
+    }
+    SECTION("malformed Soroban envelope cannot reach packing")
+    {
+        malformed = true;
+        expectedInvalid = 1;
+    }
+
+    PerPhaseTransactionList phases(2);
+    std::vector<std::shared_ptr<CountedValidationFrame<TransactionFrame>>>
+        counted;
+    for (size_t i = 0; i < count; ++i)
+    {
+        auto source = getGenesisAccount(*app, i);
+        SorobanResources resources;
+        resources.instructions = instructionBound ? 1'000'000 : 1000;
+        if (instructionBound)
+        {
+            resources.footprint.readWrite.push_back(
+                contractDataKey(SCAddress(SC_ADDRESS_TYPE_CONTRACT), makeU32(1),
+                                ContractDataDurability::PERSISTENT));
+        }
+        auto tx = createUploadWasmTx(
+            *app, source, 1000 + i, DEFAULT_TEST_RESOURCE_FEE, resources,
+            std::nullopt, 0, byteBound ? (bad.count(i) ? 8192 : 2048) : 128);
+        auto env = tx->getEnvelope();
+        if (bad.count(i))
+        {
+            env.v1().signatures[0].signature[0] ^= 1;
+        }
+        if (malformed && i == count - 1)
+        {
+            env.v1().tx.ext.v(0);
+        }
+        auto frame = std::make_shared<CountedValidationFrame<TransactionFrame>>(
+            app->getNetworkID(), env);
+        counted.push_back(frame);
+        phases[1].push_back(frame);
+    }
+    if (byteBound || instructionBound)
+    {
+        modifySorobanNetworkConfig(*app, [&](SorobanNetworkConfig& config) {
+            config.mLedgerMaxTxCount = 40;
+            if (byteBound)
+            {
+                config.mLedgerMaxTransactionsSizeBytes =
+                    8 * xdr::xdr_size(phases[1][0]->getEnvelope());
+                config.mTxMaxSizeBytes = 10'000;
+            }
+            else
+            {
+                config.mLedgerMaxInstructions = 8'000'000;
+                config.mTxMaxInstructions = 2'500'000;
+            }
+        });
+    }
+
+    PerPhaseTransactionList invalid(2);
+    auto [wire, applicable] =
+        makeTxSetFromTransactions(phases, *app, ApplyTimeOffset{}, invalid);
+    REQUIRE(wire->sizeTxTotal() == expectedIncluded);
+    REQUIRE(invalid[1].size() == expectedInvalid);
+    for (auto const& tx : counted)
+    {
+        REQUIRE(tx->checks <= 1);
+    }
+    if (bad == std::set<size_t>{0})
+    {
+        REQUIRE(counted[0]->checks == 0);
+    }
+    for (auto const& tx : applicable->getPhase(TxSetPhase::SOROBAN))
+    {
+        if (surge)
+        {
+            REQUIRE(*applicable->getTxBaseFee(tx) > 100);
+        }
+        else
+        {
+            REQUIRE(*applicable->getTxBaseFee(tx) == 100);
+        }
+    }
+    REQUIRE(applicable->checkValid(*app, 0, 0));
+}
+
+TEST_CASE("Soroban candidate validity matches ordered eager fee accounting",
+          "[txset][soroban][candidate-validation]")
+{
+    auto requestOrder = GENERATE(0, 1, 2);
+    VirtualClock clock;
+    auto cfg = getTestConfig();
+    cfg.LEDGER_PROTOCOL_VERSION = Config::CURRENT_LEDGER_PROTOCOL_VERSION;
+    cfg.TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION = cfg.LEDGER_PROTOCOL_VERSION;
+    cfg.GENESIS_TEST_ACCOUNT_COUNT = 64;
+    auto app = createTestApplication(clock, cfg);
+    overrideSorobanNetworkConfigForTest(*app);
+    app->getBatchExecutor().setPreferredTaskCountForTesting(4);
+
+    TxFrameList txs;
+    UnorderedMap<AccountID, int64_t> priorFees;
+    bool funded = false;
+    bool reverseInput = false;
+    SECTION("constrained payers")
+    {
+    }
+    SECTION("constrained payers with reversed input")
+    {
+        reverseInput = true;
+    }
+    SECTION("funded payers")
+    {
+        funded = true;
+    }
+    for (size_t i = 0; i < 24; ++i)
+    {
+        auto source = getGenesisAccount(*app, i);
+        auto payer = getGenesisAccount(*app, 60 + i % 4);
+        CheckValidLedgerViewWrapper view(*app);
+        auto balance = getAvailableBalance(
+            view.getLedgerHeader().current(),
+            view.getAccount(payer.getPublicKey()).current());
+        priorFees[payer.getPublicKey()] = i % 4 == 0 ? balance / 3 : 0;
+        SorobanResources resources;
+        resources.instructions = 1000;
+        auto inner = createUploadWasmTx(*app, source, 1000,
+                                        DEFAULT_TEST_RESOURCE_FEE, resources);
+        auto fullFee =
+            funded ? 2 * DEFAULT_TEST_RESOURCE_FEE + 2000 + i : balance / 4 + i;
+        auto env = feeBump(*app, payer, inner, fullFee, true)->getEnvelope();
+        if (i % 7 == 0)
+        {
+            env.feeBump().signatures[0].signature[0] ^= 1;
+        }
+        txs.push_back(TransactionFrameBase::makeTransactionFromWire(
+            app->getNetworkID(), env));
+    }
+    if (reverseInput)
+    {
+        std::reverse(txs.begin(), txs.end());
+    }
+    auto eagerFees = priorFees;
+    auto invalid =
+        TxSetUtils::getInvalidTxListWithErrors(txs, *app, eagerFees, 0, 0)
+            .first;
+    std::set<Hash> invalidHashes;
+    for (auto const& tx : invalid)
+    {
+        invalidHashes.insert(tx->getFullHash());
+    }
+    TxFrameList candidates;
+    std::vector<
+        std::shared_ptr<CountedValidationFrame<FeeBumpTransactionFrame>>>
+        counted;
+    for (auto const& tx : txs)
+    {
+        auto frame =
+            std::make_shared<CountedValidationFrame<FeeBumpTransactionFrame>>(
+                app->getNetworkID(), tx->getEnvelope());
+        candidates.push_back(frame);
+        counted.push_back(frame);
+    }
+    TxSetCandidateValidator validator(candidates, *app, priorFees, 0, 0);
+    // Selection can request transactions in any order, not just input order.
+    // Repeat each pointer in the request to exercise cache and worker
+    // isolation.
+    for (size_t offset = 0; offset < candidates.size(); ++offset)
+    {
+        auto index = requestOrder == 0   ? offset
+                     : requestOrder == 1 ? candidates.size() - offset - 1
+                                         : (offset * 7) % candidates.size();
+        auto const& tx = candidates[index];
+        validator.validate({tx, tx});
+        REQUIRE(validator.isChecked(tx));
+        REQUIRE(validator.isInvalid(tx) ==
+                invalidHashes.contains(tx->getFullHash()));
+    }
+    for (auto const& tx : counted)
+    {
+        REQUIRE(tx->checks == 1);
+        REQUIRE(validator.isInvalid(tx) ==
+                invalidHashes.contains(tx->getFullHash()));
+    }
+}
+
+TEST_CASE("Soroban selection preserves ordered shared fee payer affordability",
+          "[txset][soroban][candidate-validation]")
+{
+    VirtualClock clock;
+    auto cfg = getTestConfig();
+    cfg.LEDGER_PROTOCOL_VERSION = Config::CURRENT_LEDGER_PROTOCOL_VERSION;
+    cfg.TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION = cfg.LEDGER_PROTOCOL_VERSION;
+    cfg.GENESIS_TEST_ACCOUNT_COUNT = 64;
+    auto app = createTestApplication(clock, cfg);
+    overrideSorobanNetworkConfigForTest(*app);
+    modifySorobanNetworkConfig(*app, [](SorobanNetworkConfig& config) {
+        config.mLedgerMaxTxCount = 2;
+    });
+    auto payer = getGenesisAccount(*app, 63);
+    int64_t balance;
+    {
+        CheckValidLedgerViewWrapper view(*app);
+        balance = getAvailableBalance(
+            view.getLedgerHeader().current(),
+            view.getAccount(payer.getPublicKey()).current());
+    }
+    bool funded = false, invalidFirst = false, crossPhase = false,
+         extremeFees = false;
+    SECTION(
+        "higher fee later candidate cannot displace affordable earlier sibling")
+    {
+    }
+    SECTION("invalid earlier sibling consumes no fee budget")
+    {
+        invalidFirst = true;
+    }
+    SECTION("funded shared payer needs no dependency checks")
+    {
+        funded = true;
+    }
+    SECTION("earlier Classic phase consumes the same budget")
+    {
+        crossPhase = true;
+    }
+    SECTION("provisional inclusion fees cannot overflow")
+    {
+        extremeFees = true;
+        modifySorobanNetworkConfig(*app, [](SorobanNetworkConfig& config) {
+            config.mLedgerMaxTxCount = 4;
+        });
+    }
+    PerPhaseTransactionList phases(2);
+    std::vector<
+        std::shared_ptr<CountedValidationFrame<FeeBumpTransactionFrame>>>
+        bumps;
+    for (size_t i = 0; i < (funded ? 20 : 2); ++i)
+    {
+        auto source = getGenesisAccount(*app, i);
+        SorobanResources resources;
+        resources.instructions = 1000;
+        auto inner = createUploadWasmTx(*app, source, 1000,
+                                        DEFAULT_TEST_RESOURCE_FEE, resources);
+        int64_t fullFee =
+            funded ? 2 * DEFAULT_TEST_RESOURCE_FEE + 2000 + i
+                   : (crossPhase ? balance / 3 : balance / 2 + 1) + i;
+        if (extremeFees)
+        {
+            fullFee = INT64_MAX;
+        }
+        auto env = feeBump(*app, payer, inner, fullFee, true)->getEnvelope();
+        if (invalidFirst && i == 0)
+        {
+            env.feeBump().signatures[0].signature[0] ^= 1;
+        }
+        auto frame =
+            std::make_shared<CountedValidationFrame<FeeBumpTransactionFrame>>(
+                app->getNetworkID(), env);
+        bumps.push_back(frame);
+        phases[1].push_back(frame);
+    }
+    for (size_t i = 30; i < 34; ++i)
+    {
+        auto source = getGenesisAccount(*app, i);
+        SorobanResources resources;
+        resources.instructions = 1000;
+        phases[1].push_back(createUploadWasmTx(
+            *app, source, 1000, DEFAULT_TEST_RESOURCE_FEE, resources));
+    }
+    if (crossPhase)
+    {
+        auto source = getGenesisAccount(*app, 62);
+        auto tx = transactionFromOperations(
+            *app, source.getSecretKey(), source.nextSequenceNumber(),
+            {payment(source.getPublicKey(), 1)}, 100);
+        phases[0].push_back(feeBump(*app, payer, tx, balance / 2, true));
+    }
+    PerPhaseTransactionList invalid(2);
+    auto [wire, applicable] =
+        makeTxSetFromTransactions(phases, *app, ApplyTimeOffset{}, invalid);
+    REQUIRE(applicable->sizeTx(TxSetPhase::SOROBAN) == (extremeFees ? 4 : 1));
+    REQUIRE(invalid[0].empty());
+    REQUIRE(invalid[1].size() == (funded ? 0 : extremeFees ? 2 : 1));
+    if (!extremeFees)
+    {
+        auto const expected =
+            funded ? bumps.back() : bumps[invalidFirst ? 1 : 0];
+        for (auto const& tx : applicable->getPhase(TxSetPhase::SOROBAN))
+        {
+            REQUIRE(tx->getFullHash() == expected->getFullHash());
+        }
+    }
+    size_t checks = 0;
+    for (auto const& tx : bumps)
+    {
+        REQUIRE(tx->checks <= 1);
+        checks += tx->checks;
+    }
+    REQUIRE(checks == 2);
+    REQUIRE(applicable->checkValid(*app, 0, 0));
+}
+
+TEST_CASE("Soroban surge demand includes a probe's validated fee dependencies",
+          "[txset][soroban][candidate-validation]")
+{
+    VirtualClock clock;
+    auto cfg = getTestConfig();
+    cfg.LEDGER_PROTOCOL_VERSION = Config::CURRENT_LEDGER_PROTOCOL_VERSION;
+    cfg.TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION = cfg.LEDGER_PROTOCOL_VERSION;
+    cfg.GENESIS_TEST_ACCOUNT_COUNT = 8;
+    auto app = createTestApplication(clock, cfg);
+    overrideSorobanNetworkConfigForTest(*app);
+    modifySorobanNetworkConfig(*app, [](SorobanNetworkConfig& config) {
+        config.mLedgerMaxTxCount = 2;
+    });
+    auto payer = getGenesisAccount(*app, 6);
+    auto winnerPayer = getGenesisAccount(*app, 7);
+    CheckValidLedgerViewWrapper view(*app);
+    auto balance =
+        getAvailableBalance(view.getLedgerHeader().current(),
+                            view.getAccount(payer.getPublicKey()).current());
+    bool invalidDependency = false;
+    SECTION("affordable dependency establishes demand")
+    {
+    }
+    SECTION("invalid dependency leaves an affordable probe")
+    {
+        invalidDependency = true;
+    }
+    PerPhaseTransactionList phases(2);
+    for (size_t i = 0; i < 3; ++i)
+    {
+        auto source = getGenesisAccount(*app, i);
+        SorobanResources resources;
+        resources.instructions = 1000;
+        auto inner = createUploadWasmTx(*app, source, 1000,
+                                        DEFAULT_TEST_RESOURCE_FEE, resources);
+        auto fee = i == 0   ? balance / 2
+                   : i == 1 ? balance * 3 / 4
+                            : balance * 9 / 10;
+        auto env = feeBump(*app, i == 2 ? winnerPayer : payer, inner, fee, true)
+                       ->getEnvelope();
+        if (invalidDependency && i == 0)
+        {
+            env.feeBump().signatures[0].signature[0] ^= 1;
+        }
+        phases[1].push_back(TransactionFrameBase::makeTransactionFromWire(
+            app->getNetworkID(), env));
+    }
+    PerPhaseTransactionList invalid(2);
+    auto [wire, applicable] =
+        makeTxSetFromTransactions(phases, *app, ApplyTimeOffset{}, invalid);
+    REQUIRE(applicable->sizeTxTotal() == 1);
+    REQUIRE(invalid[1].size() == 1);
+    REQUIRE(invalid[1][0]->getFullHash() ==
+            phases[1][invalidDependency ? 0 : 1]->getFullHash());
+    for (auto const& tx : applicable->getPhase(TxSetPhase::SOROBAN))
+    {
+        REQUIRE(tx->getFullHash() == phases[1][2]->getFullHash());
+        auto fee = phases[1][2]->getInclusionFee();
+        REQUIRE(*applicable->getTxBaseFee(tx) == fee / 2);
+    }
+    REQUIRE(applicable->checkValid(*app, 0, 0));
+}
+
+TEST_CASE("Soroban construction fills 6000 slots from 12200 candidates",
+          "[txset][soroban][candidate-validation]")
+{
+    VirtualClock clock;
+    auto cfg = getTestConfig();
+    cfg.LEDGER_PROTOCOL_VERSION = Config::CURRENT_LEDGER_PROTOCOL_VERSION;
+    cfg.TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION = cfg.LEDGER_PROTOCOL_VERSION;
+    cfg.GENESIS_TEST_ACCOUNT_COUNT = 12'200;
+    auto app = createTestApplication(clock, cfg);
+    overrideSorobanNetworkConfigForTest(*app);
+    app->getBatchExecutor().setPreferredTaskCountForTesting(4);
+    modifySorobanNetworkConfig(*app, [](SorobanNetworkConfig& config) {
+        config.mLedgerMaxTxCount = 6'000;
+        config.mLedgerMaxDiskReadEntries = 24'000;
+        config.mLedgerMaxWriteLedgerEntries = 12'000;
+        config.mLedgerMaxTransactionsSizeBytes = 8'000'000;
+        config.mLedgerMaxInstructions = 20'000'000;
+        config.mTxMaxInstructions = 4'000'000;
+    });
+    PerPhaseTransactionList phases(2);
+    std::vector<std::shared_ptr<CountedValidationFrame<TransactionFrame>>>
+        counted;
+    for (size_t i = 0; i < 12'200; ++i)
+    {
+        auto source = getGenesisAccount(*app, i);
+        SorobanResources resources;
+        resources.instructions = 1000;
+        auto tx = createUploadWasmTx(*app, source, 1000 + i,
+                                     DEFAULT_TEST_RESOURCE_FEE, resources,
+                                     std::nullopt, 0, 128);
+        auto frame = std::make_shared<CountedValidationFrame<TransactionFrame>>(
+            app->getNetworkID(), tx->getEnvelope());
+        counted.push_back(frame);
+        phases[1].push_back(frame);
+    }
+    PerPhaseTransactionList invalid(2);
+    auto [wire, applicable] =
+        makeTxSetFromTransactions(phases, *app, ApplyTimeOffset{}, invalid);
+    REQUIRE(wire->sizeTxTotal() == 6'000);
+    REQUIRE(invalid[1].empty());
+    size_t checks = 0;
+    for (auto const& tx : counted)
+    {
+        REQUIRE(tx->checks <= 1);
+        checks += tx->checks;
+    }
+    REQUIRE(checks == 6'001);
+    REQUIRE(applicable->checkValid(*app, 0, 0));
+}
 
 TEST_CASE("generalized tx set XDR validation", "[txset]")
 {

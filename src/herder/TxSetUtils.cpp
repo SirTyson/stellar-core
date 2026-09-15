@@ -164,16 +164,21 @@ TxSetUtils::buildAccountTxQueues(TxFrameList const& txs)
     return queues;
 }
 
-template <typename T>
-TxFrameListWithErrors
-TxSetUtils::getInvalidTxListWithErrors(
-    T const& inTxs, Application& app,
-    UnorderedMap<AccountID, int64_t>& accountFeeMap,
-    uint64_t lowerBoundCloseTimeOffset, uint64_t upperBoundCloseTimeOffset)
+namespace
+{
+using IndividualValidationResult = std::pair<bool, std::optional<int64_t>>;
+
+std::vector<IndividualValidationResult>
+checkTransactionsInParallel(TxFrameList const& txs, Application& app,
+                            uint64_t lowerBoundCloseTimeOffset,
+                            uint64_t upperBoundCloseTimeOffset)
 {
     ZoneScoped;
     releaseAssert(threadIsMain());
-    TxFrameList txs(inTxs.begin(), inTxs.end());
+    if (txs.empty())
+    {
+        return {};
+    }
 
     auto ledgerView = std::make_unique<CheckValidLedgerViewWrapper>(app);
 #ifdef BUILD_TESTS
@@ -220,6 +225,12 @@ TxSetUtils::getInvalidTxListWithErrors(
     }
 #endif
 
+    // Match the executor's serial fallback before allocating ledger views.
+    if (txs.size() < taskCount)
+    {
+        taskCount = 1;
+    }
+
     std::vector<std::unique_ptr<CheckValidLedgerViewWrapper>> ledgerViews;
     ledgerViews.emplace_back(std::move(ledgerView));
 
@@ -234,8 +245,7 @@ TxSetUtils::getInvalidTxListWithErrors(
 #endif
     }
 
-    std::vector<std::pair<bool, std::optional<int64_t>>> txValidationResult(
-        txs.size());
+    std::vector<IndividualValidationResult> txValidationResult(txs.size());
     auto& appConnector = app.getAppConnector();
 
     app.getBatchExecutor().executeBatchOverRanges(
@@ -265,6 +275,31 @@ TxSetUtils::getInvalidTxListWithErrors(
                 }
             }
         });
+
+    return txValidationResult;
+}
+
+int64_t
+addFees(int64_t total, int64_t fee)
+{
+    releaseAssert(total >= 0 && fee >= 0);
+    return fee > INT64_MAX - total ? INT64_MAX : total + fee;
+}
+} // namespace
+
+template <typename T>
+TxFrameListWithErrors
+TxSetUtils::getInvalidTxListWithErrors(
+    T const& inTxs, Application& app,
+    UnorderedMap<AccountID, int64_t>& accountFeeMap,
+    uint64_t lowerBoundCloseTimeOffset, uint64_t upperBoundCloseTimeOffset)
+{
+    ZoneScoped;
+    releaseAssert(threadIsMain());
+    TxFrameList txs(inTxs.begin(), inTxs.end());
+
+    auto txValidationResult = checkTransactionsInParallel(
+        txs, app, lowerBoundCloseTimeOffset, upperBoundCloseTimeOffset);
 
     TxFrameListWithErrors invalidTxsWithError;
     auto& [invalidTxs, errorCode] = invalidTxsWithError;
@@ -328,6 +363,156 @@ TxSetUtils::getInvalidTxListWithErrors<TxSetPhaseFrame>(
     TxSetPhaseFrame const& txs, Application& app,
     UnorderedMap<AccountID, int64_t>& accountFeeMap,
     uint64_t lowerBoundCloseTimeOffset, uint64_t upperBoundCloseTimeOffset);
+
+TxSetCandidateValidator::TxSetCandidateValidator(
+    TxFrameList const& candidates, Application& app,
+    UnorderedMap<AccountID, int64_t> const& priorFees,
+    uint64_t lowerBoundCloseTimeOffset, uint64_t upperBoundCloseTimeOffset)
+    : mApp(app)
+    , mLowerBoundCloseTimeOffset(lowerBoundCloseTimeOffset)
+    , mUpperBoundCloseTimeOffset(upperBoundCloseTimeOffset)
+{
+    mFeeSources.reserve(candidates.size());
+    mValidation.reserve(candidates.size());
+    for (auto const& tx : candidates)
+    {
+        auto const id = tx->getFeeSourceID();
+        auto [it, inserted] = mFeeSources.try_emplace(id);
+        auto& source = it->second;
+        if (inserted)
+        {
+            auto prior = priorFees.find(id);
+            source.prefixFees = prior == priorFees.end() ? 0 : prior->second;
+            source.maximumFees = source.prefixFees;
+        }
+        mValidation[tx].feeSourceIndex = source.candidates.size();
+        source.candidates.push_back(tx);
+        source.maximumFees = addFees(source.maximumFees, tx->getFullFee());
+    }
+}
+
+void
+TxSetCandidateValidator::checkTransactions(TxFrameList const& candidates)
+{
+    TxFrameList unchecked;
+    unchecked.reserve(candidates.size());
+    for (auto const& tx : candidates)
+    {
+        auto& result = mValidation.at(tx);
+        if (!result.checked)
+        {
+            // Transaction frames contain mutable caches. Mark the request now
+            // so repeated pointers cannot be checked by multiple workers.
+            result.checked = true;
+            unchecked.push_back(tx);
+        }
+    }
+    auto results =
+        checkTransactionsInParallel(unchecked, mApp, mLowerBoundCloseTimeOffset,
+                                    mUpperBoundCloseTimeOffset);
+    for (size_t i = 0; i < unchecked.size(); ++i)
+    {
+        auto const& [valid, balance] = results[i];
+        auto const& tx = unchecked[i];
+        mValidation.at(tx).individuallyValid = valid && balance.has_value();
+        if (valid && !balance)
+        {
+            CLOG_ERROR(Herder,
+                       "Account not found when checking TxSet validity");
+            CLOG_ERROR(Herder, "{}", REPORT_INTERNAL_BUG);
+        }
+        if (valid && balance)
+        {
+            mFeeSources.at(tx->getFeeSourceID()).availableBalance = balance;
+        }
+    }
+}
+
+void
+TxSetCandidateValidator::validate(TxFrameList const& candidates)
+{
+    checkTransactions(candidates);
+    UnorderedMap<AccountID, size_t> prefixesToResolve;
+    for (auto const& tx : candidates)
+    {
+        auto const& result = mValidation.at(tx);
+        if (!result.individuallyValid)
+        {
+            continue;
+        }
+        auto const id = tx->getFeeSourceID();
+        auto& source = mFeeSources.at(id);
+        if (source.allAffordable ||
+            result.feeSourceIndex < source.resolvedCount)
+        {
+            continue;
+        }
+        releaseAssert(source.availableBalance);
+        if (source.maximumFees <= *source.availableBalance)
+        {
+            // This upper bound includes unchecked candidates. If it fits, no
+            // other signatures are needed to establish affordability.
+            source.allAffordable = true;
+        }
+        else
+        {
+            auto& count = prefixesToResolve[id];
+            count = std::max(count, result.feeSourceIndex + 1);
+        }
+    }
+
+    TxFrameList dependencies;
+    for (auto const& [id, count] : prefixesToResolve)
+    {
+        auto const& source = mFeeSources.at(id);
+        dependencies.insert(dependencies.end(),
+                            source.candidates.begin() + source.resolvedCount,
+                            source.candidates.begin() + count);
+    }
+    checkTransactions(dependencies);
+    for (auto const& [id, count] : prefixesToResolve)
+    {
+        auto& source = mFeeSources.at(id);
+        for (; source.resolvedCount < count; ++source.resolvedCount)
+        {
+            auto const& tx = source.candidates[source.resolvedCount];
+            auto& result = mValidation.at(tx);
+            if (result.individuallyValid)
+            {
+                // Match trimInvalid: individually invalid transactions consume
+                // no fees; individually valid but unaffordable ones still
+                // contribute to the prefix seen by subsequent transactions.
+                source.prefixFees =
+                    addFees(source.prefixFees, tx->getFullFee());
+                result.affordable =
+                    source.prefixFees <= *source.availableBalance;
+            }
+        }
+    }
+}
+
+bool
+TxSetCandidateValidator::isChecked(TransactionFrameBasePtr const& tx) const
+{
+    return mValidation.at(tx).checked;
+}
+
+bool
+TxSetCandidateValidator::isValid(TransactionFrameBasePtr const& tx) const
+{
+    auto const& result = mValidation.at(tx);
+    auto const& source = mFeeSources.at(tx->getFeeSourceID());
+    return result.individuallyValid &&
+           (source.allAffordable ||
+            (result.feeSourceIndex < source.resolvedCount &&
+             result.affordable));
+}
+
+bool
+TxSetCandidateValidator::isInvalid(TransactionFrameBasePtr const& tx) const
+{
+    return isChecked(tx) && !isValid(tx);
+}
 
 TxFrameList
 TxSetUtils::trimInvalid(TxFrameList const& txs, Application& app,
