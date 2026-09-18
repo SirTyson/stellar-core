@@ -54,9 +54,10 @@ close time, and upgrades before voting. They can then emit early
 PREPARE votes while the transaction-set body is downloading or awaits full
 validation. This also applies when an early push delivered the body first.
 
-Full validation is scheduled once per slot/value on Core's main thread, where
-the ledger state is safe to read. The initial PREPARE can travel and peers can
-vote during this work; validation itself does not run on a separate CPU thread.
+Full validation is scheduled once per slot/value through Core's existing
+main-thread entry point, retaining its snapshot and batch-executor machinery.
+The main thread still waits for validation to finish, but the initial PREPARE
+can travel and peers can vote during this work.
 The result is cached against the previous ledger and close-time offset. A queued
 job whose ledger context changed is discarded. If commit evidence arrives first,
 the commit-vote gate performs the full validation synchronously.

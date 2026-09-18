@@ -316,8 +316,8 @@ class HerderSCPDriver : public SCPDriver
     mutable RandomEvictionCache<TxSetValidityKey, bool, TxSetValidityKeyHash>
         mTxSetValidCache;
 
-    // One deferred main-thread validation per slot/value. Ledger state is
-    // never read from a worker thread. Early votes can travel in the meantime.
+    // One deferred validation per slot/value through the existing main-thread
+    // entry point and snapshot/batch machinery. Early votes can travel meanwhile.
     mutable std::set<std::pair<uint64_t, Value>> mPendingValueValidations;
 
     SCPDriver::ValidationLevel
