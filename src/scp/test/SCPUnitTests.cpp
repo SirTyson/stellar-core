@@ -1,3 +1,4 @@
+#include "scp/LeaderElection.h"
 #include "scp/LocalNode.h"
 #include "scp/SCP.h"
 #include "scp/Slot.h"
@@ -8,23 +9,15 @@
 
 namespace stellar
 {
-static bool
-isNear(uint64 r, double target)
-{
-    double v = (double)r / (double)UINT64_MAX;
-    return (std::abs(v - target) < .01);
-}
 
-class TestNominationSCP : public SCPDriver
+class TestElectionSCP : public SCPDriver
 {
   public:
     SCP mSCP;
-    uint32_t mInitialNominationTimeoutMS = 1000;
-    uint32_t mIncrementNominationTimeoutMS = 1000;
     uint32_t mInitialBallotTimeoutMS = 1000;
     uint32_t mIncrementBallotTimeoutMS = 1000;
 
-    TestNominationSCP(NodeID const& nodeID, SCPQuorumSet const& qSetLocal)
+    TestElectionSCP(NodeID const& nodeID, SCPQuorumSet const& qSetLocal)
         : mSCP(*this, nodeID, true, qSetLocal)
     {
         auto localQSet =
@@ -45,8 +38,7 @@ class TestNominationSCP : public SCPDriver
     }
 
     SCPDriver::ValidationLevel
-    validateValue(uint64 slotIndex, Value const& value,
-                  bool nomination) const override
+    validateValue(uint64 slotIndex, Value const& value) const override
     {
         return SCPDriver::kFullyValidatedValue;
     }
@@ -65,33 +57,6 @@ class TestNominationSCP : public SCPDriver
     void
     emitEnvelope(SCPEnvelope const& envelope) override
     {
-    }
-
-    ValueWrapperPtr
-    combineCandidates(uint64 slotIndex,
-                      ValueWrapperPtrSet const& candidates) override
-    {
-        return nullptr;
-    }
-
-    bool
-    hasUpgrades(Value const& v) override
-    {
-        // Not implemented
-        releaseAssert(false);
-    }
-
-    ValueWrapperPtr
-    stripAllUpgrades(Value const& v) override
-    {
-        // Not implemented
-        releaseAssert(false);
-    }
-
-    uint32_t
-    getUpgradeNominationTimeoutLimit() const override
-    {
-        return std::numeric_limits<uint32_t>::max();
     }
 
     void
@@ -143,13 +108,6 @@ class TestNominationSCP : public SCPDriver
 
     std::map<Hash, SCPQuorumSetPtr> mQuorumSets;
 
-    Value const&
-    getLatestCompositeCandidate(uint64 slotIndex)
-    {
-        static Value const emptyValue{};
-        return emptyValue;
-    }
-
     Hash
     getHashOf(std::vector<xdr::opaque_vec<>> const& vals) const override
     {
@@ -165,21 +123,10 @@ class TestNominationSCP : public SCPDriver
     static uint32_t const MAX_TIMEOUT_MS = (30 * 60) * 1000;
 
     std::chrono::milliseconds
-    computeTimeout(uint32 roundNumber, bool isNomination) override
+    computeTimeout(uint32 roundNumber) override
     {
-        int initialTimeoutMS;
-        int incrementMS;
-
-        if (isNomination)
-        {
-            initialTimeoutMS = mInitialNominationTimeoutMS;
-            incrementMS = mIncrementNominationTimeoutMS;
-        }
-        else
-        {
-            initialTimeoutMS = mInitialBallotTimeoutMS;
-            incrementMS = mIncrementBallotTimeoutMS;
-        }
+        int initialTimeoutMS = mInitialBallotTimeoutMS;
+        int incrementMS = mIncrementBallotTimeoutMS;
 
         int timeoutMS = initialTimeoutMS + (roundNumber - 1) * incrementMS;
         if (timeoutMS > MAX_TIMEOUT_MS)
@@ -200,7 +147,7 @@ class TestNominationSCP : public SCPDriver
 
 // Deliberately repeat the first winner in round 2, so the second call must
 // fast-forward to round 3. This catches predicting round 2's hash in isolation.
-class LeaderPreviewTestDriver : public TestNominationSCP
+class LeaderPreviewTestDriver : public TestElectionSCP
 {
   public:
     std::vector<NodeID> nodes;
@@ -208,15 +155,14 @@ class LeaderPreviewTestDriver : public TestNominationSCP
     std::set<NodeID> zeroWeight;
     size_t emitted = 0;
     size_t timers = 0;
-    std::function<void()> nominationTimeout;
 
     LeaderPreviewTestDriver(NodeID const& local, SCPQuorumSet const& qset)
-        : TestNominationSCP(local, qset), nodes(qset.validators)
+        : TestElectionSCP(local, qset), nodes(qset.validators)
     {
     }
 
     uint64
-    getNodeWeight(NodeID const& id, SCPQuorumSet const&, bool) const override
+    getNodeWeight(NodeID const& id) const override
     {
         return zeroWeight.count(id) ? 0 : UINT64_MAX;
     }
@@ -244,15 +190,10 @@ class LeaderPreviewTestDriver : public TestNominationSCP
                std::function<void()> cb) override
     {
         ++timers;
-        if (timerID == Slot::NOMINATION_TIMER)
-        {
-            nominationTimeout = std::move(cb);
-        }
     }
 };
 
-TEST_CASE("nomination leader preview has no protocol side effects",
-          "[scp][early-nomination]")
+TEST_CASE("leader preview has no protocol side effects", "[scp][leader]")
 {
     SIMULATION_CREATE_NODE(0);
     SIMULATION_CREATE_NODE(1);
@@ -260,135 +201,22 @@ TEST_CASE("nomination leader preview has no protocol side effects",
     SCPQuorumSet qset;
     qset.threshold = 2;
     qset.validators = {v0NodeID, v1NodeID, v2NodeID};
-    // The local node is the *second* leader. Merely preparing its value must
-    // not cause it to vote before the actual nomination timeout.
+    // The local node appears in a later round. Previewing the schedule must
+    // not create a ballot, emit a vote, or arm a timer.
     LeaderPreviewTestDriver driver(v1NodeID, qset);
     auto& scp = driver.mSCP;
     Value previous{42}, value{43};
-    auto slot = std::make_shared<Slot>(7, scp);
-    auto const first = scp.predictNominationLeaders(7, previous, 1);
-    auto const firstTwo = scp.predictNominationLeaders(7, previous, 2);
+    auto const first = scp.predictLeaders(7, previous, 1);
+    auto const firstTwo = scp.predictLeaders(7, previous, 2);
     REQUIRE(first == std::set<NodeID>{v0NodeID});
     REQUIRE(firstTwo == std::set<NodeID>{v0NodeID, v1NodeID});
+    REQUIRE(scp.electLeader(7, previous) == v0NodeID);
     REQUIRE(scp.getKnownSlotsCount() == 0);
-    REQUIRE(slot->getNominationLeaders().empty());
     REQUIRE(driver.emitted == 0);
     REQUIRE(driver.timers == 0);
-
-    size_t builds = 0;
-    slot->nominate(
-        [&]() {
-            ++builds;
-            return std::make_shared<ValueWrapper>(value);
-        },
-        previous, false);
-    REQUIRE(builds == 0);
-    REQUIRE(slot->getNominationLeaders() == first);
-    REQUIRE(driver.emitted == 0);
-    REQUIRE(driver.timers == 1);
-    // Preview again after nomination has started: it still changes no state.
-    REQUIRE(scp.predictNominationLeaders(7, previous, 2) == firstTwo);
-    REQUIRE(slot->getNominationLeaders() == first);
-    REQUIRE(driver.timers == 1);
-    auto timeout = std::move(driver.nominationTimeout);
-    REQUIRE(timeout);
-    timeout();
-    REQUIRE(slot->getNominationLeaders() == firstTwo);
-    REQUIRE(driver.emitted == 1);
-    REQUIRE(driver.timers == 2);
-    REQUIRE(builds == 1);
-    timeout = std::move(driver.nominationTimeout);
-    REQUIRE(timeout);
-    timeout();
-    REQUIRE(builds == 1);
 }
 
-TEST_CASE("lazy nomination follows leaders and handles unavailable values",
-          "[scp][early-nomination]")
-{
-    SIMULATION_CREATE_NODE(0);
-    SIMULATION_CREATE_NODE(1);
-    SIMULATION_CREATE_NODE(2);
-    SCPQuorumSet qset;
-    qset.threshold = 3;
-    qset.validators = {v0NodeID, v1NodeID, v2NodeID};
-    LeaderPreviewTestDriver driver(v1NodeID, qset);
-    auto& scp = driver.mSCP;
-    Value previous{42}, value{43};
-    size_t builds = 0;
-    bool available = true;
-    bool stopWhileBuilding = false;
-    NominationValueSupplier makeValue = [&]() -> ValueWrapperPtr {
-        ++builds;
-        if (stopWhileBuilding)
-        {
-            scp.stopNomination(7);
-        }
-        return available ? std::make_shared<ValueWrapper>(value) : nullptr;
-    };
-
-    SECTION("a follower votes for the leader without constructing a value")
-    {
-        SCPEnvelope envelope;
-        envelope.statement.nodeID = v0NodeID;
-        envelope.statement.slotIndex = 7;
-        envelope.statement.pledges.type(SCP_ST_NOMINATE);
-        auto& nom = envelope.statement.pledges.nominate();
-        nom.quorumSetHash = sha256(xdr::xdr_to_opaque(qset));
-        nom.votes.push_back(value);
-        REQUIRE(scp.receiveEnvelope(driver.wrapEnvelope(envelope)) ==
-                SCP::VALID);
-        REQUIRE(scp.nominate(7, makeValue, previous));
-        REQUIRE(builds == 0);
-        REQUIRE(driver.emitted == 1);
-        auto timeout = std::move(driver.nominationTimeout);
-        timeout();
-        REQUIRE(scp.getNominationLeaders(7).count(v1NodeID));
-        // Even a promoted leader needs no private value if it already follows
-        // a usable value from the first leader.
-        REQUIRE(builds == 0);
-    }
-    SECTION("an unavailable proposal is retried on the next timeout")
-    {
-        available = false;
-        REQUIRE(!scp.nominate(7, makeValue, previous));
-        REQUIRE(builds == 0);
-        auto timeout = std::move(driver.nominationTimeout);
-        timeout();
-        REQUIRE(builds == 1);
-        REQUIRE(driver.emitted == 0);
-        available = true;
-        timeout = std::move(driver.nominationTimeout);
-        REQUIRE(timeout);
-        timeout();
-        REQUIRE(builds == 2);
-        REQUIRE(driver.emitted == 1);
-    }
-    SECTION("stopping nomination during construction cannot emit or rearm")
-    {
-        stopWhileBuilding = true;
-        scp.nominate(7, makeValue, previous);
-        REQUIRE(builds == 0);
-        auto timeout = std::move(driver.nominationTimeout);
-        timeout();
-        REQUIRE(builds == 1);
-        REQUIRE(driver.emitted == 0);
-        REQUIRE(driver.timers == 1);
-    }
-    SECTION("a stopped follower never constructs a proposal")
-    {
-        scp.nominate(7, makeValue, previous);
-        scp.stopNomination(7);
-        auto timeout = std::move(driver.nominationTimeout);
-        timeout();
-        REQUIRE(builds == 0);
-        REQUIRE(driver.emitted == 0);
-        REQUIRE(driver.timers == 1);
-    }
-}
-
-TEST_CASE("nomination leader preview preserves ties and zero weights",
-          "[scp][early-nomination]")
+TEST_CASE("leader preview preserves ties and zero weights", "[scp][leader]")
 {
     SIMULATION_CREATE_NODE(0);
     SIMULATION_CREATE_NODE(1);
@@ -401,440 +229,114 @@ TEST_CASE("nomination leader preview preserves ties and zero weights",
     SECTION("ties may elect more than two nodes in the first two calls")
     {
         driver.tie = true;
-        REQUIRE(driver.mSCP.predictNominationLeaders(7, previous, 1) ==
+        REQUIRE(driver.mSCP.predictLeaders(7, previous, 1) ==
                 std::set<NodeID>{v0NodeID, v2NodeID});
-        REQUIRE(driver.mSCP.predictNominationLeaders(7, previous, 2) ==
+        REQUIRE(driver.mSCP.predictLeaders(7, previous, 2) ==
                 std::set<NodeID>{v0NodeID, v1NodeID, v2NodeID});
     }
     SECTION("zero weight winners are excluded, including self")
     {
         driver.zeroWeight = {v0NodeID, v1NodeID};
-        REQUIRE(driver.mSCP.predictNominationLeaders(7, previous, 2) ==
+        REQUIRE(driver.mSCP.predictLeaders(7, previous, 2) ==
                 std::set<NodeID>{v2NodeID});
     }
     SECTION("no eligible nodes")
     {
         driver.zeroWeight = {v0NodeID, v1NodeID, v2NodeID};
-        REQUIRE(driver.mSCP.predictNominationLeaders(7, previous, 2).empty());
+        REQUIRE(driver.mSCP.predictLeaders(7, previous, 2).empty());
     }
     REQUIRE(driver.emitted == 0);
     REQUIRE(driver.timers == 0);
     REQUIRE(driver.mSCP.getKnownSlotsCount() == 0);
 }
 
-TEST_CASE("nomination weight", "[scp]")
+TEST_CASE("leader election agrees across observers and quorum shapes",
+          "[scp][leader-ballot][leader]")
 {
-    SIMULATION_CREATE_NODE(0);
-    SIMULATION_CREATE_NODE(1);
-    SIMULATION_CREATE_NODE(2);
-    SIMULATION_CREATE_NODE(3);
-    SIMULATION_CREATE_NODE(4);
-    SIMULATION_CREATE_NODE(5);
-
-    SCPQuorumSet qSet;
-    qSet.threshold = 3;
-    qSet.validators.push_back(v0NodeID);
-    qSet.validators.push_back(v1NodeID);
-    qSet.validators.push_back(v2NodeID);
-    qSet.validators.push_back(v3NodeID);
-
-    TestNominationSCP const nomSCP(v0NodeID, qSet);
-
-    uint64 result = nomSCP.getNodeWeight(v2NodeID, qSet, false);
-
-    REQUIRE(isNear(result, .75));
-
-    result = nomSCP.getNodeWeight(v4NodeID, qSet, false);
-    REQUIRE(result == 0);
-
-    SCPQuorumSet iQSet;
-    iQSet.threshold = 1;
-    iQSet.validators.push_back(v4NodeID);
-    iQSet.validators.push_back(v5NodeID);
-    qSet.innerSets.push_back(iQSet);
-
-    result = nomSCP.getNodeWeight(v4NodeID, qSet, false);
-
-    REQUIRE(isNear(result, .6 * .5));
+    std::vector<NodeID> ids;
+    for (int i = 0; i < 5; ++i)
+        ids.push_back(
+            SecretKey::fromSeed(sha256("leader-election-" + std::to_string(i)))
+                .getPublicKey());
+    SCPQuorumSet qset;
+    qset.threshold = 4;
+    qset.validators.assign(ids.begin(), ids.end());
+    std::vector<std::unique_ptr<TestElectionSCP>> nodes;
+    for (size_t i = 0; i < ids.size(); ++i)
+    {
+        auto local = qset;
+        std::rotate(local.validators.begin(), local.validators.begin() + i,
+                    local.validators.end());
+        nodes.emplace_back(std::make_unique<TestElectionSCP>(ids[i], local));
+    }
+    std::set<NodeID> winners;
+    for (uint64 slot = 1; slot <= 256; ++slot)
+    {
+        for (auto previous : {Value{1}, Value{2}, Value{3}})
+        {
+            auto winner = nodes[0]->mSCP.electLeader(slot, previous);
+            winners.insert(winner);
+            for (auto& node : nodes)
+            {
+                REQUIRE(node->mSCP.electLeader(slot, previous) == winner);
+                REQUIRE(node->mSCP.getKnownSlotsCount() == 0);
+            }
+        }
+    }
+    REQUIRE(winners.size() == ids.size());
 }
 
-class NominationTestHandler : public NominationProtocol
+TEST_CASE("weighted leader election agrees across validators and watchers",
+          "[scp][leader-ballot][leader]")
 {
-  public:
-    NominationTestHandler(Slot& s) : NominationProtocol(s)
+    class WeightedDriver : public TestElectionSCP
     {
-    }
-
-    void
-    setPreviousValue(Value const& v)
-    {
-        mPreviousValue = v;
-    }
-
-    void
-    setRoundNumber(int32 n)
-    {
-        mRoundNumber = n;
-    }
-
-    void
-    updateRoundLeaders()
-    {
-        NominationProtocol::updateRoundLeaders();
-    }
-
-    std::set<NodeID>&
-    getRoundLeaders()
-    {
-        return mRoundLeaders;
-    }
-
-    uint64
-    getNodePriority(NodeID const& nodeID, SCPQuorumSet const& qset)
-    {
-        return NominationProtocol::getNodePriority(nodeID, qset);
-    }
-};
-
-// A test SCPDriver that allows specification of nodes with 0 weight.
-class ZeroWeightTestNominationSCP : public TestNominationSCP
-{
-  public:
-    std::set<NodeID> mZeroWeightNodes;
-
-    ZeroWeightTestNominationSCP(NodeID const& nodeID,
-                                SCPQuorumSet const& qSetLocal,
-                                std::set<NodeID> const& zeroWeightNodes)
-        : TestNominationSCP(nodeID, qSetLocal)
-        , mZeroWeightNodes(zeroWeightNodes)
-    {
-    }
-
-    uint64
-    getNodeWeight(NodeID const& nodeID, SCPQuorumSet const& qset,
-                  bool isLocalNode) const override
-    {
-        if (mZeroWeightNodes.count(nodeID))
+      public:
+        std::map<NodeID, uint64> weights;
+        WeightedDriver(NodeID const& id, SCPQuorumSet const& qset)
+            : TestElectionSCP(id, qset)
         {
-            return 0;
         }
-        return TestNominationSCP::getNodeWeight(nodeID, qset, isLocalNode);
-    }
-};
-
-static SCPQuorumSet
-makeQSet(std::vector<NodeID> const& nodeIDs, int threshold, int total,
-         int offset)
-{
-    SCPQuorumSet qSet;
-    qSet.threshold = threshold;
-    for (int i = 0; i < total; i++)
-    {
-        qSet.validators.push_back(nodeIDs[i + offset]);
-    }
-    return qSet;
-}
-
-TEST_CASE("updateRoundLeaders handles zero weight nodes", "[scp]")
-{
-    SIMULATION_CREATE_NODE(0);
-    SIMULATION_CREATE_NODE(1);
-    SIMULATION_CREATE_NODE(2);
-
-    // 3 nodes total: v0 (local), v1 (normal weight), v2 (zero weight).
-    SCPQuorumSet qSet;
-    qSet.threshold = 2;
-    qSet.validators.push_back(v0NodeID);
-    qSet.validators.push_back(v1NodeID);
-    qSet.validators.push_back(v2NodeID);
-
-    auto runScenario = [&](std::set<NodeID> const& zeroWeightNodes) {
-        ZeroWeightTestNominationSCP nomSCP(v0NodeID, qSet, zeroWeightNodes);
-
-        Slot slot(0, nomSCP.mSCP);
-        NominationTestHandler nom(slot);
-
-        Value v;
-        v.emplace_back(uint8_t(42));
-        nom.setPreviousValue(v);
-
-        // Ensure that even with many more rounds than validators,
-        // `updateRoundLeaders` always terminates and never picks a zero-weight
-        // node as leader.
-        int const maxRounds = 20;
-        for (int i = 0; i < maxRounds; i++)
+        uint64
+        getNodeWeight(NodeID const& id) const override
         {
-            nom.setRoundNumber(i);
-            nom.updateRoundLeaders();
+            return weights.at(id);
         }
-
-        return nom.getRoundLeaders();
     };
-
-    SECTION("non-local zero-weight validator is excluded from round leaders")
+    std::vector<NodeID> ids;
+    for (int i = 0; i < 5; ++i)
+        ids.push_back(SecretKey::fromSeed(
+                          sha256("weighted-election-" + std::to_string(i)))
+                          .getPublicKey());
+    SCPQuorumSet qset;
+    qset.threshold = 4;
+    qset.validators.assign(ids.begin(), ids.end());
+    std::vector<std::unique_ptr<WeightedDriver>> nodes;
+    for (auto const& id : ids)
     {
-        // v2 simulates a LOW-quality validator with zero weight, mimicking
-        // HerderSCPDriver::getNodeWeight behavior for LOW-quality nodes.
-        auto const& leaders = runScenario({v2NodeID});
-        REQUIRE(leaders.count(v0NodeID) == 1);
-        REQUIRE(leaders.count(v1NodeID) == 1);
-        REQUIRE(leaders.count(v2NodeID) == 0);
-        REQUIRE(leaders.size() == 2);
+        auto node = std::make_unique<WeightedDriver>(id, qset);
+        for (size_t i = 0; i < ids.size(); ++i)
+            node->weights[ids[i]] = i == 4 ? 0 : UINT64_MAX / (i + 1);
+        nodes.push_back(std::move(node));
     }
-
-    SECTION("local zero-weight validator is excluded from round leaders")
+    std::set<NodeID> winners;
+    for (uint64 slot = 1; slot <= 256; ++slot)
     {
-        auto const& leaders = runScenario({v0NodeID});
-        REQUIRE(leaders.count(v0NodeID) == 0);
-        REQUIRE(leaders.count(v1NodeID) == 1);
-        REQUIRE(leaders.count(v2NodeID) == 1);
-        REQUIRE(leaders.size() == 2);
-    }
-}
-
-// this test case display statistical information on the priority function used
-// by nomination
-TEST_CASE("nomination weight stats", "[scp][!hide]")
-{
-    SIMULATION_CREATE_NODE(0);
-    SIMULATION_CREATE_NODE(1);
-    SIMULATION_CREATE_NODE(2);
-
-    SIMULATION_CREATE_NODE(3);
-    SIMULATION_CREATE_NODE(4);
-    SIMULATION_CREATE_NODE(5);
-    SIMULATION_CREATE_NODE(6);
-
-    std::vector<NodeID> nodeIDs = {v0NodeID, v1NodeID, v2NodeID, v3NodeID,
-                                   v4NodeID, v5NodeID, v6NodeID};
-
-    int const totalSlots = 1000;
-    int const maxRoundPerSlot = 5; // 5 -> 15 seconds
-    int const totalRounds = totalSlots * maxRoundPerSlot;
-
-    auto runTests = [&](SCPQuorumSet qSet) {
-        std::map<NodeID, int> wins;
-
-        TestNominationSCP nomSCP(v0NodeID, qSet);
-        for (int s = 0; s < totalSlots; s++)
+        Value previous{42};
+        auto leader = nodes[0]->mSCP.electLeader(slot, previous);
+        REQUIRE(leader != ids.back());
+        winners.insert(leader);
+        for (auto& node : nodes)
         {
-            Slot slot(s, nomSCP.mSCP);
-
-            NominationTestHandler nom(slot);
-
-            Value v;
-            v.emplace_back(uint8_t(s)); // anything will do as a value
-
-            nom.setPreviousValue(v);
-
-            for (int i = 0; i < maxRoundPerSlot; i++)
-            {
-                nom.setRoundNumber(i);
-                nom.updateRoundLeaders();
-                auto& l = nom.getRoundLeaders();
-                REQUIRE(!l.empty());
-                for (auto& w : l)
-                {
-                    wins[w]++;
-                }
-            }
-        }
-        return wins;
-    };
-
-    SECTION("flat quorum")
-    {
-        auto flatTest = [&](int threshold, int total) {
-            auto qSet = makeQSet(nodeIDs, threshold, total, 0);
-
-            auto wins = runTests(qSet);
-
-            for (auto& w : wins)
-            {
-                double stats = double(w.second * 100) / double(totalRounds);
-                CLOG_INFO(SCP, "Got {}{}", stats,
-                          ((v0NodeID == w.first) ? " LOCAL" : ""));
-            }
-        };
-
-        SECTION("3 out of 5")
-        {
-            flatTest(3, 5);
-        }
-        SECTION("2 out of 3")
-        {
-            flatTest(2, 3);
+            REQUIRE(node->mSCP.electLeader(slot, previous) == leader);
+            auto watcher = stellar::predictLeaders(
+                *node, slot, previous, qset,
+                SecretKey::fromSeed(sha256("watcher")).getPublicKey(), false,
+                1);
+            REQUIRE(*watcher.begin() == leader);
+            REQUIRE(node->mSCP.getKnownSlotsCount() == 0);
         }
     }
-    SECTION("hierarchy")
-    {
-        auto qSet = makeQSet(nodeIDs, 3, 4, 0);
-
-        auto qSetInner = makeQSet(nodeIDs, 2, 3, 4);
-        qSet.innerSets.emplace_back(qSetInner);
-
-        auto wins = runTests(qSet);
-
-        for (auto& w : wins)
-        {
-            double stats = double(w.second * 100) / double(totalRounds);
-            bool outer =
-                std::any_of(qSet.validators.begin(), qSet.validators.end(),
-                            [&](auto const& k) { return k == w.first; });
-            CLOG_INFO(SCP, "Got {} {}", stats,
-                      ((v0NodeID == w.first) ? "LOCAL"
-                                             : (outer ? "OUTER" : "INNER")));
-        }
-    }
-}
-
-TEST_CASE("nomination two nodes win stats", "[scp][!hide]")
-{
-    int const nbRoundsForStats = 9;
-    SIMULATION_CREATE_NODE(0);
-    SIMULATION_CREATE_NODE(1);
-    SIMULATION_CREATE_NODE(2);
-
-    SIMULATION_CREATE_NODE(3);
-    SIMULATION_CREATE_NODE(4);
-    SIMULATION_CREATE_NODE(5);
-    SIMULATION_CREATE_NODE(6);
-
-    std::vector<NodeID> nodeIDs = {v0NodeID, v1NodeID, v2NodeID, v3NodeID,
-                                   v4NodeID, v5NodeID, v6NodeID};
-
-    int const totalIter = 10000;
-
-    // maxRounds is the number of rounds to evaluate in a row
-    // the iteration is considered successful if validators could
-    // agree on what to nominate before maxRounds is reached
-    auto nominationLeaders = [&](int maxRounds, SCPQuorumSet qSetNode0,
-                                 SCPQuorumSet qSetNode1) {
-        TestNominationSCP nomSCP0(v0NodeID, qSetNode0);
-        TestNominationSCP nomSCP1(v1NodeID, qSetNode1);
-
-        int tot = 0;
-        for (int g = 0; g < totalIter; g++)
-        {
-            Slot slot0(0, nomSCP0.mSCP);
-            NominationTestHandler nom0(slot0);
-
-            Slot slot1(0, nomSCP1.mSCP);
-            NominationTestHandler nom1(slot1);
-
-            Value v;
-            v.emplace_back(uint8_t(g));
-            nom0.setPreviousValue(v);
-            nom1.setPreviousValue(v);
-
-            bool res = true;
-
-            bool v0Voted = false;
-            bool v1Voted = false;
-
-            int r = 0;
-            do
-            {
-                nom0.setRoundNumber(r);
-                nom1.setRoundNumber(r);
-                nom0.updateRoundLeaders();
-                nom1.updateRoundLeaders();
-
-                auto& l0 = nom0.getRoundLeaders();
-                REQUIRE(!l0.empty());
-                auto& l1 = nom1.getRoundLeaders();
-                REQUIRE(!l1.empty());
-
-                auto updateVoted = [&](auto const& id, auto const& leaders,
-                                       bool& voted) {
-                    if (!voted)
-                    {
-                        voted = std::find(leaders.begin(), leaders.end(), id) !=
-                                leaders.end();
-                    }
-                };
-
-                // checks if id voted (any past round, including this one)
-                // AND id is a leader this round
-                auto findNode = [](auto const& id, bool idVoted,
-                                   auto const& otherLeaders) {
-                    bool r = (idVoted && std::find(otherLeaders.begin(),
-                                                   otherLeaders.end(),
-                                                   id) != otherLeaders.end());
-                    return r;
-                };
-
-                updateVoted(v0NodeID, l0, v0Voted);
-                updateVoted(v1NodeID, l1, v1Voted);
-
-                // either both vote for v0 or both vote for v1
-                res = findNode(v0NodeID, v0Voted, l1);
-                res = res || findNode(v1NodeID, v1Voted, l0);
-            } while (!res && ++r < maxRounds);
-
-            tot += res ? 1 : 0;
-        }
-        return tot;
-    };
-
-    SECTION("flat quorum")
-    {
-        // test using the same quorum on all nodes
-        auto flatTest = [&](int threshold, int total) {
-            auto qSet = makeQSet(nodeIDs, threshold, total, 0);
-
-            for (int maxRounds = 1; maxRounds <= nbRoundsForStats; maxRounds++)
-            {
-                int tot = nominationLeaders(maxRounds, qSet, qSet);
-                double stats = double(tot * 100) / double(totalIter);
-                CLOG_INFO(SCP, "Win rate for {} : {}", maxRounds, stats);
-            }
-        };
-
-        SECTION("3 out of 5")
-        {
-            flatTest(3, 5);
-        }
-        SECTION("2 out of 3")
-        {
-            flatTest(2, 3);
-        }
-    }
-
-    SECTION("hierarchy")
-    {
-        SECTION("same qSet")
-        {
-            auto qSet = makeQSet(nodeIDs, 3, 4, 0);
-
-            auto qSetInner = makeQSet(nodeIDs, 2, 3, 4);
-            qSet.innerSets.emplace_back(qSetInner);
-
-            for (int maxRounds = 1; maxRounds <= nbRoundsForStats; maxRounds++)
-            {
-                int tot = nominationLeaders(maxRounds, qSet, qSet);
-                double stats = double(tot * 100) / double(totalIter);
-                CLOG_INFO(SCP, "Win rate for {} : {}", maxRounds, stats);
-            }
-        }
-        SECTION("v0 is inner node for v1")
-        {
-            auto qSet0 = makeQSet(nodeIDs, 3, 4, 0);
-            auto qSetInner0 = makeQSet(nodeIDs, 2, 3, 4);
-            qSet0.innerSets.emplace_back(qSetInner0);
-
-            // v1's qset: we move v0 into the inner set
-            auto qSet1 = qSet0;
-            REQUIRE(qSet1.validators[0] == v0NodeID);
-            std::swap(qSet1.validators[0], qSet1.innerSets[0].validators[0]);
-
-            for (int maxRounds = 1; maxRounds <= nbRoundsForStats; maxRounds++)
-            {
-                int tot = nominationLeaders(maxRounds, qSet0, qSet1);
-                double stats = double(tot * 100) / double(totalIter);
-                CLOG_INFO(SCP, "Win rate for {} : {}", maxRounds, stats);
-            }
-        }
-    }
+    REQUIRE(winners.size() == 4);
 }
 }

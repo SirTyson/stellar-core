@@ -248,6 +248,16 @@ BallotProtocol::processEnvelope(SCPEnvelopeWrapperPtr envelope, bool self)
 
         recordEnvelope(envelope);
         advanceSlot(statement);
+        // Choosing the initial ballot is application policy. The driver has
+        // validated the proposer; never replace a ballot or override federated
+        // agreement with an unsolicited proposal.
+        if (!self && validationRes >= SCPDriver::kStructurallyValidValue &&
+            !mCurrentBallot && mPhase == SCP_PHASE_PREPARE &&
+            getLocalNode()->isValidator() && mSlot.isFullyValidated())
+        {
+            startBallot(mSlot.getSCPDriver().wrapValue(
+                getWorkingBallot(statement).value));
+        }
         return SCP::EnvelopeState::VALID;
     }
 
@@ -345,12 +355,31 @@ BallotProtocol::isStatementSane(SCPStatement const& st, bool self)
 }
 
 bool
+BallotProtocol::startBallot(ValueWrapperPtr value)
+{
+    releaseAssert(value);
+    if (mCurrentBallot || mPhase != SCP_PHASE_PREPARE ||
+        !getLocalNode()->isValidator() || !mSlot.isFullyValidated())
+    {
+        return false;
+    }
+    if (mSlot.getSCPDriver().validateValue(mSlot.getSlotIndex(),
+                                           value->getValue()) <
+        SCPDriver::kStructurallyValidValue)
+    {
+        return false;
+    }
+    mProposal = std::move(value);
+    return bumpState(mProposal->getValue(), false);
+}
+
+bool
 BallotProtocol::abandonBallot(uint32 n)
 {
     ZoneScoped;
     CLOG_TRACE(SCP, "BallotProtocol::abandonBallot");
     bool res = false;
-    auto v = mSlot.getLatestCompositeCandidate();
+    auto v = mProposal;
 
     if (!v || v->getValue().empty())
     {
@@ -384,7 +413,7 @@ BallotProtocol::maybeReplaceValueWithEmptyTxSet(Value& v) const
 
     // Check validation value
     auto validationLevel =
-        mSlot.getSCPDriver().validateValue(mSlot.getSlotIndex(), v, false);
+        mSlot.getSCPDriver().validateValue(mSlot.getSlotIndex(), v);
 
     if (validationLevel != SCPDriver::kStructurallyValidValue)
     {
@@ -586,7 +615,7 @@ void
 BallotProtocol::startBallotProtocolTimer()
 {
     std::chrono::milliseconds timeout = mSlot.getSCPDriver().computeTimeout(
-        mCurrentBallot->getBallot().counter, /*isNomination=*/false);
+        mCurrentBallot->getBallot().counter);
 
     std::shared_ptr<Slot> slot = mSlot.shared_from_this();
     mSlot.getSCPDriver().setupTimer(
@@ -1162,7 +1191,7 @@ BallotProtocol::setConfirmPrepared(SCPBallot const& newC, SCPBallot const& newH)
             // We must ensure the transaction set value is fully validated
             // before we can vote to commit it.
             auto validationLevel = mSlot.getSCPDriver().validateValue(
-                mSlot.getSlotIndex(), newC.value, false);
+                mSlot.getSlotIndex(), newC.value);
 
             if (validationLevel == SCPDriver::kStructurallyValidValue)
             {
@@ -1437,8 +1466,8 @@ BallotProtocol::attemptAcceptCommit(SCPStatement const& hint)
 void
 BallotProtocol::throwIfValueInvalidForConfirmCommit(Value const& value)
 {
-    auto validationLevel = mSlot.getSCPDriver().validateValue(
-        mSlot.getSlotIndex(), value, /*nomination=*/false);
+    auto validationLevel =
+        mSlot.getSCPDriver().validateValue(mSlot.getSlotIndex(), value);
 
     if (validationLevel == SCPDriver::kFullyValidatedValue ||
         validationLevel == SCPDriver::kMaybeValidNotCurrentValue)
@@ -1684,8 +1713,6 @@ BallotProtocol::setConfirmCommit(SCPBallot const& c, SCPBallot const& h)
     mPhase = SCP_PHASE_EXTERNALIZE;
 
     emitCurrentStateStatement();
-
-    mSlot.stopNomination();
 
     mSlot.getSCPDriver().valueExternalized(mSlot.getSlotIndex(),
                                            mCommit->getBallot().value);
@@ -2139,8 +2166,8 @@ BallotProtocol::statementValidationLevel(SCPStatement const& st)
         [&](SCPDriver::ValidationLevel lv, stellar::Value const& v) {
             if (lv > SCPDriver::kInvalidValue)
             {
-                auto tr = mSlot.getSCPDriver().validateValue(
-                    mSlot.getSlotIndex(), v, false);
+                auto tr =
+                    mSlot.getSCPDriver().validateValue(mSlot.getSlotIndex(), v);
                 lv = std::min(tr, lv);
             }
             return lv;

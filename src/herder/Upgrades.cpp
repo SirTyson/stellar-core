@@ -43,8 +43,8 @@ namespace
 constexpr uint32_t UPGRADE_VERSION = 1;
 
 // The version of upgrade parameters serialization that introduced the
-// nominationtimeoutlimit and expirationminutes fields.
-constexpr uint32_t UPGRADE_VERSION_WITH_NOMINATION_STRIPPING = 1;
+// expirationminutes field.
+constexpr uint32_t UPGRADE_VERSION_WITH_EXPIRATION = 1;
 }
 
 namespace cereal
@@ -70,7 +70,6 @@ save(JSONOutputArchive& ar, stellar::Upgrades::UpgradeParameters const& p)
     }
     ar(make_nvp("configupgradesetkey", configUpgradeKeyStr));
     ar(make_nvp("maxsorobantxsetsize", p.mMaxSorobanTxSetSize));
-    ar(make_nvp("nominationtimeoutlimit", p.mNominationTimeoutLimit));
 
     auto const expirationMinutesUint =
         p.mExpirationMinutes.has_value()
@@ -157,9 +156,8 @@ load(JSONInputArchive& ar, stellar::Upgrades::UpgradeParameters& o)
         o.mConfigUpgradeSetKey.reset();
     }
 
-    if (upgradeVersion >= UPGRADE_VERSION_WITH_NOMINATION_STRIPPING)
+    if (upgradeVersion >= UPGRADE_VERSION_WITH_EXPIRATION)
     {
-        load_nvp(ar, "nominationtimeoutlimit", o.mNominationTimeoutLimit);
 
         std::optional<uint32_t> expirationMinutesUint;
         load_nvp(ar, "expirationminutes", expirationMinutesUint);
@@ -498,7 +496,6 @@ Upgrades::removeUpgrades(std::vector<UpgradeType>::const_iterator beginUpdates,
         resetParamIfSet(res.mMaxSorobanTxSetSize);
         resetParamIfSet(res.mBaseReserve);
         resetParamIfSet(res.mFlags);
-        resetParamIfSet(res.mNominationTimeoutLimit);
         resetParamIfSet(res.mExpirationMinutes);
         if (res.mConfigUpgradeSetKey)
         {
@@ -643,66 +640,13 @@ Upgrades::isValidForApply(UpgradeType const& opaqueUpgrade,
 }
 
 bool
-Upgrades::isValidForNomination(
-    LedgerUpgrade const& upgrade,
-    CheckValidLedgerViewWrapper const& ledgerView) const
-{
-    if (!timeForUpgrade(
-            getApplyTime(ledgerView.getLedgerHeader().current().scpValue)))
-    {
-        return false;
-    }
-
-    switch (upgrade.type())
-    {
-    case LEDGER_UPGRADE_VERSION:
-        return mParams.mProtocolVersion &&
-               (upgrade.newLedgerVersion() == *mParams.mProtocolVersion);
-    case LEDGER_UPGRADE_BASE_FEE:
-        return mParams.mBaseFee && (upgrade.newBaseFee() == *mParams.mBaseFee);
-    case LEDGER_UPGRADE_MAX_TX_SET_SIZE:
-        return mParams.mMaxTxSetSize &&
-               (upgrade.newMaxTxSetSize() == *mParams.mMaxTxSetSize);
-    case LEDGER_UPGRADE_BASE_RESERVE:
-        return mParams.mBaseReserve &&
-               (upgrade.newBaseReserve() == *mParams.mBaseReserve);
-    case LEDGER_UPGRADE_FLAGS:
-        return mParams.mFlags && (upgrade.newFlags() == *mParams.mFlags);
-    case LEDGER_UPGRADE_CONFIG:
-    {
-        if (!mParams.mConfigUpgradeSetKey)
-        {
-            return false;
-        }
-
-        auto cfgUpgrade =
-            ConfigUpgradeSetFrame::makeFromKey(ledgerView, upgrade.newConfig());
-        return cfgUpgrade &&
-               cfgUpgrade->isConsistentWith(ConfigUpgradeSetFrame::makeFromKey(
-                   ledgerView, *mParams.mConfigUpgradeSetKey));
-    }
-    case LEDGER_UPGRADE_MAX_SOROBAN_TX_SET_SIZE:
-        return mParams.mMaxSorobanTxSetSize &&
-               (upgrade.newMaxSorobanTxSetSize() ==
-                *mParams.mMaxSorobanTxSetSize);
-    default:
-        return false;
-    }
-}
-
-bool
 Upgrades::isValid(UpgradeType const& upgrade, LedgerUpgradeType& upgradeType,
-                  bool nomination, Application& app) const
+                  Application& app) const
 {
     LedgerUpgrade lupgrade;
     auto ledgerView = CheckValidLedgerViewWrapper(app);
     bool res = isValidForApply(upgrade, lupgrade, app, ledgerView) ==
                UpgradeValidity::VALID;
-
-    if (nomination)
-    {
-        res = res && isValidForNomination(lupgrade, ledgerView);
-    }
 
     if (res)
     {

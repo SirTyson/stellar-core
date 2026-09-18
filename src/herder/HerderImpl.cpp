@@ -3,6 +3,7 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "herder/HerderImpl.h"
+#include <thread>
 
 #include "bucket/BucketManager.h"
 #include "crypto/Hex.h"
@@ -97,6 +98,7 @@ HerderImpl::HerderImpl(Application& app)
     , mLastExternalize(app.getClock().now())
     , mTriggerTimer(app)
     , mPrepareTxSetTimer(app)
+    , mBallotRecoveryTimer(app)
     , mOutOfSyncTimer(app)
     , mTxSetGarbageCollectTimer(app)
     , mCheckForDeadNodesTimer(app)
@@ -299,6 +301,7 @@ HerderImpl::purgeOldSlots()
 void
 HerderImpl::shutdown()
 {
+    mBallotRecoveryTimer.cancel();
     discardPreparedTxSet();
     mTrackingTimer.cancel();
     mOutOfSyncTimer.cancel();
@@ -605,6 +608,15 @@ HerderImpl::outOfSyncRecovery()
         broadcast(e);
     }
 
+    rebroadcastBallot();
+    if (mLedgerManager.isSynced() && !mLedgerManager.isApplying())
+    {
+        auto slot = mLedgerManager.getLastClosedLedgerNum() + 1;
+        if (mHerderSCPDriver.isLocalLeader(slot) && !getSCP().hasBallot(slot))
+        {
+            triggerNextLedger(slot);
+        }
+    }
     getMoreSCPState();
 }
 
@@ -813,6 +825,10 @@ Herder::EnvelopeStatus
 HerderImpl::recvSCPEnvelope(SCPEnvelope const& envelope)
 {
     ZoneScoped;
+    if (envelope.statement.pledges.type() == SCP_ST_NOMINATE)
+    {
+        return Herder::ENVELOPE_STATUS_DISCARDED;
+    }
     if (mApp.getConfig().MANUAL_CLOSE)
     {
         return Herder::ENVELOPE_STATUS_DISCARDED;
@@ -1300,17 +1316,17 @@ HerderImpl::triggerAnchorFromPrepareStart(
 //    either the network itself is slow, or our clock is ahead.
 //
 //   To get a better sense of which, we also take into account
-//   nomination time, so the check becomes timeSinceNetworkLedgerStart > target
-//   + nominationBudget. The budget is measured on the steady clock from the
+//   proposal time, so the check becomes timeSinceNetworkLedgerStart > target
+//   + proposalBudget. The budget is measured on the steady clock from the
 //   local trigger to entry into ballot. This includes proposal construction
-//   and all nomination time, including unfinished rounds and delayed timer
+//   and all proposal time, including unfinished rounds and delayed timer
 //   callbacks.
 //
-//   If we think we're drifting ahead after taking nomination into account, we
+//   If we think we're drifting ahead after taking proposal into account, we
 //   fall back to prepare-start anchor, which is based on our local clock and
 //   can't drift, but is slower.
 //
-//   Note that if nomination is quick, but apply takes a long time, it still
+//   Note that if proposal is quick, but apply takes a long time, it still
 //   appears like we're ahead and we fall back to prepare-start. This isn't a
 //   problem. The prepare-start timer starts before the apply stage, so a long
 //   apply is "baked in" to the time. If apply was the bottleneck, we'll
@@ -1318,11 +1334,11 @@ HerderImpl::triggerAnchorFromPrepareStart(
 //   we're behind, so using prepare-start is identical to the network-based
 //   anchor from the perf standpoint if we really are in sync anyway.
 //
-//   This is not true for nomination. The prepare-start timer starts after
-//   nomination, so it does not reflect a long nomination. This is why we need
-//   the nomination budget in our check. If nomination took a long time and we
+//   This is not true for proposal. The prepare-start timer starts after
+//   proposal, so it does not reflect a long proposal. This is why we need
+//   the proposal budget in our check. If proposal took a long time and we
 //   fall back to the conservative timer, this is much worse from a perf
-//   perspective, as we are waiting nomination time + target time before
+//   perspective, as we are waiting proposal time + target time before
 //   starting the next ledger.
 //
 // 2. Our clock behind network: Check whether our local timer says
@@ -1336,13 +1352,13 @@ HerderImpl::triggerAnchorFromPrepareStart(
 //   anchor. This anchor is conservative and local, but it gives us a bounded
 //   trigger time even when system time is badly behind.
 //
-// 3. Clocks synced, but nomination/apply was slow: With synced clocks,
+// 3. Clocks synced, but proposal/apply was slow: With synced clocks,
 //    time since network close time is large because real time really passed,
 //    not because our system clock drifted. The goal is to avoid falling back to
 //    a conservative timer and snowballing the real delay.
 //
-//    See scenario 1: measured elapsed time accounts for slow nomination
-//    independently of system clock drift. If nomination is slow, we
+//    See scenario 1: measured elapsed time accounts for slow proposal
+//    independently of system clock drift. If proposal is slow, we
 //    can't fall back to the prepare-apply timer because it would compound the
 //    delay. If apply is slow, it doesn't matter which timer we use, they both
 //    will result in triggering immediately.
@@ -1379,7 +1395,7 @@ HerderImpl::triggerAnchorFromConsensusCloseTime(
         std::chrono::duration_cast<std::chrono::milliseconds>(now -
                                                               localBallotStart);
 
-    auto nominationBudget =
+    auto proposalBudget =
         mHerderSCPDriver.getTriggerToBallotDuration(lastIndex);
     auto logFallback = [&](char const* reason) {
         auto zero = std::chrono::milliseconds::zero();
@@ -1389,7 +1405,7 @@ HerderImpl::triggerAnchorFromConsensusCloseTime(
             "ms, trigger-to-ballot {} ms, ballot elapsed {} ms, local "
             "wait {} ms, network wait {} ms",
             lastIndex, reason, timeSinceNetworkLedgerStart.count(),
-            nominationBudget.count(), timeSinceLocalBallotStart.count(),
+            proposalBudget.count(), timeSinceLocalBallotStart.count(),
             std::max(zero, expectedClose - timeSinceLocalBallotStart).count(),
             std::max(zero, expectedClose - timeSinceNetworkLedgerStart)
                 .count());
@@ -1405,11 +1421,11 @@ HerderImpl::triggerAnchorFromConsensusCloseTime(
 
     // A timeout counts only after its callback runs, and none are counted
     // after entry into ballot. A slow fetch or busy main thread can therefore
-    // delay nomination without increasing the count. Measure elapsed time
+    // delay proposal without increasing the count. Measure elapsed time
     // directly instead of approximating it with completed timeout durations.
     // Scenario 1: if elapsed system time exceeds target plus explainable
-    // nomination delay, treat it as clock-ahead drift and use the fallback.
-    if (timeSinceNetworkLedgerStart > expectedClose + nominationBudget)
+    // proposal delay, treat it as clock-ahead drift and use the fallback.
+    if (timeSinceNetworkLedgerStart > expectedClose + proposalBudget)
     {
         return logFallback("clock ahead or slow ballot/apply");
     }
@@ -1420,6 +1436,7 @@ HerderImpl::triggerAnchorFromConsensusCloseTime(
 void
 HerderImpl::setupTriggerNextLedger()
 {
+    mProposalRetryAttempt = 0;
     discardPreparedTxSet();
     // Invariant: core proceeds to vote for the next ledger only when it's _not_
     // applying to ensure block production does not conflict with ledger close.
@@ -1462,7 +1479,7 @@ HerderImpl::setupTriggerNextLedger()
             : triggerAnchorFromPrepareStart(lastIndex, now, milliseconds);
 
     // Adjust trigger time in case node's clock has drifted.
-    // This ensures that next value to nominate is valid
+    // This ensures that next value to propose is valid
     auto triggerTime = lastLedgerStartingPoint + milliseconds;
 
     if (triggerTime < now)
@@ -1473,7 +1490,7 @@ HerderImpl::setupTriggerNextLedger()
     auto triggerOffset = std::chrono::duration_cast<std::chrono::milliseconds>(
         triggerTime - now);
 
-    // The smallest close time the next nomination may propose
+    // The smallest close time the next proposal may propose
     auto minCandidateCt =
         getConsensusTime(lcl.header.scpValue).next(lcl.header.ledgerVersion);
     auto ctOffset = ctValidityOffset(minCandidateCt, triggerOffset);
@@ -1492,15 +1509,15 @@ HerderImpl::setupTriggerNextLedger()
     if (!mApp.getConfig().MANUAL_CLOSE)
     {
         mTriggerTimer.async_wait(std::bind(&HerderImpl::triggerNextLedger, this,
-                                           static_cast<uint32_t>(nextIndex),
-                                           true),
+                                           static_cast<uint32_t>(nextIndex)),
                                  &VirtualTimer::onFailureNoop);
 
         if (getSCP().isValidator())
         {
-            auto leaders = getSCP().predictNominationLeaders(
+            auto leaders = getSCP().predictLeaders(
                 nextIndex, xdr::xdr_to_opaque(lcl.header.scpValue), 1);
-            if (leaders.count(getSCP().getLocalNodeID()))
+            if (!leaders.empty() &&
+                *leaders.begin() == getSCP().getLocalNodeID())
             {
                 // Validate against the close time we expect at the trigger,
                 // not the earlier wall-clock time at which we start work.
@@ -1653,7 +1670,7 @@ HerderImpl::setInSyncAndTriggerNextLedger()
 
     // Trigger next ledger, without requiring Herder to properly track SCP
     auto lcl = mLedgerManager.getLastClosedLedgerNum();
-    triggerNextLedger(lcl + 1, false);
+    triggerNextLedger(lcl + 1);
 }
 
 void
@@ -1672,12 +1689,7 @@ HerderImpl::prepareTxSet(uint32_t ledgerSeq, ConsensusTime closeTime)
     {
         return;
     }
-    auto const& lcl = mLedgerManager.getLastClosedLedgerHeader();
-    if (!getSCP().isValidator() ||
-        !getSCP()
-             .predictNominationLeaders(
-                 ledgerSeq, xdr::xdr_to_opaque(lcl.header.scpValue), 1)
-             .count(getSCP().getLocalNodeID()))
+    if (!mHerderSCPDriver.isLocalLeader(ledgerSeq))
     {
         return;
     }
@@ -1695,15 +1707,9 @@ HerderImpl::buildTxSet(uint32_t ledgerSeq, ConsensusTime closeTime)
     auto const lcl = mLedgerManager.getLastClosedLedgerHeader();
     releaseAssert(ledgerSeq == lcl.header.ledgerSeq + 1);
     releaseAssert(closeTime > getConsensusTime(lcl.header.scpValue));
-    bool const activeLeader = getSCP().getNominationLeaders(ledgerSeq).count(
-        getSCP().getLocalNodeID());
-    releaseAssert(activeLeader ||
-                  getSCP()
-                      .predictNominationLeaders(
-                          ledgerSeq, xdr::xdr_to_opaque(lcl.header.scpValue), 1)
-                      .count(getSCP().getLocalNodeID()));
-    CLOG_INFO(Herder, "Building TX set as {} nomination leader for ledger {}",
-              activeLeader ? "active" : "first-round", ledgerSeq);
+    releaseAssert(mHerderSCPDriver.isLocalLeader(ledgerSeq));
+    CLOG_INFO(Herder, "Building TX set as slot leader for ledger {}",
+              ledgerSeq);
     auto const closeTimeOffset =
         closeTime.toApplyTime() - getApplyTime(lcl.header.scpValue);
     TxSetXDRFrameConstPtr proposedSet;
@@ -1820,7 +1826,7 @@ HerderImpl::buildTxSet(uint32_t ledgerSeq, ConsensusTime closeTime)
 
     // The mempool does no stateful validation, so it would keep handing us the
     // transactions that just failed validation (stale sequence number, can't
-    // pay fee, expired, ...) on every nomination, crowding out valid ones.
+    // pay fee, expired, ...) on every proposal, crowding out valid ones.
     // Collect removals to apply at the trigger, except for transactions with
     // a *future* sequence number: those are chained behind a pending
     // transaction from the same account and become valid once it applies.
@@ -1870,15 +1876,12 @@ HerderImpl::buildTxSet(uint32_t ledgerSeq, ConsensusTime closeTime)
 // called to take a position during the next round
 // uses the state in LedgerManager to derive a starting position
 void
-HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
-                              bool checkTrackingSCP)
+HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger)
 {
     ZoneScoped;
     ZoneValue(static_cast<int64_t>(ledgerSeqToTrigger));
 
-    auto isTrackingValid = isTracking() || !checkTrackingSCP;
-
-    if (!isTrackingValid || !mLedgerManager.isSynced())
+    if (!mLedgerManager.isSynced())
     {
         CLOG_DEBUG(Herder, "triggerNextLedger: skipping (out of sync) : {}",
                    mApp.getStateHuman());
@@ -1906,7 +1909,7 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
         return;
     }
 
-    mHerderSCPDriver.recordNominationTrigger(ledgerSeqToTrigger);
+    mHerderSCPDriver.recordTrigger(ledgerSeqToTrigger);
 
     // We pick as next close time the current time unless it's before the last
     // close time. We don't know how much time it will take to reach consensus
@@ -1930,9 +1933,9 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
         }
         else
         {
-            CLOG_WARNING(Herder,
-                         "Herder::triggerNextLedger called twice on ledger {}",
-                         ledgerSeqToTrigger);
+            CLOG_DEBUG(Herder,
+                       "Herder::triggerNextLedger called twice on ledger {}",
+                       ledgerSeqToTrigger);
         }
     }
 
@@ -1942,41 +1945,65 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
         nextCloseTime = lclCloseTime.next(lcl.header.ledgerVersion);
     }
 
-    // Ensure we're about to nominate a value with valid close time
+    // Ensure we're about to propose a value with valid close time
     auto isCtValid =
         ctValidityOffset(nextCloseTime) == std::chrono::milliseconds::zero();
 
     if (!isCtValid)
     {
         CLOG_WARNING(Herder,
-                     "Invalid close time selected ({}), skipping nomination",
+                     "Invalid close time selected ({}), skipping proposal",
                      nextCloseTime.toString());
+        if (mHerderSCPDriver.isLocalLeader(ledgerSeqToTrigger))
+        {
+            scheduleProposalRetry(ledgerSeqToTrigger);
+        }
         return;
     }
 
     if (!getSCP().isValidator())
     {
-        CLOG_DEBUG(Herder, "Non-validating node, skipping nomination (SCP).");
+        CLOG_DEBUG(Herder, "Non-validating node, skipping proposal (SCP).");
         return;
     }
 
-    getHerderSCPDriver().recordSCPEvent(ledgerSeqToTrigger, true);
-    mHerderSCPDriver.nominate(
-        ledgerSeqToTrigger,
-        [this, ledgerSeqToTrigger, checkTrackingSCP]() {
-            return makeNominationValue(ledgerSeqToTrigger, checkTrackingSCP);
-        },
-        lcl.header.scpValue);
+    if (!mHerderSCPDriver.isLocalLeader(ledgerSeqToTrigger) ||
+        getSCP().hasBallot(ledgerSeqToTrigger))
+    {
+        return;
+    }
+    auto value = makeProposal(ledgerSeqToTrigger);
+    if (value)
+    {
+        CLOG_INFO(Herder, "Starting leader ballot for ledger {}",
+                  ledgerSeqToTrigger);
+        StellarValue proposal;
+        xdr::xdr_from_opaque(value->getValue(), proposal);
+#ifdef BUILD_TESTS
+        if (!mApp.getConfig().TESTING_PROPOSE_RANDOM_TX_SET_HASH)
+#endif
+        {
+            mApp.getOverlayManager().broadcastTxSet(proposal.txSetHash,
+                                                    ledgerSeqToTrigger);
+        }
+#ifdef BUILD_TESTS
+        std::this_thread::sleep_for(
+            mApp.getConfig().ARTIFICIALLY_DELAY_PROPOSAL_FOR_TESTING);
+#endif
+        getSCP().startBallot(ledgerSeqToTrigger, value);
+    }
+    else if (ledgerSeqToTrigger == mLedgerManager.getLastClosedLedgerNum() + 1)
+    {
+        scheduleProposalRetry(ledgerSeqToTrigger);
+    }
 }
 
 ValueWrapperPtr
-HerderImpl::makeNominationValue(uint32_t ledgerSeqToTrigger,
-                                bool checkTrackingSCP)
+HerderImpl::makeProposal(uint32_t ledgerSeqToTrigger)
 {
-    // A follower can be promoted long after the trigger. Recheck the ledger
-    // state and select a fresh close time when SCP actually needs our value.
-    if ((!isTracking() && checkTrackingSCP) || !mLedgerManager.isSynced() ||
-        mLedgerManager.isApplying())
+    // Retries may run after the original trigger. Recheck ledger state and
+    // select a fresh close time before constructing a proposal.
+    if (!mLedgerManager.isSynced() || mLedgerManager.isApplying())
     {
         return nullptr;
     }
@@ -2030,7 +2057,6 @@ HerderImpl::makeNominationValue(uint32_t ledgerSeqToTrigger,
 
     if (!applicableProposedSet)
     {
-        releaseAssert(!mApp.getConfig().FORCE_SCP);
         return nullptr;
     }
 
@@ -2092,12 +2118,12 @@ HerderImpl::makeNominationValue(uint32_t ledgerSeqToTrigger,
     }
 
 #ifdef BUILD_TESTS
-    if (mApp.getConfig().TESTING_NOMINATE_RANDOM_VALUES &&
+    if (mApp.getConfig().TESTING_PROPOSE_RANDOM_TX_SET_HASH &&
         getHerderSCPDriver().protocolAllowsEmptyTxSetValues())
     {
         txSetHash = HashUtils::pseudoRandomForTesting();
         CLOG_INFO(Herder,
-                  "TESTING_NOMINATE_RANDOM_VALUES: nominating slot {} "
+                  "TESTING_PROPOSE_RANDOM_TX_SET_HASH: proposing slot {} "
                   "with random tx-set hash {}",
                   slotIndex, hexAbbrev(txSetHash));
     }
@@ -2721,9 +2747,18 @@ HerderImpl::restoreSCPState()
             }
             for (auto const& e : scpState.v1().scpEnvelopes)
             {
+                if (e.statement.pledges.type() == SCP_ST_NOMINATE)
+                {
+                    continue;
+                }
                 getHerderSCPDriver().markSlotAsRestored(e.statement.slotIndex);
                 auto envW = getHerderSCPDriver().wrapEnvelope(e);
                 getSCP().setStateFromEnvelope(e.statement.slotIndex, envW);
+                if (e.statement.slotIndex ==
+                    mLedgerManager.getLastClosedLedgerNum() + 1)
+                {
+                    mPendingEnvelopes.fetchForRestoredEnvelope(e);
+                }
                 mLastSlotSaved =
                     std::max<uint64>(mLastSlotSaved, e.statement.slotIndex);
             }
@@ -2871,6 +2906,7 @@ HerderImpl::start()
     }
 
     restoreUpgrades();
+    startBallotRecoveryTimer();
     startTxSetGCTimer();
     startCheckForDeadNodesInterval();
 
@@ -2891,6 +2927,84 @@ HerderImpl::start()
     setFilteredAccounts(bap.getBannedAccounts());
     // RustOverlayManager is started automatically in OverlayManager::start()
     // which is called by ApplicationImpl::start() before Herder::start()
+}
+
+void
+HerderImpl::scheduleProposalRetry(uint32_t slot)
+{
+    auto delay = std::chrono::milliseconds(250u << mProposalRetryAttempt);
+    mProposalRetryAttempt = std::min(mProposalRetryAttempt + 1, 2u);
+    mApp.getMetrics().NewMeter({"scp", "proposal", "retry"}, "retry").Mark();
+    mTriggerTimer.expires_from_now(delay);
+    mTriggerTimer.async_wait([this, slot]() { triggerNextLedger(slot); },
+                             &VirtualTimer::onFailureNoop);
+}
+
+void
+HerderImpl::rebroadcastBallot()
+{
+    if (!mLedgerManager.isSynced() || mLedgerManager.isApplying())
+        return;
+    auto slot = mLedgerManager.getLastClosedLedgerNum() + 1;
+    auto envelopes = getSCP().getLatestMessagesSend(slot);
+    for (auto const& envelope : envelopes)
+    {
+        // Republish the persisted body after an overlay/validator restart.
+        if (mHerderSCPDriver.isLocalLeader(slot))
+        {
+            for (auto const& hash : getValidatedTxSetHashes(envelope))
+            {
+                auto known = getTxSet(hash);
+                auto set = std::get_if<TxSetXDRFrameConstPtr>(&known);
+                if (set && *set && (*set)->isGeneralizedTxSet())
+                {
+                    GeneralizedTransactionSet xdrSet;
+                    (*set)->toXDR(xdrSet);
+                    mApp.getOverlayManager().cacheTxSet(
+                        hash, xdr::xdr_to_opaque(xdrSet), slot);
+                    mApp.getOverlayManager().broadcastTxSet(hash, slot);
+                }
+                else if (hash != Herder::EMPTY_TX_SET_HASH)
+                {
+                    mApp.getOverlayManager().requestTxSet(hash, slot);
+                }
+            }
+        }
+        broadcast(envelope);
+        mApp.getMetrics()
+            .NewMeter({"scp", "envelope", "retransmit"}, "envelope")
+            .Mark();
+    }
+}
+
+void
+HerderImpl::startBallotRecoveryTimer()
+{
+    if (mApp.getConfig().MANUAL_CLOSE)
+        return;
+    mBallotRecoveryTimer.expires_from_now(std::chrono::seconds(2));
+    mBallotRecoveryTimer.async_wait(
+        [this]() {
+            if (mApp.getClock().now() - mLastExternalize >
+                mLedgerManager.getExpectedLedgerCloseTime() +
+                    std::chrono::seconds(2))
+            {
+                rebroadcastBallot();
+                if (mLedgerManager.isSynced() && !mLedgerManager.isApplying())
+                {
+                    auto slot = mLedgerManager.getLastClosedLedgerNum() + 1;
+                    if (mHerderSCPDriver.isLocalLeader(slot) &&
+                        !getSCP().hasBallot(slot) &&
+                        (mTriggerTimer.seq() == 0 ||
+                         mTriggerTimer.expiry_time() <= mApp.getClock().now()))
+                    {
+                        triggerNextLedger(slot);
+                    }
+                }
+            }
+            startBallotRecoveryTimer();
+        },
+        &VirtualTimer::onFailureNoop);
 }
 
 void
@@ -3017,7 +3131,7 @@ HerderImpl::herderOutOfSync()
     // there are no ledgers queued to be applied. If there are ledgers
     // queued, it's possible the rest of the network is waiting for this
     // node to vote. In this case we should _still_ remain in tracking and
-    // emit nomination; If the node does not hear anything from the network
+    // emit proposal; If the node does not hear anything from the network
     // after that, then node can go into out of sync recovery.
     releaseAssert(threadIsMain());
     releaseAssert(!mLedgerManager.isApplying());
@@ -3152,9 +3266,9 @@ HerderImpl::makeStellarValue(Hash const& txSetHash, ConsensusTime closeTime,
 }
 
 bool
-HerderImpl::isNewerNominationOrBallotSt(SCPStatement const& oldSt,
-                                        SCPStatement const& newSt)
+HerderImpl::isNewerBallotSt(SCPStatement const& oldSt,
+                            SCPStatement const& newSt)
 {
-    return getSCP().isNewerNominationOrBallotSt(oldSt, newSt);
+    return getSCP().isNewerBallotSt(oldSt, newSt);
 }
 }

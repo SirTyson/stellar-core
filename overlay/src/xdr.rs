@@ -125,11 +125,7 @@ pub(crate) fn extract_txset_hashes_from_envelope(envelope: &ScpEnvelope) -> Vec<
         ScpStatementPledges::Externalize(externalize) => {
             collect_ballot_hash(&mut hashes, &externalize.commit);
         }
-        ScpStatementPledges::Nominate(nominate) => {
-            for value in nominate.votes.iter().chain(nominate.accepted.iter()) {
-                collect_stellar_value_hash(&mut hashes, value.as_ref());
-            }
-        }
+        ScpStatementPledges::Nominate(_) => {}
     }
     hashes
 }
@@ -186,9 +182,10 @@ impl ReadXdr for StellarValueTxSetHash {
 pub(crate) mod tests {
     use super::*;
     use xdr::{
-        DecoratedSignature, GeneralizedTransactionSet, Hash, Limits, Operation, ScpNomination,
-        ScpStatementPledges, SequenceNumber, StellarValue, StellarValueExt, TimePoint, Transaction,
-        TransactionEnvelope, TransactionV1Envelope, Uint256, Value, VecM, WriteXdr,
+        DecoratedSignature, GeneralizedTransactionSet, Hash, Limits, Operation, ScpBallot,
+        ScpStatementPledges, ScpStatementPrepare, SequenceNumber, StellarValue, StellarValueExt,
+        TimePoint, Transaction, TransactionEnvelope, TransactionV1Envelope, Uint256, Value, VecM,
+        WriteXdr,
     };
 
     pub(crate) fn valid_transaction_xdr(fee: u32, sequence: i64, num_ops: usize) -> Vec<u8> {
@@ -292,10 +289,10 @@ pub(crate) mod tests {
         let value = Value::try_from(stellar_value.to_xdr(Limits::none()).unwrap()).unwrap();
 
         let mut envelope = ScpEnvelope::default();
-        envelope.statement.pledges = ScpStatementPledges::Nominate(ScpNomination {
+        envelope.statement.pledges = ScpStatementPledges::Prepare(ScpStatementPrepare {
             quorum_set_hash: Hash([0; 32]),
-            votes: VecM::try_from(vec![value.clone()]).unwrap(),
-            accepted: VecM::try_from(vec![value]).unwrap(),
+            ballot: ScpBallot { counter: 1, value },
+            ..Default::default()
         });
 
         let hashes = extract_txset_hashes_from_envelope(&envelope);
@@ -340,10 +337,10 @@ pub(crate) mod tests {
 
             let value = Value::try_from(value).unwrap();
             let mut envelope = ScpEnvelope::default();
-            envelope.statement.pledges = ScpStatementPledges::Nominate(ScpNomination {
+            envelope.statement.pledges = ScpStatementPledges::Prepare(ScpStatementPrepare {
                 quorum_set_hash: Hash([0; 32]),
-                votes: VecM::try_from(vec![value.clone()]).unwrap(),
-                accepted: VecM::try_from(vec![value]).unwrap(),
+                ballot: ScpBallot { counter: 1, value },
+                ..Default::default()
             });
             assert_eq!(
                 extract_txset_hashes_from_envelope(&envelope),

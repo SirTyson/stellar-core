@@ -1,5 +1,12 @@
 # SCP Flooding
 
+On this experimental branch, PREPARE is the first consensus statement. Nomination
+is removed. Inbound NOMINATE frames are dropped immediately after decoding,
+before deduplication, prefetch or forwarding to Core. A failed SCP send removes
+its peer from the sent-to set, and disconnect cleanup clears that peer across
+all entries, allowing a later Core recovery rebroadcast to retry it.
+
+
 SCP envelopes are flooded **push-first** on a dedicated QUIC stream
 (`/stellar/scp/1.0.0`). They are small, latency-sensitive, and never
 dropped — there is no batching, no backpressure, no INV/GETDATA round

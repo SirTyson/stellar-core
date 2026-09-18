@@ -82,7 +82,8 @@ class BallotProtocol
     SCPBallotWrapperUPtr mCommit;                             // c
     std::map<NodeID, SCPEnvelopeWrapperPtr> mLatestEnvelopes; // M
     SCPPhase mPhase;                                          // Phi
-    ValueWrapperPtr mValueOverride;                           // z
+    ValueWrapperPtr mProposal;
+    ValueWrapperPtr mValueOverride; // z
 
     int mCurrentMessageLevel; // number of messages triggered in one run
 
@@ -104,6 +105,18 @@ class BallotProtocol
     // trigger more potential state changes
     SCP::EnvelopeState processEnvelope(SCPEnvelopeWrapperPtr envelope,
                                        bool self);
+
+    bool startBallot(ValueWrapperPtr value);
+    bool
+    hasCurrentBallot() const
+    {
+        return mCurrentBallot != nullptr;
+    }
+    ValueWrapperPtr const&
+    getProposal() const
+    {
+        return mProposal;
+    }
 
     void ballotProtocolTimerExpired();
     // abandon's current ballot, move to a new ballot

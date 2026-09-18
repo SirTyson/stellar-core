@@ -898,3 +898,42 @@ VALIDATORS=[")" + otherKey + R"( A"]
         REQUIRE(c.DATABASE.value == "sqlite3://test.db");
     }
 }
+
+TEST_CASE("watchers retain the validator election weights",
+          "[config][leader-ballot]")
+{
+    std::vector<ValidatorEntry> validators;
+    for (int i = 0; i < 6; ++i)
+    {
+        ValidatorEntry entry;
+        entry.mName = fmt::format("election-validator-{}", i);
+        entry.mHomeDomain = fmt::format("election-domain-{}", i / 3);
+        entry.mKey = SecretKey::fromSeed(sha256(entry.mName)).getPublicKey();
+        entry.mQuality = i < 3 ? ValidatorQuality::VALIDATOR_HIGH_QUALITY
+                               : ValidatorQuality::VALIDATOR_MED_QUALITY;
+        entry.mHasHistory = false;
+        validators.push_back(entry);
+    }
+    Config validator;
+    validator.NODE_IS_VALIDATOR = true;
+    validator.generateQuorumSetForTesting(validators);
+    Config watcher;
+    watcher.NODE_IS_VALIDATOR = false;
+    watcher.generateQuorumSetForTesting(validators);
+    REQUIRE(validator.VALIDATOR_WEIGHT_CONFIG.has_value());
+    REQUIRE(watcher.VALIDATOR_WEIGHT_CONFIG.has_value());
+    REQUIRE(watcher.QUORUM_SET == validator.QUORUM_SET);
+    auto const& expected = *validator.VALIDATOR_WEIGHT_CONFIG;
+    auto const& observed = *watcher.VALIDATOR_WEIGHT_CONFIG;
+    REQUIRE(observed.mHomeDomainSizes == expected.mHomeDomainSizes);
+    REQUIRE(observed.mQualityWeights == expected.mQualityWeights);
+    REQUIRE(observed.mValidatorEntries.size() ==
+            expected.mValidatorEntries.size());
+    for (auto const& entry : validators)
+    {
+        auto const& actual = observed.mValidatorEntries.at(entry.mKey);
+        REQUIRE(actual.mKey == entry.mKey);
+        REQUIRE(actual.mHomeDomain == entry.mHomeDomain);
+        REQUIRE(actual.mQuality == entry.mQuality);
+    }
+}

@@ -31,6 +31,7 @@ PendingEnvelopes::PendingEnvelopes(Application& app, HerderImpl& herder)
     : mApp(app)
     , mHerder(herder)
     , mQsetCache(QSET_CACHE_SIZE)
+    , mTxSetFetchRetryTimer(app)
     , mTxSetCache(TXSET_CACHE_SIZE)
     , mValueSizeCache(TXSET_CACHE_SIZE + QSET_CACHE_SIZE)
     , mRebuildQuorum(true)
@@ -51,6 +52,34 @@ PendingEnvelopes::PendingEnvelopes(Application& app, HerderImpl& herder)
 
 PendingEnvelopes::~PendingEnvelopes()
 {
+    mTxSetFetchRetryTimer.cancel();
+}
+
+void
+PendingEnvelopes::scheduleTxSetFetchRetry()
+{
+    if (mTxSetFetchRetryArmed || mPendingTxSetFetches.empty())
+        return;
+    mTxSetFetchRetryArmed = true;
+    mTxSetFetchRetryTimer.expires_from_now(std::chrono::seconds(2));
+    mTxSetFetchRetryTimer.async_wait(
+        [this]() {
+            mTxSetFetchRetryArmed = false;
+            for (auto const& [hash, envelopes] : mPendingTxSetFetches)
+            {
+                if (!envelopes.empty() && !hasTxSet(hash))
+                {
+                    mApp.getMetrics()
+                        .NewMeter({"scp", "fetch", "txset-retry"}, "request")
+                        .Mark();
+                    mApp.getOverlayManager().requestTxSet(
+                        hash, static_cast<uint32_t>(
+                                  envelopes.front().statement.slotIndex));
+                }
+            }
+            scheduleTxSetFetchRetry();
+        },
+        &VirtualTimer::onFailureNoop);
 }
 
 SCPQuorumSetPtr
@@ -686,6 +715,15 @@ PendingEnvelopes::isFullyFetched(SCPEnvelope const& envelope)
 
 // Requests all missing tx sets in `envelope`
 void
+PendingEnvelopes::fetchForRestoredEnvelope(SCPEnvelope const& envelope)
+{
+    if (!isFullyFetched(envelope))
+    {
+        startFetch(envelope);
+    }
+}
+
+void
 PendingEnvelopes::startFetch(SCPEnvelope const& envelope)
 {
     ZoneScoped;
@@ -721,9 +759,8 @@ PendingEnvelopes::startFetch(SCPEnvelope const& envelope)
             vec.push_back(envelope);
             mTxSetFetchStartTimes.emplace(h2, mApp.getClock().now());
             mApp.getOverlayManager().requestTxSet(
-                h2,
-                static_cast<uint32_t>(
-                    envelope.statement.slotIndex)); // Only once!
+                h2, static_cast<uint32_t>(envelope.statement.slotIndex));
+            scheduleTxSetFetchRetry();
         }
     }
 

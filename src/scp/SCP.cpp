@@ -4,6 +4,7 @@
 
 #include "scp/SCP.h"
 #include "crypto/Hex.h"
+#include "scp/LeaderElection.h"
 #include "scp/LocalNode.h"
 #include "scp/Slot.h"
 #include "util/GlobalChecks.h"
@@ -29,34 +30,46 @@ SCP::SCP(SCPDriver& driver, NodeID const& nodeID, bool isValidator,
 SCP::EnvelopeState
 SCP::receiveEnvelope(SCPEnvelopeWrapperPtr envelope)
 {
+    if (envelope->getStatement().pledges.type() == SCP_ST_NOMINATE)
+    {
+        return INVALID;
+    }
     uint64 slotIndex = envelope->getStatement().slotIndex;
     return getSlot(slotIndex, true)->processEnvelope(envelope, false);
 }
 
-bool
-SCP::nominate(uint64 slotIndex, NominationValueSupplier const& makeValue,
-              Value const& previousValue)
-{
-    dbgAssert(isValidator());
-    return getSlot(slotIndex, true)->nominate(makeValue, previousValue, false);
-}
-
 std::set<NodeID>
-SCP::predictNominationLeaders(uint64 slotIndex, Value const& previousValue,
-                              uint32_t rounds)
+SCP::predictLeaders(uint64 slotIndex, Value const& previousValue,
+                    uint32_t rounds)
 {
-    Slot preview(slotIndex, *this);
-    return NominationProtocol::predictLeaders(preview, previousValue, rounds);
+    return stellar::predictLeaders(mDriver, slotIndex, previousValue,
+                                   getLocalQuorumSet(), getLocalNodeID(),
+                                   isValidator(), rounds);
 }
 
-void
-SCP::stopNomination(uint64 slotIndex)
+bool
+SCP::startBallot(uint64 slotIndex, ValueWrapperPtr value)
 {
-    auto s = getSlot(slotIndex, false);
-    if (s)
+    releaseAssert(isValidator());
+    return getSlot(slotIndex, true)->getBallotProtocol().startBallot(value);
+}
+
+bool
+SCP::hasBallot(uint64 slotIndex)
+{
+    auto slot = getSlot(slotIndex, false);
+    return slot && slot->getBallotProtocol().hasCurrentBallot();
+}
+
+NodeID
+SCP::electLeader(uint64 slotIndex, Value const& previousValue)
+{
+    auto leaders = predictLeaders(slotIndex, previousValue, 1);
+    if (leaders.empty())
     {
-        s->stopNomination();
+        throw std::runtime_error("No eligible consensus leader");
     }
+    return *leaders.begin();
 }
 
 void
@@ -287,17 +300,6 @@ SCP::getMissingNodes(NodeID const& id, uint64 index)
     return ret;
 }
 
-std::set<NodeID>
-SCP::getNominationLeaders(uint64 slotIndex)
-{
-    auto slot = getSlot(slotIndex, false);
-    if (slot)
-    {
-        return slot->getNominationLeaders();
-    }
-    return {};
-}
-
 bool
 SCP::isValidator()
 {
@@ -433,8 +435,7 @@ SCP::getLatestMessage(NodeID const& id)
 }
 
 bool
-SCP::isNewerNominationOrBallotSt(SCPStatement const& oldSt,
-                                 SCPStatement const& newSt)
+SCP::isNewerBallotSt(SCPStatement const& oldSt, SCPStatement const& newSt)
 {
     if (oldSt.slotIndex != newSt.slotIndex || !(oldSt.nodeID == newSt.nodeID))
     {
@@ -444,7 +445,7 @@ SCP::isNewerNominationOrBallotSt(SCPStatement const& oldSt,
     auto slot = getSlot(oldSt.slotIndex, false);
     if (slot)
     {
-        return slot->isNewerNominationOrBallotSt(oldSt, newSt);
+        return slot->isNewerBallotSt(oldSt, newSt);
     }
 
     return false;

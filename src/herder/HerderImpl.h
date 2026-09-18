@@ -136,7 +136,7 @@ class HerderImpl : public Herder
     // still run through their production paths.
     std::function<std::vector<TransactionEnvelope>(size_t)>
         mGetTopTransactionsForTesting;
-    friend class EarlyNominationTestAccess;
+    friend class LeaderBallotTestAccess;
 
     std::optional<uint32_t> mMaxClassicTxSize;
     std::optional<uint32_t> mMaxTxSizeOverride;
@@ -188,13 +188,12 @@ class HerderImpl : public Herder
 
     uint32_t getMinLedgerSeqToRemember() const override;
 
-    bool isNewerNominationOrBallotSt(SCPStatement const& oldSt,
-                                     SCPStatement const& newSt) override;
+    bool isNewerBallotSt(SCPStatement const& oldSt,
+                         SCPStatement const& newSt) override;
 
     uint32_t getMostRecentCheckpointSeq() override;
 
-    void triggerNextLedger(uint32_t ledgerSeqToTrigger,
-                           bool checkTrackingSCP) override;
+    void triggerNextLedger(uint32_t ledgerSeqToTrigger) override;
 
     void setInSyncAndTriggerNextLedger() override;
 
@@ -267,8 +266,7 @@ class HerderImpl : public Herder
     PreparedTxSet buildTxSet(uint32_t ledgerSeq, ConsensusTime closeTime);
     void prepareTxSet(uint32_t ledgerSeq, ConsensusTime closeTime);
     void discardPreparedTxSet();
-    ValueWrapperPtr makeNominationValue(uint32_t ledgerSeq,
-                                        bool checkTrackingSCP);
+    ValueWrapperPtr makeProposal(uint32_t ledgerSeq);
 
     // Compute the trigger-timer anchor point using the local node's
     // prepare-start timestamp for the previous slot. Returns a pessimistic
@@ -323,7 +321,7 @@ class HerderImpl : public Herder
     // restores SCP state based on the last messages saved on disk
     void restoreSCPState();
 
-    // Map SCP slots to local time of nomination and the time slot was
+    // Map SCP slots to local time of proposal and the time slot was
     // externalized by the network
     std::map<uint32_t, std::pair<ConsensusTime, std::optional<ConsensusTime>>>
         mDriftCTSlidingWindow;
@@ -339,6 +337,11 @@ class HerderImpl : public Herder
 
     VirtualTimer mTriggerTimer;
     VirtualTimer mPrepareTxSetTimer;
+    VirtualTimer mBallotRecoveryTimer;
+    uint32_t mProposalRetryAttempt{0};
+    void scheduleProposalRetry(uint32_t slot);
+    void startBallotRecoveryTimer();
+    void rebroadcastBallot();
 
     VirtualTimer mOutOfSyncTimer;
 

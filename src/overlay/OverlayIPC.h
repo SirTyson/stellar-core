@@ -174,6 +174,7 @@ class OverlayIPC
      * @param xdr The serialized TX set XDR
      * @param slotIndex The slot the set is for (stamps the cache entry)
      */
+    void broadcastTxSet(Hash const& hash, uint32_t slotIndex);
     void cacheTxSet(Hash const& hash, std::vector<uint8_t> const& xdr,
                     uint32_t slotIndex);
 

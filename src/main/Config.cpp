@@ -68,7 +68,7 @@ static std::unordered_set<std::string> const TESTING_ONLY_OPTIONS = {
     "ARTIFICIALLY_SET_SURVEY_PHASE_DURATION_FOR_TESTING",
     "ARTIFICIALLY_DELAY_BUCKET_APPLICATION_FOR_TESTING",
     "ARTIFICIALLY_SLEEP_MAIN_THREAD_FOR_TESTING",
-    "ARTIFICIALLY_DELAY_NOMINATION_EMIT_FOR_TESTING",
+    "ARTIFICIALLY_DELAY_PROPOSAL_FOR_TESTING",
     "ARTIFICIALLY_SKIP_CONNECTION_ADJUSTMENT_FOR_TESTING",
     "ARTIFICIALLY_DELAY_LEDGER_CLOSE_FOR_TESTING",
     "SKIP_HIGH_CRITICAL_VALIDATOR_CHECKS_FOR_TESTING",
@@ -155,7 +155,7 @@ Config::Config() : NODE_SEED(SecretKey::random())
     TESTING_MAX_CLASSIC_BYTE_ALLOWANCE = 0;
     IGNORE_MESSAGE_LIMITS_FOR_TESTING = false;
     TESTING_IGNORE_LEDGER_TIME_UPGRADE_BOUNDS = false;
-    TESTING_NOMINATE_RANDOM_VALUES = false;
+    TESTING_PROPOSE_RANDOM_TX_SET_HASH = false;
     ALLOW_PRIVATE_ADDRESSES_FOR_TESTING = false;
 #endif
 
@@ -349,7 +349,6 @@ Config::Config() : NODE_SEED(SecretKey::random())
     EMIT_SOROBAN_TRANSACTION_META_EXT_V1 = false;
     EMIT_LEDGER_CLOSE_META_EXT_V1 = false;
 
-    FORCE_OLD_STYLE_LEADER_ELECTION = false;
     // This is not configurable for now. It doesn't need to be a network-wide
     // setting and there aren't many good values for it.
     SOROBAN_PHASE_MIN_STAGE_COUNT = 1;
@@ -378,8 +377,7 @@ Config::Config() : NODE_SEED(SecretKey::random())
     SKIP_HIGH_CRITICAL_VALIDATOR_CHECKS_FOR_TESTING = false;
     ARTIFICIALLY_SET_SYSTEM_CLOCK_OFFSET_FOR_TESTING =
         std::chrono::milliseconds::zero();
-    ARTIFICIALLY_DELAY_NOMINATION_EMIT_FOR_TESTING =
-        std::chrono::milliseconds::zero();
+    ARTIFICIALLY_DELAY_PROPOSAL_FOR_TESTING = std::chrono::milliseconds::zero();
 #endif
 
 #ifdef BEST_OFFER_DEBUGGING
@@ -1198,8 +1196,10 @@ Config::processConfig(std::shared_ptr<cpptoml::table> t)
                                      "upgrade bounds for testing");
                      }
                  }},
-                {"TESTING_NOMINATE_RANDOM_VALUES",
-                 [&]() { TESTING_NOMINATE_RANDOM_VALUES = readBool(item); }},
+                {"TESTING_PROPOSE_RANDOM_TX_SET_HASH",
+                 [&]() {
+                     TESTING_PROPOSE_RANDOM_TX_SET_HASH = readBool(item);
+                 }},
 #endif
                 {"PEER_PORT",
                  [&]() { PEER_PORT = readInt<unsigned short>(item, 1); }},
@@ -2009,9 +2009,9 @@ Config::processConfig(std::shared_ptr<cpptoml::table> t)
                      ARTIFICIALLY_SET_SYSTEM_CLOCK_OFFSET_FOR_TESTING =
                          std::chrono::milliseconds(readInt<int64_t>(item));
                  }},
-                {"ARTIFICIALLY_DELAY_NOMINATION_EMIT_FOR_TESTING",
+                {"ARTIFICIALLY_DELAY_PROPOSAL_FOR_TESTING",
                  [&]() {
-                     ARTIFICIALLY_DELAY_NOMINATION_EMIT_FOR_TESTING =
+                     ARTIFICIALLY_DELAY_PROPOSAL_FOR_TESTING =
                          std::chrono::milliseconds(readInt<uint32_t>(item));
                  }},
 #endif
@@ -2048,10 +2048,7 @@ Config::processConfig(std::shared_ptr<cpptoml::table> t)
             {
                 it->second();
             }
-            else if (item.first == "FORCE_OLD_STYLE_LEADER_ELECTION")
-            {
-                FORCE_OLD_STYLE_LEADER_ELECTION = readBool(item);
-            }
+
             else
             {
                 std::string err("Unknown configuration entry: '");
@@ -2863,12 +2860,8 @@ Config::setValidatorWeightConfig(std::vector<ValidatorEntry> const& validators)
 {
     releaseAssert(!VALIDATOR_WEIGHT_CONFIG.has_value());
 
-    if (!NODE_IS_VALIDATOR)
-    {
-        // There is no reason to populate VALIDATOR_WEIGHT_CONFIG if the node is
-        // not a validator.
-        return;
-    }
+    // Watchers validate leader signatures too and must compute the same
+    // weights as the validators whose ballots they follow.
 
     ValidatorWeightConfig& vwc = VALIDATOR_WEIGHT_CONFIG.emplace();
     ValidatorQuality highestQuality = ValidatorQuality::VALIDATOR_LOW_QUALITY;

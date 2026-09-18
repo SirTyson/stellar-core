@@ -220,6 +220,15 @@ RustOverlayManager::requestTxSet(Hash const& txSetHash, uint32_t slotIndex)
 }
 
 void
+RustOverlayManager::broadcastTxSet(Hash const& hash, uint32_t slotIndex)
+{
+    if (mOverlayIPC && !mShuttingDown)
+    {
+        mOverlayIPC->broadcastTxSet(hash, slotIndex);
+    }
+}
+
+void
 RustOverlayManager::cacheTxSet(Hash const& txSetHash,
                                std::vector<uint8_t> const& xdr,
                                uint32_t slotIndex)

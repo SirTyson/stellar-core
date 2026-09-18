@@ -7,6 +7,7 @@
 #include "herder/PendingEnvelopes.h"
 #include "herder/test/TestTxSetUtils.h"
 #include "main/Application.h"
+#include "scp/LocalNode.h"
 #include "test/Catch2.h"
 #include "test/TestAccount.h"
 #include "test/TestUtils.h"
@@ -113,11 +114,17 @@ TEST_CASE_VERSIONS("PendingEnvelopes recvSCPEnvelope", "[herder]")
     auto s = SecretKey::pseudoRandomForTesting();
     auto& pk = s.getPublicKey();
     cfg.QUORUM_SET.validators.emplace_back(s.getPublicKey());
+    // Keep fetch and retention checks from externalizing via self alone.
+    cfg.QUORUM_SET.threshold = 2;
     Application::pointer app = createTestApplication(clock, cfg);
 
     auto const lcl = app->getLedgerManager().getLastClosedLedgerHeader();
 
     auto& herder = static_cast<HerderImpl&>(app->getHerder());
+    auto const& signer =
+        herder.getHerderSCPDriver().isLocalLeader(lcl.header.ledgerSeq + 1)
+            ? cfg.NODE_SEED
+            : s;
 
     auto root = app->getRoot();
     size_t numAccounts = 50;
@@ -151,7 +158,7 @@ TEST_CASE_VERSIONS("PendingEnvelopes recvSCPEnvelope", "[herder]")
     auto bigQSetHash = sha256(xdr::xdr_to_opaque(bigQSet));
 
     auto txSet = makeTransactions(*app, accs, *root, numAccounts);
-    auto p = makeTxPair(herder, s, txSet, 10);
+    auto p = makeTxPair(herder, signer, txSet, 10);
     auto saneEnvelope =
         makeEnvelope(herder, s, p, saneQSetHash, lcl.header.ledgerSeq + 1);
     auto bigEnvelope =
@@ -401,8 +408,9 @@ TEST_CASE_VERSIONS("PendingEnvelopes recvSCPEnvelope", "[herder]")
                                                lastCheckpointSeq);
             auto saneQSetP = pendingEnvelopes.getQSet(saneQSetHash);
 
-            // 3 as we have "p", "txSet" and SCP
-            REQUIRE(txSet.use_count() == 3);
+            // "p" and "txSet" plus the received and automatically emitted
+            // ballot values keep this alive until the SCP slot is purged.
+            REQUIRE(txSet.use_count() >= 3);
             // 4 as we have "saneQSetP", SCP, cache and quorum tracker
             REQUIRE(saneQSetP.use_count() == 4);
 
@@ -485,8 +493,8 @@ TEST_CASE_VERSIONS("PendingEnvelopes recvSCPEnvelope", "[herder]")
 
             auto saneQSetP = pendingEnvelopes.getQSet(saneQSetHash);
 
-            // txSet refs: "p", "txSet", SCP (saneEnvelope's slot still in SCP)
-            REQUIRE(txSet.use_count() == 3);
+            // The SCP slot retains received and automatically emitted values.
+            REQUIRE(txSet.use_count() >= 3);
             // qSet refs: "saneQSetP", SCP, cache, quorum tracker
             REQUIRE(saneQSetP.use_count() == 4);
 
@@ -616,7 +624,7 @@ TEST_CASE_VERSIONS("PendingEnvelopes recvSCPEnvelope", "[herder]")
     {
         GeneralizedTransactionSet malformedXdrSet(1);
         auto malformedTxSet = TxSetXDRFrame::makeFromWire(malformedXdrSet);
-        auto p2 = makeTxPair(herder, s, malformedTxSet, 10);
+        auto p2 = makeTxPair(herder, signer, malformedTxSet, 10);
         auto malformedEnvelope =
             makeEnvelope(herder, s, p2, saneQSetHash, lcl.header.ledgerSeq + 1);
         REQUIRE(pendingEnvelopes.recvSCPEnvelope(malformedEnvelope) ==
@@ -655,7 +663,7 @@ TEST_CASE_VERSIONS("PendingEnvelopes recvSCPEnvelope", "[herder]")
             scpDriver.onTxSetReceived(txSetHash, txSet);
 
             // Now the wrapper holds a reference to the tx set
-            REQUIRE(txSet.use_count() == 3);
+            REQUIRE(txSet.use_count() >= 3);
 
             // Dropping the wrapper releases its reference
             wrapper.reset();
@@ -672,7 +680,7 @@ TEST_CASE_VERSIONS("PendingEnvelopes recvSCPEnvelope", "[herder]")
 
             scpDriver.onTxSetReceived(txSetHash, txSet);
 
-            REQUIRE(txSet.use_count() == 3);
+            REQUIRE(txSet.use_count() >= 3);
 
             wrapper.reset();
             REQUIRE(txSet.use_count() == 2);
@@ -694,7 +702,7 @@ TEST_CASE_VERSIONS("PendingEnvelopes recvSCPEnvelope", "[herder]")
             REQUIRE(txSet.use_count() == 4);
 
             wrapper1.reset();
-            REQUIRE(txSet.use_count() == 3);
+            REQUIRE(txSet.use_count() >= 3);
 
             wrapper2.reset();
             REQUIRE(txSet.use_count() == 2);
@@ -731,11 +739,17 @@ TEST_CASE("PendingEnvelopes recvSCPEnvelope without parallel tx set download",
     auto s = SecretKey::pseudoRandomForTesting();
     auto& pk = s.getPublicKey();
     cfg.QUORUM_SET.validators.emplace_back(s.getPublicKey());
+    // Keep fetch and retention checks from externalizing via self alone.
+    cfg.QUORUM_SET.threshold = 2;
     Application::pointer app = createTestApplication(clock, cfg);
 
     auto const lcl = app->getLedgerManager().getLastClosedLedgerHeader();
 
     auto& herder = static_cast<HerderImpl&>(app->getHerder());
+    auto const& signer =
+        herder.getHerderSCPDriver().isLocalLeader(lcl.header.ledgerSeq + 1)
+            ? cfg.NODE_SEED
+            : s;
 
     auto root = app->getRoot();
     size_t numAccounts = 50;
@@ -751,7 +765,7 @@ TEST_CASE("PendingEnvelopes recvSCPEnvelope without parallel tx set download",
     auto saneQSetHash = sha256(xdr::xdr_to_opaque(saneQSet));
 
     auto txSet = makeTransactions(*app, accs, *root, numAccounts);
-    auto p = makeTxPair(herder, s, txSet, 10);
+    auto p = makeTxPair(herder, signer, txSet, 10);
 
     auto& pendingEnvelopes = herder.getPendingEnvelopes();
 
@@ -776,4 +790,61 @@ TEST_CASE("PendingEnvelopes recvSCPEnvelope without parallel tx set download",
             pendingEnvelopes.recvTxSet(p.second->getContentsHash(), p.second));
         REQUIRE(herder.getSCP().getLatestMessage(pk) != nullptr);
     }
+}
+
+TEST_CASE("pending transaction sets are retried until received",
+          "[herder][leader-ballot]")
+{
+    VirtualClock clock;
+    auto cfg = getTestConfig();
+    cfg.MANUAL_CLOSE = false;
+    cfg.ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING = false;
+    auto peer = SecretKey::fromSeed(sha256("txset-retry-peer"));
+    cfg.QUORUM_SET.validators.push_back(peer.getPublicKey());
+    cfg.QUORUM_SET.threshold = 2;
+    auto app = createTestApplication(clock, cfg);
+    auto& herder = static_cast<HerderImpl&>(app->getHerder());
+    auto const lcl = app->getLedgerManager().getLastClosedLedgerHeader();
+    auto txset = TxSetXDRFrame::makeEmpty(lcl);
+    auto pair = makeTxPair(herder, peer, txset, app->timeNow() + 1);
+    auto env = makePrepareEnvelope(
+        herder, peer, pair, herder.getSCP().getLocalNode()->getQuorumSetHash(),
+        lcl.header.ledgerSeq + 1);
+    auto& pending = herder.getPendingEnvelopes();
+    REQUIRE(pending.recvSCPEnvelope(env) == Herder::ENVELOPE_STATUS_FETCHING);
+    auto& retries =
+        app->getMetrics().NewMeter({"scp", "fetch", "txset-retry"}, "request");
+    testutil::crankUntil(
+        app, [&]() { return retries.count() > 0; }, std::chrono::seconds(3));
+    REQUIRE(retries.count() > 0);
+    REQUIRE(pending.recvTxSet(txset->getContentsHash(), txset));
+    auto before = retries.count();
+    clock.setCurrentVirtualTime(clock.now() + std::chrono::seconds(3));
+    clock.crank(false);
+    REQUIRE(retries.count() == before);
+}
+
+TEST_CASE("restored ballot bodies use the normal pending fetch path",
+          "[herder][leader-ballot]")
+{
+    VirtualClock clock;
+    auto cfg = getTestConfig();
+    cfg.MANUAL_CLOSE = true;
+    auto peer = SecretKey::fromSeed(sha256("restored-fetch-peer"));
+    cfg.QUORUM_SET.validators.push_back(peer.getPublicKey());
+    cfg.QUORUM_SET.threshold = 2;
+    auto app = createTestApplication(clock, cfg);
+    auto& herder = static_cast<HerderImpl&>(app->getHerder());
+    auto const lcl = app->getLedgerManager().getLastClosedLedgerHeader();
+    auto txset = TxSetXDRFrame::makeEmpty(lcl);
+    auto pair = makeTxPair(herder, peer, txset, app->timeNow() + 1);
+    auto env = makePrepareEnvelope(
+        herder, peer, pair, herder.getSCP().getLocalNode()->getQuorumSetHash(),
+        lcl.header.ledgerSeq + 1);
+    auto& pending = herder.getPendingEnvelopes();
+    REQUIRE_FALSE(pending.recvTxSet(txset->getContentsHash(), txset));
+    pending.fetchForRestoredEnvelope(env);
+    REQUIRE(pending.recvTxSet(txset->getContentsHash(), txset));
+    REQUIRE(std::get<TxSetXDRFrameConstPtr>(
+        pending.getTxSet(txset->getContentsHash())));
 }

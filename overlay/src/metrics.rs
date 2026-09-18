@@ -96,6 +96,10 @@ pub struct OverlayMetrics {
     pub send_transaction: AtomicU64,
     /// overlay.send.txset — TX set messages sent
     pub send_txset: AtomicU64,
+    pub fetch_txset_retry: AtomicU64,
+    pub scp_nominate_dropped: AtomicU64,
+    pub txset_broadcast_miss: AtomicU64,
+    pub txset_broadcast: AtomicU64,
 
     // Receive timers (per message type, tracked as sum_us + count)
     /// overlay.recv.scp-message — time processing SCP messages
@@ -152,6 +156,10 @@ impl Default for OverlayMetrics {
             send_scp_message: AtomicU64::new(0),
             send_transaction: AtomicU64::new(0),
             send_txset: AtomicU64::new(0),
+            fetch_txset_retry: AtomicU64::new(0),
+            scp_nominate_dropped: AtomicU64::new(0),
+            txset_broadcast_miss: AtomicU64::new(0),
+            txset_broadcast: AtomicU64::new(0),
             recv_scp_sum_us: AtomicU64::new(0),
             recv_scp_count: AtomicU64::new(0),
             fetch_txset_sum_us: AtomicU64::new(0),
@@ -213,6 +221,10 @@ impl OverlayMetrics {
             send_scp_message: self.send_scp_message.load(ORD),
             send_transaction: self.send_transaction.load(ORD),
             send_txset: self.send_txset.load(ORD),
+            fetch_txset_retry: self.fetch_txset_retry.load(ORD),
+            scp_nominate_dropped: self.scp_nominate_dropped.load(ORD),
+            txset_broadcast_miss: self.txset_broadcast_miss.load(ORD),
+            txset_broadcast: self.txset_broadcast.load(ORD),
             recv_scp_sum_us: self.recv_scp_sum_us.load(ORD),
             recv_scp_count: self.recv_scp_count.load(ORD),
             fetch_txset_sum_us: self.fetch_txset_sum_us.load(ORD),
@@ -282,6 +294,10 @@ pub struct MetricsSnapshot {
     pub send_scp_message: u64,
     pub send_transaction: u64,
     pub send_txset: u64,
+    pub fetch_txset_retry: u64,
+    pub scp_nominate_dropped: u64,
+    pub txset_broadcast_miss: u64,
+    pub txset_broadcast: u64,
     pub recv_scp_sum_us: u64,
     pub recv_scp_count: u64,
     pub fetch_txset_sum_us: u64,

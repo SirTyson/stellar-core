@@ -892,14 +892,19 @@ async fn fetch_reservation_is_deduplicated_and_failure_preserves_reassignment() 
             1,
             "duplicate fetch scheduled another write"
         );
-        let replacement = (PeerId::random(), Instant::now(), 13);
+        let replacement = PendingTxSetFetch {
+            peer: PeerId::random(),
+            sent_at: Instant::now(),
+            slot: 13,
+            tried: HashSet::new(),
+        };
         if reassigned {
             overlay
                 .state
                 .pending_txset_requests
                 .write()
                 .await
-                .insert(hash, replacement);
+                .insert(hash, replacement.clone());
         }
         // These uncontended bookkeeping operations do not yield. Disconnect
         // before the spawned write is polled, making it fail deterministically.
@@ -916,7 +921,7 @@ async fn fetch_reservation_is_deduplicated_and_failure_preserves_reassignment() 
                 .read()
                 .await
                 .get(&hash)
-                .copied(),
+                .cloned(),
             reassigned.then_some(replacement)
         );
     }
@@ -954,4 +959,168 @@ async fn queued_peer_sends_share_payload_and_release_it_on_drop() {
         retained.upgrade().is_none(),
         "completed sends retained the payload"
     );
+}
+
+#[tokio::test]
+async fn expired_fetch_rotates_peers_without_replacing_healthy_reservations() {
+    let (_handle, _events, _admissions, mut overlay) =
+        create_test_overlay(Keypair::generate_ed25519(), Arc::new(OverlayMetrics::new())).unwrap();
+    let peers = [PeerId::random(), PeerId::random(), PeerId::random()];
+    for peer in peers {
+        overlay
+            .state
+            .peer_streams
+            .write()
+            .await
+            .insert(peer, Arc::new(PeerOutboundStreams::new()));
+    }
+    let hash = [7; 32];
+    overlay
+        .state
+        .txset_sources
+        .write()
+        .await
+        .put(hash, peers[0]);
+    overlay.fetch_txset(hash, 12).await;
+    let first = overlay.state.pending_txset_requests.read().await[&hash].clone();
+    assert_eq!(first.peer, peers[0]);
+    overlay.fetch_txset(hash, 12).await;
+    assert_eq!(overlay.sends.len(), 1);
+    for expected_count in 2..=3 {
+        overlay
+            .state
+            .pending_txset_requests
+            .write()
+            .await
+            .get_mut(&hash)
+            .unwrap()
+            .sent_at = Instant::now() - Duration::from_secs(6);
+        overlay.fetch_txset(hash, 12).await;
+        let next = overlay.state.pending_txset_requests.read().await[&hash].clone();
+        assert_ne!(next.peer, peers[0]);
+        assert_eq!(next.tried.len(), expected_count);
+    }
+    assert_eq!(
+        overlay
+            .state
+            .metrics
+            .fetch_txset_retry
+            .load(Ordering::Relaxed),
+        2
+    );
+    overlay.sends.shutdown().await;
+}
+
+#[tokio::test]
+async fn abandoned_scp_send_can_be_rebroadcast() {
+    let (_handle, _events, _admissions, mut overlay) =
+        create_test_overlay(Keypair::generate_ed25519(), Arc::new(OverlayMetrics::new())).unwrap();
+    let peer = PeerId::random();
+    overlay
+        .state
+        .peer_streams
+        .write()
+        .await
+        .insert(peer, Arc::new(PeerOutboundStreams::new()));
+    let envelope = test_scp_envelope_xdr(1);
+    let hash = blake2b_hash(&envelope);
+    overlay.broadcast_scp(&envelope).await;
+    assert!(overlay
+        .state
+        .scp_sent_to
+        .read()
+        .await
+        .peek(&hash)
+        .unwrap()
+        .contains(&peer));
+    overlay.state.peer_streams.write().await.remove(&peer);
+    overlay.sends.join_next().await.unwrap().unwrap();
+    assert!(!overlay
+        .state
+        .scp_sent_to
+        .read()
+        .await
+        .peek(&hash)
+        .unwrap()
+        .contains(&peer));
+}
+
+#[tokio::test]
+async fn proposal_push_reaches_every_peer_without_requests() {
+    let mut leader = TestNode::start().await;
+    let mut a = TestNode::start().await;
+    let mut b = TestNode::start().await;
+    leader.connect(&a).await;
+    leader.connect(&b).await;
+    let (hash, bytes) = test_txset_xdr(19);
+    leader
+        .handle
+        .broadcast_txset(hash, Arc::new(TxSetData::from_local(bytes).unwrap()))
+        .await;
+    for receiver in [&mut a, &mut b] {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(OverlayEvent::TxSetReceived {
+                    hash: received,
+                    slot,
+                    ..
+                }) = receiver.events.recv().await
+                {
+                    assert_eq!(received, hash);
+                    assert_eq!(slot, None);
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("unsolicited proposal did not arrive");
+        assert!(receiver
+            .state
+            .pending_txset_requests
+            .read()
+            .await
+            .is_empty());
+    }
+    leader.stop().await;
+    a.stop().await;
+    b.stop().await;
+}
+
+#[tokio::test]
+async fn nomination_frames_are_dropped_before_prefetch_or_core_delivery() {
+    use stellar_xdr::curr::{Limits, ScpEnvelope, ScpNomination, ScpStatementPledges, WriteXdr};
+    let mut sender = TestNode::start().await;
+    let mut receiver = TestNode::start().await;
+    sender.connect(&receiver).await;
+    let mut envelope = ScpEnvelope::default();
+    envelope.statement.pledges = ScpStatementPledges::Nominate(ScpNomination::default());
+    let bytes = envelope.to_xdr(Limits::none()).unwrap();
+    sender
+        .handle
+        .send_scp_to_peer(receiver.peer, &bytes)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while receiver
+            .state
+            .metrics
+            .scp_nominate_dropped
+            .load(Ordering::Relaxed)
+            != 1
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    while let Ok(event) = receiver.events.try_recv() {
+        assert!(!matches!(
+            event,
+            OverlayEvent::ScpReceived { .. } | OverlayEvent::TxSetRequested { .. }
+        ));
+    }
+    assert!(receiver.state.txset_sources.read().await.is_empty());
+    assert!(receiver.state.scp_seen.read().await.is_empty());
+    sender.stop().await;
+    receiver.stop().await;
 }

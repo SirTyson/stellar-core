@@ -67,6 +67,9 @@ class PendingEnvelopes
     // when each pending tx set fetch was started, used to report how long
     // we've been waiting for a tx set (see getTxSetWaitingTime)
     std::map<Hash, VirtualClock::time_point> mTxSetFetchStartTimes;
+    VirtualTimer mTxSetFetchRetryTimer;
+    bool mTxSetFetchRetryArmed{false};
+    void scheduleTxSetFetchRetry();
 
     using TxSetFramCacheItem = std::pair<uint64, TxSetXDRFrameConstPtr>;
     // recent txsets
@@ -131,6 +134,9 @@ class PendingEnvelopes
                              std::optional<uint64> maxSlot, uint64 slotToKeep);
 
   public:
+    // Register missing bodies of persisted ballots with the normal fetch and
+    // retry path, so responses are accepted after a validator restart.
+    void fetchForRestoredEnvelope(SCPEnvelope const& envelope);
     PendingEnvelopes(Application& app, HerderImpl& herder);
     ~PendingEnvelopes();
 

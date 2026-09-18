@@ -76,6 +76,10 @@ enum class IPCMessageType : uint32_t
     /// Response: OVERLAY_METRICS_RESPONSE with JSON payload
     REQUEST_OVERLAY_METRICS = 13,
 
+    /// Push a previously cached proposal to connected peers.
+    /// Payload: [hash:32][slotSeq:4]
+    BROADCAST_TX_SET = 14,
+
     // ═══ Overlay → Core (Critical Path) ═══
 
     /// Received SCP envelope from network

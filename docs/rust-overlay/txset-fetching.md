@@ -24,14 +24,10 @@ See [transport](transport.md).
 
 ## Encoding ownership
 
-Only nomination leaders construct local proposals. Followers start SCP with a
-lazy value supplier and vote for received leader proposals without pulling the
-mempool, building a private set, or compressing it. A node promoted by a
-nomination timeout builds only if SCP needs its own value; it rechecks ledger
-state and chooses a current close time then. Subsequent rounds reuse that value.
-First-round leaders may prepare before the trigger; later leaders do no
-speculative preparation. Nomination stops on externalization even for followers
-that never constructed a local value.
+Only the elected slot leader constructs a local proposal. Followers adopt the
+leader-signed value from a ballot statement without pulling the mempool, building
+a private set, or compressing it. The leader may prepare before the normal ledger
+trigger. There is no nomination phase or timeout-based leader promotion.
 
 Core sends `CacheTxSet` as soon as a locally constructed proposal's final XDR is
 available, before the builder's roundtrip and final validation. Rust eagerly
@@ -60,6 +56,15 @@ before. Locally built sets supplied with `CacheTxSet` can also satisfy pending
 demand. There is no permanent delivered marker. Failed IPC enqueueing retains
 the pending request.
 
+## Leader push
+
+After publishing its proposal, Core sends `BroadcastTxSet` with
+`[hash:32][slot:u32 LE]`. Rust looks up the prepared cache entry and starts an
+independent response send for every connected peer. Each send uses the existing
+bulk admission limits and shares the encoded representation. A cache miss logs
+`TXSET_BROADCAST_MISS`; the normal pull path remains available. Receivers cache
+unsolicited sets and satisfy a later Core request directly from that cache.
+
 ## Peer requests
 
 The reader emits `TxSetRequested { hash, from }`. App looks up the cache and
@@ -67,21 +72,23 @@ starts a response send. Send admission and the stream write happen outside the
 App and network dispatcher loops. Count and byte permits bound admitted bulk
 sends; per-route stream locks preserve complete frame ordering.
 
-A cache miss has no network reply. There is no `DontHave` message or automatic
-alternate-peer retry in this path.
+A cache miss has no network reply. There is no `DontHave` message in this path; the fetch retry scheduler handles it.
 
 ## Fetch selection
 
-Before spawning the request write, the dispatcher reserves the hash with
-`(peer, request_time, slot)` in `pending_txset_requests`. An existing request to
-a connected peer suppresses another request. Selection prefers the connected
-peer that supplied an SCP reference, then another connected peer. With no peer,
-the attempt returns without reserving the hash.
+Before spawning the request write, the dispatcher reserves the hash with its
+peer, send time, slot and previously tried peers. A connected peer suppresses
+another request for 5 seconds. Selection first prefers the recorded SCP source
+if untried, then another connected peer. After all connected peers have been
+tried, selection starts a new cycle. With no peer, no new reservation is made.
 
-A failed write removes only its own reservation. Disconnect cleanup removes
-reservations assigned to that peer. A received response clears its matching
-reservation and records fetch latency and the requested slot. This does not
-provide a timeout or automatic retry for a silent peer.
+Core reissues unresolved requests every 2 seconds, preserving the original
+fetch-start timestamp. This is the retry scheduler, including for a connected
+peer that never responds or a lost IPC request. Rust has no second periodic
+retry loop. A failed write removes only its own reservation; a stale failure
+cannot erase a newer attempt. Disconnect cleanup removes reservations assigned
+to that peer. Any matching received body, including an unsolicited push, clears
+the reservation. Reservations beyond the retained slot window are pruned.
 
 ## Cache and externalization
 
@@ -103,6 +110,7 @@ See [mempool](mempool.md).
 
 ## Remaining limitations
 
-- A peer that stays connected but silent can leave a fetch pending indefinitely.
-- A cache miss at the selected peer has no explicit negative response or retry.
-- Selecting one connected peer does not guarantee it has the requested body.
+- Cache misses have no explicit negative response; retries wait for expiry.
+- An arbitrary connected peer may not have the body; retries cycle through peers.
+- Push reaches connected peers only. Other validators depend on normal SCP
+  propagation and pull. Eventual progress assumes a live source and delivery.

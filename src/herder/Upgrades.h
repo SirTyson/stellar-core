@@ -61,10 +61,6 @@ class Upgrades
         std::optional<uint32> mMaxSorobanTxSetSize;
         std::optional<ConfigUpgradeSetKey> mConfigUpgradeSetKey;
 
-        // The maximum number of nomination timeouts this upgrade may experience
-        // per slot before SCP strips it out of the Value being voted on.
-        std::optional<uint32_t> mNominationTimeoutLimit;
-
         // The number of minutes after the scheduled upgrade time before this
         // upgrade is removed (expires).
         std::optional<std::chrono::minutes> mExpirationMinutes;
@@ -117,7 +113,7 @@ class Upgrades
     // returns true if upgrade is a valid upgrade step
     // in which case it also sets upgradeType
     bool isValid(UpgradeType const& upgrade, LedgerUpgradeType& upgradeType,
-                 bool nomination, Application& app) const;
+                 Application& app) const;
 
     // constructs a human readable string that represents
     // the pending upgrades
@@ -135,12 +131,6 @@ class Upgrades
     UpgradeParameters mParams;
 
     bool timeForUpgrade(ApplyTime time) const;
-
-    // returns true if upgrade is a valid upgrade step
-    // in which case it also sets lupgrade
-    bool
-    isValidForNomination(LedgerUpgrade const& upgrade,
-                         CheckValidLedgerViewWrapper const& ledgerView) const;
 
     static void applyVersionUpgrade(Application& app, AbstractLedgerTxn& ltx,
                                     uint32_t newVersion);

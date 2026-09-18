@@ -623,8 +623,6 @@ CommandHandler::upgrades(std::string const& params, std::string& retStr)
                               SOROBAN_PROTOCOL_VERSION);
         p.mMaxSorobanTxSetSize =
             parseOptionalParam<uint32>(retMap, "maxsorobantxsetsize");
-        p.mNominationTimeoutLimit =
-            parseOptionalParam<uint32_t>(retMap, "nominationtimeoutlimit");
         auto expirationMins =
             parseOptionalParam<uint32_t>(retMap, "expirationminutes");
         p.mExpirationMinutes = expirationMins.has_value()

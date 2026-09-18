@@ -700,6 +700,20 @@ OverlayIPC::requestTxSet(Hash const& hash, uint32_t slotIndex)
 }
 
 void
+OverlayIPC::broadcastTxSet(Hash const& hash, uint32_t slotIndex)
+{
+    if (!mChannel || !mChannel->isConnected())
+        return;
+    IPCMessage msg;
+    msg.type = IPCMessageType::BROADCAST_TX_SET;
+    msg.payload.resize(36);
+    std::memcpy(msg.payload.data(), hash.data(), 32);
+    std::memcpy(msg.payload.data() + 32, &slotIndex, 4);
+    std::lock_guard<std::mutex> lock(mSendMutex);
+    mChannel->send(msg);
+}
+
+void
 OverlayIPC::cacheTxSet(Hash const& hash, std::vector<uint8_t> const& xdr,
                        uint32_t slotIndex)
 {

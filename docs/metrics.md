@@ -180,7 +180,6 @@ scp.envelope.sign                         | meter     | envelope signed
 scp.envelope.validsig                     | meter     | envelope signature verified
 scp.fetch.envelope                        | timer     | time to complete fetching of an envelope
 scp.memory.cumulative-statements          | counter   | number of known SCP statements known
-scp.nomination.combinecandidates          | meter     | number of candidates per call
 scp.pending.discarded                     | counter   | number of discarded envelopes
 scp.pending.fetching                      | counter   | number of incomplete envelopes
 scp.pending.processed                     | counter   | number of already processed envelopes
@@ -188,9 +187,12 @@ scp.pending.ready                         | counter   | number of envelopes read
 scp.empty-tx-set.externalized             | counter   | number of times the local node externalized an empty-tx-set value
 scp.empty-tx-set.value-replaced           | counter   | number of times the ballot protocol swapped a value for an empty-tx-set value
 scp.sync.lost                             | meter     | validator lost sync
-scp.timeout.nominate                      | meter     | timeouts in nomination
 scp.timeout.prepare                       | meter     | timeouts in ballot protocol
-scp.timing.nominated                      | timer     | time spent in nomination
+scp.timing.proposal                       | timer     | trigger-to-first-ballot time (includes leader wait and proposal construction)
+scp.proposal.retry                        | meter     | proposal construction retry attempts
+scp.value.wrong-leader                    | meter     | values rejected because the signer is not the elected leader
+scp.fetch.txset-retry                     | meter     | unresolved transaction-set requests reissued to the overlay
+scp.envelope.retransmit                   | meter     | overdue-slot ballot envelopes rebroadcast
 scp.timing.externalized                   | timer     | time spent in ballot protocol
 scp.timing.first-to-self-externalize-lag  | timer     | delay between first externalize message and local node externalizing
 scp.timing.self-to-others-externalize-lag | timer     | delay between local node externalizing and later externalize messages from other nodes
@@ -283,3 +285,8 @@ soroban.in-memory-state.contract-code-size   | counter   | size in bytes of non-
 soroban.in-memory-state.contract-data-size   | counter   | size in bytes of ContractData entries in memory
 soroban.in-memory-state.contract-code-entries   | counter   | number of ContractCode entries in memory
 soroban.in-memory-state.contract-data-entries   | counter   | number of ContractData entries in memory
+
+The Rust overlay JSON snapshot also reports `txset_broadcast` (cache-hit
+broadcast commands), `txset_broadcast_miss`, `scp_nominate_dropped` and
+`fetch_txset_retry` (expired fetch reservations assigned again). Broadcast
+commands do not count successful per-peer delivery.

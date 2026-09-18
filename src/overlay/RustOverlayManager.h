@@ -71,6 +71,7 @@ class RustOverlayManager
 
     // Cache a locally-built TX set in Rust overlay. slotIndex is the slot the
     // set is for, used to stamp the Rust-side cache entry.
+    void broadcastTxSet(Hash const& hash, uint32_t slotIndex);
     void cacheTxSet(Hash const& txSetHash, std::vector<uint8_t> const& xdr,
                     uint32_t slotIndex);
 

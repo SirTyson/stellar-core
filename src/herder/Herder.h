@@ -202,16 +202,15 @@ class Herder
     virtual uint32 getMinLedgerSeqToAskPeers() const = 0;
     virtual uint32 getMinLedgerSeqToRemember() const = 0;
 
-    virtual bool isNewerNominationOrBallotSt(SCPStatement const& oldSt,
-                                             SCPStatement const& newSt) = 0;
+    virtual bool isNewerBallotSt(SCPStatement const& oldSt,
+                                 SCPStatement const& newSt) = 0;
 
     // Returns sequence number for most recent completed checkpoint that the
     // node knows about, as derived from
     // trackingConsensusLedgerIndex
     virtual uint32_t getMostRecentCheckpointSeq() = 0;
 
-    virtual void triggerNextLedger(uint32_t ledgerSeqToTrigger,
-                                   bool forceTrackingSCP) = 0;
+    virtual void triggerNextLedger(uint32_t ledgerSeqToTrigger) = 0;
     virtual void setInSyncAndTriggerNextLedger() = 0;
 
     // lookup a nodeID in config and in SCP messages

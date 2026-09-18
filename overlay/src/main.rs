@@ -1043,6 +1043,26 @@ impl App {
                 }
             }
 
+            MessageType::BroadcastTxSet => {
+                if msg.payload.len() != 36 {
+                    warn!("TXSET_BROADCAST_MISS: malformed request");
+                    return true;
+                }
+                let hash: [u8; 32] = msg.payload[..32].try_into().unwrap();
+                if let Some(cached) = self.tx_set_cache.get(&hash) {
+                    let data = Arc::clone(&cached.xdr);
+                    let handle = self.libp2p_handle.clone();
+                    self.metrics.txset_broadcast.fetch_add(1, Ordering::Relaxed);
+                    tokio::spawn(async move {
+                        handle.broadcast_txset(hash, data).await;
+                    });
+                } else {
+                    self.metrics
+                        .txset_broadcast_miss
+                        .fetch_add(1, Ordering::Relaxed);
+                    warn!("TXSET_BROADCAST_MISS: hash={:02x?}", &hash[..4]);
+                }
+            }
             MessageType::CacheTxSet => {
                 // Core built a TX set locally and wants us to cache it for peer requests
                 // Payload: [hash:32][slotSeq:4][txSetXDR...]

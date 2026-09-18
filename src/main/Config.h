@@ -825,13 +825,8 @@ class Config : public std::enable_shared_from_this<Config>
     std::map<std::string, std::string> VALIDATOR_NAMES;
 
     // Information necessary to compute the weight of a validator for leader
-    // election. Nullopt if this node is not a validator, or if this node is
-    // using manual quorum set configuration.
+    // election. Nullopt when using manual quorum set configuration.
     std::optional<ValidatorWeightConfig> VALIDATOR_WEIGHT_CONFIG;
-
-    // Revert to the old, application-agnostic nomination weight function for
-    // SCP leader election.
-    bool FORCE_OLD_STYLE_LEADER_ELECTION;
 
     // History config
     std::map<std::string, HistoryArchiveConfiguration> HISTORY;
@@ -960,18 +955,18 @@ class Config : public std::enable_shared_from_this<Config>
     // bounds on config upgrades (for testing only).
     bool TESTING_IGNORE_LEDGER_TIME_UPGRADE_BOUNDS;
 
-    // When set, this node will nominate random values when it is the round
-    // leader. This is useful for testing CAP-0083 behavior. This is a testing
-    // only flag.
-    bool TESTING_NOMINATE_RANDOM_VALUES;
+    // When set, this node will propose a random transaction-set hash when it is
+    // the slot leader. This is useful for testing CAP-0083 behavior. This is a
+    // testing only flag.
+    bool TESTING_PROPOSE_RANDOM_TX_SET_HASH;
 
     // Injects a signed wall-clock offset into the node's system clock for
     // testing. Expressed in milliseconds.
     std::chrono::milliseconds ARTIFICIALLY_SET_SYSTEM_CLOCK_OFFSET_FOR_TESTING;
 
-    // Delay emission of updated nomination messages for testing nomination
-    // timeout behavior. Expressed in milliseconds.
-    std::chrono::milliseconds ARTIFICIALLY_DELAY_NOMINATION_EMIT_FOR_TESTING;
+    // Delay the leader before starting its ballot for testing proposal
+    // latency. Expressed in milliseconds.
+    std::chrono::milliseconds ARTIFICIALLY_DELAY_PROPOSAL_FOR_TESTING;
 
     // Set QUORUM_SET using automatic quorum set configuration based on
     // `validators`.

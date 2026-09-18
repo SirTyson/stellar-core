@@ -50,10 +50,10 @@ makeMockSCPEnvelope(uint64_t slotIndex, uint32_t nodeId)
 {
     SCPEnvelope env;
     env.statement.slotIndex = slotIndex;
-    env.statement.pledges.type(SCP_ST_NOMINATE);
+    env.statement.pledges.type(SCP_ST_PREPARE);
 
     // Set some mock data
-    auto& nom = env.statement.pledges.nominate();
+    auto& nom = env.statement.pledges.prepare();
     nom.quorumSetHash.fill(static_cast<uint8_t>(nodeId));
 
     // Value is opaque<> (xvector<uint8_t>), not Hash
@@ -61,7 +61,7 @@ makeMockSCPEnvelope(uint64_t slotIndex, uint32_t nodeId)
     mockValue.resize(32);
     std::fill(mockValue.begin(), mockValue.end(),
               static_cast<uint8_t>(slotIndex & 0xFF));
-    nom.votes.push_back(mockValue);
+    nom.ballot = SCPBallot(1, mockValue);
 
     return env;
 }
