@@ -58,8 +58,14 @@ the pending request.
 
 ## Leader push
 
-After publishing its proposal, Core sends `BroadcastTxSet` with
-`[hash:32][slot:u32 LE]`. Rust looks up the prepared cache entry and starts an
+For a set whose selection excluded valid candidates, Core sends `BroadcastTxSet`
+with `[hash:32][slot:u32 LE]` immediately after `CacheTxSet`. The final XDR is
+already fixed, so delivery can overlap the remaining local validation. Ballot
+start still waits for successful validation. Reusing the set at the trigger does
+not repeat the broadcast. Underfilled early snapshots are expected to be
+replaced and are not broadcast; their final replacement is pushed at the trigger.
+
+Rust looks up the prepared cache entry and starts an
 independent response send for every connected peer. Each send uses the existing
 bulk admission limits and shares the encoded representation. A cache miss logs
 `TXSET_BROADCAST_MISS`; the normal pull path remains available. Receivers cache

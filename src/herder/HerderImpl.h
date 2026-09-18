@@ -266,6 +266,8 @@ class HerderImpl : public Herder
     PreparedTxSet buildTxSet(uint32_t ledgerSeq, ConsensusTime closeTime);
     void prepareTxSet(uint32_t ledgerSeq, ConsensusTime closeTime);
     void discardPreparedTxSet();
+    void broadcastProposalTxSet(TxSetXDRFrameConstPtr const& txSet,
+                                uint32_t ledgerSeq);
     ValueWrapperPtr makeProposal(uint32_t ledgerSeq);
 
     // Compute the trigger-timer anchor point using the local node's

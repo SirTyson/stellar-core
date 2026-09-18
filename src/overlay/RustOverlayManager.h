@@ -7,6 +7,7 @@
 #include "herder/TxSetFrame.h"
 #include "overlay/OverlayIPC.h"
 #include "overlay/OverlayMetrics.h"
+#include <functional>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -46,6 +47,10 @@ class RustOverlayManager
     // initial peer config) or after it (the updated peer list is pushed to the
     // Rust overlay immediately).
     void addKnownPeerForTesting(std::string const& addr);
+
+    // Observe broadcast requests without replacing the production IPC path.
+    std::function<void(Hash const&, uint32_t)>
+        mBroadcastTxSetObserverForTesting;
 #endif
 
     // Network operations

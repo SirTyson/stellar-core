@@ -222,6 +222,12 @@ RustOverlayManager::requestTxSet(Hash const& txSetHash, uint32_t slotIndex)
 void
 RustOverlayManager::broadcastTxSet(Hash const& hash, uint32_t slotIndex)
 {
+#ifdef BUILD_TESTS
+    if (mBroadcastTxSetObserverForTesting)
+    {
+        mBroadcastTxSetObserverForTesting(hash, slotIndex);
+    }
+#endif
     if (mOverlayIPC && !mShuttingDown)
     {
         mOverlayIPC->broadcastTxSet(hash, slotIndex);

@@ -1,9 +1,9 @@
 # Leader-driven ballots (latency experiment)
 
 This branch removes SCP nomination. For the next ledger, one deterministic
-leader constructs and signs a value, pushes its transaction set to connected
-peers, and starts ballot `(1, value)`. A validator without a ballot adopts a
-validated value from a peer ballot statement. Prepare, confirm, externalize,
+leader constructs a transaction set and pushes it to connected peers, then signs
+a validated value and starts ballot `(1, value)`. A validator without a ballot
+adopts a validated value from a peer ballot statement. Prepare, confirm, externalize,
 ballot counters and value overrides retain their existing SCP rules.
 
 This experiment assumes live, honest validators, eventual message delivery,
@@ -47,10 +47,17 @@ confirmed value overrides still take precedence.
 ## Timing and dissemination
 
 The normal next-ledger trigger and close-time checks remain. Only the elected
-leader prepares a local set. At the trigger it publishes the body through the
-existing cache IPC, requests broadcast to connected peers, then emits PREPARE.
-IPC ordering ensures publication precedes the broadcast command; independent
-QUIC streams do not guarantee that every peer receives the body before PREPARE.
+leader prepares a local set. When selection excludes valid candidates, the final
+XDR is cached and broadcast immediately, overlapping Core's remaining roundtrip
+and final validity checks. Reusing that prepared set at the trigger does not send
+it again. Underfilled early snapshots stay local because they will be refreshed;
+their replacement is broadcast when selected at the trigger.
+
+Early delivery distributes unsigned, content-addressed bytes. It does not start
+a ballot or bypass value validation. A discarded snapshot may remain in peer
+caches, but only a successfully validated proposal can produce PREPARE. IPC
+ordering ensures publication precedes the broadcast command; independent QUIC
+streams do not guarantee that every peer receives the body before PREPARE.
 Receivers cache unsolicited sets and retain pull/prefetch as a fallback.
 
 A failed proposal construction schedules another attempt after 250 ms, then

@@ -917,9 +917,9 @@ makeTxSetFromTransactions(
     }
 #endif
 
-    // The final XDR is available now. Start proposal encoding while the
-    // roundtrip and final validity checks below run; only the local builder
-    // supplies this callback. The callback must not nominate the set.
+    // The final XDR is available now. Start encoding and dissemination while
+    // the roundtrip and final validity checks below run; only the local builder
+    // supplies this callback. The callback must not start a ballot for the set.
     if (onTxSetReady)
     {
         onTxSetReady(outputTxSet);

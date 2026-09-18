@@ -6077,6 +6077,16 @@ TEST_CASE("prepare leader proposal before trigger", "[herder][leader-ballot]")
     auto extra = makeTx(bob, alice);
     mempool = {tx->getEnvelope(), extra->getEnvelope()};
     size_t pulls = 0;
+    std::vector<std::pair<Hash, uint32_t>> broadcasts;
+    app->getOverlayManager().mBroadcastTxSetObserverForTesting =
+        [&](Hash const& hash, uint32_t slot) {
+            REQUIRE(slot == seq);
+            REQUIRE_FALSE(herder.getSCP().hasBallot(slot));
+            // The body is available to the overlay before preparation returns;
+            // it must not publish an SCP vote or populate Core's value cache.
+            REQUIRE(LeaderBallotTestAccess::prepared(herder) == nullptr);
+            broadcasts.emplace_back(hash, slot);
+        };
     herder.mGetTopTransactionsForTesting = [&](size_t) {
         ++pulls;
         return mempool;
@@ -6101,6 +6111,8 @@ TEST_CASE("prepare leader proposal before trigger", "[herder][leader-ballot]")
     REQUIRE(herder.getSCP().getLatestMessagesSend(seq).empty());
     auto known = herder.getTxSet(prepared->getContentsHash());
     REQUIRE(std::get<TxSetXDRFrameConstPtr>(known) == nullptr);
+    REQUIRE(broadcasts.size() == 1);
+    REQUIRE(broadcasts.front().first == prepared->getContentsHash());
 
     SECTION("trigger reuses exactly the validated set and close time")
     {
@@ -6138,6 +6150,9 @@ TEST_CASE("prepare leader proposal before trigger", "[herder][leader-ballot]")
         REQUIRE(value.txSetHash == prepared->getContentsHash());
         REQUIRE(getConsensusTime(value) == preparedCloseTime);
         REQUIRE(pulls == 1);
+        REQUIRE(broadcasts.size() == 1);
+        herder.triggerNextLedger(seq);
+        REQUIRE(broadcasts.size() == 1);
     }
     SECTION("clock regression rejects the prepared future close time")
     {
@@ -6174,6 +6189,7 @@ TEST_CASE("prepare leader proposal before trigger", "[herder][leader-ballot]")
         REQUIRE(!LeaderBallotTestAccess::prepared(herder));
     }
     herder.mGetTopTransactionsForTesting = nullptr;
+    app->getOverlayManager().mBroadcastTxSetObserverForTesting = nullptr;
 }
 
 TEST_CASE("only the slot leader constructs local proposals",
@@ -6321,6 +6337,13 @@ TEST_CASE("early underfilled proposals refresh at the trigger",
         mempool = {bad->getEnvelope(), bad->getEnvelope(), bad->getEnvelope()};
     }
     size_t pulls = 0;
+    std::vector<std::pair<Hash, uint32_t>> broadcasts;
+    app->getOverlayManager().mBroadcastTxSetObserverForTesting =
+        [&](Hash const& hash, uint32_t slot) {
+            REQUIRE(slot == seq);
+            REQUIRE_FALSE(herder.getSCP().hasBallot(slot));
+            broadcasts.emplace_back(hash, slot);
+        };
     herder.mGetTopTransactionsForTesting = [&](size_t) {
         ++pulls;
         return mempool;
@@ -6332,6 +6355,7 @@ TEST_CASE("early underfilled proposals refresh at the trigger",
         std::chrono::seconds(1));
     REQUIRE(pulls == 1);
     REQUIRE(LeaderBallotTestAccess::prepared(herder)->sizeTxTotal() == 0);
+    REQUIRE(broadcasts.empty());
     // Transactions arrive while we are waiting for the normal trigger.
     mempool = {tx->getEnvelope(), extra->getEnvelope()};
     clock.setCurrentVirtualTime(herder.getTriggerTimer().expiry_time());
@@ -6349,8 +6373,11 @@ TEST_CASE("early underfilled proposals refresh at the trigger",
         herder.getTxSet(expected->getContentsHash()));
     REQUIRE(proposed);
     REQUIRE(proposed->sizeTxTotal() == 2);
+    REQUIRE(broadcasts.size() == 1);
+    REQUIRE(broadcasts.front().first == proposed->getContentsHash());
     REQUIRE(!LeaderBallotTestAccess::prepared(herder));
     herder.mGetTopTransactionsForTesting = nullptr;
+    app->getOverlayManager().mBroadcastTxSetObserverForTesting = nullptr;
 }
 
 TEST_CASE("early preparation respects manual and immediately due triggers",

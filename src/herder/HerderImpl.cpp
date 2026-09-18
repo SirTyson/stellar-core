@@ -1802,6 +1802,7 @@ HerderImpl::buildTxSet(uint32_t ledgerSeq, ConsensusTime closeTime)
 
     PerPhaseTransactionList invalidTxPhases;
     invalidTxPhases.resize(txPhases.size());
+    bool capacityLimited = false;
 
     std::tie(proposedSet, applicableProposedSet) = makeTxSetFromTransactions(
         txPhases, mApp, closeTimeOffset, invalidTxPhases
@@ -1811,14 +1812,30 @@ HerderImpl::buildTxSet(uint32_t ledgerSeq, ConsensusTime closeTime)
 #endif
         ,
         [&](TxSetXDRFrameConstPtr const& txSet) {
-            // Hand the final XDR to the overlay before the builder's remaining
-            // validation. Its eager compression runs concurrently in Rust.
+            // Selection has already populated invalidTxPhases. A set that
+            // excluded valid candidates can be reused at the trigger; an
+            // underfilled snapshot must be refreshed there instead.
+            size_t validCandidates = 0;
+            for (size_t i = 0; i < txPhases.size(); ++i)
+            {
+                validCandidates +=
+                    txPhases[i].size() - invalidTxPhases[i].size();
+            }
+            capacityLimited = validCandidates > txSet->sizeTxTotal();
+
+            // Encoding and delivery can overlap the remaining roundtrip and
+            // final validation. This only distributes content-addressed bytes:
+            // no SCP value is signed or voted on until validation succeeds.
             if (txSet->isGeneralizedTxSet())
             {
                 GeneralizedTransactionSet xdrTxSet;
                 txSet->toXDR(xdrTxSet);
                 overlayMgr.cacheTxSet(txSet->getContentsHash(),
                                       xdr::xdr_to_opaque(xdrTxSet), ledgerSeq);
+                if (capacityLimited)
+                {
+                    broadcastProposalTxSet(txSet, ledgerSeq);
+                }
             }
         });
     CLOG_INFO(Herder, "Proposed TX set has {} transactions",
@@ -1854,16 +1871,6 @@ HerderImpl::buildTxSet(uint32_t ledgerSeq, ConsensusTime closeTime)
         }
     }
 
-    // If all valid candidates fit, refresh at the trigger so an early empty
-    // or small snapshot doesn't prevent collecting transactions during the
-    // timer wait. Reuse a snapshot when selection actually excluded valid
-    // candidates. Invalid transactions do not establish excess demand.
-    size_t validCandidates = 0;
-    for (size_t i = 0; i < txPhases.size(); ++i)
-    {
-        validCandidates += txPhases[i].size() - invalidTxPhases[i].size();
-    }
-    bool capacityLimited = validCandidates > proposedSet->sizeTxTotal();
     return PreparedTxSet{lcl.hash,
                          ledgerSeq,
                          closeTime,
@@ -1871,6 +1878,23 @@ HerderImpl::buildTxSet(uint32_t ledgerSeq, ConsensusTime closeTime)
                          std::move(applicableProposedSet),
                          std::move(invalidTxHashes),
                          capacityLimited};
+}
+
+void
+HerderImpl::broadcastProposalTxSet(TxSetXDRFrameConstPtr const& txSet,
+                                   uint32_t ledgerSeq)
+{
+#ifdef BUILD_TESTS
+    if (mApp.getConfig().TESTING_PROPOSE_RANDOM_TX_SET_HASH)
+    {
+        return;
+    }
+#endif
+    if (txSet->isGeneralizedTxSet())
+    {
+        mApp.getOverlayManager().broadcastTxSet(txSet->getContentsHash(),
+                                                ledgerSeq);
+    }
 }
 
 // called to take a position during the next round
@@ -1977,15 +2001,6 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger)
     {
         CLOG_INFO(Herder, "Starting leader ballot for ledger {}",
                   ledgerSeqToTrigger);
-        StellarValue proposal;
-        xdr::xdr_from_opaque(value->getValue(), proposal);
-#ifdef BUILD_TESTS
-        if (!mApp.getConfig().TESTING_PROPOSE_RANDOM_TX_SET_HASH)
-#endif
-        {
-            mApp.getOverlayManager().broadcastTxSet(proposal.txSetHash,
-                                                    ledgerSeqToTrigger);
-        }
 #ifdef BUILD_TESTS
         std::this_thread::sleep_for(
             mApp.getConfig().ARTIFICIALLY_DELAY_PROPOSAL_FOR_TESTING);
@@ -2088,6 +2103,14 @@ HerderImpl::makeProposal(uint32_t ledgerSeqToTrigger)
     if (ledgerSeqToTrigger != slotIndex || mLedgerManager.isApplying())
     {
         return nullptr;
+    }
+
+    // Capacity-limited sets were already pushed from the XDR-ready callback.
+    // Only publish an underfilled set once it is selected at the trigger,
+    // so early empty/small snapshots do not create redundant network traffic.
+    if (!prepared->capacityLimited)
+    {
+        broadcastProposalTxSet(proposedSet, ledgerSeqToTrigger);
     }
 
     auto newUpgrades = emptyUpgradeSteps;
