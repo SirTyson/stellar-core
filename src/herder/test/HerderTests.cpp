@@ -4264,6 +4264,10 @@ TEST_CASE("slot herder policy", "[herder]")
     Application::pointer app = createTestApplication(clock, cfg);
 
     auto& herder = static_cast<HerderImpl&>(app->getHerder());
+    // Keep the fixture's v1-signed values valid under leader election.
+    herder.getHerderSCPDriver().setPriorityLookup([v1NodeID](NodeID const& id) {
+        return id == v1NodeID ? uint64_t{2} : uint64_t{1};
+    });
 
     auto qSet = herder.getSCP().getLocalQuorumSet();
     auto qsetHash = sha256(xdr::xdr_to_opaque(qSet));
@@ -4421,6 +4425,17 @@ TEST_CASE("SCP message capture from previous ledger", "[herder]")
     auto C = simulation->addNode(validatorCKey, qset);
     simulation->addPendingConnection(validatorAKey.getPublicKey(),
                                      validatorBKey.getPublicKey());
+    // This test isolates history capture while C is disconnected. Keep the
+    // proposer in the connected pair; election fairness is tested separately.
+    for (auto const& node : simulation->getNodes())
+    {
+        static_cast<HerderImpl&>(node->getHerder())
+            .getHerderSCPDriver()
+            .setPriorityLookup(
+                [leader = validatorAKey.getPublicKey()](NodeID const& nodeID) {
+                    return nodeID == leader ? uint64_t{2} : uint64_t{1};
+                });
+    }
     simulation->startAllNodes();
 
     // Crank A and B until they're on ledger 2. crankUntil only samples its
@@ -4493,6 +4508,20 @@ TEST_CASE("SCP message capture from previous ledger", "[herder]")
     HerderImpl& herderB = dynamic_cast<HerderImpl&>(B->getHerder());
     std::vector<SCPEnvelope> AEnvs = herderA.getSCP().getLatestMessagesSend(2);
     std::vector<SCPEnvelope> BEnvs = herderB.getSCP().getLatestMessagesSend(2);
+
+    // Followers no longer construct a matching empty proposal themselves.
+    // Transfer the body along with the manually delivered ballot messages.
+    REQUIRE(AEnvs.size() == 1);
+    REQUIRE(AEnvs.front().statement.pledges.type() == SCP_ST_EXTERNALIZE);
+    StellarValue value;
+    xdr::xdr_from_opaque(
+        AEnvs.front().statement.pledges.externalize().commit.value, value);
+    auto txSet =
+        std::get<TxSetXDRFrameConstPtr>(herderA.getTxSet(value.txSetHash));
+    REQUIRE(txSet);
+    static_cast<HerderImpl&>(C->getHerder())
+        .getPendingEnvelopes()
+        .putTxSet(value.txSetHash, 2, txSet);
 
     // Pass A and B's messages to C
     for (auto const& env : AEnvs)
@@ -5243,6 +5272,9 @@ TEST_CASE("SCP state restore with missing tx set", "[herder]")
 {
     auto cfg = getTestConfig(0, Config::TESTDB_BUCKET_DB_PERSISTENT);
     cfg.MANUAL_CLOSE = false;
+    // Restore now restarts the missing-body fetch. Model an expired download
+    // when exercising the existing empty-value counter-bump behavior below.
+    cfg.TX_SET_DOWNLOAD_TIMEOUT = std::chrono::milliseconds{0};
     // Test with parallel tx set downloading both enabled and disabled. The
     // disabled case tests a node operator shutting down a node with parallel tx
     // set downloading enabled, then flipping the flag off and restarting the
@@ -5277,9 +5309,13 @@ TEST_CASE("SCP state restore with missing tx set", "[herder]")
         auto const& lcl = app->getLedgerManager().getLastClosedLedgerHeader();
         slot = lcl.header.ledgerSeq + 1;
 
+        auto const& proposer =
+            herder.getHerderSCPDriver().leaderFor(slot) == selfPk
+                ? cfg.NODE_SEED
+                : peerKey;
         auto sv = herder.makeStellarValue(fakeTxSetHash,
                                           makeConsensusTime(app->timeNow() + 1),
-                                          emptyUpgradeSteps, cfg.NODE_SEED);
+                                          emptyUpgradeSteps, proposer);
         value = xdr::xdr_to_opaque(sv);
 
         SCPEnvelope env;
@@ -5311,8 +5347,9 @@ TEST_CASE("SCP state restore with missing tx set", "[herder]")
     // The ballot state was restored
     REQUIRE(!herder.getSCP().getLatestMessagesSend(slot).empty());
 
-    // The restored value's tx set is missing and nothing is fetching it, but
-    // the value is still structurally valid
+    // Restore registers the missing body for fetching; the leader's signed
+    // value remains structurally valid until the body arrives.
+    REQUIRE(driver.getTxSetDownloadWaitTime(value).has_value());
     REQUIRE(driver.validateValue(slot, value) ==
             SCPDriver::kStructurallyValidValue);
 
@@ -5363,8 +5400,8 @@ TEST_CASE("SCP state restore with missing tx set", "[herder]")
     SECTION("peer is v-blocking ahead")
     {
         // The v-blocking peer is on a higher ballot counter, so the node
-        // abandons its ballot. Since nothing is downloading the missing tx
-        // set, the node replaces the restored value with the empty-tx-set
+        // abandons its ballot. Since the missing-body download has timed out,
+        // the node replaces the restored value with the empty-tx-set
         // value when bumping.
         REQUIRE(herder.recvSCPEnvelope(makePrepareFromPeer(false)) ==
                 Herder::ENVELOPE_STATUS_READY);
