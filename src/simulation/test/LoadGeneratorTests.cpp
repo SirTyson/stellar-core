@@ -446,7 +446,13 @@ TEST_CASE("generate soroban load", "[loadgen][soroban]")
     Simulation::pointer simulation = Topologies::pair(networkID, [&](int i) {
         auto cfg = getTestConfig(i);
         cfg.ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING = true;
-        cfg.USE_CONFIG_FOR_GENESIS = false;
+        // Keep an actual protocol upgrade in this test, starting with a
+        // linked Soroban host and generalized tx sets. The Rust transport
+        // cannot distribute pre-Soroban tx sets; followers no longer build
+        // duplicate empty sets that happened to mask that limitation.
+        cfg.USE_CONFIG_FOR_GENESIS = true;
+        cfg.TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION =
+            Config::CURRENT_LEDGER_PROTOCOL_VERSION - 1;
         cfg.ARTIFICIALLY_GENERATE_LOAD_FOR_TESTING = true;
         cfg.UPDATE_SOROBAN_COSTS_DURING_PROTOCOL_UPGRADE_FOR_TESTING = true;
         cfg.GENESIS_TEST_ACCOUNT_COUNT = 500;

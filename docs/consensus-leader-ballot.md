@@ -10,6 +10,8 @@ This experiment assumes live, honest validators, eventual message delivery,
 compatible clocks, and identical election configuration. It has no leader
 rotation. A configured validator that remains offline can stop progress when it
 is elected. It is not a fault-tolerant replacement for the complete SCP protocol.
+The latency campaign runs protocol 28. Networked operation requires generalized
+transaction sets: the Rust transport does not distribute pre-Soroban sets.
 
 ## Election and validation
 
