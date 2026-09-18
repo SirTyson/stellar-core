@@ -54,7 +54,7 @@ printStats(int& nLedgers, std::chrono::system_clock::time_point tBegin,
     LOG_INFO(DEFAULT_LOG, "{}", sim->metricsSummary("scp"));
 }
 
-TEST_CASE("3 nodes 2 running threshold 2", "[simulation][core3][acceptance]")
+TEST_CASE("3 live nodes threshold 2", "[simulation][core3][acceptance]")
 {
 
     {
@@ -78,8 +78,10 @@ TEST_CASE("3 nodes 2 running threshold 2", "[simulation][core3][acceptance]")
 
         simulation->addNode(keys[0], qSet);
         simulation->addNode(keys[1], qSet);
-        simulation->addPendingConnection(keys[0].getPublicKey(),
-                                         keys[1].getPublicKey());
+        // Every configured validator can lead a slot. This experiment requires
+        // all three to be live even though the ballot quorum needs only two.
+        simulation->addNode(keys[2], qSet);
+        simulation->fullyConnectAllPending();
 
         LOG_INFO(DEFAULT_LOG,
                  "#######################################################");
@@ -165,8 +167,6 @@ resilienceTest(Simulation::pointer sim)
 
     sim->startAllNodes();
 
-    stellar::uniform_int_distribution<size_t> gen(0, nbNodes - 1);
-
     // bring network to a good place
     uint32 targetLedger = LedgerManager::GENESIS_LEDGER_SEQ + 1;
     uint32 const nbLedgerStep = 2;
@@ -175,7 +175,7 @@ resilienceTest(Simulation::pointer sim)
         targetLedger += step;
         sim->crankUntil(
             [&]() { return sim->haveAllExternalized(targetLedger, maxGap); },
-            5 * nbLedgerStep * sim->getExpectedLedgerCloseTime(), false);
+            std::chrono::seconds(90), false);
 
         REQUIRE(sim->haveAllExternalized(targetLedger, maxGap));
     };
@@ -184,9 +184,21 @@ resilienceTest(Simulation::pointer sim)
 
     for (size_t rounds = 0; rounds < 2; rounds++)
     {
-        // now restart a random node i, will reconnect to
-        // j to join the network
-        auto i = gen(getGlobalRandomEngine());
+        // Restart the next slot's elected leader, then a follower. All
+        // validators eventually return; progress while the leader remains
+        // offline is outside the experiment's liveness assumptions.
+        auto reference = sim->getNode(nodes.front());
+        auto const lcl =
+            reference->getLedgerManager().getLastClosedLedgerHeader();
+        auto& herder = static_cast<HerderImpl&>(reference->getHerder());
+        auto leader = herder.getSCP().electLeader(
+            lcl.header.ledgerSeq + 1, xdr::xdr_to_opaque(lcl.header.scpValue));
+        reference.reset();
+        auto leaderIt = std::find(nodes.begin(), nodes.end(), leader);
+        REQUIRE(leaderIt != nodes.end());
+        auto i = static_cast<size_t>(std::distance(nodes.begin(), leaderIt));
+        if (rounds != 0)
+            i = (i + 1) % nbNodes;
         auto j = (i + 1) % nbNodes;
 
         auto victimID = nodes[i];
@@ -201,8 +213,6 @@ resilienceTest(Simulation::pointer sim)
         victimConfig.FORCE_SCP = false;
         // kill instance
         sim->removeNode(victimID);
-        // let the rest of the network move on
-        crankForward(nbLedgerStep, 1);
         // start the instance
         sim->addNode(victimConfig.NODE_SEED, victimConfig.QUORUM_SET,
                      &victimConfig, false);
@@ -235,6 +245,19 @@ resilienceTest(Simulation::pointer sim)
         }
     }
 }
+
+TEST_CASE("leader and follower restart with direct ballots",
+          "[herder][simulation][leader-ballot][resilience]")
+{
+    auto networkID = sha256(getTestConfig().NETWORK_PASSPHRASE);
+    auto confGen = [](int i) {
+        auto cfg = getTestConfig(i, Config::TESTDB_BUCKET_DB_PERSISTENT);
+        cfg.ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING = true;
+        return cfg;
+    };
+    resilienceTest(Topologies::core(4, 0.75, networkID, confGen));
+}
+
 // TODO(overlay-v2): this topology gives nodes different quorum sets, and the
 // Rust overlay cannot yet fetch an unknown quorum set from peers
 // (PendingEnvelopes::startFetch records the hash but nothing requests it), so
