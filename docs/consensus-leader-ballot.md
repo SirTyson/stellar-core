@@ -69,6 +69,11 @@ the leader's body. It can also restart proposal construction when the ledger is
 synced and no ballot exists. Recovery is deliberately outside the normal fast
 path. It does not elect a replacement leader.
 
+After loading a persisted ledger beyond genesis, a restarted next-slot leader
+leaves the ledger manager's booting state so it can propose without waiting for
+its own proposal to externalize. A restored ballot is retained; otherwise the
+normal trigger cadence is armed. Genesis still needs explicit bootstrap.
+
 NOMINATE remains a wire enum for decoding old messages, but the Rust receive
 boundary and Core intake reject it before nomination-specific processing.
 Persisted nomination envelopes are skipped during restore. There is no runtime

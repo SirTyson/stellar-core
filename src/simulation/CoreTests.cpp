@@ -218,6 +218,12 @@ resilienceTest(Simulation::pointer sim)
                      &victimConfig, false);
         auto refreshedApp = sim->getNode(victimID);
         refreshedApp->start();
+        if (rounds == 0)
+        {
+            // A leader must resume its persisted LCL without waiting for the
+            // next externalization, which itself needs this leader's proposal.
+            REQUIRE(refreshedApp->getLedgerManager().isSynced());
+        }
         // connect to another node
         sim->addConnection(victimID, otherID);
         // this crank should allow the node to rejoin the network

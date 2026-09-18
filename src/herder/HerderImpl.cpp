@@ -2906,6 +2906,22 @@ HerderImpl::start()
     }
 
     restoreUpgrades();
+    // A restarted leader cannot wait for a newer externalization to leave
+    // BOOTING: the other validators are waiting for its proposal. The loaded
+    // LCL is a complete validation context for LCL+1. Resume from it, retaining
+    // any persisted ballot, and use the normal cadence for a fresh proposal.
+    // Genesis without FORCE_SCP still requires explicit network bootstrap.
+    if (!cfg.MANUAL_CLOSE &&
+        lcl.header.ledgerSeq > LedgerManager::GENESIS_LEDGER_SEQ &&
+        mLedgerManager.getState() == LedgerManager::LM_BOOTING_STATE &&
+        mHerderSCPDriver.isLocalLeader(lcl.header.ledgerSeq + 1))
+    {
+        mLedgerManager.moveToSynced();
+        if (!getSCP().hasBallot(lcl.header.ledgerSeq + 1))
+        {
+            setupTriggerNextLedger();
+        }
+    }
     startBallotRecoveryTimer();
     startTxSetGCTimer();
     startCheckForDeadNodesInterval();
