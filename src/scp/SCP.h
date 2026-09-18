@@ -53,6 +53,9 @@ class SCP
 
     bool startBallot(uint64 slotIndex, ValueWrapperPtr value);
     bool hasBallot(uint64 slotIndex);
+    // Reconsider existing evidence after a value becomes fully validated.
+    // Does not create a slot or bump the ballot counter.
+    void revalidateValue(uint64 slotIndex, Value const& value);
     NodeID electLeader(uint64 slotIndex, Value const& previousValue);
 
     // Local QuorumSet interface (can be dynamically updated)

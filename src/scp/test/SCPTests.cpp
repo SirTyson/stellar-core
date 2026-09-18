@@ -2573,7 +2573,6 @@ TEST_CASE("ballot protocol core3", "[scp][ballotprotocol]")
     testTimeouts(scp, test);
 }
 
-#ifdef CAP_0087
 TEST_CASE(
     "follower adoption times out structurally-valid value into empty tx set",
     "[scp][leader-ballot]")
@@ -2940,6 +2939,39 @@ TEST_CASE("setConfirmPrepared stalls on kStructurallyValidValue value",
         }
         REQUIRE(foundC);
     }
+
+    SECTION("validation completion resumes the same ballot without new votes")
+    {
+        auto const before = scp.mEnvs.size();
+        REQUIRE(scp.mEnvs.back().statement.pledges.prepare().nC == 0);
+        scp.mSCP.revalidateValue(0, xValue);
+        REQUIRE(scp.mEnvs.size() == before);
+
+        scp.clearDownload(xValue);
+        scp.mSCP.revalidateValue(0, xValue);
+        REQUIRE(scp.mEnvs.size() == before + 1);
+        verifyPrepare(scp.mEnvs.back(), v0SecretKey,
+                      scp.mSCP.getLocalNode()->getQuorumSetHash(), 0, xB1, &xB1,
+                      1, 1);
+
+        // Duplicate completions neither emit again nor bump the counter.
+        scp.mSCP.revalidateValue(0, xValue);
+        REQUIRE(scp.mEnvs.size() == before + 1);
+    }
+
+    SECTION("peer commit vote is newer at the same prepared ballot")
+    {
+        auto withoutCommit =
+            makePrepare(v1SecretKey, qSetHash, 0, xB1, &xB1, 0, 1);
+        auto withCommit =
+            makePrepare(v1SecretKey, qSetHash, 0, xB1, &xB1, 1, 1);
+        REQUIRE(scp.receiveEnvelope(withoutCommit) ==
+                SCP::EnvelopeState::VALID);
+        REQUIRE(scp.receiveEnvelope(withCommit) == SCP::EnvelopeState::VALID);
+        REQUIRE(scp.receiveEnvelope(withCommit) == SCP::EnvelopeState::INVALID);
+        REQUIRE(scp.receiveEnvelope(withoutCommit) ==
+                SCP::EnvelopeState::INVALID);
+    }
 }
 
 TEST_CASE("incoming PREPARE with structurally valid prepared value is accepted",
@@ -3012,7 +3044,6 @@ TEST_CASE("incoming PREPARE with non-tx-set-invalid value is dropped",
     // No local emit triggered.
     REQUIRE(scp.mEnvs.empty());
 }
-#endif // CAP_0087
 
 TEST_CASE("direct ballot proposal and follower adoption",
           "[scp][leader-ballot]")

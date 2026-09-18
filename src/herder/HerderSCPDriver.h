@@ -69,6 +69,11 @@ class HerderSCPDriver : public SCPDriver
     // value validation
     SCPDriver::ValidationLevel validateValue(uint64_t slotIndex,
                                              Value const& value) const override;
+    SCPDriver::ValidationLevel
+    validateValueForPrepare(uint64_t slotIndex,
+                            Value const& value) const override;
+    bool isValueValidationPending(uint64 slotIndex,
+                                  Value const& value) const override;
 
     // value marshaling
     std::string toShortString(NodeID const& pk) const override;
@@ -311,9 +316,19 @@ class HerderSCPDriver : public SCPDriver
     mutable RandomEvictionCache<TxSetValidityKey, bool, TxSetValidityKeyHash>
         mTxSetValidCache;
 
+    // One deferred main-thread validation per slot/value. Ledger state is
+    // never read from a worker thread. Early votes can travel in the meantime.
+    mutable std::set<std::pair<uint64_t, Value>> mPendingValueValidations;
+
     SCPDriver::ValidationLevel
-    validateValueAgainstLocalState(uint64_t slotIndex,
-                                   StellarValue const& sv) const;
+    validateValueImpl(uint64_t slotIndex, Value const& value,
+                      bool deferTxSetValidation) const;
+    void scheduleTxSetValidation(uint64_t slotIndex, StellarValue const& sv,
+                                 TxSetXDRFrameConstPtr txSet) const;
+
+    SCPDriver::ValidationLevel
+    validateValueAgainstLocalState(uint64_t slotIndex, StellarValue const& sv,
+                                   bool deferTxSetValidation) const;
 
     SCPDriver::ValidationLevel
     validatePastOrFutureValue(uint64_t slotIndex, StellarValue const& b,

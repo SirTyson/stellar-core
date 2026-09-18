@@ -795,8 +795,11 @@ TEST_CASE("PendingEnvelopes recvSCPEnvelope without parallel tx set download",
 TEST_CASE("pending transaction sets are retried until received",
           "[herder][leader-ballot]")
 {
+    bool const parallel = GENERATE(false, true);
+    CAPTURE(parallel);
     VirtualClock clock;
     auto cfg = getTestConfig();
+    cfg.EXPERIMENTAL_PARALLEL_TX_SET_DOWNLOAD = parallel;
     cfg.MANUAL_CLOSE = false;
     cfg.ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING = false;
     auto peer = SecretKey::fromSeed(sha256("txset-retry-peer"));
@@ -811,7 +814,9 @@ TEST_CASE("pending transaction sets are retried until received",
         herder, peer, pair, herder.getSCP().getLocalNode()->getQuorumSetHash(),
         lcl.header.ledgerSeq + 1);
     auto& pending = herder.getPendingEnvelopes();
-    REQUIRE(pending.recvSCPEnvelope(env) == Herder::ENVELOPE_STATUS_FETCHING);
+    REQUIRE(pending.recvSCPEnvelope(env) ==
+            (parallel ? Herder::ENVELOPE_STATUS_READY
+                      : Herder::ENVELOPE_STATUS_FETCHING));
     auto& retries =
         app->getMetrics().NewMeter({"scp", "fetch", "txset-retry"}, "request");
     testutil::crankUntil(

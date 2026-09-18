@@ -107,6 +107,7 @@ class BallotProtocol
                                        bool self);
 
     bool startBallot(ValueWrapperPtr value);
+    void revalidateValue(Value const& value);
     bool
     hasCurrentBallot() const
     {

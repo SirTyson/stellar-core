@@ -2582,6 +2582,9 @@ testSCPDriver(uint32 protocolVersion, uint32_t maxTxSetSize, size_t expectedOps)
     cfg.TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION = protocolVersion;
     cfg.TESTING_UPGRADE_MAX_TX_SET_SIZE = maxTxSetSize;
     cfg.GENESIS_TEST_ACCOUNT_COUNT = 1000;
+    // This fixture exercises the fetch-before-processing intake contract.
+    // Parallel intake and deferred validation have their own coverage below.
+    cfg.EXPERIMENTAL_PARALLEL_TX_SET_DOWNLOAD = false;
 
     VirtualClock clock;
     auto s = SecretKey::pseudoRandomForTesting();
@@ -6879,6 +6882,170 @@ TEST_CASE("leader signature gates direct ballot adoption",
     env.statement.pledges.type(SCP_ST_NOMINATE);
     env.statement.pledges.nominate().votes.push_back(Value{255});
     REQUIRE(herder.recvSCPEnvelope(env) == Herder::ENVELOPE_STATUS_DISCARDED);
+}
+
+TEST_CASE("direct ballots overlap transaction set delivery and validation",
+          "[herder][leader-ballot][parallel-txset]")
+{
+    bool const enableParallel = GENERATE(false, true);
+    auto const protocol = GENERATE(27u, 28u);
+    bool const parallel = enableParallel && protocol >= 28;
+    CAPTURE(enableParallel, protocol);
+    VirtualClock clock;
+    auto cfg = getTestConfig();
+    cfg.MANUAL_CLOSE = false;
+    cfg.HTTP_PORT = 0;
+    cfg.EXPERIMENTAL_PARALLEL_TX_SET_DOWNLOAD = enableParallel;
+    cfg.TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION = protocol;
+    cfg.TX_SET_DOWNLOAD_TIMEOUT = std::chrono::hours(1);
+    auto app = createTestApplication(clock, cfg);
+    auto& herder = static_cast<HerderImpl&>(app->getHerder());
+    auto& driver = herder.getHerderSCPDriver();
+    auto& pending = herder.getPendingEnvelopes();
+    auto& scp = herder.getSCP();
+    auto const lcl = app->getLedgerManager().getLastClosedLedgerHeader();
+    auto const slot = lcl.header.ledgerSeq + 1;
+    auto peer = SecretKey::fromSeed(sha256("parallel-ballot-peer"));
+    SecretKey other;
+    SCPQuorumSet qset;
+    qset.threshold = 3;
+    for (int i = 0; i < 100; ++i)
+    {
+        other = SecretKey::fromSeed(
+            sha256(fmt::format("parallel-ballot-other-{}", i)));
+        qset.validators = {cfg.NODE_SEED.getPublicKey(), peer.getPublicKey(),
+                           other.getPublicKey()};
+        scp.updateLocalQuorumSet(qset);
+        if (!driver.isLocalLeader(slot))
+        {
+            break;
+        }
+    }
+    REQUIRE_FALSE(driver.isLocalLeader(slot));
+    auto const qhash = scp.getLocalNode()->getQuorumSetHash();
+    pending.addSCPQuorumSet(qhash, scp.getLocalQuorumSet());
+    // Each peer uses the full three-validator quorum set.
+    auto const peerQHash = sha256(xdr::xdr_to_opaque(qset));
+    pending.addSCPQuorumSet(peerQHash, qset);
+    pending.rebuildQuorumTrackerState();
+    auto const& leader =
+        driver.leaderFor(slot) == peer.getPublicKey() ? peer : other;
+
+    bool bodyFirst = false;
+    bool invalidBody = false;
+    SECTION("body arrives before the first PREPARE")
+    {
+        bodyFirst = true;
+    }
+    SECTION("body arrives after prepared quorum evidence")
+    {
+    }
+    SECTION("invalid body cannot unlock a commit vote")
+    {
+        invalidBody = true;
+    }
+
+    auto txset = TxSetXDRFrame::makeEmpty(lcl);
+    if (invalidBody)
+    {
+        GeneralizedTransactionSet wire;
+        txset->toXDR(wire);
+        wire.v1TxSet().previousLedgerHash[0] ^= 1;
+        txset = TxSetXDRFrame::makeFromWire(wire);
+    }
+    auto time = std::max(
+        ConsensusTime::fromSystemTime(clock.system_now(),
+                                      lcl.header.ledgerVersion),
+        getConsensusTime(lcl.header.scpValue).next(lcl.header.ledgerVersion));
+    auto value = xdr::xdr_to_opaque(herder.makeStellarValue(
+        txset->getContentsHash(), time, emptyUpgradeSteps, leader));
+    auto& validation =
+        app->getMetrics().NewTimer({"herder", "txset", "validate"});
+    auto const beforeValidation = validation.count();
+    auto receivePrepare = [&](SecretKey const& sender, bool prepared) {
+        SCPEnvelope env;
+        env.statement.nodeID = sender.getPublicKey();
+        env.statement.slotIndex = slot;
+        env.statement.pledges.type(SCP_ST_PREPARE);
+        auto& p = env.statement.pledges.prepare();
+        p.quorumSetHash = peerQHash;
+        p.ballot = SCPBallot(1, value);
+        if (prepared)
+        {
+            p.prepared.activate() = p.ballot;
+        }
+        herder.signEnvelope(sender, env);
+        return herder.recvSCPEnvelope(env);
+    };
+    auto ownPrepare = [&]() {
+        auto own = scp.getLatestMessagesSend(slot);
+        REQUIRE(own.size() == 1);
+        REQUIRE(own.front().statement.pledges.type() == SCP_ST_PREPARE);
+        return own.front().statement.pledges.prepare();
+    };
+    auto finishValidation = [&]() {
+        for (int i = 0; i < 100 && driver.isValueValidationPending(slot, value);
+             ++i)
+        {
+            clock.crank(false);
+        }
+        REQUIRE_FALSE(driver.isValueValidationPending(slot, value));
+    };
+
+    if (bodyFirst)
+    {
+        // No active fetch exists. Queued validation of a present body must
+        // not be confused with a failed or invalid download.
+        pending.putTxSet(txset->getContentsHash(), slot, txset);
+        REQUIRE(receivePrepare(leader, false) == Herder::ENVELOPE_STATUS_READY);
+        REQUIRE(ownPrepare().ballot.value == value);
+        REQUIRE(ownPrepare().nC == 0);
+        REQUIRE(validation.count() == beforeValidation + (parallel ? 0 : 1));
+        REQUIRE(driver.isValueValidationPending(slot, value) == parallel);
+        finishValidation();
+        REQUIRE(validation.count() == beforeValidation + 1);
+    }
+    else
+    {
+        for (auto const& sender : {peer, other})
+        {
+            REQUIRE(receivePrepare(sender, false) ==
+                    (parallel ? Herder::ENVELOPE_STATUS_READY
+                              : Herder::ENVELOPE_STATUS_FETCHING));
+        }
+        receivePrepare(peer, true);
+        receivePrepare(other, true);
+        REQUIRE(validation.count() == beforeValidation);
+        if (parallel)
+        {
+            REQUIRE(ownPrepare().nH == 1);
+            REQUIRE(ownPrepare().nC == 0);
+            REQUIRE(ownPrepare().ballot.value == value);
+        }
+        else
+        {
+            REQUIRE(scp.getLatestMessagesSend(slot).empty());
+        }
+
+        REQUIRE(herder.recvTxSet(txset->getContentsHash(), txset));
+        finishValidation();
+        REQUIRE(validation.count() == beforeValidation + 1);
+        if (invalidBody && protocol < 28)
+        {
+            REQUIRE(scp.getLatestMessagesSend(slot).empty());
+            REQUIRE(driver.validateValue(slot, value) ==
+                    SCPDriver::kInvalidValue);
+            return;
+        }
+        auto own = ownPrepare();
+        REQUIRE(own.ballot.counter == 1);
+        REQUIRE(own.nC == (invalidBody ? 0 : 1));
+        REQUIRE(own.nH == 1);
+        // No new peer messages or timer bumps were required to resume voting.
+        REQUIRE(driver.validateValue(slot, value) ==
+                (invalidBody ? SCPDriver::kStructurallyValidValue
+                             : SCPDriver::kFullyValidatedValue));
+    }
 }
 
 TEST_CASE("direct ballots agree on leaders with a slow validator",

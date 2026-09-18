@@ -98,7 +98,9 @@ BallotProtocol::isNewerStatement(SCPStatement const& oldst,
         else
         {
             // Lexicographical order between PREPARE statements:
-            // (b, p, p', h)
+            // (b, p, p', h), followed by the first commit vote. With deferred
+            // validation, c can become nonzero after h without changing any
+            // of the other fields.
             auto const& oldPrep = oldst.pledges.prepare();
             auto const& prep = st.pledges.prepare();
 
@@ -124,7 +126,9 @@ BallotProtocol::isNewerStatement(SCPStatement const& oldst,
                     }
                     else if (compBallot == 0)
                     {
-                        res = (oldPrep.nH < prep.nH);
+                        res = oldPrep.nH < prep.nH ||
+                              (oldPrep.nH == prep.nH && oldPrep.nC == 0 &&
+                               prep.nC != 0);
                     }
                 }
             }
@@ -363,14 +367,44 @@ BallotProtocol::startBallot(ValueWrapperPtr value)
     {
         return false;
     }
-    if (mSlot.getSCPDriver().validateValue(mSlot.getSlotIndex(),
-                                           value->getValue()) <
+    if (mSlot.getSCPDriver().validateValueForPrepare(mSlot.getSlotIndex(),
+                                                     value->getValue()) <
         SCPDriver::kStructurallyValidValue)
     {
         return false;
     }
     mProposal = std::move(value);
     return bumpState(mProposal->getValue(), false);
+}
+
+void
+BallotProtocol::revalidateValue(Value const& value)
+{
+    if (mPhase == SCP_PHASE_EXTERNALIZE || !mSlot.isFullyValidated() ||
+        mSlot.getSCPDriver().validateValue(mSlot.getSlotIndex(), value) !=
+            SCPDriver::kFullyValidatedValue)
+    {
+        return;
+    }
+
+    // Advancing may replace entries (including our own), so retain snapshots
+    // rather than iterating the live map across protocol callbacks.
+    std::vector<SCPEnvelopeWrapperPtr> evidence;
+    for (auto const& [node, envelope] : mLatestEnvelopes)
+    {
+        if (getStatementValues(envelope->getStatement()).count(value))
+        {
+            evidence.emplace_back(envelope);
+        }
+    }
+    for (auto const& envelope : evidence)
+    {
+        if (mPhase == SCP_PHASE_EXTERNALIZE)
+        {
+            break;
+        }
+        advanceSlot(envelope->getStatement());
+    }
 }
 
 bool
@@ -413,7 +447,7 @@ BallotProtocol::maybeReplaceValueWithEmptyTxSet(Value& v) const
 
     // Check validation value
     auto validationLevel =
-        mSlot.getSCPDriver().validateValue(mSlot.getSlotIndex(), v);
+        mSlot.getSCPDriver().validateValueForPrepare(mSlot.getSlotIndex(), v);
 
     if (validationLevel != SCPDriver::kStructurallyValidValue)
     {
@@ -425,6 +459,11 @@ BallotProtocol::maybeReplaceValueWithEmptyTxSet(Value& v) const
     // Implied by `validationLevel == kStructurallyValidValue`
     releaseAssert(mSlot.getSCPDriver().protocolAllowsEmptyTxSetValues());
     releaseAssert(!mSlot.getSCPDriver().isEmptyTxSetValue(v));
+
+    if (mSlot.getSCPDriver().isValueValidationPending(mSlot.getSlotIndex(), v))
+    {
+        return false;
+    }
 
     // Check if we're awaiting download on the value
     auto waitingTime = mSlot.getSCPDriver().getTxSetDownloadWaitTime(v);
@@ -1066,9 +1105,12 @@ BallotProtocol::attemptConfirmPrepared(SCPStatement const& hint)
     {
         SCPBallot ballot = *cur;
 
-        // only consider it if we can potentially raise h
+        // Reconsider the existing h when validation previously prevented
+        // setting c. Receiving the body must not require a higher ballot.
         if (mHighBallot &&
-            compareBallots(mHighBallot->getBallot(), ballot) >= 0)
+            (compareBallots(mHighBallot->getBallot(), ballot) > 0 ||
+             (mCommit &&
+              compareBallots(mHighBallot->getBallot(), ballot) == 0)))
         {
             break;
         }
@@ -2166,8 +2208,11 @@ BallotProtocol::statementValidationLevel(SCPStatement const& st)
         [&](SCPDriver::ValidationLevel lv, stellar::Value const& v) {
             if (lv > SCPDriver::kInvalidValue)
             {
-                auto tr =
-                    mSlot.getSCPDriver().validateValue(mSlot.getSlotIndex(), v);
+                auto& driver = mSlot.getSCPDriver();
+                auto tr = st.pledges.type() == SCP_ST_PREPARE
+                              ? driver.validateValueForPrepare(
+                                    mSlot.getSlotIndex(), v)
+                              : driver.validateValue(mSlot.getSlotIndex(), v);
                 lv = std::min(tr, lv);
             }
             return lv;

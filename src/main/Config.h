@@ -543,7 +543,8 @@ class Config : public std::enable_shared_from_this<Config>
     // Enable parallel block application
     bool PARALLEL_LEDGER_APPLY;
 
-    // Allow downloading of transaction sets in parallel with SCP (experimental)
+    // Allow early PREPARE votes while transaction sets download/validate.
+    // Enabled by default on this experiment; gated on protocol 28 support.
     bool EXPERIMENTAL_PARALLEL_TX_SET_DOWNLOAD;
 
     // Disable expensive Soroban metrics for performance testing

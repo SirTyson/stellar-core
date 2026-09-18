@@ -3,7 +3,7 @@
 This branch removes SCP nomination. For the next ledger, one deterministic
 leader constructs a transaction set and pushes it to connected peers, then signs
 a validated value and starts ballot `(1, value)`. A validator without a ballot
-adopts a validated value from a peer ballot statement. Prepare, confirm, externalize,
+adopts a structurally validated value from a peer PREPARE. Prepare, confirm, externalize,
 ballot counters and value overrides retain their existing SCP rules.
 
 This experiment assumes live, honest validators, eventual message delivery,
@@ -43,6 +43,39 @@ The experiment relies on the stated honest-node assumptions and the existing
 ballot safety rules, rather than a new uniqueness proof. CAP-0083 replacement
 retains the original proposal for a later counter bump when its body arrives;
 confirmed value overrides still take precedence.
+
+## Parallel delivery and early voting
+
+`EXPERIMENTAL_PARALLEL_TX_SET_DOWNLOAD` defaults to true on this experimental
+branch and takes effect at protocol 28. It can be disabled for comparisons.
+The leader still validates its own proposal before signing and starting a ballot.
+Followers check the proposal's signature, elected leader, slot context,
+close time, and upgrades before voting. They can then emit early
+PREPARE votes while the transaction-set body is downloading or awaits full
+validation. This also applies when an early push delivered the body first.
+
+Full validation is scheduled once per slot/value on Core's main thread, where
+the ledger state is safe to read. The initial PREPARE can travel and peers can
+vote during this work; validation itself does not run on a separate CPU thread.
+The result is cached against the previous ledger and close-time offset. A queued
+job whose ledger context changed is discarded. If commit evidence arrives first,
+the commit-vote gate performs the full validation synchronously.
+
+The existing CAP-0083 gate still prohibits setting `nC` (voting to commit the
+original value) without full validation. Missing or invalid bodies cannot unlock
+that vote or local externalization. Receiving and validating the body explicitly
+reconsiders stored ballot evidence, including an already confirmed-prepared
+`nH` with `nC == 0`; no higher ballot or additional peer message is needed.
+The first nonzero `nC` is consequently a newer PREPARE even when its ballot,
+prepared ballots, and `nH` are unchanged; duplicates and the reverse update
+remain stale.
+
+The CAP-0083 empty-set value remains the fallback. A missing body that exceeds
+`TX_SET_DOWNLOAD_TIMEOUT` (default 5000 ms) can be replaced on a ballot bump
+while still in PREPARE and before commitment. A present body awaiting queued
+validation is not treated as a failed fetch. The empty-set value still needs
+normal ballot agreement. Received CONFIRM/EXTERNALIZE statements retain their
+full-validation checks, including the existing federated accept-commit rules.
 
 ## Timing and dissemination
 

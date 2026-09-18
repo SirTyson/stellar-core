@@ -313,17 +313,21 @@ PendingEnvelopes::recvTxSet(Hash const& hash, TxSetXDRFrameConstPtr txset)
 
     addTxSet(hash, 0, txset);
 
+    // Processing a waiting envelope can externalize a slot and purge fetches.
+    // Keep the waiting list independent of the live map across callbacks.
+    auto envelopes = std::move(it->second);
+    mPendingTxSetFetches.erase(it);
+
     // Update any ValueWrappers that were created before this tx set was
     // available
     mHerder.getHerderSCPDriver().onTxSetReceived(hash, txset);
 
-    for (auto& env : it->second)
+    for (auto const& env : envelopes)
     {
         CLOG_INFO(Herder, "Re-processing envelope after TxSet {} fetch",
                   hexAbbrev(hash));
         mApp.getHerder().recvSCPEnvelope(env);
     }
-    mPendingTxSetFetches.erase(hash);
     mTxSetFetchStartTimes.erase(hash);
     return true;
 }

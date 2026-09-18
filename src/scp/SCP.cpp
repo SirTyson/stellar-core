@@ -61,6 +61,15 @@ SCP::hasBallot(uint64 slotIndex)
     return slot && slot->getBallotProtocol().hasCurrentBallot();
 }
 
+void
+SCP::revalidateValue(uint64 slotIndex, Value const& value)
+{
+    if (auto slot = getSlot(slotIndex, false))
+    {
+        slot->getBallotProtocol().revalidateValue(value);
+    }
+}
+
 NodeID
 SCP::electLeader(uint64 slotIndex, Value const& previousValue)
 {

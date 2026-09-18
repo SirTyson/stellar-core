@@ -431,7 +431,8 @@ HerderSCPDriver::validatePastOrFutureValue(
 
 SCPDriver::ValidationLevel
 HerderSCPDriver::validateValueAgainstLocalState(uint64_t slotIndex,
-                                                StellarValue const& b) const
+                                                StellarValue const& b,
+                                                bool deferTxSetValidation) const
 {
     ZoneScoped;
     releaseAssert(threadIsMain());
@@ -509,6 +510,16 @@ HerderSCPDriver::validateValueAgainstLocalState(uint64_t slotIndex,
 
                 res = SCPDriver::kInvalidValue;
             }
+        }
+        else if (deferTxSetValidation &&
+                 !mTxSetValidCache.exists(TxSetValidityKey{
+                     lcl.hash, txSetHash, closeTimeOffset.seconds(),
+                     closeTimeOffset.seconds()}))
+        {
+            // Permit early PREPARE votes even when the body arrived first.
+            // Commit voting still calls synchronous full validation.
+            scheduleTxSetValidation(slotIndex, b, txSet);
+            res = SCPDriver::kStructurallyValidValue;
         }
         else if (!checkAndCacheTxSetValid(*txSet, lcl, closeTimeOffset))
         {
@@ -660,6 +671,57 @@ HerderSCPDriver::extractValidUpgrades(StellarValue& sv) const
 SCPDriver::ValidationLevel
 HerderSCPDriver::validateValue(uint64_t slotIndex, Value const& value) const
 {
+    return validateValueImpl(slotIndex, value, false);
+}
+
+SCPDriver::ValidationLevel
+HerderSCPDriver::validateValueForPrepare(uint64_t slotIndex,
+                                         Value const& value) const
+{
+    return validateValueImpl(slotIndex, value,
+                             isParallelTxSetDownloadEnabled());
+}
+
+bool
+HerderSCPDriver::isValueValidationPending(uint64 slotIndex,
+                                          Value const& value) const
+{
+    return mPendingValueValidations.count({slotIndex, value}) != 0;
+}
+
+void
+HerderSCPDriver::scheduleTxSetValidation(uint64_t slotIndex,
+                                         StellarValue const& sv,
+                                         TxSetXDRFrameConstPtr txSet) const
+{
+    auto value = xdr::xdr_to_opaque(sv);
+    if (!mPendingValueValidations.emplace(slotIndex, value).second)
+    {
+        return;
+    }
+    auto const lclHash = mLedgerManager.getLastClosedLedgerHeader().hash;
+    mApp.postOnMainThread(
+        [this, slotIndex, sv, value, txSet, lclHash]() {
+            mPendingValueValidations.erase({slotIndex, value});
+            auto const& lcl = mLedgerManager.getLastClosedLedgerHeader();
+            if (mApp.isStopping() || slotIndex != lcl.header.ledgerSeq + 1 ||
+                lcl.hash != lclHash)
+            {
+                return;
+            }
+            auto offset = getApplyTime(sv) - getApplyTime(lcl.header.scpValue);
+            if (checkAndCacheTxSetValid(*txSet, lcl, offset))
+            {
+                mHerder.getSCP().revalidateValue(slotIndex, value);
+            }
+        },
+        "validate ballot transaction set");
+}
+
+SCPDriver::ValidationLevel
+HerderSCPDriver::validateValueImpl(uint64_t slotIndex, Value const& value,
+                                   bool deferTxSetValidation) const
+{
     ZoneScoped;
     releaseAssert(threadIsMain());
 
@@ -670,21 +732,16 @@ HerderSCPDriver::validateValue(uint64_t slotIndex, Value const& value) const
         return SCPDriver::kInvalidValue;
     }
 
-    SCPDriver::ValidationLevel res =
-        validateValueAgainstLocalState(slotIndex, b);
-    if (res != SCPDriver::kInvalidValue)
+    // Reject malformed upgrades before scheduling any transaction-set work.
+    auto origSize = b.upgrades.size();
+    extractValidUpgrades(b);
+    if (b.upgrades.size() != origSize)
     {
-        auto origSize = b.upgrades.size();
-        extractValidUpgrades(b);
-        if (b.upgrades.size() != origSize)
-        {
-            CLOG_TRACE(Herder,
-                       "HerderSCPDriver::validateValue i: {} rejected due to "
-                       "invalid or misordered upgrade steps",
-                       slotIndex);
-            res = SCPDriver::kInvalidValue;
-        }
+        mSCPMetrics.mValueInvalid.Mark();
+        return SCPDriver::kInvalidValue;
     }
+    auto res =
+        validateValueAgainstLocalState(slotIndex, b, deferTxSetValidation);
 
     if (res)
     {
@@ -1398,6 +1455,7 @@ void
 HerderSCPDriver::onTxSetReceived(Hash const& txSetHash,
                                  TxSetXDRFrameConstPtr txSet)
 {
+    std::set<std::pair<uint64_t, Value>> valuesToReconsider;
     // Update any ValueWrappers waiting for this tx set
     auto it = mPendingTxSetWrappers.find(txSetHash);
     if (it != mPendingTxSetWrappers.end())
@@ -1421,9 +1479,35 @@ HerderSCPDriver::onTxSetReceived(Hash const& txSetHash,
             if (auto sp = wp.lock())
             {
                 sp->addTxSet(txSet);
+                auto const& st = sp->getStatement();
+                for (auto const& value : Slot::getStatementValues(st))
+                {
+                    valuesToReconsider.emplace(st.slotIndex, value);
+                }
             }
         }
         mPendingTxSetEnvelopeWrappers.erase(envIt);
+    }
+
+    // PREPAREs processed during download are already deduplicated by
+    // PendingEnvelopes. Schedule validation explicitly so existing evidence
+    // is reconsidered without waiting for a new envelope or a ballot timer.
+    for (auto const& [slot, value] : valuesToReconsider)
+    {
+        if (isParallelTxSetDownloadEnabled())
+        {
+            if (validateValueForPrepare(slot, value) == kFullyValidatedValue)
+            {
+                mApp.postOnMainThread(
+                    [this, slot, value]() {
+                        if (!mApp.isStopping())
+                        {
+                            mSCP.revalidateValue(slot, value);
+                        }
+                    },
+                    "resume ballot after transaction set delivery");
+            }
+        }
     }
 }
 

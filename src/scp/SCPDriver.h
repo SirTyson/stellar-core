@@ -131,7 +131,7 @@ class SCPDriver
     // is done. It should be used to filter out values that are not compatible
     // with the current state of that node. Invalid values can never
     // externalize. Neither can values that are only structurally valid (they
-    // reference a missing or invalid transaction set.)
+    // reference a missing, unvalidated, or invalid transaction set.)
     // If the value cannot be validated (node is missing some context due to the
     // value belonging to a ledger other than LCL+1) but passes the validity
     // checks, kMaybeValidNotCurrentValue can be returned. This will cause the
@@ -151,8 +151,8 @@ class SCPDriver
         // cannot be fully validated.
         kMaybeValidNotCurrentValue = 1,
         // Value is for LCL+1 and is structurally valid (close time is valid,
-        // etc), but the transaction set it references is either missing or
-        // invalid.
+        // etc), but the transaction set it references is missing, awaiting
+        // full validation, or invalid.
         kStructurallyValidValue = 2,
         // Value is for LCL+1 and is known to be fully valid
         kFullyValidatedValue = 3
@@ -161,6 +161,23 @@ class SCPDriver
     validateValue(uint64 slotIndex, Value const& value) const
     {
         return kMaybeValidNotCurrentValue;
+    }
+
+    // Early PREPARE processing may defer transaction-set validation. All
+    // structural checks still apply; commit voting and externalization use
+    // validateValue above and require full validation for the current slot.
+    virtual ValidationLevel
+    validateValueForPrepare(uint64 slotIndex, Value const& value) const
+    {
+        return validateValue(slotIndex, value);
+    }
+
+    // A downloaded body awaiting local validation is not a failed download.
+    // Do not replace it with an empty set merely because no fetch is active.
+    virtual bool
+    isValueValidationPending(uint64 slotIndex, Value const& value) const
+    {
+        return false;
     }
 
     // Helper function to craft an empty-tx-set value from a Value.
