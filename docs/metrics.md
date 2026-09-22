@@ -178,6 +178,9 @@ process.action.overloaded                 | counter   | 0-or-1 value indicating 
 process.file.handles                      | counter   | number of open file handles
 process.memory.handles                    | counter   | number of running processes in process manager
 scp.envelope.emit                         | meter     | SCP message sent
+scp.emit.broadcast                        | timer     | time handing an own SCP statement to the overlay
+scp.emit.persist                          | timer     | time persisting SCP state (synchronously) before broadcasting an own statement
+scp.emit.persisted-txset-bytes            | meter     | encoded bytes of tx sets persisted with own SCP statements
 scp.envelope.invalidsig                   | meter     | envelope failed signature verification
 scp.envelope.receive                      | meter     | SCP message received
 scp.envelope.sign                         | meter     | envelope signed

@@ -87,8 +87,47 @@ HerderImpl::SCPMetrics::SCPMetrics(Application& app)
           {"scp", "envelope", "invalidsig"}, "envelope"))
     , mTriggerPrepareStartFallback(app.getMetrics().NewMeter(
           {"scp", "trigger", "prepare-start-fallback"}, "trigger"))
+    , mEmitPersist(app.getMetrics().NewTimer({"scp", "emit", "persist"}))
+    , mEmitBroadcast(app.getMetrics().NewTimer({"scp", "emit", "broadcast"}))
+    , mEmitPersistedTxSetBytes(app.getMetrics().NewMeter(
+          {"scp", "emit", "persisted-txset-bytes"}, "byte"))
 {
 }
+
+namespace
+{
+// Compact summary of an SCP statement's ballot state for logging.
+std::string
+describeStatement(SCPStatement const& st)
+{
+    auto const& pl = st.pledges;
+    switch (pl.type())
+    {
+    case SCP_ST_PREPARE:
+    {
+        auto const& p = pl.prepare();
+        return fmt::format(
+            "PREPARE b={} p={} p'={} c={} h={}", p.ballot.counter,
+            p.prepared ? p.prepared->counter : 0,
+            p.preparedPrime ? p.preparedPrime->counter : 0, p.nC, p.nH);
+    }
+    case SCP_ST_CONFIRM:
+    {
+        auto const& c = pl.confirm();
+        return fmt::format("CONFIRM b={} p={} c={} h={}", c.ballot.counter,
+                           c.nPrepared, c.nCommit, c.nH);
+    }
+    case SCP_ST_EXTERNALIZE:
+    {
+        auto const& e = pl.externalize();
+        return fmt::format("EXTERNALIZE c={} h={}", e.commit.counter, e.nH);
+    }
+    case SCP_ST_NOMINATE:
+        return "NOMINATE";
+    }
+    return "UNKNOWN";
+}
+} // namespace
 
 HerderImpl::HerderImpl(Application& app)
     : mPendingEnvelopes(app, *this)
@@ -669,9 +708,30 @@ HerderImpl::emitEnvelope(SCPEnvelope const& envelope)
                envelope.statement.pledges.type(), slotIndex,
                mApp.getStateHuman());
 
-    persistSCPState(slotIndex);
-
+    auto const start = std::chrono::steady_clock::now();
+    auto const txSetBytes = persistSCPState(slotIndex);
+    auto const persisted = std::chrono::steady_clock::now();
     broadcast(envelope);
+    auto const broadcasted = std::chrono::steady_clock::now();
+
+    mSCPMetrics.mEmitPersist.Update(persisted - start);
+    mSCPMetrics.mEmitBroadcast.Update(broadcasted - persisted);
+    if (txSetBytes > 0)
+    {
+        mSCPMetrics.mEmitPersistedTxSetBytes.Mark(txSetBytes);
+    }
+    // One line per own statement (~5 per ledger): the timeline of this
+    // node's votes, and what persisting SCP state costs before each one
+    // reaches the network.
+    using std::chrono::duration_cast;
+    using std::chrono::microseconds;
+    CLOG_INFO(Herder,
+              "SCP_EMIT slot={} {} persist_us={} txset_bytes={} "
+              "broadcast_us={}",
+              slotIndex, describeStatement(envelope.statement),
+              duration_cast<microseconds>(persisted - start).count(),
+              txSetBytes,
+              duration_cast<microseconds>(broadcasted - persisted).count());
 }
 
 TxSubmitStatus
@@ -2653,13 +2713,13 @@ HerderImpl::checkAndMaybeReanalyzeQuorumMap()
     }
 }
 
-void
+size_t
 HerderImpl::persistSCPState(uint64 slot)
 {
     ZoneScoped;
     if (slot < mLastSlotSaved)
     {
-        return;
+        return 0;
     }
 
     mLastSlotSaved = slot;
@@ -2705,12 +2765,14 @@ HerderImpl::persistSCPState(uint64 slot)
     stellar::Value latestSCPData;
 
     std::unordered_map<Hash, std::string> txSetsToPersist;
+    size_t txSetBytes = 0;
     for (auto it : txSets)
     {
         StoredTransactionSet tempTxSet;
         it.second->storeXDR(tempTxSet);
-        txSetsToPersist.emplace(
-            it.first, decoder::encode_b64(xdr::xdr_to_opaque(tempTxSet)));
+        auto encoded = decoder::encode_b64(xdr::xdr_to_opaque(tempTxSet));
+        txSetBytes += encoded.size();
+        txSetsToPersist.emplace(it.first, std::move(encoded));
     }
 
     latestSCPData = xdr::xdr_to_opaque(scpState);
@@ -2719,6 +2781,7 @@ HerderImpl::persistSCPState(uint64 slot)
 
     mApp.getPersistentState().setSCPStateV1ForSlot(slot, encodedScpState,
                                                    txSetsToPersist);
+    return txSetBytes;
 }
 
 void

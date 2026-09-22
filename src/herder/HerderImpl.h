@@ -319,7 +319,9 @@ class HerderImpl : public Herder
     VirtualClock::time_point mLastExternalize;
 
     // saves the SCP messages that the instance sent out last
-    void persistSCPState(uint64 slot);
+    // Persists the latest SCP state for `slot`; returns the encoded size of
+    // the tx sets it persisted for the first time (0 if none).
+    size_t persistSCPState(uint64 slot);
     // restores SCP state based on the last messages saved on disk
     void restoreSCPState();
 
@@ -375,6 +377,13 @@ class HerderImpl : public Herder
         // Marked when the trigger timer falls back from the
         // network-close-time anchor to the local prepare-start anchor.
         medida::Meter& mTriggerPrepareStartFallback;
+
+        // Own statements: time persisting SCP state (synchronous, before the
+        // broadcast) and time handing the envelope to the overlay, plus the
+        // tx-set bytes persisted along the way.
+        medida::Timer& mEmitPersist;
+        medida::Timer& mEmitBroadcast;
+        medida::Meter& mEmitPersistedTxSetBytes;
 
         SCPMetrics(Application& app);
     };

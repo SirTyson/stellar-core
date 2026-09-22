@@ -7123,3 +7123,32 @@ TEST_CASE("persisted upgrades ignore the retired nomination timeout limit",
     REQUIRE(restored.toJson().find("nominationtimeoutlimit") ==
             std::string::npos);
 }
+
+TEST_CASE("herder times its own SCP statements", "[herder]")
+{
+    auto networkID = sha256(getTestConfig().NETWORK_PASSPHRASE);
+    auto simulation = Topologies::pair(networkID, [](int i) {
+        auto cfg = getTestConfig(i);
+        cfg.ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING = true;
+        return cfg;
+    });
+    simulation->startAllNodes();
+    simulation->crankUntil(
+        [&]() { return simulation->haveAllExternalized(4, 1); },
+        20 * simulation->getExpectedLedgerCloseTime(), false);
+
+    for (auto const& node : simulation->getNodes())
+    {
+        auto& metrics = node->getMetrics();
+        auto emitted =
+            metrics.NewMeter({"scp", "envelope", "emit"}, "envelope").count();
+        REQUIRE(emitted > 0);
+        // Every own statement is persisted, then broadcast, and both steps
+        // are timed (the emit meter also counts rebroadcasts).
+        auto persisted = metrics.NewTimer({"scp", "emit", "persist"}).count();
+        REQUIRE(persisted > 0);
+        REQUIRE(persisted <= emitted);
+        REQUIRE(metrics.NewTimer({"scp", "emit", "broadcast"}).count() ==
+                persisted);
+    }
+}
