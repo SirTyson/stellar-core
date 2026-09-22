@@ -322,10 +322,14 @@ PendingEnvelopes::recvTxSet(Hash const& hash, TxSetXDRFrameConstPtr txset)
     // available
     mHerder.getHerderSCPDriver().onTxSetReceived(hash, txset);
 
+    // One line per tx set rather than per envelope (dozens per ledger, all
+    // logged in one burst on the main thread just as the body arrives).
+    CLOG_DEBUG(Herder, "Re-processing {} envelopes after TxSet {} fetch",
+               envelopes.size(), hexAbbrev(hash));
     for (auto const& env : envelopes)
     {
-        CLOG_INFO(Herder, "Re-processing envelope after TxSet {} fetch",
-                  hexAbbrev(hash));
+        CLOG_TRACE(Herder, "Re-processing envelope after TxSet {} fetch",
+                   hexAbbrev(hash));
         mApp.getHerder().recvSCPEnvelope(env);
     }
     mTxSetFetchStartTimes.erase(hash);
