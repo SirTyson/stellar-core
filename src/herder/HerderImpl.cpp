@@ -91,6 +91,15 @@ HerderImpl::SCPMetrics::SCPMetrics(Application& app)
     , mEmitBroadcast(app.getMetrics().NewTimer({"scp", "emit", "broadcast"}))
     , mEmitPersistedTxSetBytes(app.getMetrics().NewMeter(
           {"scp", "emit", "persisted-txset-bytes"}, "byte"))
+    , mTriggerLate(app.getMetrics().NewTimer({"scp", "trigger", "late"}))
+    , mTriggerTimerDelay(
+          app.getMetrics().NewTimer({"scp", "trigger", "timer-delay"}))
+    , mBuildFetch(app.getMetrics().NewTimer({"herder", "build", "fetch"}))
+    , mBuildDecode(app.getMetrics().NewTimer({"herder", "build", "decode"}))
+    , mBuildSelect(app.getMetrics().NewTimer({"herder", "build", "select"}))
+    , mBuildPublish(app.getMetrics().NewTimer({"herder", "build", "publish"}))
+    , mBuildFinalize(app.getMetrics().NewTimer({"herder", "build", "finalize"}))
+    , mBuildTotal(app.getMetrics().NewTimer({"herder", "build", "total"}))
 {
 }
 
@@ -1540,9 +1549,11 @@ HerderImpl::setupTriggerNextLedger()
 
     // Adjust trigger time in case node's clock has drifted.
     // This ensures that next value to propose is valid
-    auto triggerTime = lastLedgerStartingPoint + milliseconds;
+    auto const triggerTarget = lastLedgerStartingPoint + milliseconds;
+    auto triggerTime = triggerTarget;
+    bool const triggerClamped = triggerTime < now;
 
-    if (triggerTime < now)
+    if (triggerClamped)
     {
         triggerTime = now;
     }
@@ -1565,6 +1576,9 @@ HerderImpl::setupTriggerNextLedger()
     // time as reference point for triggering again (this may trigger right
     // away if externalizing took a long time)
     mTriggerTimer.expires_at(triggerTime);
+    mScheduledTrigger =
+        ScheduledTrigger{static_cast<uint32_t>(nextIndex), triggerTarget,
+                         triggerTime, triggerClamped};
 
     if (!mApp.getConfig().MANUAL_CLOSE)
     {
@@ -1770,6 +1784,8 @@ HerderImpl::buildTxSet(uint32_t ledgerSeq, ConsensusTime closeTime)
     releaseAssert(mHerderSCPDriver.isLocalLeader(ledgerSeq));
     CLOG_INFO(Herder, "Building TX set as slot leader for ledger {}",
               ledgerSeq);
+    using BuildClock = std::chrono::steady_clock;
+    auto const buildStart = BuildClock::now();
     auto const closeTimeOffset =
         closeTime.toApplyTime() - getApplyTime(lcl.header.scpValue);
     TxSetXDRFrameConstPtr proposedSet;
@@ -1795,6 +1811,7 @@ HerderImpl::buildTxSet(uint32_t ledgerSeq, ConsensusTime closeTime)
             :
 #endif
             overlayMgr.getTopTransactions(maxCandidates * 2);
+    auto const fetched = BuildClock::now();
 
     CLOG_INFO(Herder, "Got {} transactions from Rust overlay mempool",
               txEnvelopes.size());
@@ -1859,10 +1876,19 @@ HerderImpl::buildTxSet(uint32_t ledgerSeq, ConsensusTime closeTime)
     {
         txPhases.emplace_back(std::move(sorobanTxs));
     }
+    size_t candidates = 0;
+    for (auto const& phase : txPhases)
+    {
+        candidates += phase.size();
+    }
+    auto const decoded = BuildClock::now();
 
     PerPhaseTransactionList invalidTxPhases;
     invalidTxPhases.resize(txPhases.size());
     bool capacityLimited = false;
+    // Set in the XDR-ready callback: selection done / set cached and pushed.
+    std::optional<BuildClock::time_point> xdrReady;
+    std::optional<BuildClock::time_point> published;
 
     std::tie(proposedSet, applicableProposedSet) = makeTxSetFromTransactions(
         txPhases, mApp, closeTimeOffset, invalidTxPhases
@@ -1872,6 +1898,7 @@ HerderImpl::buildTxSet(uint32_t ledgerSeq, ConsensusTime closeTime)
 #endif
         ,
         [&](TxSetXDRFrameConstPtr const& txSet) {
+            xdrReady = BuildClock::now();
             // Selection has already populated invalidTxPhases. A set that
             // excluded valid candidates can be reused at the trigger; an
             // underfilled snapshot must be refreshed there instead.
@@ -1897,7 +1924,9 @@ HerderImpl::buildTxSet(uint32_t ledgerSeq, ConsensusTime closeTime)
                     broadcastProposalTxSet(txSet, ledgerSeq);
                 }
             }
+            published = BuildClock::now();
         });
+    auto const built = BuildClock::now();
     CLOG_INFO(Herder, "Proposed TX set has {} transactions",
               proposedSet->sizeTxTotal());
 
@@ -1930,6 +1959,39 @@ HerderImpl::buildTxSet(uint32_t ledgerSeq, ConsensusTime closeTime)
             }
         }
     }
+
+    // One line per build (the leader only): candidates pulled vs included
+    // and where the time went. select = decode done -> XDR ready (includes
+    // candidate validation and packing), publish = caching and pushing the
+    // set to the overlay, finalize = the rest of makeTxSetFromTransactions
+    // (roundtrip checks), bookkeeping = invalid-candidate collection.
+    auto const done = BuildClock::now();
+    auto const selectEnd = xdrReady.value_or(built);
+    auto const publishEnd = published.value_or(selectEnd);
+    mSCPMetrics.mBuildFetch.Update(fetched - buildStart);
+    mSCPMetrics.mBuildDecode.Update(decoded - fetched);
+    mSCPMetrics.mBuildSelect.Update(selectEnd - decoded);
+    mSCPMetrics.mBuildPublish.Update(publishEnd - selectEnd);
+    mSCPMetrics.mBuildFinalize.Update(built - publishEnd);
+    mSCPMetrics.mBuildTotal.Update(done - buildStart);
+    auto const us = [](BuildClock::duration d) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(d).count();
+    };
+    size_t invalidCandidates = 0;
+    for (auto const& phase : invalidTxPhases)
+    {
+        invalidCandidates += phase.size();
+    }
+    CLOG_INFO(Herder,
+              "TXSET_BUILD slot={} pulled={} candidates={} invalid={} "
+              "included={} capacity_limited={} fetch_us={} decode_us={} "
+              "select_us={} publish_us={} finalize_us={} bookkeeping_us={} "
+              "total_us={}",
+              ledgerSeq, txEnvelopes.size(), candidates, invalidCandidates,
+              proposedSet->sizeTxTotal(), capacityLimited,
+              us(fetched - buildStart), us(decoded - fetched),
+              us(selectEnd - decoded), us(publishEnd - selectEnd),
+              us(built - publishEnd), us(done - built), us(done - buildStart));
 
     return PreparedTxSet{lcl.hash,
                          ledgerSeq,
@@ -1994,6 +2056,31 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger)
     }
 
     mHerderSCPDriver.recordTrigger(ledgerSeqToTrigger);
+
+    if (mScheduledTrigger && mScheduledTrigger->ledgerSeq == ledgerSeqToTrigger)
+    {
+        // One line per ledger: how late relative to the cadence target this
+        // ledger was triggered (positive = late), how late the timer itself
+        // fired, and whether the target had already passed when it was set.
+        using std::chrono::duration_cast;
+        using std::chrono::milliseconds;
+        auto const firedAt = mApp.getClock().now();
+        auto const lateVsTarget = firedAt - mScheduledTrigger->target;
+        auto const timerDelay = firedAt - mScheduledTrigger->scheduled;
+        mSCPMetrics.mTriggerLate.Update(
+            std::max(lateVsTarget, decltype(lateVsTarget)::zero()));
+        mSCPMetrics.mTriggerTimerDelay.Update(
+            std::max(timerDelay, decltype(timerDelay)::zero()));
+        CLOG_INFO(Herder,
+                  "TRIGGER slot={} late_vs_target_ms={} timer_delay_ms={} "
+                  "clamped={} local_leader={}",
+                  ledgerSeqToTrigger,
+                  duration_cast<milliseconds>(lateVsTarget).count(),
+                  duration_cast<milliseconds>(timerDelay).count(),
+                  mScheduledTrigger->clamped,
+                  mHerderSCPDriver.isLocalLeader(ledgerSeqToTrigger));
+        mScheduledTrigger.reset();
+    }
 
     // We pick as next close time the current time unless it's before the last
     // close time. We don't know how much time it will take to reach consensus

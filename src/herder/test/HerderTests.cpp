@@ -7124,7 +7124,8 @@ TEST_CASE("persisted upgrades ignore the retired nomination timeout limit",
             std::string::npos);
 }
 
-TEST_CASE("herder times its own SCP statements", "[herder]")
+TEST_CASE("herder instruments triggers builds and own SCP statements",
+          "[herder]")
 {
     auto networkID = sha256(getTestConfig().NETWORK_PASSPHRASE);
     auto simulation = Topologies::pair(networkID, [](int i) {
@@ -7150,5 +7151,24 @@ TEST_CASE("herder times its own SCP statements", "[herder]")
         REQUIRE(persisted <= emitted);
         REQUIRE(metrics.NewTimer({"scp", "emit", "broadcast"}).count() ==
                 persisted);
+        // Every node triggers every ledger.
+        REQUIRE(metrics.NewTimer({"scp", "trigger", "late"}).count() > 0);
+        REQUIRE(metrics.NewTimer({"scp", "trigger", "timer-delay"}).count() ==
+                metrics.NewTimer({"scp", "trigger", "late"}).count());
     }
+    // Leaders build tx sets, and each build is timed stage by stage.
+    uint64_t builds = 0;
+    for (auto const& node : simulation->getNodes())
+    {
+        auto& metrics = node->getMetrics();
+        auto total = metrics.NewTimer({"herder", "build", "total"}).count();
+        builds += total;
+        for (auto const& stage :
+             {"fetch", "decode", "select", "publish", "finalize"})
+        {
+            REQUIRE(metrics.NewTimer({"herder", "build", stage}).count() ==
+                    total);
+        }
+    }
+    REQUIRE(builds > 0);
 }

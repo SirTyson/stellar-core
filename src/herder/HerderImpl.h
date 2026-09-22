@@ -340,6 +340,19 @@ class HerderImpl : public Herder
     void trackingHeartBeat();
 
     VirtualTimer mTriggerTimer;
+    // The trigger most recently armed by setupTriggerNextLedger: the time the
+    // cadence asked for, the time the timer was actually set to (the target
+    // clamped to "now" when already late, plus any close-time adjustment),
+    // and whether it was clamped. Consumed by triggerNextLedger to log and
+    // measure how late the ledger was triggered.
+    struct ScheduledTrigger
+    {
+        uint32_t ledgerSeq;
+        VirtualClock::time_point target;
+        VirtualClock::time_point scheduled;
+        bool clamped;
+    };
+    std::optional<ScheduledTrigger> mScheduledTrigger;
     VirtualTimer mPrepareTxSetTimer;
     VirtualTimer mBallotRecoveryTimer;
     uint32_t mProposalRetryAttempt{0};
@@ -384,6 +397,19 @@ class HerderImpl : public Herder
         medida::Timer& mEmitPersist;
         medida::Timer& mEmitBroadcast;
         medida::Meter& mEmitPersistedTxSetBytes;
+
+        // How late the ledger trigger fired relative to the cadence target,
+        // and relative to the time its timer was set for.
+        medida::Timer& mTriggerLate;
+        medida::Timer& mTriggerTimerDelay;
+
+        // Leader tx set construction stages (see TXSET_BUILD log line).
+        medida::Timer& mBuildFetch;
+        medida::Timer& mBuildDecode;
+        medida::Timer& mBuildSelect;
+        medida::Timer& mBuildPublish;
+        medida::Timer& mBuildFinalize;
+        medida::Timer& mBuildTotal;
 
         SCPMetrics(Application& app);
     };

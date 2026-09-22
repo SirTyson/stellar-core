@@ -66,6 +66,12 @@ HerderSCPDriver::SCPMetrics::SCPMetrics(Application& app)
           {"scp", "timing", "ballot-blocked-on-txset"}))
     , mTxSetValidation(
           app.getMetrics().NewTimer({"herder", "txset", "validate"}))
+    , mTxSetValidationPrepare(
+          app.getMetrics().NewTimer({"herder", "txset", "validate-prepare"}))
+    , mTxSetValidationCheck(
+          app.getMetrics().NewTimer({"herder", "txset", "validate-check"}))
+    , mTxSetValidationQueueDelay(app.getMetrics().NewTimer(
+          {"herder", "txset", "validate-queue-delay"}))
     , mEmptyTxSetExternalized(
           app.getMetrics().NewCounter({"scp", "empty-tx-set", "externalized"}))
     , mEmptyTxSetValueReplaced(app.getMetrics().NewCounter(
@@ -521,7 +527,8 @@ HerderSCPDriver::validateValueAgainstLocalState(uint64_t slotIndex,
             scheduleTxSetValidation(slotIndex, b, txSet);
             res = SCPDriver::kStructurallyValidValue;
         }
-        else if (!checkAndCacheTxSetValid(*txSet, lcl, closeTimeOffset))
+        else if (!checkAndCacheTxSetValid(*txSet, lcl, closeTimeOffset,
+                                          "synchronous"))
         {
             CLOG_DEBUG(Herder,
                        "HerderSCPDriver::validateValue i: {} invalid txSet {}",
@@ -700,8 +707,11 @@ HerderSCPDriver::scheduleTxSetValidation(uint64_t slotIndex,
         return;
     }
     auto const lclHash = mLedgerManager.getLastClosedLedgerHeader().hash;
+    auto const postedAt = std::chrono::steady_clock::now();
     mApp.postOnMainThread(
-        [this, slotIndex, sv, value, txSet, lclHash]() {
+        [this, slotIndex, sv, value, txSet, lclHash, postedAt]() {
+            auto const queuedFor = std::chrono::steady_clock::now() - postedAt;
+            mSCPMetrics.mTxSetValidationQueueDelay.Update(queuedFor);
             mPendingValueValidations.erase({slotIndex, value});
             auto const& lcl = mLedgerManager.getLastClosedLedgerHeader();
             if (mApp.isStopping() || slotIndex != lcl.header.ledgerSeq + 1 ||
@@ -710,7 +720,8 @@ HerderSCPDriver::scheduleTxSetValidation(uint64_t slotIndex,
                 return;
             }
             auto offset = getApplyTime(sv) - getApplyTime(lcl.header.scpValue);
-            if (checkAndCacheTxSetValid(*txSet, lcl, offset))
+            if (checkAndCacheTxSetValid(*txSet, lcl, offset, "scheduled",
+                                        queuedFor))
             {
                 mHerder.getSCP().revalidateValue(slotIndex, value);
             }
@@ -1622,9 +1633,10 @@ HerderSCPDriver::cacheValidTxSet(ApplicableTxSetFrame const& txSet,
 }
 
 bool
-HerderSCPDriver::checkAndCacheTxSetValid(TxSetXDRFrame const& txSet,
-                                         LedgerHeaderHistoryEntry const& lcl,
-                                         ApplyTimeOffset closeTimeOffset) const
+HerderSCPDriver::checkAndCacheTxSetValid(
+    TxSetXDRFrame const& txSet, LedgerHeaderHistoryEntry const& lcl,
+    ApplyTimeOffset closeTimeOffset, char const* caller,
+    std::optional<std::chrono::nanoseconds> queuedFor) const
 {
     ZoneScoped;
 
@@ -1643,11 +1655,13 @@ HerderSCPDriver::checkAndCacheTxSetValid(TxSetXDRFrame const& txSet,
         // if we receive a bad SCP value for the current state, we still
         // might end up with malformed tx set that doesn't refer to the
         // LCL.
+        auto const start = std::chrono::steady_clock::now();
         ApplicableTxSetFrameConstPtr applicableTxSet;
         if (txSet.previousLedgerHash() == lcl.hash)
         {
             applicableTxSet = txSet.prepareForApply(mApp, lcl.header);
         }
+        auto const prepared = std::chrono::steady_clock::now();
 
         bool res = true;
         if (applicableTxSet == nullptr)
@@ -1662,6 +1676,24 @@ HerderSCPDriver::checkAndCacheTxSetValid(TxSetXDRFrame const& txSet,
             res = applicableTxSet->checkValid(mApp, closeTimeOffset.seconds(),
                                               closeTimeOffset.seconds());
         }
+        auto const checked = std::chrono::steady_clock::now();
+        mSCPMetrics.mTxSetValidationPrepare.Update(prepared - start);
+        mSCPMetrics.mTxSetValidationCheck.Update(checked - prepared);
+
+        // One line per validated set (about once per ledger): where it was
+        // validated from, how long the job waited on the main thread and
+        // what each stage cost. All of this blocks the main thread.
+        using std::chrono::duration_cast;
+        using std::chrono::microseconds;
+        CLOG_INFO(
+            Herder,
+            "TXSET_VALIDATE slot={} txset={} txs={} caller={} queued_us={} "
+            "prepare_us={} check_us={} valid={}",
+            lcl.header.ledgerSeq + 1, hexAbbrev(txSet.getContentsHash()),
+            applicableTxSet ? applicableTxSet->sizeTxTotal() : 0, caller,
+            queuedFor ? duration_cast<microseconds>(*queuedFor).count() : -1,
+            duration_cast<microseconds>(prepared - start).count(),
+            duration_cast<microseconds>(checked - prepared).count(), res);
 
         mTxSetValidCache.put(key, res);
         return res;

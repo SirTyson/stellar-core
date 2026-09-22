@@ -260,6 +260,11 @@ class HerderSCPDriver : public SCPDriver
 
         // Timer tracking time to check and cache a tx set
         medida::Timer& mTxSetValidation;
+        // Its two stages (cache misses only), and how long a scheduled
+        // validation job waited on the main thread before it ran.
+        medida::Timer& mTxSetValidationPrepare;
+        medida::Timer& mTxSetValidationCheck;
+        medida::Timer& mTxSetValidationQueueDelay;
 
         // Tracks how many ledgers we externalized an empty-tx-set value.
         medida::Counter& mEmptyTxSetExternalized;
@@ -317,7 +322,8 @@ class HerderSCPDriver : public SCPDriver
         mTxSetValidCache;
 
     // One deferred validation per slot/value through the existing main-thread
-    // entry point and snapshot/batch machinery. Early votes can travel meanwhile.
+    // entry point and snapshot/batch machinery. Early votes can travel
+    // meanwhile.
     mutable std::set<std::pair<uint64_t, Value>> mPendingValueValidations;
 
     SCPDriver::ValidationLevel
@@ -346,9 +352,12 @@ class HerderSCPDriver : public SCPDriver
                          std::chrono::nanoseconds threshold,
                          uint64_t slotIndex);
 
-    bool checkAndCacheTxSetValid(TxSetXDRFrame const& txSet,
-                                 LedgerHeaderHistoryEntry const& lcl,
-                                 ApplyTimeOffset closeTimeOffset) const;
+    // `caller` and `queuedFor` (time the job waited, if it was scheduled)
+    // only feed the TXSET_VALIDATE log line.
+    bool checkAndCacheTxSetValid(
+        TxSetXDRFrame const& txSet, LedgerHeaderHistoryEntry const& lcl,
+        ApplyTimeOffset closeTimeOffset, char const* caller,
+        std::optional<std::chrono::nanoseconds> queuedFor = std::nullopt) const;
 
     bool deserializeAndValidateStellarValue(uint64_t slotIndex,
                                             Value const& value,

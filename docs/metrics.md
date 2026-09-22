@@ -65,6 +65,15 @@ crypto.verify.total                       | meter     | sum of both hits and mis
 crypto.verify.tx-valid-hit                | meter     | signature cache hits that occurred while validating transactions (outside of background signature validation)
 crypto.verify.tx-valid-total              | meter     | sum of both hits and misses during transaction validation (outside of background signature validation)
 herder.txset.validate                     | timer     | time spent turning a received tx set into an applicable tx set and validating it on a validity-cache miss
+herder.txset.validate-prepare             | timer     | validity-cache miss: time turning the tx set into an applicable tx set (prepareForApply)
+herder.txset.validate-check               | timer     | validity-cache miss: time checking the applicable tx set (checkValid)
+herder.txset.validate-queue-delay         | timer     | time a scheduled tx set validation job waited on the main thread before running
+herder.build.fetch                        | timer     | leader: time fetching candidate transactions from the overlay mempool
+herder.build.decode                       | timer     | leader: time decoding candidates into transaction frames
+herder.build.select                       | timer     | leader: time validating candidates and selecting/packing the tx set (until its XDR is ready)
+herder.build.publish                      | timer     | leader: time caching the built tx set in the overlay and pushing it to peers
+herder.build.finalize                     | timer     | leader: time for the remaining tx set construction checks
+herder.build.total                        | timer     | leader: total tx set construction time
 herder.pending[-soroban]-txs.age0         | counter   | number of gen0 pending transactions
 herder.pending[-soroban]-txs.age1         | counter   | number of gen1 pending transactions
 herder.pending[-soroban]-txs.age2         | counter   | number of gen2 pending transactions
@@ -207,6 +216,8 @@ scp.timing.first-to-self-externalize-lag  | timer     | delay between first exte
 scp.timing.self-to-others-externalize-lag | timer     | delay between local node externalizing and later externalize messages from other nodes
 scp.timing.ballot-blocked-on-txset        | timer     | time balloting was blocked waiting for a txset download (milliseconds)
 scp.trigger.prepare-start-fallback        | meter     | trigger timer fell back from the network-close-time anchor to the local prepare-start anchor
+scp.trigger.late                          | timer     | how late the ledger trigger fired relative to the cadence target (0 if on time)
+scp.trigger.timer-delay                   | timer     | how late the ledger trigger fired relative to the time its timer was set for
 scp.value.invalid                         | meter     | SCP value is invalid
 scp.value.valid                           | meter     | SCP value is valid
 scp.slot.values-referenced                | histogram | number of values referenced per consensus round
