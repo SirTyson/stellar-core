@@ -15,12 +15,14 @@ use crate::wire::ValidatedTx;
 pub type TxHash = [u8; 32];
 
 /// A mempool-resident transaction: the shared validated tx plus its arrival
-/// time (for age-based eviction). Internal detail — callers get the shared
-/// `Arc<ValidatedTx>` back from [`Mempool::get`].
+/// time (for age-based eviction) and arrival sequence number (for FIFO
+/// ordering among equal-fee transactions). Internal detail — callers get the
+/// shared `Arc<ValidatedTx>` back from [`Mempool::get`].
 #[derive(Debug, Clone)]
 struct MempoolEntry {
     meta: Arc<ValidatedTx>,
     received_at: Instant,
+    arrival_seq: u64,
 }
 
 /// Comparison key for fee-sorted ordering (higher fee = higher priority)
@@ -30,6 +32,8 @@ struct FeePriority {
     fee: i64,
     /// Number of ops (lower is better for same fee)
     num_ops: u32,
+    /// Arrival order (earlier is better for same fee and ops)
+    arrival_seq: u64,
     /// Hash for tie-breaking
     hash: TxHash,
 }
@@ -44,14 +48,13 @@ impl Ord for FeePriority {
         match left.cmp(&right).reverse() {
             // reverse for descending order
             std::cmp::Ordering::Equal => {
-                // Same fee/op ratio: prefer fewer ops (simpler tx)
-                match self.num_ops.cmp(&other.num_ops) {
-                    std::cmp::Ordering::Equal => {
-                        // Same ops: use hash for deterministic ordering
-                        self.hash.cmp(&other.hash)
-                    }
-                    other => other,
-                }
+                // Same fee/op ratio: prefer fewer ops (simpler tx), then the
+                // earlier arrival, so equal-fee transactions are served (and
+                // retained) first-come first-served rather than by hash.
+                self.num_ops
+                    .cmp(&other.num_ops)
+                    .then(self.arrival_seq.cmp(&other.arrival_seq))
+                    .then(self.hash.cmp(&other.hash))
             }
             other => other,
         }
@@ -69,6 +72,7 @@ impl FeePriority {
         FeePriority {
             fee: entry.meta.fee(),
             num_ops: entry.meta.num_ops(),
+            arrival_seq: entry.arrival_seq,
             hash: *entry.meta.hash(),
         }
     }
@@ -87,6 +91,9 @@ pub struct Mempool {
 
     /// Maximum age before eviction
     max_age: Duration,
+
+    /// Arrival sequence number assigned to the next inserted transaction
+    next_arrival_seq: u64,
 }
 
 impl Mempool {
@@ -97,6 +104,7 @@ impl Mempool {
             by_fee: BTreeSet::new(),
             max_size,
             max_age,
+            next_arrival_seq: 0,
         }
     }
 
@@ -120,7 +128,9 @@ impl Mempool {
         let entry = MempoolEntry {
             meta,
             received_at: Instant::now(),
+            arrival_seq: self.next_arrival_seq,
         };
+        self.next_arrival_seq += 1;
         self.by_fee.insert(FeePriority::of(&entry));
         self.by_hash.insert(hash, entry);
         true
@@ -245,6 +255,39 @@ mod tests {
 
         let top = mempool.top_by_fee(2);
         assert_eq!(top, vec![h2, h1]);
+    }
+
+    #[test]
+    fn test_equal_fee_ordering_is_first_come_first_served() {
+        let mut mempool = Mempool::new(100, Duration::from_secs(300));
+        let txs: Vec<_> = (1..=20).map(|seq| make_tx(100, 1, seq)).collect();
+        let mut arrival: Vec<TxHash> = txs.iter().map(|tx| *tx.hash()).collect();
+        // Make sure the check below cannot pass by accident: the arrival order
+        // must differ from the hash order that used to break ties.
+        let mut by_hash = arrival.clone();
+        by_hash.sort();
+        assert_ne!(arrival, by_hash);
+
+        for tx in txs {
+            assert!(mempool.insert(tx));
+        }
+        assert_eq!(mempool.top_by_fee(20), arrival);
+
+        // Removing an early arrival keeps the rest in arrival order.
+        let removed = arrival.remove(3);
+        mempool.remove(&removed);
+        assert_eq!(mempool.top_by_fee(19), arrival);
+    }
+
+    #[test]
+    fn test_fee_still_dominates_arrival_order() {
+        let mut mempool = Mempool::new(100, Duration::from_secs(300));
+        let early_low = make_tx(100, 1, 1);
+        let late_high = make_tx(200, 1, 2);
+        let (low_h, high_h) = (*early_low.hash(), *late_high.hash());
+        mempool.insert(early_low);
+        mempool.insert(late_high);
+        assert_eq!(mempool.top_by_fee(2), vec![high_h, low_h]);
     }
 
     #[test]

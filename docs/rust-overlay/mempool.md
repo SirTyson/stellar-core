@@ -30,8 +30,9 @@ Mempool::new(100000, Duration::from_secs(300))
 | `by_hash`     | `HashMap<TxHash, MempoolEntry>`       | O(1) lookup, dedup                       |
 | `by_fee`      | `BTreeSet<FeePriority>`               | Ordered access (for `top_by_fee`)        |
 
-`MempoolEntry` (`flood/mempool.rs:20-24`) is an
-`Arc<ValidatedTx>` plus `received_at` (for age-based eviction). The
+`MempoolEntry` is an `Arc<ValidatedTx>` plus `received_at` (for
+age-based eviction) and a per-mempool `arrival_seq` (for first-come
+first-served ordering among equal-fee transactions). The
 `ValidatedTx` (`wire.rs`) carries the canonical envelope bytes, sha256
 hash, fee, and op count — computed once at the trust boundary where the
 transaction entered the process, and shared by reference through the
@@ -47,8 +48,12 @@ without using division. Given two priorities `(fee1, ops1)` and
 fee1 / ops1 > fee2 / ops2  iff  fee1 * ops2 > fee2 * ops1
 ```
 
-Tie-breakers in order: equal ratio → fewer ops wins → equal ops → hash
-comparison (deterministic).
+Tie-breakers in order: equal ratio → fewer ops wins → equal ops →
+earlier arrival (`arrival_seq`) → hash comparison. Arrival order means
+equal-fee transactions are selected, and retained under capacity
+pressure, first-come first-served. (Breaking ties by hash instead
+starved high-hash transactions deterministically whenever the pool was
+backlogged.)
 
 > **Caveat — fee overflow**: `fee * num_ops` is computed in `u64`. For
 > pathological values (very large fee or ops counts) this can overflow.
