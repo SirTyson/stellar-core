@@ -408,6 +408,7 @@ OverlayIPC::handleMessage(IPCMessage const& msg)
         // latest snapshot and wake a synchronous waiter, if any.
         std::lock_guard<std::mutex> lock(mMetricsMutex);
         mLatestMetricsJson.emplace(msg.payload.begin(), msg.payload.end());
+        ++mMetricsGeneration;
         mPendingMetricsResponse = msg;
         mMetricsCv.notify_one();
         break;
@@ -992,9 +993,13 @@ OverlayIPC::requestMetricsAsync()
 }
 
 std::optional<std::string>
-OverlayIPC::latestMetrics()
+OverlayIPC::latestMetrics(uint64_t* generation)
 {
     std::lock_guard<std::mutex> lock(mMetricsMutex);
+    if (generation)
+    {
+        *generation = mMetricsGeneration;
+    }
     return mLatestMetricsJson;
 }
 

@@ -222,8 +222,10 @@ class OverlayIPC
     void requestMetricsAsync();
 
     /// The most recent metrics snapshot (JSON) received from the overlay, if
-    /// any.
-    std::optional<std::string> latestMetrics();
+    /// any. If `generation` is given, it is set to the number of snapshots
+    /// received so far (so a caller can tell a new snapshot from one it has
+    /// seen).
+    std::optional<std::string> latestMetrics(uint64_t* generation = nullptr);
 
     /// Check if connected to overlay
     bool isConnected() const;
@@ -281,6 +283,7 @@ class OverlayIPC
     std::optional<IPCMessage> mPendingMetricsResponse;
     // Latest snapshot received, whether requested synchronously or not.
     std::optional<std::string> mLatestMetricsJson;
+    uint64_t mMetricsGeneration{0};
 
     // Protects mChannel->send() - channel is not thread-safe
     mutable std::mutex mSendMutex;

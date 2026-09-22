@@ -460,7 +460,10 @@ impl App {
         // inclusion are reported back to Core (e.g. so a load generator can
         // release the accounts reserved for them).
         let (drop_tx, mut drop_rx) = mpsc::unbounded_channel::<LocalTxsDropped>();
-        let mut mempool_manager = Overlay::new(cmd_rx).with_drop_listener(drop_tx);
+        let metrics = Arc::new(OverlayMetrics::new());
+        let mut mempool_manager = Overlay::new(cmd_rx)
+            .with_drop_listener(drop_tx)
+            .with_metrics(Arc::clone(&metrics));
         if let Some(max_txs) = config.mempool_max_txs {
             info!("Mempool capacity overridden: {} transactions", max_txs);
             mempool_manager = mempool_manager.with_mempool_capacity(max_txs);
@@ -499,7 +502,6 @@ impl App {
 
         // Create libp2p QUIC overlay for SCP + TX + TxSet (unified, independent streams)
         let libp2p_keypair = Libp2pKeypair::generate_ed25519();
-        let metrics = Arc::new(OverlayMetrics::new());
         spawn_traffic_summary(Arc::clone(&metrics), Duration::from_secs(1));
         let (libp2p_handle, libp2p_event_rx, mut libp2p_overlay) =
             create_overlay(libp2p_keypair, Arc::clone(&metrics), overlay_handle.clone())
@@ -1475,6 +1477,13 @@ impl App {
 
             MessageType::RequestOverlayMetrics => {
                 // Snapshot metrics and send back as JSON
+                let (queue, queue_max) = self.core_ipc.sender.take_queue_depth();
+                self.metrics
+                    .ipc_to_core_queue
+                    .store(queue, Ordering::Relaxed);
+                self.metrics
+                    .ipc_to_core_queue_max
+                    .store(queue_max, Ordering::Relaxed);
                 let snapshot = self.metrics.snapshot();
                 match serde_json::to_vec(&snapshot) {
                     Ok(json_bytes) => {

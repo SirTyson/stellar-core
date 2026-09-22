@@ -11,6 +11,7 @@ use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, RwLock, Semaphore};
 use tracing::{debug, info};
 
 use crate::flood::{DropReason, InsertOutcome, Mempool, TxHash};
+use crate::metrics::OverlayMetrics;
 use crate::wire::ValidatedTx;
 
 /// Bound network admissions waiting for or undergoing mempool insertion.
@@ -101,6 +102,9 @@ pub struct Overlay {
 
     /// Where to report dropped local transactions, if anywhere.
     drop_listener: Option<mpsc::UnboundedSender<LocalTxsDropped>>,
+
+    /// Metrics to update (mempool size and admission outcomes), if any.
+    metrics: Option<Arc<OverlayMetrics>>,
 }
 
 impl Overlay {
@@ -113,7 +117,14 @@ impl Overlay {
                 DEFAULT_MEMPOOL_MAX_AGE,
             ))),
             drop_listener: None,
+            metrics: None,
         }
+    }
+
+    /// Record mempool size and admission outcomes in `metrics`.
+    pub fn with_metrics(mut self, metrics: Arc<OverlayMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Replace the (empty) mempool with one holding at most `max_txs`
@@ -192,6 +203,22 @@ impl Overlay {
                 } else {
                     mempool.insert(tx)
                 };
+                if let Some(m) = &self.metrics {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    match &outcome {
+                        InsertOutcome::Inserted { evicted } => {
+                            m.mempool_inserted.fetch_add(1, Relaxed);
+                            m.mempool_evicted.fetch_add(evicted.len() as u64, Relaxed);
+                        }
+                        InsertOutcome::Duplicate => {
+                            m.mempool_duplicate.fetch_add(1, Relaxed);
+                        }
+                        InsertOutcome::Rejected => {
+                            m.mempool_rejected.fetch_add(1, Relaxed);
+                        }
+                    }
+                    m.mempool_size.store(mempool.len() as i64, Relaxed);
+                }
                 self.report_local_drops(&mut mempool);
                 drop(mempool);
                 drop(admission);
@@ -222,6 +249,11 @@ impl Overlay {
                     mempool.remove(&hash);
                 }
                 let expired = mempool.evict_expired();
+                if let Some(m) = &self.metrics {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    m.mempool_expired.fetch_add(expired as u64, Relaxed);
+                    m.mempool_size.store(mempool.len() as i64, Relaxed);
+                }
                 self.report_local_drops(&mut mempool);
                 info!(
                     "Removed {} (requested) + {} (expired) TXs from mempool",
@@ -512,6 +544,32 @@ mod tests {
         // Removal requested by Core (inclusion) is not reported.
         handle.remove_txs_sync(vec![*kept.hash()]).await;
         assert!(drop_rx.try_recv().is_err());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn mempool_metrics_track_size_and_outcomes() {
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let handle = OverlayHandle::new(cmd_tx);
+        let metrics = Arc::new(OverlayMetrics::new());
+        let overlay = Overlay::new(cmd_rx)
+            .with_mempool_capacity(2)
+            .with_metrics(Arc::clone(&metrics));
+        let task = tokio::spawn(overlay.run());
+
+        let (a, b, c) = (transaction(1), transaction(2), transaction(3));
+        handle.submit_local_tx(a.clone()).await.unwrap();
+        handle.submit_local_tx(a.clone()).await.unwrap(); // duplicate
+        handle.submit_local_tx(b).await.unwrap();
+        handle.submit_local_tx(c).await.unwrap(); // full: rejected
+        handle.remove_txs_sync(vec![*a.hash()]).await;
+
+        use std::sync::atomic::Ordering::Relaxed;
+        assert_eq!(metrics.mempool_inserted.load(Relaxed), 2);
+        assert_eq!(metrics.mempool_duplicate.load(Relaxed), 1);
+        assert_eq!(metrics.mempool_rejected.load(Relaxed), 1);
+        assert_eq!(metrics.mempool_evicted.load(Relaxed), 0);
+        assert_eq!(metrics.mempool_size.load(Relaxed), 1);
         task.abort();
     }
 

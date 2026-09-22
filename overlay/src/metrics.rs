@@ -118,6 +118,27 @@ pub struct OverlayMetrics {
     /// overlay.flood.tx-batch-size — number of entries per INV batch
     pub flood_tx_batch_size_sum: AtomicU64,
     pub flood_tx_batch_size_count: AtomicU64,
+
+    // Mempool (all transactions, local and from peers)
+    /// overlay.mempool.size — transactions currently in the mempool
+    pub mempool_size: AtomicI64,
+    /// overlay.mempool.inserted — transactions admitted
+    pub mempool_inserted: AtomicU64,
+    /// overlay.mempool.duplicate — submissions already present
+    pub mempool_duplicate: AtomicU64,
+    /// overlay.mempool.rejected — refused because the pool was full
+    pub mempool_rejected: AtomicU64,
+    /// overlay.mempool.evicted — displaced by higher-priority transactions
+    pub mempool_evicted: AtomicU64,
+    /// overlay.mempool.expired — aged out
+    pub mempool_expired: AtomicU64,
+
+    // IPC to Core (set when a snapshot is taken)
+    /// overlay.ipc.to-core-queue — messages queued for Core, not yet written
+    pub ipc_to_core_queue: AtomicI64,
+    /// Largest such queue since the previous snapshot (Core requests one
+    /// every second and records these in overlay.ipc.to-core-queue-max)
+    pub ipc_to_core_queue_max: AtomicI64,
 }
 
 impl Default for OverlayMetrics {
@@ -168,6 +189,14 @@ impl Default for OverlayMetrics {
             flood_tx_pull_latency_count: AtomicU64::new(0),
             flood_tx_batch_size_sum: AtomicU64::new(0),
             flood_tx_batch_size_count: AtomicU64::new(0),
+            mempool_size: AtomicI64::new(0),
+            mempool_inserted: AtomicU64::new(0),
+            mempool_duplicate: AtomicU64::new(0),
+            mempool_rejected: AtomicU64::new(0),
+            mempool_evicted: AtomicU64::new(0),
+            mempool_expired: AtomicU64::new(0),
+            ipc_to_core_queue: AtomicI64::new(0),
+            ipc_to_core_queue_max: AtomicI64::new(0),
         }
     }
 }
@@ -233,6 +262,14 @@ impl OverlayMetrics {
             flood_tx_pull_latency_count: self.flood_tx_pull_latency_count.load(ORD),
             flood_tx_batch_size_sum: self.flood_tx_batch_size_sum.load(ORD),
             flood_tx_batch_size_count: self.flood_tx_batch_size_count.load(ORD),
+            mempool_size: self.mempool_size.load(ORD),
+            mempool_inserted: self.mempool_inserted.load(ORD),
+            mempool_duplicate: self.mempool_duplicate.load(ORD),
+            mempool_rejected: self.mempool_rejected.load(ORD),
+            mempool_evicted: self.mempool_evicted.load(ORD),
+            mempool_expired: self.mempool_expired.load(ORD),
+            ipc_to_core_queue: self.ipc_to_core_queue.load(ORD),
+            ipc_to_core_queue_max: self.ipc_to_core_queue_max.load(ORD),
         }
     }
 
@@ -306,6 +343,18 @@ pub struct MetricsSnapshot {
     pub flood_tx_pull_latency_count: u64,
     pub flood_tx_batch_size_sum: u64,
     pub flood_tx_batch_size_count: u64,
+
+    // Mempool
+    pub mempool_size: i64,
+    pub mempool_inserted: u64,
+    pub mempool_duplicate: u64,
+    pub mempool_rejected: u64,
+    pub mempool_evicted: u64,
+    pub mempool_expired: u64,
+
+    // IPC to Core
+    pub ipc_to_core_queue: i64,
+    pub ipc_to_core_queue_max: i64,
 }
 
 #[cfg(test)]

@@ -118,9 +118,12 @@ class RustOverlayManager
 
     OverlayMetrics mOverlayMetrics;
 
-    // Periodically requests a fresh overlay metrics snapshot.
+    // Requests a fresh overlay metrics snapshot every second, first sampling
+    // the latest one's IPC queue max.
     std::unique_ptr<VirtualTimer> mMetricsRefreshTimer;
     void scheduleMetricsRefresh();
+    void recordIpcQueueMax();
+    uint64_t mLastQueueMaxSnapshot{0};
 
     // For computing deltas on monotonic counters between syncs.
     // Key: metric name, Value: last synced value.

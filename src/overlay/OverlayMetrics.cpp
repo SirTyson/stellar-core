@@ -63,6 +63,21 @@ OverlayMetrics::OverlayMetrics(Application& app)
           {"overlay", "mempool", "local-evicted"}, "transaction"))
     , mLocalTxsExpired(app.getMetrics().NewMeter(
           {"overlay", "mempool", "local-expired"}, "transaction"))
+    , mMempoolSize(app.getMetrics().NewCounter({"overlay", "mempool", "size"}))
+    , mMempoolInserted(app.getMetrics().NewMeter(
+          {"overlay", "mempool", "inserted"}, "transaction"))
+    , mMempoolDuplicate(app.getMetrics().NewMeter(
+          {"overlay", "mempool", "duplicate"}, "transaction"))
+    , mMempoolRejected(app.getMetrics().NewMeter(
+          {"overlay", "mempool", "rejected"}, "transaction"))
+    , mMempoolEvicted(app.getMetrics().NewMeter(
+          {"overlay", "mempool", "evicted"}, "transaction"))
+    , mMempoolExpired(app.getMetrics().NewMeter(
+          {"overlay", "mempool", "expired"}, "transaction"))
+    , mIpcToCoreQueue(
+          app.getMetrics().NewCounter({"overlay", "ipc", "to-core-queue"}))
+    , mIpcToCoreQueueMax(app.getMetrics().NewHistogram(
+          {"overlay", "ipc", "to-core-queue-max"}))
 {
 }
 }

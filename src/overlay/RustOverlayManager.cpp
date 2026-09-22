@@ -114,10 +114,33 @@ RustOverlayManager::scheduleMetricsRefresh()
     {
         return;
     }
+    recordIpcQueueMax();
     mOverlayIPC->requestMetricsAsync();
     mMetricsRefreshTimer->expires_from_now(std::chrono::seconds(1));
     mMetricsRefreshTimer->async_wait([this]() { scheduleMetricsRefresh(); },
                                      &VirtualTimer::onFailureNoop);
+}
+
+void
+RustOverlayManager::recordIpcQueueMax()
+{
+    // Only this timer requests snapshots, so each one's queue max covers the
+    // second since the previous request. A snapshot seen before (the reply to
+    // the last request has not arrived) is not sampled again.
+    uint64_t generation = 0;
+    auto latest = mOverlayIPC->latestMetrics(&generation);
+    if (!latest || latest->empty() || generation == mLastQueueMaxSnapshot)
+    {
+        return;
+    }
+    mLastQueueMaxSnapshot = generation;
+    Json::Value root;
+    Json::Reader reader;
+    if (reader.parse(*latest, root) && root.isMember("ipc_to_core_queue_max"))
+    {
+        mOverlayMetrics.mIpcToCoreQueueMax.Update(
+            root["ipc_to_core_queue_max"].asInt64());
+    }
 }
 
 std::vector<std::string>
@@ -353,9 +376,8 @@ RustOverlayManager::syncOverlayMetrics()
     }
 
     // Never block the caller (the /metrics handler runs on the main thread)
-    // on an IPC round trip: apply the latest snapshot and ask for a fresh
-    // one for next time.
-    mOverlayIPC->requestMetricsAsync();
+    // on an IPC round trip: apply the latest snapshot, which the refresh
+    // timer requests every second.
     auto latest = mOverlayIPC->latestMetrics();
     if (!latest || latest->empty())
     {
@@ -450,6 +472,21 @@ RustOverlayManager::syncOverlayMetrics()
     markDelta(m.mSendSCPMessageSetMeter, "send_scp_message");
     markDelta(m.mSendTransactionMeter, "send_transaction");
     markDelta(m.mSendTxSetMeter, "send_txset");
+
+    // Mempool
+    markDelta(m.mMempoolInserted, "mempool_inserted");
+    markDelta(m.mMempoolDuplicate, "mempool_duplicate");
+    markDelta(m.mMempoolRejected, "mempool_rejected");
+    markDelta(m.mMempoolEvicted, "mempool_evicted");
+    markDelta(m.mMempoolExpired, "mempool_expired");
+    auto setGauge = [&](medida::Counter& counter, std::string const& field) {
+        if (root.isMember(field))
+        {
+            counter.set_count(root[field].asInt64());
+        }
+    };
+    setGauge(m.mMempoolSize, "mempool_size");
+    setGauge(m.mIpcToCoreQueue, "ipc_to_core_queue");
 
     // Connection lifecycle — these aren't registered as medida meters on
     // the C++ side yet, so they'll just be tracked by the existing counters.

@@ -71,5 +71,18 @@ struct OverlayMetrics
     medida::Meter& mLocalTxsRejected;
     medida::Meter& mLocalTxsEvicted;
     medida::Meter& mLocalTxsExpired;
+
+    // ── Rust mempool (all transactions) ──
+    medida::Counter& mMempoolSize;
+    medida::Meter& mMempoolInserted;
+    medida::Meter& mMempoolDuplicate;
+    medida::Meter& mMempoolRejected;
+    medida::Meter& mMempoolEvicted;
+    medida::Meter& mMempoolExpired;
+
+    // ── Overlay -> Core IPC queue ──
+    medida::Counter& mIpcToCoreQueue;
+    // Largest queue in each second.
+    medida::Histogram& mIpcToCoreQueueMax;
 };
 }

@@ -172,6 +172,14 @@ overlay.memory.flood-known                | counter   | number of known flooded 
 overlay.mempool.local-evicted             | meter     | locally submitted transactions evicted from the mempool by higher-priority ones
 overlay.mempool.local-expired             | meter     | locally submitted transactions that aged out of the mempool
 overlay.mempool.local-rejected            | meter     | locally submitted transactions refused because the mempool was full
+overlay.mempool.size                      | counter   | transactions in the Rust overlay mempool
+overlay.mempool.inserted                  | meter     | transactions admitted to the mempool (local and from peers)
+overlay.mempool.duplicate                 | meter     | submissions already present in the mempool
+overlay.mempool.rejected                  | meter     | transactions refused because the mempool was full
+overlay.mempool.evicted                   | meter     | transactions evicted by higher-priority ones
+overlay.mempool.expired                   | meter     | transactions that aged out of the mempool
+overlay.ipc.to-core-queue                 | counter   | messages the overlay has queued for Core but not yet written
+overlay.ipc.to-core-queue-max             | histogram | largest such queue in each second
 overlay.message.broadcast                 | meter     | message broadcasted
 overlay.message.read                      | meter     | message received
 overlay.message.write                     | meter     | message sent

@@ -4,6 +4,7 @@
 
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
@@ -47,16 +48,41 @@ impl From<std::io::Error> for IpcError {
     }
 }
 
+/// Depth of the outbound (to Core) queue: messages accepted by
+/// [`CoreSender::send`] and not yet written to the socket.
+#[derive(Default)]
+pub struct OutboundQueueDepth {
+    current: AtomicI64,
+    /// Largest depth since the last [`CoreSender::take_queue_depth`].
+    max: AtomicI64,
+}
+
 /// Handle for sending messages to Core.
 #[derive(Clone)]
 pub struct CoreSender {
     tx: mpsc::UnboundedSender<Message>,
+    depth: Arc<OutboundQueueDepth>,
 }
 
 impl CoreSender {
+    fn new(tx: mpsc::UnboundedSender<Message>, depth: Arc<OutboundQueueDepth>) -> Self {
+        Self { tx, depth }
+    }
+
     /// Send a message to Core. Never blocks.
     pub fn send(&self, msg: Message) -> Result<(), IpcError> {
-        self.tx.send(msg).map_err(|_| IpcError::ChannelClosed)
+        self.tx.send(msg).map_err(|_| IpcError::ChannelClosed)?;
+        let depth = self.depth.current.fetch_add(1, Ordering::Relaxed) + 1;
+        self.depth.max.fetch_max(depth, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Current depth of the queue to Core, and the largest depth since the
+    /// previous call (which starts a new window).
+    pub fn take_queue_depth(&self) -> (i64, i64) {
+        let current = self.depth.current.load(Ordering::Relaxed).max(0);
+        let max = self.depth.max.swap(current, Ordering::Relaxed).max(current);
+        (current, max)
     }
 
     /// Convenience: send SCP received notification
@@ -178,6 +204,7 @@ impl CoreIpc {
         // Channels for async communication
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Message>();
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<Message>();
+        let depth = Arc::new(OutboundQueueDepth::default());
 
         // Spawn reader task
         let reader_stream = Arc::clone(&stream);
@@ -187,12 +214,13 @@ impl CoreIpc {
 
         // Spawn writer task
         let writer_stream = Arc::clone(&stream);
+        let writer_depth = Arc::clone(&depth);
         tokio::spawn(async move {
-            Self::writer_loop(writer_stream, outbound_rx).await;
+            Self::writer_loop(writer_stream, outbound_rx, writer_depth).await;
         });
 
         Ok(Self {
-            sender: CoreSender { tx: outbound_tx },
+            sender: CoreSender::new(outbound_tx, depth),
             receiver: CoreReceiver { rx: inbound_rx },
         })
     }
@@ -248,7 +276,11 @@ impl CoreIpc {
     }
 
     /// Writer loop: receive from channel, blocking write.
-    async fn writer_loop(stream: Arc<UnixStream>, mut rx: mpsc::UnboundedReceiver<Message>) {
+    async fn writer_loop(
+        stream: Arc<UnixStream>,
+        mut rx: mpsc::UnboundedReceiver<Message>,
+        depth: Arc<OutboundQueueDepth>,
+    ) {
         while let Some(msg) = rx.recv().await {
             let stream = Arc::clone(&stream);
             let msg_type = msg.msg_type;
@@ -260,6 +292,7 @@ impl CoreIpc {
                 MessageCodec::write(&mut writer, &msg)
             })
             .await;
+            depth.current.fetch_sub(1, Ordering::Relaxed);
 
             match result {
                 Ok(Ok(())) => {
@@ -286,9 +319,27 @@ mod tests {
     use std::os::unix::net::UnixStream as StdUnixStream;
 
     #[test]
+    fn outbound_queue_depth_tracks_current_and_window_max() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let depth = Arc::new(OutboundQueueDepth::default());
+        let sender = CoreSender::new(tx, Arc::clone(&depth));
+        for _ in 0..3 {
+            sender
+                .send(Message::new(MessageType::ScpReceived, vec![]))
+                .unwrap();
+        }
+        assert_eq!(sender.take_queue_depth(), (3, 3));
+        // The writer drains two messages.
+        depth.current.fetch_sub(2, Ordering::Relaxed);
+        assert_eq!(sender.take_queue_depth(), (1, 3));
+        // New window: the max restarts from the current depth.
+        assert_eq!(sender.take_queue_depth(), (1, 1));
+    }
+
+    #[test]
     fn txs_dropped_payload_layout() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let sender = CoreSender { tx };
+        let sender = CoreSender::new(tx, Arc::default());
         sender.send_txs_dropped(3, &[[1u8; 32], [2u8; 32]]).unwrap();
         let msg = rx.try_recv().unwrap();
         assert_eq!(msg.msg_type, MessageType::TxsDropped);

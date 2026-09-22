@@ -9,8 +9,10 @@
 #include "test/TestUtils.h"
 #include "test/test.h"
 #include "transactions/test/SorobanTxTestUtils.h"
+#include "util/MetricsRegistry.h"
 #include "util/TmpDir.h"
 #include "xdr/Stellar-SCP.h"
+#include <medida/histogram.h>
 
 #include <algorithm>
 #include <chrono>
@@ -117,6 +119,28 @@ TEST_CASE("OverlayIPC requests metrics without blocking", "[overlay-ipc]")
     REQUIRE(snapshot->find("byte_read") != std::string::npos);
 
     ipc.shutdown();
+}
+
+TEST_CASE("Rust overlay samples the IPC queue max every second",
+          "[overlay-ipc]")
+{
+    // Nobody reads /metrics here: the refresh timer alone requests a
+    // snapshot every second and records its queue max.
+    VirtualClock clock(VirtualClock::REAL_TIME);
+    auto cfg = getTestConfig();
+    cfg.RUN_STANDALONE = false; // start the overlay
+    auto app = createTestApplication(clock, cfg);
+    auto& queueMax =
+        app->getMetrics().NewHistogram({"overlay", "ipc", "to-core-queue-max"});
+    auto const start = clock.now();
+    while (queueMax.count() < 3 &&
+           clock.now() < start + std::chrono::seconds(10))
+    {
+        clock.crank(true);
+    }
+    REQUIRE(queueMax.count() >= 3);
+    // One sample per snapshot, so no faster than one per second.
+    REQUIRE(clock.now() - start >= std::chrono::seconds(2));
 }
 
 TEST_CASE("OverlayIPC broadcasts SCP to Rust overlay", "[overlay-ipc][.]")
