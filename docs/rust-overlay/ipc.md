@@ -78,6 +78,7 @@ are rejected with `InvalidData`.
 | 103 | `TxSetAvailable`       | `[hash:32][txset_xdr]`                       | Reply to `RequestTxSet` (cache or peer fetch) |
 | 104 | `QuorumSetAvailable`   | (quorum set XDR)                             | A quorum set arrived                          |
 | 105 | `OverlayMetricsResponse` | UTF-8 JSON                                | Reply to `RequestOverlayMetrics`              |
+| 106 | `TxsDropped`           | `[reason:u32 LE][count:u32 LE][tx_hash:32]…` | TXs Core submitted left the mempool without inclusion (1 = rejected when full, 2 = evicted, 3 = expired) |
 
 ### Notes on individual fields
 

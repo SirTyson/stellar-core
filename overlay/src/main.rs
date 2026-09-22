@@ -21,7 +21,9 @@ use libp2p::identity::Keypair as Libp2pKeypair;
 use libp2p::{Multiaddr, PeerId};
 use stellar_overlay::config::Config;
 use stellar_overlay::flood::{CachedTxSet, Hash256, TxSetCache, TxSetData};
-use stellar_overlay::integrated::{Overlay, OverlayHandle};
+use stellar_overlay::integrated::{
+    coalesce_local_drops, LocalTxsDropped, Overlay, OverlayHandle, DROP_REPORT_COALESCE_WINDOW,
+};
 use stellar_overlay::ipc::{CoreIpc, Message, MessageType};
 use stellar_overlay::libp2p_overlay::{
     create_overlay, OverlayEvent as LibP2pOverlayEvent, OverlayHandle as LibP2pOverlayHandle,
@@ -36,6 +38,7 @@ struct Args {
     socket_path: Option<PathBuf>,
     listen_mode: bool,
     peer_port: Option<u16>,
+    mempool_max_txs: Option<usize>,
 }
 
 impl Args {
@@ -45,6 +48,7 @@ impl Args {
             socket_path: None,
             listen_mode: false,
             peer_port: None,
+            mempool_max_txs: None,
         };
 
         let mut iter = std::env::args().skip(1);
@@ -58,6 +62,9 @@ impl Args {
                 }
                 "--peer-port" | "-p" => {
                     args.peer_port = iter.next().and_then(|s| s.parse().ok());
+                }
+                "--mempool-max-txs" => {
+                    args.mempool_max_txs = iter.next().and_then(|s| s.parse().ok());
                 }
                 "--listen" | "-l" => {
                     args.listen_mode = true;
@@ -75,6 +82,7 @@ impl Args {
                     eprintln!("  -c, --config <PATH>    Path to config file (TOML)");
                     eprintln!("  -s, --socket <PATH>    Path to Core IPC socket");
                     eprintln!("  -p, --peer-port <PORT> Port for peer TCP connections");
+                    eprintln!("      --mempool-max-txs <N> Mempool capacity (tests only)");
                     eprintln!(
                         "  -l, --listen           Listen mode (create socket, wait for Core)"
                     );
@@ -446,9 +454,40 @@ impl App {
         // Create channels for mempool manager communication
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
-        // Create mempool manager (no network - libp2p handles all P2P)
-        let mempool_manager = Overlay::new(cmd_rx);
+        // Create mempool manager (no network - libp2p handles all P2P).
+        // Transactions Core submitted that the mempool drops without
+        // inclusion are reported back to Core (e.g. so a load generator can
+        // release the accounts reserved for them).
+        let (drop_tx, mut drop_rx) = mpsc::unbounded_channel::<LocalTxsDropped>();
+        let mut mempool_manager = Overlay::new(cmd_rx).with_drop_listener(drop_tx);
+        if let Some(max_txs) = config.mempool_max_txs {
+            info!("Mempool capacity overridden: {} transactions", max_txs);
+            mempool_manager = mempool_manager.with_mempool_capacity(max_txs);
+        }
         let overlay_handle = OverlayHandle::new(cmd_tx);
+        let drop_sender = core_ipc.sender.clone();
+        tokio::spawn(async move {
+            while let Some(first) = drop_rx.recv().await {
+                tokio::time::sleep(DROP_REPORT_COALESCE_WINDOW).await;
+                let mut reports = vec![first];
+                while let Ok(more) = drop_rx.try_recv() {
+                    reports.push(more);
+                }
+                for dropped in coalesce_local_drops(reports) {
+                    debug!(
+                        "TXS_DROPPED: {} local TXs ({:?})",
+                        dropped.hashes.len(),
+                        dropped.reason
+                    );
+                    if drop_sender
+                        .send_txs_dropped(dropped.reason as u32, &dropped.hashes)
+                        .is_err()
+                    {
+                        return; // Core IPC closed
+                    }
+                }
+            }
+        });
 
         // Spawn mempool manager task
         tokio::spawn(async move {
@@ -1507,6 +1546,11 @@ async fn main() {
     // Override peer port from command line
     if let Some(port) = args.peer_port {
         config.peer_port = port;
+    }
+
+    // Override mempool capacity from command line (tests only)
+    if let Some(max_txs) = args.mempool_max_txs {
+        config.mempool_max_txs = Some(max_txs);
     }
 
     // Setup logging

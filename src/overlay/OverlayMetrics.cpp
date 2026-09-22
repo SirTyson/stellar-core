@@ -57,6 +57,12 @@ OverlayMetrics::OverlayMetrics(Application& app)
     , mAuthenticatedPeersSize(app.getMetrics().NewCounter(
           {"overlay", "connection", "authenticated"}))
     , mFetchTxSetTimer(app.getMetrics().NewTimer({"overlay", "fetch", "txset"}))
+    , mLocalTxsRejected(app.getMetrics().NewMeter(
+          {"overlay", "mempool", "local-rejected"}, "transaction"))
+    , mLocalTxsEvicted(app.getMetrics().NewMeter(
+          {"overlay", "mempool", "local-evicted"}, "transaction"))
+    , mLocalTxsExpired(app.getMetrics().NewMeter(
+          {"overlay", "mempool", "local-expired"}, "transaction"))
 {
 }
 }

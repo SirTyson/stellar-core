@@ -568,6 +568,7 @@ class LedgerManagerImpl : public LedgerManager
     void rebuildInMemorySorobanStateForTesting(uint32_t ledgerVersion) override;
     uint64_t getSorobanInMemoryStateSizeForTesting() override;
     void recordTxSubmission(Hash const& contentsHash) override;
+    bool forgetTxSubmission(Hash const& contentsHash) override;
     void beginTxLatencyMeasurement(uint32_t expectedTxCount) override;
     void finalizeTxLatencyMeasurement() override;
 #endif

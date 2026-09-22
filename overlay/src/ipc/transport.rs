@@ -82,6 +82,18 @@ impl CoreSender {
         self.send(Message::new(MessageType::TopTxsResponse, payload))
     }
 
+    /// Convenience: report locally submitted transactions dropped from the
+    /// mempool. Payload: [reason:u32][count:u32][hash:32]... (little-endian)
+    pub fn send_txs_dropped(&self, reason: u32, hashes: &[[u8; 32]]) -> Result<(), IpcError> {
+        let mut payload = Vec::with_capacity(8 + 32 * hashes.len());
+        payload.extend_from_slice(&reason.to_le_bytes());
+        payload.extend_from_slice(&(hashes.len() as u32).to_le_bytes());
+        for hash in hashes {
+            payload.extend_from_slice(hash);
+        }
+        self.send(Message::new(MessageType::TxsDropped, payload))
+    }
+
     /// Convenience: send TX set available notification
     pub fn send_tx_set_available(&self, hash: [u8; 32], xdr: &[u8]) -> Result<(), IpcError> {
         // Payload: [hash:32][xdr...]
@@ -272,6 +284,20 @@ impl CoreIpc {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixStream as StdUnixStream;
+
+    #[test]
+    fn txs_dropped_payload_layout() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sender = CoreSender { tx };
+        sender.send_txs_dropped(3, &[[1u8; 32], [2u8; 32]]).unwrap();
+        let msg = rx.try_recv().unwrap();
+        assert_eq!(msg.msg_type, MessageType::TxsDropped);
+        let mut expected = 3u32.to_le_bytes().to_vec();
+        expected.extend_from_slice(&2u32.to_le_bytes());
+        expected.extend_from_slice(&[1u8; 32]);
+        expected.extend_from_slice(&[2u8; 32]);
+        assert_eq!(msg.payload, expected);
+    }
 
     #[tokio::test]
     async fn test_ipc_roundtrip() {

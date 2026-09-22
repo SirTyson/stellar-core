@@ -2068,6 +2068,12 @@ HerderImpl::makeProposal(uint32_t ledgerSeqToTrigger)
                    "from the mempool",
                    prepared->invalidTxHashes.size());
         mApp.getOverlayManager().removeTransactions(prepared->invalidTxHashes);
+#ifdef BUILD_TESTS
+        // Discarded from this node's mempool: none of these that this node's
+        // load generator submitted will be included from here.
+        mApp.getLoadGenerator().handleTxsDroppedFromMempool(
+            prepared->invalidTxHashes);
+#endif
     }
 
     if (!applicableProposedSet)

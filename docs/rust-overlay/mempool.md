@@ -87,6 +87,24 @@ refused or already held.
   only from the `RemoveTxsFromMempool` handler (i.e. piggybacked on
   externalization) — there is no periodic timer that invokes it.
 
+## Reporting dropped local transactions
+
+Entries remember whether the local Core submitted them. When a local
+transaction is refused on submission (full pool), evicted by a
+higher-priority arrival, or expires, the mempool records it; after each
+command the manager groups these by reason and sends them to its drop
+listener. The listener collects reports for 10 ms (a full pool refuses
+submissions one command at a time) and forwards them to Core as one
+`TxsDropped` (IPC 106) per reason, of at most 65,536 hashes each. Core
+marks `overlay.mempool.local-{rejected,evicted,expired}` and, in test
+builds, lets the load generator release the accounts reserved for those
+transactions and count them as finished. Removals requested by Core
+(inclusion in a ledger, or discarded by the tx set builder) are not
+reported: Core initiated them.
+
+The capacity (default 100,000) can be lowered for tests with
+`--mempool-max-txs <n>` (Core: `OVERLAY_MEMPOOL_MAX_TXS_FOR_TESTING`).
+
 ## Removal on externalization
 
 When Core sends `TxSetExternalized`, `main.rs:1180` calls
@@ -135,8 +153,8 @@ Core for inclusion in a TX set.
 
 ## Known gaps
 
-- Mempool size (100,000) and age limit (300 s) are hardcoded — there
-  are no config knobs for them.
+- Mempool age limit (300 s) is hardcoded, and the size (100,000) can
+  only be overridden for tests.
 - Age-based eviction runs only on externalization, not on a timer — on
   a stalled network, old TXs sit in the mempool until pushed out by
   capacity-based eviction.

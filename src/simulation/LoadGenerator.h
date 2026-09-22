@@ -232,6 +232,13 @@ class LoadGenerator
     void cleanupAccounts(uint32_t ledgerSeq,
                          PerPhaseTransactionList const& perPhaseTxs);
 
+    // The mempool dropped these transactions (identified by full hash)
+    // without including them: they were refused, evicted or aged out, or
+    // discarded as invalid by this node's tx set builder. Releases the
+    // accounts reserved for the ones this generator submitted and counts them
+    // as finished (dropped) for the run's completion check.
+    void handleTxsDroppedFromMempool(std::vector<Hash> const& txFullHashes);
+
   private:
     struct TxMetrics
     {
@@ -284,12 +291,20 @@ class LoadGenerator
     // Accounts whose transaction externalized in the given ledger; released
     // once that ledger is applied.
     std::unordered_map<uint64_t, uint32_t> mAccountsExternalized;
-    // Full hash of every submitted transaction whose source account is
-    // reserved in mAccountsInUse, mapped to that account. Externalization
+    // A submitted transaction that is neither externalized nor dropped yet.
+    struct PendingTx
+    {
+        // Source account reserved in mAccountsInUse for this transaction, if
+        // any (pre-generated transactions read from a file reserve none).
+        std::optional<uint64_t> reservedAccount;
+        bool isSoroban;
+        Hash contentsHash;
+    };
+    // Every pending submitted transaction, by full hash. Externalization
     // releases exactly the reservations whose own transaction was included,
     // in time proportional to the externalized set rather than to the number
-    // of accounts in use.
-    UnorderedMap<Hash, uint64_t> mReservedAccountByTxHash;
+    // of accounts in use; a mempool drop releases its reservation right away.
+    UnorderedMap<Hash, PendingTx> mPendingTxs;
     // Accounts enter this pool only when initialized or released from one of
     // the disjoint in-use/externalized collections. A dense vector allows
     // uniform random selection and removal without walking the account pool.
@@ -340,6 +355,10 @@ class LoadGenerator
     // check trivially hold for that stream. For MIXED_PREGEN_* both are used.
     uint64_t mClassicSubmitted{0};
     uint64_t mSorobanSubmitted{0};
+    // Per-stream counts of submitted transactions the mempool dropped without
+    // including them; they count as finished in waitTillComplete.
+    uint64_t mClassicDropped{0};
+    uint64_t mSorobanDropped{0};
     // Per-stream applied-at-start snapshots captured in start(), so
     // waitTillComplete compares per-stream applied deltas against per-stream
     // submitted counters.
@@ -350,6 +369,7 @@ class LoadGenerator
 
     medida::Meter& mLoadgenComplete;
     medida::Meter& mLoadgenFail;
+    medida::Meter& mTxsDroppedFromMempool;
 
     // Counts of successful and failed soroban transactions prior to running
     // loadgen

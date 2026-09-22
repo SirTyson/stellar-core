@@ -10,22 +10,28 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, RwLock, Semaphore};
 use tracing::{debug, info};
 
-use crate::flood::{InsertOutcome, Mempool};
+use crate::flood::{DropReason, InsertOutcome, Mempool, TxHash};
 use crate::wire::ValidatedTx;
 
 /// Bound network admissions waiting for or undergoing mempool insertion.
 const MAX_NETWORK_ADMISSIONS: usize = 10_000;
+
+/// Default mempool capacity (transactions) and maximum age.
+pub const DEFAULT_MEMPOOL_MAX_TXS: usize = 100_000;
+pub const DEFAULT_MEMPOOL_MAX_AGE: Duration = Duration::from_secs(300);
 
 /// One ordered stream for Core commands and network TX admissions.
 #[derive(Debug)]
 pub enum CoreCommand {
     /// Insert a transaction. Network admission owns capacity until processed;
     /// local Core submissions retain their existing unbounded enqueue policy.
-    /// `reply`, if present, receives the insertion outcome.
+    /// `reply`, if present, receives the insertion outcome. `local` marks a
+    /// transaction submitted by the local Core, whose drops are reported.
     SubmitTx {
         tx: Arc<ValidatedTx>,
         admission: Option<OwnedSemaphorePermit>,
         reply: Option<oneshot::Sender<InsertOutcome>>,
+        local: bool,
     },
 
     /// Request top N transactions by fee
@@ -41,6 +47,50 @@ pub enum CoreCommand {
     },
 }
 
+/// Locally submitted transactions that left (or never entered) the mempool
+/// without being included in a ledger, all for the same reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalTxsDropped {
+    pub reason: DropReason,
+    pub hashes: Vec<TxHash>,
+}
+
+/// How long drop reports are collected before being sent to Core. A full
+/// mempool refuses submissions one command at a time; collecting them turns
+/// one IPC message (and one Core main-thread task) per transaction into one
+/// per reason per window.
+pub const DROP_REPORT_COALESCE_WINDOW: Duration = Duration::from_millis(10);
+
+/// Most hashes sent to Core in one drop report (2 MiB of hashes).
+pub const MAX_DROP_REPORT_HASHES: usize = 65_536;
+
+/// Merges `reports` by reason, in the order each reason first appears, into
+/// reports of at most `MAX_DROP_REPORT_HASHES` hashes.
+pub fn coalesce_local_drops(
+    reports: impl IntoIterator<Item = LocalTxsDropped>,
+) -> Vec<LocalTxsDropped> {
+    let mut merged: Vec<LocalTxsDropped> = Vec::new();
+    for report in reports {
+        match merged.iter_mut().find(|m| m.reason == report.reason) {
+            Some(m) => m.hashes.extend(report.hashes),
+            None => merged.push(report),
+        }
+    }
+    merged
+        .into_iter()
+        .flat_map(|m| {
+            let reason = m.reason;
+            m.hashes
+                .chunks(MAX_DROP_REPORT_HASHES)
+                .map(|chunk| LocalTxsDropped {
+                    reason,
+                    hashes: chunk.to_vec(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 /// Mempool manager (no longer handles network connections).
 pub struct Overlay {
     /// Commands from Core
@@ -48,6 +98,9 @@ pub struct Overlay {
 
     /// TX mempool
     mempool: Arc<RwLock<Mempool>>,
+
+    /// Where to report dropped local transactions, if anywhere.
+    drop_listener: Option<mpsc::UnboundedSender<LocalTxsDropped>>,
 }
 
 impl Overlay {
@@ -55,7 +108,53 @@ impl Overlay {
     pub fn new(core_commands: mpsc::UnboundedReceiver<CoreCommand>) -> Self {
         Self {
             core_commands,
-            mempool: Arc::new(RwLock::new(Mempool::new(100000, Duration::from_secs(300)))),
+            mempool: Arc::new(RwLock::new(Mempool::new(
+                DEFAULT_MEMPOOL_MAX_TXS,
+                DEFAULT_MEMPOOL_MAX_AGE,
+            ))),
+            drop_listener: None,
+        }
+    }
+
+    /// Replace the (empty) mempool with one holding at most `max_txs`
+    /// transactions.
+    pub fn with_mempool_capacity(self, max_txs: usize) -> Self {
+        *self.mempool.try_write().expect("mempool not yet shared") =
+            Mempool::new(max_txs, DEFAULT_MEMPOOL_MAX_AGE);
+        self
+    }
+
+    /// Report locally submitted transactions dropped without inclusion
+    /// (refused, evicted or expired) to `listener`, grouped by reason, after
+    /// each command that dropped any.
+    pub fn with_drop_listener(mut self, listener: mpsc::UnboundedSender<LocalTxsDropped>) -> Self {
+        self.drop_listener = Some(listener);
+        self
+    }
+
+    /// Forward drops recorded by `mempool` to the listener.
+    fn report_local_drops(&self, mempool: &mut Mempool) {
+        let drops = mempool.take_local_drops();
+        let Some(listener) = &self.drop_listener else {
+            return;
+        };
+        let mut batch: Option<LocalTxsDropped> = None;
+        for (hash, reason) in drops {
+            match &mut batch {
+                Some(current) if current.reason == reason => current.hashes.push(hash),
+                _ => {
+                    if let Some(done) = batch.take() {
+                        let _ = listener.send(done);
+                    }
+                    batch = Some(LocalTxsDropped {
+                        reason,
+                        hashes: vec![hash],
+                    });
+                }
+            }
+        }
+        if let Some(done) = batch {
+            let _ = listener.send(done);
         }
     }
 
@@ -78,6 +177,7 @@ impl Overlay {
                 tx,
                 admission,
                 reply,
+                local,
             } => {
                 debug!(
                     "[SubmitTx] TX: hash={:02x?}, size={}, fee={}, ops={}",
@@ -87,7 +187,12 @@ impl Overlay {
                     tx.num_ops()
                 );
                 let mut mempool = self.mempool.write().await;
-                let outcome = mempool.insert(tx);
+                let outcome = if local {
+                    mempool.insert_local(tx)
+                } else {
+                    mempool.insert(tx)
+                };
+                self.report_local_drops(&mut mempool);
                 drop(mempool);
                 drop(admission);
                 if let Some(reply) = reply {
@@ -117,6 +222,7 @@ impl Overlay {
                     mempool.remove(&hash);
                 }
                 let expired = mempool.evict_expired();
+                self.report_local_drops(&mut mempool);
                 info!(
                     "Removed {} (requested) + {} (expired) TXs from mempool",
                     count, expired
@@ -159,12 +265,13 @@ impl OverlayHandle {
         }
     }
 
-    /// Submit a validated transaction.
+    /// Submit a validated transaction (not reported if later dropped).
     pub fn submit_tx(&self, tx: Arc<ValidatedTx>) {
         let _ = self.cmd_tx.send(CoreCommand::SubmitTx {
             tx,
             admission: None,
             reply: None,
+            local: false,
         });
     }
 
@@ -172,12 +279,15 @@ impl OverlayHandle {
     /// admitted it. The command is enqueued synchronously, so it keeps its
     /// FIFO position relative to later commands; the receiver resolves once
     /// the mempool has processed it (and errors if the manager shut down).
+    /// If the transaction is refused, or later evicted or expired, the drop
+    /// is reported to the manager's drop listener.
     pub fn submit_local_tx(&self, tx: Arc<ValidatedTx>) -> oneshot::Receiver<InsertOutcome> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let _ = self.cmd_tx.send(CoreCommand::SubmitTx {
             tx,
             admission: None,
             reply: Some(reply_tx),
+            local: true,
         });
         reply_rx
     }
@@ -197,6 +307,7 @@ impl OverlayHandle {
                 tx,
                 admission: Some(admission),
                 reply: None,
+                local: false,
             })
             .is_ok()
     }
@@ -236,6 +347,43 @@ mod tests {
 
     fn transaction(sequence: i64) -> Arc<ValidatedTx> {
         ValidatedTx::from_core_trusted(valid_transaction_xdr(100, sequence, 1), 100, 1).unwrap()
+    }
+
+    #[test]
+    fn coalesce_local_drops_merges_by_reason_and_bounds_reports() {
+        let drop = |reason, first: u8, n: usize| LocalTxsDropped {
+            reason,
+            hashes: (0..n).map(|i| [first.wrapping_add(i as u8); 32]).collect(),
+        };
+        let merged = coalesce_local_drops(vec![
+            drop(DropReason::Rejected, 1, 1),
+            drop(DropReason::Expired, 10, 2),
+            drop(DropReason::Rejected, 2, 1),
+            drop(DropReason::Rejected, 3, 1),
+        ]);
+        assert_eq!(
+            merged,
+            vec![
+                LocalTxsDropped {
+                    reason: DropReason::Rejected,
+                    hashes: vec![[1; 32], [2; 32], [3; 32]],
+                },
+                LocalTxsDropped {
+                    reason: DropReason::Expired,
+                    hashes: vec![[10; 32], [11; 32]],
+                },
+            ]
+        );
+
+        let split = coalesce_local_drops(vec![drop(
+            DropReason::Evicted,
+            0,
+            MAX_DROP_REPORT_HASHES + 1,
+        )]);
+        assert_eq!(split.len(), 2);
+        assert_eq!(split[0].hashes.len(), MAX_DROP_REPORT_HASHES);
+        assert_eq!(split[1].hashes.len(), 1);
+        assert!(split.iter().all(|r| r.reason == DropReason::Evicted));
     }
 
     #[tokio::test]
@@ -330,6 +478,40 @@ mod tests {
         let task = tokio::spawn(Overlay::new(cmd_rx).run());
         assert!(inserted.await.unwrap().is_inserted());
         assert_eq!(duplicate.await.unwrap(), InsertOutcome::Duplicate);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn local_drops_are_reported_to_listener() {
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (drop_tx, mut drop_rx) = mpsc::unbounded_channel();
+        let handle = OverlayHandle::new(cmd_tx);
+        let overlay = Overlay::new(cmd_rx).with_drop_listener(drop_tx);
+        *overlay.mempool.write().await = Mempool::new(1, Duration::from_secs(300));
+        let task = tokio::spawn(overlay.run());
+
+        let kept = transaction(1);
+        let refused = transaction(2);
+        assert!(handle
+            .submit_local_tx(kept.clone())
+            .await
+            .unwrap()
+            .is_inserted());
+        assert_eq!(
+            handle.submit_local_tx(refused.clone()).await.unwrap(),
+            InsertOutcome::Rejected
+        );
+        assert_eq!(
+            drop_rx.recv().await.unwrap(),
+            LocalTxsDropped {
+                reason: DropReason::Rejected,
+                hashes: vec![*refused.hash()]
+            }
+        );
+
+        // Removal requested by Core (inclusion) is not reported.
+        handle.remove_txs_sync(vec![*kept.hash()]).await;
+        assert!(drop_rx.try_recv().is_err());
         task.abort();
     }
 

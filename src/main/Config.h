@@ -744,6 +744,9 @@ class Config : public std::enable_shared_from_this<Config>
     // Rust overlay process config
     std::optional<std::string> OVERLAY_BINARY_PATH;
     std::optional<std::string> OVERLAY_SOCKET_PATH;
+    // Overrides the Rust overlay's mempool capacity (in transactions) when
+    // non-zero. Only for tests that need to exercise a full mempool.
+    uint32_t OVERLAY_MEMPOOL_MAX_TXS_FOR_TESTING;
     int FLOOD_SOROBAN_TX_PERIOD_MS;
     int32_t FLOOD_ARB_TX_BASE_ALLOWANCE;
     double FLOOD_ARB_TX_DAMPING_FACTOR;

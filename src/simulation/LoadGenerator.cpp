@@ -124,6 +124,8 @@ LoadGenerator::LoadGenerator(Application& app)
           mApp.getMetrics().NewMeter({"loadgen", "run", "complete"}, "run"))
     , mLoadgenFail(
           mApp.getMetrics().NewMeter({"loadgen", "run", "failed"}, "run"))
+    , mTxsDroppedFromMempool(mApp.getMetrics().NewMeter(
+          {"loadgen", "txn", "dropped-from-mempool"}, "txn"))
 {
 }
 
@@ -268,17 +270,67 @@ LoadGenerator::cleanupAccounts(uint32_t ledgerSeq,
     {
         for (auto const& tx : txs)
         {
-            auto it = mReservedAccountByTxHash.find(tx->getFullHash());
-            if (it == mReservedAccountByTxHash.end())
+            auto it = mPendingTxs.find(tx->getFullHash());
+            if (it == mPendingTxs.end())
             {
                 continue;
             }
-            auto accountId = it->second;
-            mReservedAccountByTxHash.erase(it);
-            if (mAccountsInUse.erase(accountId) != 0)
+            auto reserved = it->second.reservedAccount;
+            mPendingTxs.erase(it);
+            if (reserved && mAccountsInUse.erase(*reserved) != 0)
             {
-                mAccountsExternalized.emplace(accountId, ledgerSeq);
+                mAccountsExternalized.emplace(*reserved, ledgerSeq);
             }
+        }
+    }
+}
+
+void
+LoadGenerator::handleTxsDroppedFromMempool(
+    std::vector<Hash> const& txFullHashes)
+{
+    ZoneScoped;
+    for (auto const& hash : txFullHashes)
+    {
+        auto it = mPendingTxs.find(hash);
+        if (it == mPendingTxs.end())
+        {
+            // Not ours, or already externalized.
+            continue;
+        }
+        auto pending = it->second;
+        mPendingTxs.erase(it);
+
+        // If some other node's mempool still includes it later, it must not
+        // also count as applied. Conversely, a transaction this node has
+        // already applied (in a ledger it caught up to, which bypasses
+        // cleanupAccounts) stays counted as applied and is not a drop.
+        bool const applied =
+            !mApp.getLedgerManager().forgetTxSubmission(pending.contentsHash);
+
+        if (pending.reservedAccount &&
+            mAccountsInUse.erase(*pending.reservedAccount) != 0)
+        {
+            if (!applied)
+            {
+                // The dropped transaction was the last one generated for the
+                // account (it was reserved for it), so roll its sequence
+                // number back before the account is reused.
+                auto const& accounts = mTxGenerator.getAccounts();
+                auto accIt = accounts.find(*pending.reservedAccount);
+                if (accIt != accounts.end())
+                {
+                    accIt->second->setSequenceNumber(
+                        accIt->second->getLastSequenceNumber() - 1);
+                }
+            }
+            mAccountsAvailable.push_back(*pending.reservedAccount);
+        }
+
+        if (!applied)
+        {
+            ++(pending.isSoroban ? mSorobanDropped : mClassicDropped);
+            mTxsDroppedFromMempool.Mark();
         }
     }
 }
@@ -291,7 +343,7 @@ LoadGenerator::reset()
     mTxGenerator.reset();
     mAccountsInUse.clear();
     mAccountsExternalized.clear();
-    mReservedAccountByTxHash.clear();
+    mPendingTxs.clear();
     mAccountsAvailable.clear();
     mNoAccountsAvailableSinceLedger.reset();
 
@@ -301,6 +353,8 @@ LoadGenerator::reset()
     mTotalSubmitted = 0;
     mClassicSubmitted = 0;
     mSorobanSubmitted = 0;
+    mClassicDropped = 0;
+    mSorobanDropped = 0;
     mClassicAppliedAtStart = 0;
     mSorobanAppliedAtStart = 0;
     mSyntheticSACInstance.reset();
@@ -922,16 +976,14 @@ LoadGenerator::generateLoad(GeneratedLoadConfig cfg)
         {
             if (auto submitted = submitTx(cfg, generateTx))
             {
-                if (reservedAccountId)
-                {
-                    mReservedAccountByTxHash.emplace(submitted->getFullHash(),
-                                                     *reservedAccountId);
-                }
                 --cfg.nTxs;
                 // Mixed modes decide per-tx via the lambda; other modes are
                 // classified by the mode as a whole.
                 bool isSorobanTx =
                     cfg.modeMixesPregen() ? isMixedSorobanTx : cfg.isSoroban();
+                mPendingTxs.emplace(submitted->getFullHash(),
+                                    PendingTx{reservedAccountId, isSorobanTx,
+                                              submitted->getContentsHash()});
                 if (isSorobanTx)
                 {
                     ++mSorobanSubmitted;
@@ -1381,13 +1433,16 @@ LoadGenerator::waitTillComplete(GeneratedLoadConfig cfg)
             getTxCount(mApp, /* isSoroban */ false) - mClassicAppliedAtStart;
         auto sorobanApplied =
             getTxCount(mApp, /* isSoroban */ true) - mSorobanAppliedAtStart;
+        // Transactions the mempool dropped without including them are
+        // finished too; handleTxsDroppedFromMempool makes sure a dropped
+        // transaction is never also counted as applied.
         CLOG_INFO(LoadGen,
-                  "Classic applied {} (submitted {}), "
-                  "soroban applied {} (submitted {})",
-                  classicApplied, mClassicSubmitted, sorobanApplied,
-                  mSorobanSubmitted);
-        classicIsDone = classicApplied == mClassicSubmitted;
-        sorobanIsDone = sorobanApplied == mSorobanSubmitted;
+                  "Classic applied {} dropped {} (submitted {}), "
+                  "soroban applied {} dropped {} (submitted {})",
+                  classicApplied, mClassicDropped, mClassicSubmitted,
+                  sorobanApplied, mSorobanDropped, mSorobanSubmitted);
+        classicIsDone = classicApplied + mClassicDropped == mClassicSubmitted;
+        sorobanIsDone = sorobanApplied + mSorobanDropped == mSorobanSubmitted;
     }
     else
     {
@@ -1447,7 +1502,7 @@ LoadGenerator::waitTillComplete(GeneratedLoadConfig cfg)
         mAccountsAvailable.insert(mAccountsAvailable.end(),
                                   mAccountsInUse.begin(), mAccountsInUse.end());
         mAccountsInUse.clear();
-        mReservedAccountByTxHash.clear();
+        mPendingTxs.clear();
         for (auto const& kv : mAccountsExternalized)
         {
             mAccountsAvailable.push_back(kv.first);

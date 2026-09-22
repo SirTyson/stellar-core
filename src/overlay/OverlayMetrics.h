@@ -66,5 +66,10 @@ struct OverlayMetrics
 
     // ── TxSet fetch latency ──
     medida::Timer& mFetchTxSetTimer;
+
+    // ── Locally submitted transactions the mempool dropped uncommitted ──
+    medida::Meter& mLocalTxsRejected;
+    medida::Meter& mLocalTxsEvicted;
+    medida::Meter& mLocalTxsExpired;
 };
 }

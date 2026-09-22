@@ -49,6 +49,16 @@ class OverlayIPC
     using TxSetReceivedCallback = std::function<void(
         Hash const& hash, GeneralizedTransactionSet const& txSet)>;
 
+    /// Callback when the mempool dropped transactions this Core submitted
+    /// without including them. Invoked on the IPC reader thread.
+    using TxsDroppedCallback = std::function<void(
+        MempoolDropReason reason, std::vector<Hash> const& txHashes)>;
+
+    /// Parse a TXS_DROPPED payload; nullopt if it is malformed or names an
+    /// unknown reason.
+    static std::optional<std::pair<MempoolDropReason, std::vector<Hash>>>
+    parseTxsDroppedPayload(std::vector<uint8_t> const& payload);
+
     /**
      * Create an OverlayIPC instance.
      *
@@ -187,6 +197,13 @@ class OverlayIPC
     /// Set callback for TX set received from peers (async fetch)
     void setOnTxSetReceived(TxSetReceivedCallback cb);
 
+    /// Set callback for locally submitted transactions dropped by the mempool
+    void setOnTxsDropped(TxsDroppedCallback cb);
+
+    /// Override the overlay's mempool capacity (tests only). Must be called
+    /// before start(); 0 keeps the overlay's default.
+    void setMempoolMaxTxsForTesting(uint32_t maxTxs);
+
     /**
      * Request overlay metrics snapshot from Rust overlay.
      *
@@ -240,6 +257,8 @@ class OverlayIPC
     SCPReceivedCallback mOnSCPReceived;
     ScpStateRequestCallback mOnScpStateRequest;
     TxSetReceivedCallback mOnTxSetReceived;
+    TxsDroppedCallback mOnTxsDropped;
+    uint32_t mMempoolMaxTxsForTesting{0};
 
     // For synchronous request/response (getTopTransactions)
     std::mutex mRequestMutex;

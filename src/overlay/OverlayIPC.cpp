@@ -11,6 +11,7 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <signal.h>
 #include <sstream>
@@ -258,6 +259,23 @@ OverlayIPC::spawnOverlay()
         return false;
     }
 
+    // Build the argument vector before fork(): only async-signal-safe calls
+    // are allowed in the child.
+    // Arguments: <binary> --listen <socket-path> --peer-port <port>
+    //            [--mempool-max-txs <n>]
+    std::string const portStr = std::to_string(mPeerPort);
+    std::string const mempoolMaxTxsStr =
+        std::to_string(mMempoolMaxTxsForTesting);
+    std::vector<char const*> argv = {overlayBinaryPath->c_str(), "--listen",
+                                     mSocketPath.c_str(), "--peer-port",
+                                     portStr.c_str()};
+    if (mMempoolMaxTxsForTesting > 0)
+    {
+        argv.push_back("--mempool-max-txs");
+        argv.push_back(mempoolMaxTxsStr.c_str());
+    }
+    argv.push_back(nullptr);
+
     long const maxFd = sysconf(_SC_OPEN_MAX);
     pid_t pid = fork();
     if (pid < 0)
@@ -287,11 +305,7 @@ OverlayIPC::spawnOverlay()
         }
 
         // Exec overlay binary
-        // Arguments: <binary> --listen <socket-path> --peer-port <port>
-        std::string portStr = std::to_string(mPeerPort);
-        execl(overlayBinaryPath->c_str(), overlayBinaryPath->c_str(),
-              "--listen", mSocketPath.c_str(), "--peer-port", portStr.c_str(),
-              nullptr);
+        execv(argv[0], const_cast<char* const*>(argv.data()));
 
         // exec failed
         _exit(1);
@@ -436,6 +450,22 @@ OverlayIPC::handleMessage(IPCMessage const& msg)
         else
         {
             CLOG_WARNING(Overlay, "TX_SET_AVAILABLE payload too short for XDR");
+        }
+        break;
+    }
+
+    case IPCMessageType::TXS_DROPPED:
+    {
+        auto parsed = parseTxsDroppedPayload(msg.payload);
+        if (!parsed)
+        {
+            CLOG_WARNING(Overlay, "Malformed TXS_DROPPED payload ({} bytes)",
+                         msg.payload.size());
+            break;
+        }
+        if (mOnTxsDropped)
+        {
+            mOnTxsDropped(parsed->first, parsed->second);
         }
         break;
     }
@@ -809,6 +839,54 @@ void
 OverlayIPC::setOnTxSetReceived(TxSetReceivedCallback cb)
 {
     mOnTxSetReceived = std::move(cb);
+}
+
+void
+OverlayIPC::setOnTxsDropped(TxsDroppedCallback cb)
+{
+    mOnTxsDropped = std::move(cb);
+}
+
+void
+OverlayIPC::setMempoolMaxTxsForTesting(uint32_t maxTxs)
+{
+    mMempoolMaxTxsForTesting = maxTxs;
+}
+
+std::optional<std::pair<MempoolDropReason, std::vector<Hash>>>
+OverlayIPC::parseTxsDroppedPayload(std::vector<uint8_t> const& payload)
+{
+    // [reason:4][count:4][txHash:32]... (little-endian, like the rest of the
+    // Rust-produced payloads; this protocol only runs on little-endian hosts)
+    if (payload.size() < 8)
+    {
+        return std::nullopt;
+    }
+    uint32_t reasonRaw;
+    uint32_t count;
+    std::memcpy(&reasonRaw, payload.data(), 4);
+    std::memcpy(&count, payload.data() + 4, 4);
+    if (payload.size() != 8 + static_cast<size_t>(count) * 32)
+    {
+        return std::nullopt;
+    }
+    MempoolDropReason reason;
+    switch (reasonRaw)
+    {
+    case static_cast<uint32_t>(MempoolDropReason::REJECTED):
+    case static_cast<uint32_t>(MempoolDropReason::EVICTED):
+    case static_cast<uint32_t>(MempoolDropReason::EXPIRED):
+        reason = static_cast<MempoolDropReason>(reasonRaw);
+        break;
+    default:
+        return std::nullopt;
+    }
+    std::vector<Hash> hashes(count);
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        std::memcpy(hashes[i].data(), payload.data() + 8 + i * 32, 32);
+    }
+    return std::make_pair(reason, std::move(hashes));
 }
 
 void

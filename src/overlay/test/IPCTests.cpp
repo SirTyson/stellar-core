@@ -4,6 +4,7 @@
 
 #include "lib/catch.hpp"
 #include "overlay/IPC.h"
+#include "overlay/OverlayIPC.h"
 #include "util/TmpDir.h"
 #include <cstring>
 #include <sys/socket.h>
@@ -120,6 +121,61 @@ TEST_CASE("IPC message types", "[overlay][ipc]")
 
         close(sockets[0]);
         close(sockets[1]);
+    }
+}
+
+TEST_CASE("TXS_DROPPED payload parsing", "[overlay][ipc]")
+{
+    auto makePayload = [](uint32_t reason, uint32_t count,
+                          std::vector<uint8_t> const& hashBytes) {
+        std::vector<uint8_t> payload(8);
+        std::memcpy(payload.data(), &reason, 4);
+        std::memcpy(payload.data() + 4, &count, 4);
+        payload.insert(payload.end(), hashBytes.begin(), hashBytes.end());
+        return payload;
+    };
+    std::vector<uint8_t> twoHashes(64);
+    for (size_t i = 0; i < twoHashes.size(); ++i)
+    {
+        twoHashes[i] = static_cast<uint8_t>(i);
+    }
+
+    SECTION("well-formed")
+    {
+        auto parsed = OverlayIPC::parseTxsDroppedPayload(makePayload(
+            static_cast<uint32_t>(MempoolDropReason::EXPIRED), 2, twoHashes));
+        REQUIRE(parsed);
+        REQUIRE(parsed->first == MempoolDropReason::EXPIRED);
+        REQUIRE(parsed->second.size() == 2);
+        REQUIRE(parsed->second[0][0] == 0);
+        REQUIRE(parsed->second[0][31] == 31);
+        REQUIRE(parsed->second[1][0] == 32);
+        REQUIRE(parsed->second[1][31] == 63);
+    }
+    SECTION("empty list")
+    {
+        auto parsed = OverlayIPC::parseTxsDroppedPayload(makePayload(
+            static_cast<uint32_t>(MempoolDropReason::REJECTED), 0, {}));
+        REQUIRE(parsed);
+        REQUIRE(parsed->second.empty());
+    }
+    SECTION("count does not match hashes")
+    {
+        REQUIRE(!OverlayIPC::parseTxsDroppedPayload(makePayload(
+            static_cast<uint32_t>(MempoolDropReason::EVICTED), 3, twoHashes)));
+        REQUIRE(!OverlayIPC::parseTxsDroppedPayload(makePayload(
+            static_cast<uint32_t>(MempoolDropReason::EVICTED), 1, twoHashes)));
+    }
+    SECTION("unknown reason")
+    {
+        REQUIRE(
+            !OverlayIPC::parseTxsDroppedPayload(makePayload(0, 2, twoHashes)));
+        REQUIRE(
+            !OverlayIPC::parseTxsDroppedPayload(makePayload(4, 2, twoHashes)));
+    }
+    SECTION("truncated header")
+    {
+        REQUIRE(!OverlayIPC::parseTxsDroppedPayload({1, 0, 0}));
     }
 }
 

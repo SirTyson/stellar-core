@@ -34,6 +34,21 @@ impl InsertOutcome {
     }
 }
 
+/// Why a locally submitted transaction left (or never entered) the mempool
+/// without being included in a ledger. Values match the `TXS_DROPPED` IPC
+/// payload.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DropReason {
+    /// Refused on submission because the pool was full of transactions that
+    /// outrank it.
+    Rejected = 1,
+    /// Displaced by a higher-priority transaction.
+    Evicted = 2,
+    /// Aged out.
+    Expired = 3,
+}
+
 /// A mempool-resident transaction: the shared validated tx plus its arrival
 /// time (for age-based eviction) and arrival sequence number (for FIFO
 /// ordering among equal-fee transactions). Internal detail — callers get the
@@ -43,6 +58,8 @@ struct MempoolEntry {
     meta: Arc<ValidatedTx>,
     received_at: Instant,
     arrival_seq: u64,
+    /// Submitted by the local Core (rather than received from a peer).
+    local: bool,
 }
 
 /// Comparison key for fee-sorted ordering (higher fee = higher priority)
@@ -114,6 +131,10 @@ pub struct Mempool {
 
     /// Arrival sequence number assigned to the next inserted transaction
     next_arrival_seq: u64,
+
+    /// Locally submitted transactions dropped without being included, not
+    /// yet collected by [`Mempool::take_local_drops`].
+    local_drops: Vec<(TxHash, DropReason)>,
 }
 
 impl Mempool {
@@ -125,6 +146,7 @@ impl Mempool {
             max_size,
             max_age,
             next_arrival_seq: 0,
+            local_drops: Vec::new(),
         }
     }
 
@@ -137,6 +159,18 @@ impl Mempool {
     /// a full pool of equal-fee transactions refuses newcomers rather than
     /// displacing older arrivals.
     pub fn insert(&mut self, meta: Arc<ValidatedTx>) -> InsertOutcome {
+        self.insert_with_origin(meta, false)
+    }
+
+    /// Like [`Mempool::insert`], for a transaction submitted by the local
+    /// Core. If it is later dropped without being included (evicted,
+    /// expired) — or refused right away — that is recorded for
+    /// [`Mempool::take_local_drops`].
+    pub fn insert_local(&mut self, meta: Arc<ValidatedTx>) -> InsertOutcome {
+        self.insert_with_origin(meta, true)
+    }
+
+    fn insert_with_origin(&mut self, meta: Arc<ValidatedTx>, local: bool) -> InsertOutcome {
         let hash = *meta.hash();
 
         // Check for duplicate
@@ -149,6 +183,7 @@ impl Mempool {
             meta,
             received_at: Instant::now(),
             arrival_seq: self.next_arrival_seq,
+            local,
         };
         let priority = FeePriority::of(&entry);
 
@@ -160,11 +195,18 @@ impl Mempool {
                 Some(worst) if priority < *worst => {
                     let worst_hash = worst.hash;
                     trace!("Evicting lowest-priority tx: {:?}", &worst_hash[..4]);
-                    self.remove(&worst_hash);
+                    if let Some(removed) = self.remove_entry(&worst_hash) {
+                        if removed.local {
+                            self.local_drops.push((worst_hash, DropReason::Evicted));
+                        }
+                    }
                     evicted.push(worst_hash);
                 }
                 _ => {
                     trace!("Mempool full, refusing tx: {:?}", &hash[..4]);
+                    if local {
+                        self.local_drops.push((hash, DropReason::Rejected));
+                    }
                     return InsertOutcome::Rejected;
                 }
             }
@@ -187,10 +229,18 @@ impl Mempool {
     }
 
     /// Remove a transaction by hash, returning the removed tx if present.
+    ///
+    /// Removal on request (included in a ledger, or discarded by Core's tx
+    /// set builder) is not reported by [`Mempool::take_local_drops`]: Core
+    /// initiated it.
     pub fn remove(&mut self, hash: &TxHash) -> Option<Arc<ValidatedTx>> {
+        self.remove_entry(hash).map(|entry| entry.meta)
+    }
+
+    fn remove_entry(&mut self, hash: &TxHash) -> Option<MempoolEntry> {
         let entry = self.by_hash.remove(hash)?;
         self.by_fee.remove(&FeePriority::of(&entry));
-        Some(entry.meta)
+        Some(entry)
     }
 
     /// Get the top N transactions by fee (for nomination).
@@ -210,9 +260,19 @@ impl Mempool {
 
         let count = to_remove.len();
         for hash in to_remove {
-            self.remove(&hash);
+            if let Some(removed) = self.remove_entry(&hash) {
+                if removed.local {
+                    self.local_drops.push((hash, DropReason::Expired));
+                }
+            }
         }
         count
+    }
+
+    /// Take the locally submitted transactions dropped (refused, evicted or
+    /// expired) since the previous call, in the order they were dropped.
+    pub fn take_local_drops(&mut self) -> Vec<(TxHash, DropReason)> {
+        std::mem::take(&mut self.local_drops)
     }
 
     /// Current number of transactions.
@@ -395,6 +455,60 @@ mod tests {
         assert_eq!(
             mempool.top_by_fee(3),
             vec![higher_hash, resident_hashes[0], resident_hashes[1]]
+        );
+    }
+
+    #[test]
+    fn test_local_drops_are_reported_once_with_reason() {
+        let mut mempool = Mempool::new(2, Duration::from_secs(300));
+        let local_low = make_tx(100, 1, 1);
+        let network_low = make_tx(100, 1, 2);
+        let (local_low_h, network_low_h) = (*local_low.hash(), *network_low.hash());
+        assert!(mempool.insert_local(local_low).is_inserted());
+        assert!(mempool.insert(network_low).is_inserted());
+        assert!(mempool.take_local_drops().is_empty());
+
+        // A local newcomer refused by the full pool is reported as rejected.
+        let refused = make_tx(50, 1, 3);
+        let refused_h = *refused.hash();
+        assert_eq!(mempool.insert_local(refused), InsertOutcome::Rejected);
+        // A refused network transaction is not reported.
+        assert_eq!(mempool.insert(make_tx(50, 1, 4)), InsertOutcome::Rejected);
+
+        // Higher-fee arrivals evict the network tx (latest equal-fee arrival
+        // ranks lowest) and then the local one; only the local one is
+        // reported.
+        assert!(mempool.insert(make_tx(300, 1, 5)).is_inserted());
+        assert!(mempool.insert(make_tx(300, 1, 6)).is_inserted());
+        assert!(!mempool.contains(&network_low_h));
+        assert!(!mempool.contains(&local_low_h));
+
+        assert_eq!(
+            mempool.take_local_drops(),
+            vec![
+                (refused_h, DropReason::Rejected),
+                (local_low_h, DropReason::Evicted)
+            ]
+        );
+        assert!(mempool.take_local_drops().is_empty());
+    }
+
+    #[test]
+    fn test_local_expiry_reported_but_requested_removal_is_not() {
+        let mut mempool = Mempool::new(100, Duration::from_millis(0));
+        let expiring = make_tx(100, 1, 1);
+        let removed = make_tx(100, 1, 2);
+        let (expiring_h, removed_h) = (*expiring.hash(), *removed.hash());
+        mempool.insert_local(expiring);
+        mempool.insert_local(removed);
+        mempool.insert(make_tx(100, 1, 3)); // network: never reported
+
+        assert!(mempool.remove(&removed_h).is_some());
+        std::thread::sleep(Duration::from_millis(1));
+        assert_eq!(mempool.evict_expired(), 2);
+        assert_eq!(
+            mempool.take_local_drops(),
+            vec![(expiring_h, DropReason::Expired)]
         );
     }
 

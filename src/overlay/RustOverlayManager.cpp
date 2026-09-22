@@ -7,9 +7,13 @@
 #include "herder/TxSetFrame.h"
 #include "lib/json/json.h"
 #include "main/Application.h"
+#ifdef BUILD_TESTS
+#include "simulation/LoadGenerator.h"
+#endif
 #include "util/Backtrace.h"
 #include "util/Logging.h"
 #include "xdr/Stellar-overlay.h"
+#include <Tracy.hpp>
 #include <algorithm>
 #include <medida/counter.h>
 #include <medida/histogram.h>
@@ -29,6 +33,8 @@ RustOverlayManager::RustOverlayManager(Application& app)
 
     mOverlayIPC = std::make_unique<OverlayIPC>(
         cfg.OVERLAY_SOCKET_PATH, cfg.OVERLAY_BINARY_PATH, cfg.PEER_PORT);
+    mOverlayIPC->setMempoolMaxTxsForTesting(
+        cfg.OVERLAY_MEMPOOL_MAX_TXS_FOR_TESTING);
 }
 
 RustOverlayManager::~RustOverlayManager()
@@ -72,6 +78,16 @@ RustOverlayManager::start()
                     mApp.getHerder().recvTxSet(hash, frame);
                 },
                 "RustOverlayManager: TxSetReceived");
+        });
+
+    mOverlayIPC->setOnTxsDropped(
+        [this](MempoolDropReason reason, std::vector<Hash> const& txHashes) {
+            // Called from IPC reader thread - post to main thread
+            mApp.postOnMainThread(
+                [this, reason, txHashes]() {
+                    handleLocalTxsDropped(reason, txHashes);
+                },
+                "RustOverlayManager: TxsDropped");
         });
 
     if (!mOverlayIPC->start())
@@ -253,6 +269,31 @@ RustOverlayManager::getTopTransactions(size_t count)
         return mOverlayIPC->getTopTransactions(count);
     }
     return {};
+}
+
+void
+RustOverlayManager::handleLocalTxsDropped(MempoolDropReason reason,
+                                          std::vector<Hash> const& txHashes)
+{
+    ZoneScoped;
+    auto& m = mOverlayMetrics;
+    switch (reason)
+    {
+    case MempoolDropReason::REJECTED:
+        m.mLocalTxsRejected.Mark(txHashes.size());
+        break;
+    case MempoolDropReason::EVICTED:
+        m.mLocalTxsEvicted.Mark(txHashes.size());
+        break;
+    case MempoolDropReason::EXPIRED:
+        m.mLocalTxsExpired.Mark(txHashes.size());
+        break;
+    }
+    CLOG_DEBUG(Overlay, "Mempool dropped {} locally submitted txs (reason {})",
+               txHashes.size(), static_cast<uint32_t>(reason));
+#ifdef BUILD_TESTS
+    mApp.getLoadGenerator().handleTxsDroppedFromMempool(txHashes);
+#endif
 }
 
 OverlayMetrics&

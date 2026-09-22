@@ -104,6 +104,23 @@ enum class IPCMessageType : uint32_t
     /// Overlay metrics snapshot (JSON payload)
     /// Response to REQUEST_OVERLAY_METRICS
     OVERLAY_METRICS_RESPONSE = 105,
+
+    /// Transactions this Core submitted were dropped from the mempool without
+    /// being included (see MempoolDropReason).
+    /// Payload (little-endian): [reason:4][count:4][txHash1:32][txHash2:32]...
+    TXS_DROPPED = 106,
+};
+
+/// Why the Rust mempool dropped a locally submitted transaction without
+/// including it (TXS_DROPPED payload).
+enum class MempoolDropReason : uint32_t
+{
+    /// Refused on submission: the pool was full of transactions outranking it.
+    REJECTED = 1,
+    /// Displaced by a higher-priority transaction.
+    EVICTED = 2,
+    /// Aged out.
+    EXPIRED = 3,
 };
 
 /**

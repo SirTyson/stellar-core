@@ -20,6 +20,10 @@ pub struct Config {
 
     /// Log level
     pub log_level: String,
+
+    /// Maximum number of transactions the mempool holds (default 100,000).
+    /// Only meant for tests that need to exercise a full mempool.
+    pub mempool_max_txs: Option<usize>,
 }
 
 impl Default for Config {
@@ -29,6 +33,7 @@ impl Default for Config {
             libp2p_listen_ip: "0.0.0.0".to_string(), // Bind to all interfaces for internet operation
             peer_port: 11625,
             log_level: "info".to_string(),
+            mempool_max_txs: None,
         }
     }
 }

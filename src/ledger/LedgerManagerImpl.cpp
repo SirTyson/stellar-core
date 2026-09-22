@@ -1379,6 +1379,17 @@ LedgerManagerImpl::recordTxSubmission(Hash const& contentsHash)
     }
 }
 
+bool
+LedgerManagerImpl::forgetTxSubmission(Hash const& contentsHash)
+{
+    if (!txSelfTrackingActive())
+    {
+        return true;
+    }
+    MutexLocker guard(mTxLatencyMetrics.mMutex);
+    return mTxLatencyMetrics.mTxSubmitTimes.erase(contentsHash) != 0;
+}
+
 void
 LedgerManagerImpl::recordTxE2eLatency(ApplicableTxSetFrame const& txSet)
 {

@@ -12,6 +12,8 @@
 #include "simulation/LoadGenerator.h"
 #include "simulation/Topologies.h"
 #include "test/Catch2.h"
+#include "test/TestUtils.h"
+#include "test/TxTests.h"
 #include "test/test.h"
 #include "transactions/test/SorobanTxTestUtils.h"
 #include "util/Math.h"
@@ -203,6 +205,99 @@ TEST_CASE("loadgen recycles accounts released by transaction hash", "[loadgen]")
         500 * simulation->getExpectedLedgerCloseTime(), false);
     REQUIRE(failedRuns() == prevFailed);
     REQUIRE(completedRuns() == prevComplete + 1);
+}
+
+TEST_CASE("loadgen completes when the mempool drops its transactions",
+          "[loadgen]")
+{
+    // A tiny mempool refuses most submissions. The load generator must hear
+    // about every drop (TXS_DROPPED), release the reserved accounts and count
+    // the dropped transactions as finished, instead of waiting forever for
+    // them to be applied.
+    Hash networkID = sha256(getTestConfig().NETWORK_PASSPHRASE);
+    Simulation::pointer simulation = Topologies::pair(networkID, [&](int i) {
+        auto cfg = getTestConfig(i);
+        cfg.ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING = true;
+        cfg.ARTIFICIALLY_GENERATE_LOAD_FOR_TESTING = true;
+        cfg.TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION =
+            Config::CURRENT_LEDGER_PROTOCOL_VERSION;
+        cfg.GENESIS_TEST_ACCOUNT_COUNT = 1000;
+        cfg.OVERLAY_MEMPOOL_MAX_TXS_FOR_TESTING = 20;
+        return cfg;
+    });
+
+    simulation->startAllNodes();
+    simulation->crankUntil(
+        [&]() { return simulation->haveAllExternalized(3, 1); },
+        10 * simulation->getExpectedLedgerCloseTime(), false);
+    auto nodes = simulation->getNodes();
+    for (auto& node : nodes)
+    {
+        node->setRunInOverlayOnlyMode(true);
+    }
+
+    auto& app = *nodes[0];
+    auto meterCount = [&](std::vector<std::string> const& name) {
+        return app.getMetrics()
+            .NewMeter({name[0], name[1], name[2]}, name[3])
+            .count();
+    };
+    std::vector<std::string> const complete{"loadgen", "run", "complete",
+                                            "run"};
+    std::vector<std::string> const failed{"loadgen", "run", "failed", "run"};
+    std::vector<std::string> const dropped{"loadgen", "txn",
+                                           "dropped-from-mempool", "txn"};
+    std::vector<std::string> const rejected{"overlay", "mempool",
+                                            "local-rejected", "transaction"};
+    auto prevComplete = meterCount(complete);
+    auto prevFailed = meterCount(failed);
+    auto prevDropped = meterCount(dropped);
+    auto prevRejected = meterCount(rejected);
+
+    // Far more than 20 transactions per ledger, from 400 distinct accounts.
+    app.getLoadGenerator().generateLoad(GeneratedLoadConfig::txLoad(
+        LoadGenMode::PAY, /* nAccounts */ 400, /* nTxs */ 400,
+        /* txRate */ 200));
+
+    simulation->crankUntil(
+        [&]() {
+            return meterCount(complete) == prevComplete + 1 ||
+                   meterCount(failed) != prevFailed;
+        },
+        500 * simulation->getExpectedLedgerCloseTime(), false);
+    REQUIRE(meterCount(failed) == prevFailed);
+    REQUIRE(meterCount(complete) == prevComplete + 1);
+    auto droppedTxs = meterCount(dropped) - prevDropped;
+    REQUIRE(droppedTxs > 0);
+    REQUIRE(droppedTxs < 400);
+    REQUIRE(meterCount(rejected) - prevRejected == droppedTxs);
+}
+
+TEST_CASE("tx latency tracking forgets only unapplied submissions", "[loadgen]")
+{
+    // The load generator counts a mempool drop only if forgetTxSubmission
+    // finds the submission still pending: one this node already applied
+    // (e.g. in a ledger it caught up to) must not also count as dropped.
+    VirtualClock clock;
+    auto cfg = getTestConfig();
+    cfg.LOADGEN_MEASURE_TX_E2E_LATENCY_FOR_TESTING = true;
+    auto app = createTestApplication(clock, cfg);
+    auto& lm = app->getLedgerManager();
+    auto& externalized =
+        app->getMetrics().NewCounter({"loadgen", "tx-latency", "externalized"});
+
+    Hash const neverApplied = sha256("never applied");
+    lm.recordTxSubmission(neverApplied);
+    REQUIRE(lm.forgetTxSubmission(neverApplied));
+    REQUIRE_FALSE(lm.forgetTxSubmission(neverApplied));
+
+    auto root = app->getRoot();
+    auto tx = root->tx({txtest::payment(root->getPublicKey(), 1)});
+    lm.recordTxSubmission(tx->getContentsHash());
+    auto prevExternalized = externalized.count();
+    txtest::closeLedger(*app, {tx});
+    REQUIRE(externalized.count() == prevExternalized + 1);
+    REQUIRE_FALSE(lm.forgetTxSubmission(tx->getContentsHash()));
 }
 
 TEST_CASE("mixed pregen and synthetic soroban in overlay-only mode",

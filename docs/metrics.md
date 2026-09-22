@@ -115,6 +115,7 @@ loadgen.step.count                        | meter     | loadgenerator: generated
 loadgen.step.submit                       | timer     | loadgenerator: time spent submitting transactions per step
 loadgen.txn.attempted                     | meter     | loadgenerator: transaction submitted
 loadgen.txn.bytes                         | meter     | loadgenerator: size of transactions submitted
+loadgen.txn.dropped-from-mempool          | meter     | loadgenerator: submitted transactions the mempool dropped without including them
 loadgen.txn.rejected                      | meter     | loadgenerator: transaction rejected
 overlay.byte.read                         | meter     | number of bytes received
 overlay.byte.write                        | meter     | number of bytes sent
@@ -157,6 +158,9 @@ overlay.outbound-queue.<X>                | timer     | time <X> traffic sits in
 overlay.outbound-queue.drop-<X>           | meter     | number of <X> messages dropped from flow-controlled queues
 overlay.item-fetcher.next-peer            | meter     | ask for item past the first one
 overlay.memory.flood-known                | counter   | number of known flooded entries
+overlay.mempool.local-evicted             | meter     | locally submitted transactions evicted from the mempool by higher-priority ones
+overlay.mempool.local-expired             | meter     | locally submitted transactions that aged out of the mempool
+overlay.mempool.local-rejected            | meter     | locally submitted transactions refused because the mempool was full
 overlay.message.broadcast                 | meter     | message broadcasted
 overlay.message.read                      | meter     | message received
 overlay.message.write                     | meter     | message sent

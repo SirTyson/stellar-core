@@ -305,6 +305,13 @@ class LedgerManager
     // Config::LOADGEN_MEASURE_TX_E2E_LATENCY_FOR_TESTING is set.
     virtual void recordTxSubmission(Hash const& contentsHash) = 0;
 
+    // Forgets a self-submitted transaction recorded by recordTxSubmission that
+    // will not be applied (the mempool dropped it), so that it is neither
+    // reported as unmatched nor counted if some other node includes it later.
+    // Returns false if it was no longer pending because it has already been
+    // counted as applied (always true while self-tracking is off).
+    virtual bool forgetTxSubmission(Hash const& contentsHash) = 0;
+
     // Begins/ends a load-generation latency measurement window. No-op unless
     // Config::LOADGEN_MEASURE_TX_E2E_LATENCY_FOR_TESTING is set.
     virtual void beginTxLatencyMeasurement(uint32_t expectedTxCount) = 0;

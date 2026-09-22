@@ -108,6 +108,11 @@ class RustOverlayManager
     // Config KNOWN_PEERS plus any peers added via addKnownPeerForTesting.
     std::vector<std::string> effectiveKnownPeers() const;
 
+    // Main thread: the mempool dropped transactions this node submitted
+    // without including them.
+    void handleLocalTxsDropped(MempoolDropReason reason,
+                               std::vector<Hash> const& txHashes);
+
     OverlayMetrics mOverlayMetrics;
 
     // For computing deltas on monotonic counters between syncs.
