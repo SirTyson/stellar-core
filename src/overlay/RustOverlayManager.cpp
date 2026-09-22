@@ -100,8 +100,24 @@ RustOverlayManager::start()
     mOverlayIPC->setPeerConfig(effectiveKnownPeers(), cfg.PREFERRED_PEERS,
                                cfg.PEER_PORT);
 
+    mMetricsRefreshTimer = std::make_unique<VirtualTimer>(mApp);
+    scheduleMetricsRefresh();
+
     CLOG_INFO(Overlay, "RustOverlayManager started, peer_port={}",
               cfg.PEER_PORT);
+}
+
+void
+RustOverlayManager::scheduleMetricsRefresh()
+{
+    if (mShuttingDown || !mMetricsRefreshTimer)
+    {
+        return;
+    }
+    mOverlayIPC->requestMetricsAsync();
+    mMetricsRefreshTimer->expires_from_now(std::chrono::seconds(1));
+    mMetricsRefreshTimer->async_wait([this]() { scheduleMetricsRefresh(); },
+                                     &VirtualTimer::onFailureNoop);
 }
 
 std::vector<std::string>
@@ -146,6 +162,10 @@ RustOverlayManager::shutdown()
     }
 
     CLOG_INFO(Overlay, "Shutting down RustOverlayManager");
+    if (mMetricsRefreshTimer)
+    {
+        mMetricsRefreshTimer->cancel();
+    }
     if (mOverlayIPC)
     {
         mOverlayIPC->shutdown();
@@ -332,12 +352,17 @@ RustOverlayManager::syncOverlayMetrics()
         return;
     }
 
-    auto jsonStr = mOverlayIPC->requestMetrics(/* timeoutMs */ 500);
-    if (jsonStr.empty())
+    // Never block the caller (the /metrics handler runs on the main thread)
+    // on an IPC round trip: apply the latest snapshot and ask for a fresh
+    // one for next time.
+    mOverlayIPC->requestMetricsAsync();
+    auto latest = mOverlayIPC->latestMetrics();
+    if (!latest || latest->empty())
     {
-        CLOG_DEBUG(Overlay, "No overlay metrics received (timeout or error)");
+        CLOG_DEBUG(Overlay, "No overlay metrics snapshot received yet");
         return;
     }
+    auto const& jsonStr = *latest;
 
     Json::Value root;
     Json::Reader reader;

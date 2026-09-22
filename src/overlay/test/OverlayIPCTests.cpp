@@ -88,6 +88,37 @@ TEST_CASE("OverlayIPC connects to Rust overlay", "[overlay-ipc]")
     }
 }
 
+TEST_CASE("OverlayIPC requests metrics without blocking", "[overlay-ipc]")
+{
+    auto overlayBinary = requireOverlayBinary();
+
+    TmpDir tmpDir("overlay-ipc-test");
+    std::string socketPath = tmpDir.getName() + "/overlay.sock";
+
+    OverlayIPC ipc(socketPath, overlayBinary, getTestConfig().PEER_PORT);
+    REQUIRE(ipc.start());
+    REQUIRE(!ipc.latestMetrics());
+
+    // The request returns immediately; the snapshot arrives on the reader
+    // thread and becomes the latest one.
+    auto start = std::chrono::steady_clock::now();
+    ipc.requestMetricsAsync();
+    REQUIRE(std::chrono::steady_clock::now() - start <
+            std::chrono::milliseconds(100));
+
+    std::optional<std::string> snapshot;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!(snapshot = ipc.latestMetrics()) &&
+           std::chrono::steady_clock::now() < deadline)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    REQUIRE(snapshot);
+    REQUIRE(snapshot->find("byte_read") != std::string::npos);
+
+    ipc.shutdown();
+}
+
 TEST_CASE("OverlayIPC broadcasts SCP to Rust overlay", "[overlay-ipc][.]")
 {
     auto overlayBinary = requireOverlayBinary();

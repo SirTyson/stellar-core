@@ -215,6 +215,16 @@ class OverlayIPC
      */
     std::string requestMetrics(int timeoutMs = 1000);
 
+    /**
+     * Ask the Rust overlay for a metrics snapshot without waiting for it. The
+     * reply is kept as the latest snapshot (see latestMetrics()).
+     */
+    void requestMetricsAsync();
+
+    /// The most recent metrics snapshot (JSON) received from the overlay, if
+    /// any.
+    std::optional<std::string> latestMetrics();
+
     /// Check if connected to overlay
     bool isConnected() const;
 
@@ -269,6 +279,8 @@ class OverlayIPC
     std::mutex mMetricsMutex;
     std::condition_variable mMetricsCv;
     std::optional<IPCMessage> mPendingMetricsResponse;
+    // Latest snapshot received, whether requested synchronously or not.
+    std::optional<std::string> mLatestMetricsJson;
 
     // Protects mChannel->send() - channel is not thread-safe
     mutable std::mutex mSendMutex;

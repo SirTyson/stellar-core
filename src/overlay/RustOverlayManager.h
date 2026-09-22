@@ -7,6 +7,7 @@
 #include "herder/TxSetFrame.h"
 #include "overlay/OverlayIPC.h"
 #include "overlay/OverlayMetrics.h"
+#include "util/Timer.h"
 #include <functional>
 #include <optional>
 #include <string>
@@ -87,9 +88,11 @@ class RustOverlayManager
     // Metrics and managers
     OverlayMetrics& getOverlayMetrics();
 
-    /// Fetch the latest metrics snapshot from the Rust overlay and update
-    /// the libmedida-backed OverlayMetrics counters/timers so they appear
-    /// on the /metrics HTTP endpoint.
+    /// Apply the latest metrics snapshot received from the Rust overlay to
+    /// the libmedida-backed OverlayMetrics counters/timers so they appear on
+    /// the /metrics HTTP endpoint. Never waits for the overlay: snapshots are
+    /// requested asynchronously every second (and on each call), so the
+    /// values are at most about a second old.
     void syncOverlayMetrics();
 
     // Access to IPC (for Herder to set callbacks)
@@ -114,6 +117,10 @@ class RustOverlayManager
                                std::vector<Hash> const& txHashes);
 
     OverlayMetrics mOverlayMetrics;
+
+    // Periodically requests a fresh overlay metrics snapshot.
+    std::unique_ptr<VirtualTimer> mMetricsRefreshTimer;
+    void scheduleMetricsRefresh();
 
     // For computing deltas on monotonic counters between syncs.
     // Key: metric name, Value: last synced value.

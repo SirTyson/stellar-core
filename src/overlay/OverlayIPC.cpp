@@ -404,8 +404,10 @@ OverlayIPC::handleMessage(IPCMessage const& msg)
 
     case IPCMessageType::OVERLAY_METRICS_RESPONSE:
     {
-        // Response to requestMetrics - wake up waiting thread
+        // Response to requestMetrics / requestMetricsAsync: keep it as the
+        // latest snapshot and wake a synchronous waiter, if any.
         std::lock_guard<std::mutex> lock(mMetricsMutex);
+        mLatestMetricsJson.emplace(msg.payload.begin(), msg.payload.end());
         mPendingMetricsResponse = msg;
         mMetricsCv.notify_one();
         break;
@@ -974,6 +976,26 @@ OverlayIPC::requestMetrics(int timeoutMs)
     }
 
     return std::string(response.payload.begin(), response.payload.end());
+}
+
+void
+OverlayIPC::requestMetricsAsync()
+{
+    if (!mChannel || !mChannel->isConnected())
+    {
+        return;
+    }
+    IPCMessage req;
+    req.type = IPCMessageType::REQUEST_OVERLAY_METRICS;
+    std::lock_guard<std::mutex> sendLock(mSendMutex);
+    mChannel->send(req);
+}
+
+std::optional<std::string>
+OverlayIPC::latestMetrics()
+{
+    std::lock_guard<std::mutex> lock(mMetricsMutex);
+    return mLatestMetricsJson;
 }
 
 bool
