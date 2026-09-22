@@ -237,7 +237,6 @@ LoadGenerator::cleanupAccounts(uint32_t ledgerSeq,
                                PerPhaseTransactionList const& perPhaseTxs)
 {
     ZoneScoped;
-    auto const& accounts = mTxGenerator.getAccounts();
 
     // An account stays in use until the transaction it submitted has been
     // applied, so that the next transaction generated for it sees the updated
@@ -258,31 +257,28 @@ LoadGenerator::cleanupAccounts(uint32_t ledgerSeq,
         }
     }
 
-    // Accounts whose transaction is in the set externalized for `ledgerSeq`
-    // are released once that ledger is applied. Accounts whose transaction is
-    // not in it are still pending in the mempool and remain in use.
-    UnorderedSet<AccountID> externalized;
+    // Accounts whose own transaction is in the set externalized for
+    // `ledgerSeq` are released once that ledger is applied. Matching by
+    // transaction hash (rather than scanning every in-use account for a
+    // matching source) costs time proportional to the externalized set, and
+    // a reservation is only released by the transaction it was made for.
+    // Accounts whose transaction is not in the set are still pending and
+    // remain in use.
     for (auto const& txs : perPhaseTxs)
     {
         for (auto const& tx : txs)
         {
-            externalized.insert(tx->getSourceID());
-        }
-    }
-
-    for (auto it = mAccountsInUse.begin(); it != mAccountsInUse.end();)
-    {
-        auto accIt = accounts.find(*it);
-        releaseAssert(accIt != accounts.end());
-        if (externalized.find(accIt->second->getPublicKey()) !=
-            externalized.end())
-        {
-            mAccountsExternalized.emplace(*it, ledgerSeq);
-            it = mAccountsInUse.erase(it);
-        }
-        else
-        {
-            ++it;
+            auto it = mReservedAccountByTxHash.find(tx->getFullHash());
+            if (it == mReservedAccountByTxHash.end())
+            {
+                continue;
+            }
+            auto accountId = it->second;
+            mReservedAccountByTxHash.erase(it);
+            if (mAccountsInUse.erase(accountId) != 0)
+            {
+                mAccountsExternalized.emplace(accountId, ledgerSeq);
+            }
         }
     }
 }
@@ -295,6 +291,7 @@ LoadGenerator::reset()
     mTxGenerator.reset();
     mAccountsInUse.clear();
     mAccountsExternalized.clear();
+    mReservedAccountByTxHash.clear();
     mAccountsAvailable.clear();
     mNoAccountsAvailableSinceLedger.reset();
 
@@ -801,9 +798,13 @@ LoadGenerator::generateLoad(GeneratedLoadConfig cfg)
         mNoAccountsAvailableSinceLedger.reset();
 
         uint64_t sourceAccountId = 0;
+        // Account reserved for this transaction, if any (pre-generated
+        // transactions read from a file do not reserve one).
+        std::optional<uint64_t> reservedAccountId;
         if (cfg.mode != LoadGenMode::PAY_PREGENERATED && !cfg.modeMixesPregen())
         {
             sourceAccountId = getNextAvailableAccount(ledgerNum);
+            reservedAccountId = sourceAccountId;
         }
 
         std::function<std::pair<TxGenerator::TestAccountPtr,
@@ -905,6 +906,7 @@ LoadGenerator::generateLoad(GeneratedLoadConfig cfg)
                     --mixedSorobanBudget;
                     isMixedSorobanTx = true;
                     uint64_t srcId = getNextAvailableAccount(ledgerNum);
+                    reservedAccountId = srcId;
                     return createSyntheticSorobanTransaction(ledgerNum, srcId,
                                                              cfg);
                 }
@@ -918,8 +920,13 @@ LoadGenerator::generateLoad(GeneratedLoadConfig cfg)
 
         try
         {
-            if (submitTx(cfg, generateTx))
+            if (auto submitted = submitTx(cfg, generateTx))
             {
+                if (reservedAccountId)
+                {
+                    mReservedAccountByTxHash.emplace(submitted->getFullHash(),
+                                                     *reservedAccountId);
+                }
                 --cfg.nTxs;
                 // Mixed modes decide per-tx via the lambda; other modes are
                 // classified by the mode as a whole.
@@ -933,6 +940,13 @@ LoadGenerator::generateLoad(GeneratedLoadConfig cfg)
                 {
                     ++mClassicSubmitted;
                 }
+            }
+            else if (reservedAccountId && !mFailed)
+            {
+                // Nothing was submitted (a skipped low-fee transaction), so
+                // no externalization will release the reservation.
+                releaseAssert(mAccountsInUse.erase(*reservedAccountId) != 0);
+                mAccountsAvailable.push_back(*reservedAccountId);
             }
         }
         catch (std::runtime_error const& e)
@@ -969,7 +983,7 @@ LoadGenerator::generateLoad(GeneratedLoadConfig cfg)
     scheduleLoadGeneration(cfg);
 }
 
-bool
+TransactionFrameBaseConstPtr
 LoadGenerator::submitTx(GeneratedLoadConfig const& cfg,
                         std::function<std::pair<TxGenerator::TestAccountPtr,
                                                 TransactionFrameBaseConstPtr>()>
@@ -995,7 +1009,7 @@ LoadGenerator::submitTx(GeneratedLoadConfig const& cfg,
             from->setSequenceNumber(from->getLastSequenceNumber() - 1);
             CLOG_INFO(LoadGen, "skipped low fee tx with fee {}",
                       tx->getInclusionFee());
-            return false;
+            return nullptr;
         }
 
         // No re-submission in PAY_PREGENERATED / MIXED_PREGEN_* modes.
@@ -1008,7 +1022,7 @@ LoadGenerator::submitTx(GeneratedLoadConfig const& cfg,
             cfg.mode == LoadGenMode::PAY_PREGENERATED || cfg.modeMixesPregen())
         {
             mFailed = true;
-            return false;
+            return nullptr;
         }
 
         // In case of bad seqnum, attempt refreshing it from the DB
@@ -1018,7 +1032,7 @@ LoadGenerator::submitTx(GeneratedLoadConfig const& cfg,
         std::tie(from, tx) = generateTx();
     }
 
-    return true;
+    return tx;
 }
 
 uint64_t
@@ -1433,6 +1447,7 @@ LoadGenerator::waitTillComplete(GeneratedLoadConfig cfg)
         mAccountsAvailable.insert(mAccountsAvailable.end(),
                                   mAccountsInUse.begin(), mAccountsInUse.end());
         mAccountsInUse.clear();
+        mReservedAccountByTxHash.clear();
         for (auto const& kv : mAccountsExternalized)
         {
             mAccountsAvailable.push_back(kv.first);

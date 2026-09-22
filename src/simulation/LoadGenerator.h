@@ -10,7 +10,9 @@
 #include "simulation/TxGenerator.h"
 #include "test/TestAccount.h"
 #include "test/TxTests.h"
+#include "util/HashOfHash.h"
 #include "util/NonCopyable.h"
+#include "util/UnorderedMap.h"
 #include "xdr/Stellar-types.h"
 #include <optional>
 #include <unordered_map>
@@ -282,6 +284,12 @@ class LoadGenerator
     // Accounts whose transaction externalized in the given ledger; released
     // once that ledger is applied.
     std::unordered_map<uint64_t, uint32_t> mAccountsExternalized;
+    // Full hash of every submitted transaction whose source account is
+    // reserved in mAccountsInUse, mapped to that account. Externalization
+    // releases exactly the reservations whose own transaction was included,
+    // in time proportional to the externalized set rather than to the number
+    // of accounts in use.
+    UnorderedMap<Hash, uint64_t> mReservedAccountByTxHash;
     // Accounts enter this pool only when initialized or released from one of
     // the disjoint in-use/externalized collections. A dense vector allows
     // uniform random selection and removal without walking the account pool.
@@ -403,10 +411,12 @@ class LoadGenerator
     void logProgress(std::chrono::nanoseconds submitTimer,
                      GeneratedLoadConfig const& cfg) const;
 
-    bool submitTx(GeneratedLoadConfig const& cfg,
-                  std::function<std::pair<TxGenerator::TestAccountPtr,
-                                          TransactionFrameBaseConstPtr>()>
-                      generateTx);
+    // Returns the transaction that was submitted, or nullptr if none was.
+    TransactionFrameBaseConstPtr
+    submitTx(GeneratedLoadConfig const& cfg,
+             std::function<std::pair<TxGenerator::TestAccountPtr,
+                                     TransactionFrameBaseConstPtr>()>
+                 generateTx);
     void waitTillComplete(GeneratedLoadConfig cfg);
     void waitTillCompleteWithoutChecks();
 

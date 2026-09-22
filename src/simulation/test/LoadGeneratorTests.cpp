@@ -150,6 +150,61 @@ TEST_CASE("multiple loadgen nodes in overlay-only mode", "[loadgen]")
         500 * simulation->getExpectedLedgerCloseTime(), false);
 }
 
+TEST_CASE("loadgen recycles accounts released by transaction hash", "[loadgen]")
+{
+    // Far fewer accounts than transactions: the run only completes if every
+    // reservation is released once its own transaction externalizes, so the
+    // account can be reused (each account is reused ~10 times here). The
+    // rate leaves the 3x accounts-per-ledger margin loadgen requires.
+    Hash networkID = sha256(getTestConfig().NETWORK_PASSPHRASE);
+    Simulation::pointer simulation = Topologies::pair(networkID, [&](int i) {
+        auto cfg = getTestConfig(i);
+        cfg.ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING = true;
+        cfg.ARTIFICIALLY_GENERATE_LOAD_FOR_TESTING = true;
+        cfg.TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION =
+            Config::CURRENT_LEDGER_PROTOCOL_VERSION;
+        cfg.GENESIS_TEST_ACCOUNT_COUNT = 1000;
+        return cfg;
+    });
+
+    simulation->startAllNodes();
+    simulation->crankUntil(
+        [&]() { return simulation->haveAllExternalized(3, 1); },
+        10 * simulation->getExpectedLedgerCloseTime(), false);
+    auto nodes = simulation->getNodes();
+    for (auto& node : nodes)
+    {
+        node->setRunInOverlayOnlyMode(true);
+    }
+
+    auto& app = *nodes[0];
+    auto completedRuns = [&]() {
+        return app.getMetrics()
+            .NewMeter({"loadgen", "run", "complete"}, "run")
+            .count();
+    };
+    auto failedRuns = [&]() {
+        return app.getMetrics()
+            .NewMeter({"loadgen", "run", "failed"}, "run")
+            .count();
+    };
+    auto prevComplete = completedRuns();
+    auto prevFailed = failedRuns();
+
+    app.getLoadGenerator().generateLoad(GeneratedLoadConfig::txLoad(
+        LoadGenMode::PAY, /* nAccounts */ 20, /* nTxs */ 200,
+        /* txRate */ 5));
+
+    simulation->crankUntil(
+        [&]() {
+            return completedRuns() == prevComplete + 1 ||
+                   failedRuns() != prevFailed;
+        },
+        500 * simulation->getExpectedLedgerCloseTime(), false);
+    REQUIRE(failedRuns() == prevFailed);
+    REQUIRE(completedRuns() == prevComplete + 1);
+}
+
 TEST_CASE("mixed pregen and synthetic soroban in overlay-only mode",
           "[loadgen]")
 {
