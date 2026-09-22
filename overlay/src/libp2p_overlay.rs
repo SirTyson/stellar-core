@@ -1120,7 +1120,8 @@ async fn send_txset_response(
     hash: [u8; 32],
     data: Arc<TxSetData>,
 ) {
-    info!(
+    debug!(
+        target: "stellar_overlay::txset_trace",
         "TXSET_SEND: Sending TX set {:02x?}... ({} bytes) to {}",
         &hash[..4],
         data.len(),
@@ -1136,7 +1137,8 @@ async fn send_txset_response(
                 .metrics
                 .byte_write
                 .fetch_add(bytes as u64, Ordering::Relaxed);
-            info!(
+            debug!(
+                target: "stellar_overlay::txset_trace",
                 "TXSET_SEND_OK: Queued TX set {:02x?}... ({} bytes on wire) to {}",
                 &hash[..4],
                 bytes,
@@ -1616,6 +1618,7 @@ async fn handle_inbound_scp_streams(mut incoming: IncomingStreams, state: Arc<Sh
 
                         if is_dup {
                             debug!(
+                                target: "stellar_overlay::scp_trace",
                                 "SCP_RECV_DUP: Duplicate SCP {:02x?}... from {}",
                                 &hash[..4],
                                 peer_id
@@ -1623,7 +1626,11 @@ async fn handle_inbound_scp_streams(mut incoming: IncomingStreams, state: Arc<Sh
                             continue;
                         }
 
-                        info!(
+                        // Per-message trace, off by default (~300 lines per
+                        // ledger); enable with
+                        // RUST_LOG=...,stellar_overlay::scp_trace=debug
+                        debug!(
+                            target: "stellar_overlay::scp_trace",
                             "SCP_RECV: Received SCP {:02x?}... ({} bytes) from {}",
                             &hash[..4],
                             envelope_bytes.len(),
@@ -2033,7 +2040,8 @@ async fn handle_tx_response(state: &Arc<SharedState>, peer_id: &PeerId, tx: Arc<
 
 /// Requests arrive on the control stream, separately from bulk responses.
 fn handle_txset_request(state: &SharedState, peer_id: PeerId, hash: [u8; 32]) {
-    info!(
+    debug!(
+        target: "stellar_overlay::txset_trace",
         "TXSET_REQ_IN: Received TxSet request for {:02x?}... from {}",
         &hash[..4],
         peer_id

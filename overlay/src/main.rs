@@ -28,6 +28,7 @@ use stellar_overlay::ipc::{CoreIpc, Message, MessageType};
 use stellar_overlay::libp2p_overlay::{
     create_overlay, OverlayEvent as LibP2pOverlayEvent, OverlayHandle as LibP2pOverlayHandle,
 };
+use stellar_overlay::log_writer::{FlushGuard, NonBlockingWriter};
 use stellar_overlay::metrics::OverlayMetrics;
 use stellar_overlay::wire::ValidatedTx;
 use stellar_overlay::xdr;
@@ -499,6 +500,7 @@ impl App {
         // Create libp2p QUIC overlay for SCP + TX + TxSet (unified, independent streams)
         let libp2p_keypair = Libp2pKeypair::generate_ed25519();
         let metrics = Arc::new(OverlayMetrics::new());
+        spawn_traffic_summary(Arc::clone(&metrics), Duration::from_secs(1));
         let (libp2p_handle, libp2p_event_rx, mut libp2p_overlay) =
             create_overlay(libp2p_keypair, Arc::clone(&metrics), overlay_handle.clone())
                 .map_err(|e| format!("Failed to create libp2p overlay: {}", e))?;
@@ -783,10 +785,16 @@ impl App {
                 self.send_requested_tx_set(&hash);
             }
             LibP2pOverlayEvent::TxSetRequested { hash, from } => {
-                info!("Peer {} requesting TxSet {:02x?}...", from, &hash[..4]);
+                debug!(
+                    target: "stellar_overlay::txset_trace",
+                    "Peer {} requesting TxSet {:02x?}...",
+                    from,
+                    &hash[..4]
+                );
                 // Look up in local cache and respond
                 if let Some(cached) = self.tx_set_cache.get(&hash) {
-                    info!(
+                    debug!(
+                        target: "stellar_overlay::txset_trace",
                         "Serving TxSet {:02x?}... ({} bytes) to {}",
                         &hash[..4],
                         cached.xdr.len(),
@@ -1489,18 +1497,75 @@ impl App {
     }
 }
 
-fn setup_logging(level: &str) {
+/// Lines of log output that may queue behind a slow stdout before new lines
+/// are dropped.
+const LOG_QUEUE_LINES: usize = 16 * 1024;
+
+/// Install the log subscriber. Output goes to stdout through a bounded
+/// background writer, so a slow or blocked stdout (e.g. a container log
+/// pipe) drops lines instead of stalling tokio workers; the returned guard
+/// flushes queued lines when dropped. ANSI colors only on a terminal.
+fn setup_logging(level: &str) -> FlushGuard {
+    use std::io::IsTerminal;
     use tracing_subscriber::{fmt, EnvFilter};
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+    let ansi = std::io::stdout().is_terminal();
+    let (writer, guard) = NonBlockingWriter::new(std::io::stdout(), LOG_QUEUE_LINES);
 
     fmt()
         .with_env_filter(filter)
+        .with_writer(writer)
+        .with_ansi(ansi)
         .with_target(true)
         .with_thread_ids(false)
         .with_file(false)
         .with_line_number(false)
         .init();
+    guard
+}
+
+/// Log a one-line summary of overlay traffic every `period`, standing in for
+/// the per-message lines that are now at debug level.
+fn spawn_traffic_summary(metrics: Arc<OverlayMetrics>, period: Duration) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let read = |m: &OverlayMetrics| {
+            [
+                m.recv_scp_count.load(Ordering::Relaxed),
+                m.send_scp_message.load(Ordering::Relaxed),
+                m.send_txset.load(Ordering::Relaxed),
+                m.recv_transaction_count.load(Ordering::Relaxed),
+                m.byte_read.load(Ordering::Relaxed),
+                m.byte_write.load(Ordering::Relaxed),
+            ]
+        };
+        let mut last = read(&metrics);
+        loop {
+            interval.tick().await;
+            let now = read(&metrics);
+            let d: Vec<u64> = now
+                .iter()
+                .zip(last.iter())
+                .map(|(n, l)| n.saturating_sub(*l))
+                .collect();
+            last = now;
+            if d.iter().all(|v| *v == 0) {
+                continue;
+            }
+            info!(
+                "OVERLAY_SUMMARY: period_ms={} scp_recv={} scp_sent={} txset_sent={} tx_recv={} bytes_in={} bytes_out={}",
+                period.as_millis(),
+                d[0],
+                d[1],
+                d[2],
+                d[3],
+                d[4],
+                d[5]
+            );
+        }
+    });
 }
 
 #[tokio::main]
@@ -1553,8 +1618,8 @@ async fn main() {
         config.mempool_max_txs = Some(max_txs);
     }
 
-    // Setup logging
-    setup_logging(&config.log_level);
+    // Setup logging (flushes queued lines when `_log_guard` drops at exit)
+    let _log_guard = setup_logging(&config.log_level);
 
     info!("Stellar Overlay starting");
     info!("Core socket: {}", config.core_socket.display());
