@@ -61,20 +61,28 @@ backlogged.)
 
 ## Insertion
 
-`Mempool::insert` (`flood/mempool.rs:106-127`):
+`Mempool::insert` returns an `InsertOutcome`:
 
-1. **Dedup**: if `by_hash` already contains this hash, return `false`.
-2. **Capacity check**: while at `max_size`, call `evict_lowest_fee`.
-3. Add to both indexes.
-4. Return `true`.
+1. **Dedup**: if `by_hash` already contains this hash → `Duplicate`.
+2. **Capacity check**: while at `max_size`, compare the newcomer with the
+   lowest-priority resident (last entry of `by_fee`). If the newcomer
+   outranks it, evict that resident; otherwise → `Rejected` and nothing
+   changes. Because equal-fee ties are broken by arrival order, a full
+   pool of equal-fee transactions refuses newcomers instead of displacing
+   older arrivals.
+3. Add to both indexes → `Inserted { evicted }`, where `evicted` lists
+   the displaced residents.
+
+A transaction submitted by the local Core (`SubmitTx`) is flooded to
+peers only if the mempool admitted it (`OverlayHandle::submit_local_tx`
+reports the outcome), so peers are never offered a transaction this node
+refused or already held.
 
 ## Eviction
 
-- **Capacity-based** (`evict_lowest_fee`, `flood/mempool.rs:179-184`):
-  takes the last entry of `by_fee` (lowest priority) and removes it via
-  `remove`. Called from `insert` on capacity overflow — happens
-  *synchronously per insert*.
-- **Age-based** (`evict_expired`, `flood/mempool.rs:152-166`): scans for
+- **Capacity-based**: part of `insert` (above) — the lowest-priority
+  resident is removed only to admit a higher-priority newcomer.
+- **Age-based** (`evict_expired`): scans for
   entries with `now - received_at > max_age` and removes them. Called
   only from the `RemoveTxsFromMempool` handler (i.e. piggybacked on
   externalization) — there is no periodic timer that invokes it.

@@ -7,10 +7,10 @@
 
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, RwLock, Semaphore};
 use tracing::{debug, info};
 
-use crate::flood::Mempool;
+use crate::flood::{InsertOutcome, Mempool};
 use crate::wire::ValidatedTx;
 
 /// Bound network admissions waiting for or undergoing mempool insertion.
@@ -21,9 +21,11 @@ const MAX_NETWORK_ADMISSIONS: usize = 10_000;
 pub enum CoreCommand {
     /// Insert a transaction. Network admission owns capacity until processed;
     /// local Core submissions retain their existing unbounded enqueue policy.
+    /// `reply`, if present, receives the insertion outcome.
     SubmitTx {
         tx: Arc<ValidatedTx>,
         admission: Option<OwnedSemaphorePermit>,
+        reply: Option<oneshot::Sender<InsertOutcome>>,
     },
 
     /// Request top N transactions by fee
@@ -72,7 +74,11 @@ impl Overlay {
     /// Handle a command from Core.
     async fn handle_core_command(&self, cmd: CoreCommand) {
         match cmd {
-            CoreCommand::SubmitTx { tx, admission } => {
+            CoreCommand::SubmitTx {
+                tx,
+                admission,
+                reply,
+            } => {
                 debug!(
                     "[SubmitTx] TX: hash={:02x?}, size={}, fee={}, ops={}",
                     &tx.hash()[..4],
@@ -81,8 +87,12 @@ impl Overlay {
                     tx.num_ops()
                 );
                 let mut mempool = self.mempool.write().await;
-                mempool.insert(tx);
+                let outcome = mempool.insert(tx);
+                drop(mempool);
                 drop(admission);
+                if let Some(reply) = reply {
+                    let _ = reply.send(outcome);
+                }
             }
 
             CoreCommand::GetTopTxs { count, reply } => {
@@ -154,7 +164,22 @@ impl OverlayHandle {
         let _ = self.cmd_tx.send(CoreCommand::SubmitTx {
             tx,
             admission: None,
+            reply: None,
         });
+    }
+
+    /// Submit a transaction from the local Core and learn whether the mempool
+    /// admitted it. The command is enqueued synchronously, so it keeps its
+    /// FIFO position relative to later commands; the receiver resolves once
+    /// the mempool has processed it (and errors if the manager shut down).
+    pub fn submit_local_tx(&self, tx: Arc<ValidatedTx>) -> oneshot::Receiver<InsertOutcome> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.cmd_tx.send(CoreCommand::SubmitTx {
+            tx,
+            admission: None,
+            reply: Some(reply_tx),
+        });
+        reply_rx
     }
 
     /// Admit directly to the same FIFO as removal, without an intermediate
@@ -171,6 +196,7 @@ impl OverlayHandle {
             .send(CoreCommand::SubmitTx {
                 tx,
                 admission: Some(admission),
+                reply: None,
             })
             .is_ok()
     }
@@ -290,6 +316,21 @@ mod tests {
         assert_eq!(handle.network_admissions.available_permits(), 1);
         assert!(!handle.try_submit_network_tx(tx)); // Closed FIFO, permit returned.
         assert_eq!(handle.network_admissions.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn submit_local_tx_reports_insertion_outcome() {
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let handle = OverlayHandle::new(cmd_tx);
+        let first = transaction(1);
+        // Enqueued before the manager starts: the replies resolve in FIFO
+        // order once it runs.
+        let inserted = handle.submit_local_tx(first.clone());
+        let duplicate = handle.submit_local_tx(first);
+        let task = tokio::spawn(Overlay::new(cmd_rx).run());
+        assert!(inserted.await.unwrap().is_inserted());
+        assert_eq!(duplicate.await.unwrap(), InsertOutcome::Duplicate);
+        task.abort();
     }
 
     #[tokio::test]

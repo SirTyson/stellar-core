@@ -1150,13 +1150,25 @@ impl App {
                     }
                 };
 
-                // Add to mempool
-                self.overlay_handle.submit_tx(Arc::clone(&tx));
+                // Add to mempool. The command is enqueued now (preserving
+                // FIFO order); flood the transaction only once the mempool has
+                // admitted it, so peers are never offered a transaction this
+                // node itself refused (full pool) or already holds.
+                let admitted = self.overlay_handle.submit_local_tx(Arc::clone(&tx));
 
                 // Broadcast TX via libp2p QUIC (dedicated stream)
                 let handle = self.libp2p_handle.clone();
                 tokio::spawn(async move {
-                    handle.broadcast_tx(tx).await;
+                    match admitted.await {
+                        Ok(outcome) if outcome.is_inserted() => handle.broadcast_tx(tx).await,
+                        Ok(outcome) => debug!(
+                            "SUBMIT_TX_NOT_FLOODED: {:02x?}... {:?}",
+                            &tx.hash()[..4],
+                            outcome
+                        ),
+                        // Mempool manager gone: shutting down.
+                        Err(_) => {}
+                    }
                 });
             }
 

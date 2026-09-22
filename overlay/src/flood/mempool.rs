@@ -14,6 +14,26 @@ use crate::wire::ValidatedTx;
 /// 32-byte transaction hash
 pub type TxHash = [u8; 32];
 
+/// Result of [`Mempool::insert`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InsertOutcome {
+    /// Added. `evicted` lists the lower-priority residents displaced to make
+    /// room (empty unless the pool was at capacity).
+    Inserted { evicted: Vec<TxHash> },
+    /// Already present; nothing changed.
+    Duplicate,
+    /// The pool is at capacity and the newcomer does not outrank its
+    /// lowest-priority resident; nothing changed.
+    Rejected,
+}
+
+impl InsertOutcome {
+    /// True if the transaction is now in the mempool because of this call.
+    pub fn is_inserted(&self) -> bool {
+        matches!(self, InsertOutcome::Inserted { .. })
+    }
+}
+
 /// A mempool-resident transaction: the shared validated tx plus its arrival
 /// time (for age-based eviction) and arrival sequence number (for FIFO
 /// ordering among equal-fee transactions). Internal detail — callers get the
@@ -110,19 +130,19 @@ impl Mempool {
 
     /// Add a transaction to the mempool.
     ///
-    /// Returns true if added. Live duplicates are rejected before capacity eviction.
-    pub fn insert(&mut self, meta: Arc<ValidatedTx>) -> bool {
+    /// Live duplicates are rejected before any capacity handling. At capacity
+    /// the newcomer is admitted only if it outranks the lowest-priority
+    /// resident, which is then evicted; otherwise the newcomer is refused and
+    /// the residents stay. Because equal-fee ties are broken by arrival order,
+    /// a full pool of equal-fee transactions refuses newcomers rather than
+    /// displacing older arrivals.
+    pub fn insert(&mut self, meta: Arc<ValidatedTx>) -> InsertOutcome {
         let hash = *meta.hash();
 
         // Check for duplicate
         if self.by_hash.contains_key(&hash) {
             trace!("Duplicate transaction: {:?}", &hash[..4]);
-            return false;
-        }
-
-        // Evict if at capacity
-        while self.by_hash.len() >= self.max_size {
-            self.evict_lowest_fee();
+            return InsertOutcome::Duplicate;
         }
 
         let entry = MempoolEntry {
@@ -130,10 +150,30 @@ impl Mempool {
             received_at: Instant::now(),
             arrival_seq: self.next_arrival_seq,
         };
+        let priority = FeePriority::of(&entry);
+
+        // Make room if at capacity, but only for a newcomer that outranks
+        // the lowest-priority resident (`by_fee` is ordered best first).
+        let mut evicted = Vec::new();
+        while self.by_hash.len() >= self.max_size {
+            match self.by_fee.iter().next_back() {
+                Some(worst) if priority < *worst => {
+                    let worst_hash = worst.hash;
+                    trace!("Evicting lowest-priority tx: {:?}", &worst_hash[..4]);
+                    self.remove(&worst_hash);
+                    evicted.push(worst_hash);
+                }
+                _ => {
+                    trace!("Mempool full, refusing tx: {:?}", &hash[..4]);
+                    return InsertOutcome::Rejected;
+                }
+            }
+        }
+
         self.next_arrival_seq += 1;
-        self.by_fee.insert(FeePriority::of(&entry));
+        self.by_fee.insert(priority);
         self.by_hash.insert(hash, entry);
-        true
+        InsertOutcome::Inserted { evicted }
     }
 
     /// Check if a transaction is in the mempool.
@@ -184,14 +224,6 @@ impl Mempool {
     pub fn is_empty(&self) -> bool {
         self.by_hash.is_empty()
     }
-
-    /// Evict the lowest-fee transaction.
-    fn evict_lowest_fee(&mut self) {
-        if let Some(priority) = self.by_fee.iter().last().cloned() {
-            trace!("Evicting lowest-fee tx: {:?}", &priority.hash[..4]);
-            self.remove(&priority.hash);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -211,7 +243,7 @@ mod tests {
         let tx = make_tx(1000, 1, 1);
         let hash = *tx.hash();
 
-        assert!(mempool.insert(tx));
+        assert!(mempool.insert(tx).is_inserted());
         assert!(mempool.contains(&hash));
         assert_eq!(mempool.len(), 1);
         assert_eq!(mempool.get(&hash).unwrap().fee(), 1000);
@@ -222,8 +254,8 @@ mod tests {
         let mut mempool = Mempool::new(100, Duration::from_secs(300));
         let tx = make_tx(1000, 1, 1);
 
-        assert!(mempool.insert(tx.clone()));
-        assert!(!mempool.insert(tx)); // duplicate
+        assert!(mempool.insert(tx.clone()).is_inserted());
+        assert_eq!(mempool.insert(tx), InsertOutcome::Duplicate);
         assert_eq!(mempool.len(), 1);
     }
 
@@ -269,7 +301,7 @@ mod tests {
         assert_ne!(arrival, by_hash);
 
         for tx in txs {
-            assert!(mempool.insert(tx));
+            assert!(mempool.insert(tx).is_inserted());
         }
         assert_eq!(mempool.top_by_fee(20), arrival);
 
@@ -302,11 +334,75 @@ mod tests {
 
         let tx4 = make_tx(400, 1, 4);
         let hash4 = *tx4.hash();
-        mempool.insert(tx4);
+        assert_eq!(
+            mempool.insert(tx4),
+            InsertOutcome::Inserted {
+                evicted: vec![hash1]
+            }
+        );
 
         assert_eq!(mempool.len(), 3);
         assert!(!mempool.contains(&hash1)); // evicted
         assert!(mempool.contains(&hash4)); // kept
+    }
+
+    #[test]
+    fn test_full_pool_refuses_newcomer_not_outranking_worst() {
+        let mut mempool = Mempool::new(3, Duration::from_secs(300));
+        let residents: Vec<_> = (1..=3).map(|seq| make_tx(200, 1, seq)).collect();
+        let resident_hashes: Vec<TxHash> = residents.iter().map(|tx| *tx.hash()).collect();
+        for tx in residents {
+            assert!(mempool.insert(tx).is_inserted());
+        }
+
+        // Equal fee: the newcomer is the latest arrival, so it ranks below
+        // every resident and is refused instead of displacing one.
+        let equal = make_tx(200, 1, 4);
+        let equal_hash = *equal.hash();
+        assert_eq!(mempool.insert(equal), InsertOutcome::Rejected);
+        assert!(!mempool.contains(&equal_hash));
+
+        // Lower fee: refused too.
+        assert_eq!(mempool.insert(make_tx(100, 1, 5)), InsertOutcome::Rejected);
+
+        assert_eq!(mempool.len(), 3);
+        assert_eq!(mempool.top_by_fee(3), resident_hashes);
+
+        // A refused transaction can be admitted once there is room.
+        mempool.remove(&resident_hashes[0]);
+        assert!(mempool.insert(make_tx(200, 1, 4)).is_inserted());
+        assert!(mempool.contains(&equal_hash));
+    }
+
+    #[test]
+    fn test_full_pool_evicts_latest_equal_fee_arrival_for_higher_fee() {
+        let mut mempool = Mempool::new(3, Duration::from_secs(300));
+        let residents: Vec<_> = (1..=3).map(|seq| make_tx(200, 1, seq)).collect();
+        let resident_hashes: Vec<TxHash> = residents.iter().map(|tx| *tx.hash()).collect();
+        for tx in residents {
+            mempool.insert(tx);
+        }
+
+        let higher = make_tx(300, 1, 4);
+        let higher_hash = *higher.hash();
+        // Among equal-fee residents, the latest arrival ranks lowest.
+        assert_eq!(
+            mempool.insert(higher),
+            InsertOutcome::Inserted {
+                evicted: vec![resident_hashes[2]]
+            }
+        );
+        assert_eq!(
+            mempool.top_by_fee(3),
+            vec![higher_hash, resident_hashes[0], resident_hashes[1]]
+        );
+    }
+
+    #[test]
+    fn test_zero_capacity_refuses_everything() {
+        let mut mempool = Mempool::new(0, Duration::from_secs(300));
+        assert_eq!(mempool.insert(make_tx(1000, 1, 1)), InsertOutcome::Rejected);
+        assert!(mempool.is_empty());
     }
 
     #[test]
@@ -331,7 +427,7 @@ mod tests {
     fn test_stress_insert_many() {
         let mut mempool = Mempool::new(1000, Duration::from_secs(300));
         for i in 0..200i64 {
-            assert!(mempool.insert(make_tx((i + 1) * 10, 1, i)));
+            assert!(mempool.insert(make_tx((i + 1) * 10, 1, i)).is_inserted());
         }
         assert_eq!(mempool.len(), 200);
         assert_eq!(mempool.top_by_fee(10).len(), 10);
