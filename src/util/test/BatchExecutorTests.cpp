@@ -129,3 +129,20 @@ TEST_CASE("BatchExecutor runs many successive batches", "[batchexecutor]")
         }
     }
 }
+
+TEST_CASE("BatchExecutor task count respects the CPU quota", "[batchexecutor]")
+{
+    // Physical cores decide when there is no (or a generous) quota.
+    REQUIRE(BatchExecutor::computePreferredTaskCount(8, 16, std::nullopt) == 7);
+    REQUIRE(BatchExecutor::computePreferredTaskCount(8, 16, 16.0) == 7);
+    // A container CPU limit below the core count caps the parallelism.
+    REQUIRE(BatchExecutor::computePreferredTaskCount(8, 16, 4.0) == 3);
+    REQUIRE(BatchExecutor::computePreferredTaskCount(8, 16, 4.5) == 3);
+    // Unknown topology falls back to logical CPUs.
+    REQUIRE(BatchExecutor::computePreferredTaskCount(0, 16, std::nullopt) ==
+            15);
+    REQUIRE(BatchExecutor::computePreferredTaskCount(0, 16, 2.0) == 1);
+    // Always at least one task.
+    REQUIRE(BatchExecutor::computePreferredTaskCount(1, 1, std::nullopt) == 1);
+    REQUIRE(BatchExecutor::computePreferredTaskCount(8, 16, 0.5) == 1);
+}

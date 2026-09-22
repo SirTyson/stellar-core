@@ -3,8 +3,11 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "util/BatchExecutor.h"
+#include "util/Cgroup.h"
 #include "util/GlobalChecks.h"
 #include "util/Logging.h"
+
+#include <cmath>
 
 #include <string>
 
@@ -123,6 +126,13 @@ BatchExecutor::BatchExecutor()
     auto pinning = pinnedCpuOrder();
     mPinCpuOrder = std::move(pinning.order);
     mPhysicalCoreCount = pinning.physicalCoreCount;
+    mCpuQuota = cgroup::cpuQuota();
+    CLOG_INFO(Perf,
+              "Batch executor: {} physical cores, {} logical CPUs, CPU quota "
+              "{}; preferred task count {}",
+              mPhysicalCoreCount, std::thread::hardware_concurrency(),
+              mCpuQuota ? fmt::format("{:.2f}", *mCpuQuota) : "none",
+              preferredTaskCount());
     if (mPinCpuOrder.empty())
     {
         CLOG_WARNING(
@@ -244,12 +254,30 @@ BatchExecutor::preferredTaskCount() const
         return *mPreferredTaskCountForTesting;
     }
 #endif
+    return computePreferredTaskCount(
+        mPhysicalCoreCount, std::thread::hardware_concurrency(), mCpuQuota);
+}
+
+size_t
+BatchExecutor::computePreferredTaskCount(size_t physicalCores,
+                                         size_t hardwareConcurrency,
+                                         std::optional<double> cpuQuota)
+{
     // As this is meant to be used for parallelizing CPU-heavy work, we want to
     // only run the tasks on the physical cores (when physical core info is
     // available).
-    auto concurrency = mPhysicalCoreCount > 0
-                           ? mPhysicalCoreCount
-                           : std::thread::hardware_concurrency();
+    size_t concurrency =
+        physicalCores > 0 ? physicalCores : hardwareConcurrency;
+    // A CPU bandwidth quota (e.g. a container CPU limit) caps how many CPUs'
+    // worth of time the process gets per scheduling period, however many
+    // cores it may run on. Running more parallel tasks than that only gets
+    // every thread of the process (including the main thread) throttled.
+    if (cpuQuota && *cpuQuota > 0)
+    {
+        auto quotaCpus =
+            static_cast<size_t>(std::max(1.0, std::floor(*cpuQuota)));
+        concurrency = std::min(concurrency, quotaCpus);
+    }
     // We want to leave at least one core free to not compete with the main
     // thread and other background work.
     return concurrency > 1 ? concurrency - 1 : 1;

@@ -76,10 +76,19 @@ class BatchExecutor : private NonMovableOrCopyable
         std::function<void(size_t, size_t, size_t)> const& work);
 
     // Returns the maximum number of tasks to use in `executeBatch` without
-    // oversubscribing physical cores.
+    // oversubscribing physical cores or the process's CPU quota.
     // Use this many tasks whenever possible to maximize parallelism and avoid
     // oversubscription.
     size_t preferredTaskCount() const;
+
+    // The preferred task count for a machine with `physicalCores` distinct
+    // physical cores (0 if unknown), `hardwareConcurrency` logical CPUs and an
+    // optional CPU bandwidth quota in CPUs (e.g. a container CPU limit): one
+    // less than the smaller of the core count and the whole CPUs of quota,
+    // leaving room for the main thread, and at least 1.
+    static size_t computePreferredTaskCount(size_t physicalCores,
+                                            size_t hardwareConcurrency,
+                                            std::optional<double> cpuQuota);
 
 #ifdef BUILD_TESTS
     // Overrides the value returned by `preferredTaskCount`, so that tests can
@@ -115,6 +124,8 @@ class BatchExecutor : private NonMovableOrCopyable
     // First `mPhysicalCoreCount` entries of `mPinCpuOrder` are guaranteed to be
     // on distinct physical cores by the pinning order assignment procedure.
     size_t mPhysicalCoreCount{0};
+    // CPU bandwidth quota (in CPUs) applying to this process, if any.
+    std::optional<double> mCpuQuota;
 
     // Task that is being currently executed by the workers.
     std::function<void(size_t)> const* mRunTask{nullptr};
