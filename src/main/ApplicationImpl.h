@@ -263,6 +263,14 @@ class ApplicationImpl : public Application
 
     std::unique_ptr<MetricsRegistry> mMetrics;
     medida::Timer& mPostOnMainThreadDelay;
+    // Time spent running tasks posted to the main thread, in total and per
+    // task name (at most MAX_MAIN_THREAD_BUSY_TIMERS names; the rest are
+    // folded into "other"). Only touched on the main thread.
+    medida::Timer& mMainThreadBusy;
+    std::unordered_map<std::string, medida::Timer*> mMainThreadBusyByTask;
+    static constexpr size_t MAX_MAIN_THREAD_BUSY_TIMERS = 64;
+    void recordMainThreadBusy(std::string const& taskName,
+                              std::chrono::nanoseconds busy);
     medida::Timer& mPostOnBackgroundThreadDelay;
     medida::Timer& mPostOnOverlayThreadDelay;
     medida::Timer& mPostOnLedgerCloseThreadDelay;

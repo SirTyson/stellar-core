@@ -26,6 +26,8 @@ Metric name                               | Type      | Description
 ---------------------------------------   | --------  | --------------------
 app.post-on-background-thread.delay       | timer     | time to start task posted to background thread
 app.post-on-main-thread.delay             | timer     | time to start task posted to current crank of main thread
+app.main-thread.busy                      | timer     | time spent running tasks posted to the main thread
+app.main-thread-busy.<task>               | timer     | time spent running main-thread tasks posted as <task> (lower-cased, dash-separated; at most 64 names, the rest under "other")
 app.post-on-overlay-thread.delay          | timer     | time to start task posted to overlay thread
 app.post-on-ledger-close-thread.delay     | timer     | time to start task posted to ledger close thread
 bucket.batch.addtime                      | timer     | time to add a live batch

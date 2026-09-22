@@ -7,6 +7,7 @@
 #include "work/ConditionalWork.h"
 #include "work/WorkWithCallback.h"
 #include "xdr/Stellar-ledger-entries.h"
+#include <cctype>
 #include <limits>
 
 // ASIO is somewhat particular about when it gets included -- it wants to be the
@@ -121,6 +122,7 @@ ApplicationImpl::ApplicationImpl(VirtualClock& clock, Config const& cfg)
     , mMetrics(std::make_unique<MetricsRegistry>(cfg.HISTOGRAM_WINDOW_SIZE))
     , mPostOnMainThreadDelay(
           mMetrics->NewTimer({"app", "post-on-main-thread", "delay"}))
+    , mMainThreadBusy(mMetrics->NewTimer({"app", "main-thread", "busy"}))
     , mPostOnBackgroundThreadDelay(
           mMetrics->NewTimer({"app", "post-on-background-thread", "delay"}))
     , mPostOnOverlayThreadDelay(
@@ -1574,7 +1576,7 @@ ApplicationImpl::postOnMainThread(std::function<void()>&& f, std::string&& name,
     LogSlowExecution isSlow{name, LogSlowExecution::Mode::MANUAL,
                             "executed after"};
     mVirtualClock.postAction(
-        [this, f = std::move(f), isSlow]() {
+        [this, f = std::move(f), isSlow, taskName = name]() {
             JITTER_INJECT_DELAY();
 
             mPostOnMainThreadDelay.Update(isSlow.checkElapsedTime());
@@ -1584,9 +1586,58 @@ ApplicationImpl::postOnMainThread(std::function<void()>&& f, std::string&& name,
             {
                 std::this_thread::sleep_for(sleepFor);
             }
+            auto const start = std::chrono::steady_clock::now();
             f();
+            recordMainThreadBusy(taskName,
+                                 std::chrono::steady_clock::now() - start);
         },
         std::move(name), type);
+}
+
+void
+ApplicationImpl::recordMainThreadBusy(std::string const& taskName,
+                                      std::chrono::nanoseconds busy)
+{
+    mMainThreadBusy.Update(busy);
+    auto it = mMainThreadBusyByTask.find(taskName);
+    if (it != mMainThreadBusyByTask.end())
+    {
+        it->second->Update(busy);
+        return;
+    }
+    if (mMainThreadBusyByTask.size() >= MAX_MAIN_THREAD_BUSY_TIMERS)
+    {
+        // Don't let unexpectedly many distinct names grow the map.
+        mMetrics->NewTimer({"app", "main-thread-busy", "other"}).Update(busy);
+        return;
+    }
+    // Metric names are lower-case with dashes, e.g.
+    // "RustOverlayManager: SCPReceived" ->
+    // app.main-thread-busy.rustoverlaymanager-scpreceived
+    std::string metricName;
+    for (char c : taskName)
+    {
+        if (std::isalnum(static_cast<unsigned char>(c)))
+        {
+            metricName.push_back(
+                static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+        }
+        else if (!metricName.empty() && metricName.back() != '-')
+        {
+            metricName.push_back('-');
+        }
+    }
+    while (!metricName.empty() && metricName.back() == '-')
+    {
+        metricName.pop_back();
+    }
+    if (metricName.empty())
+    {
+        metricName = "other";
+    }
+    auto& timer = mMetrics->NewTimer({"app", "main-thread-busy", metricName});
+    mMainThreadBusyByTask.emplace(taskName, &timer);
+    timer.Update(busy);
 }
 
 void
