@@ -256,6 +256,7 @@ LedgerManagerImpl::TxLatencyMetrics::TxLatencyMetrics(MetricsRegistry& registry)
     , mRunP50(registry.NewCounter({"loadgen", "tx-latency-run", "p50-ms"}))
     , mRunP75(registry.NewCounter({"loadgen", "tx-latency-run", "p75-ms"}))
     , mRunP99(registry.NewCounter({"loadgen", "tx-latency-run", "p99-ms"}))
+    , mRunSamples(registry.NewCounter({"loadgen", "tx-latency-run", "samples"}))
 {
 }
 #endif
@@ -1390,43 +1391,68 @@ LedgerManagerImpl::forgetTxSubmission(Hash const& contentsHash)
     return mTxLatencyMetrics.mTxSubmitTimes.erase(contentsHash) != 0;
 }
 
-void
-LedgerManagerImpl::recordTxE2eLatency(ApplicableTxSetFrame const& txSet)
+LedgerManagerImpl::SelfSubmittedTxs
+LedgerManagerImpl::matchSelfSubmittedTxs(ApplicableTxSetFrame const& txSet)
 {
+    SelfSubmittedTxs matched;
     if (!txSelfTrackingActive())
     {
-        return;
+        return matched;
     }
     bool const recordLatency =
         mApp.getConfig().LOADGEN_MEASURE_TX_E2E_LATENCY_FOR_TESTING;
-    VirtualClock::time_point const applyEndTime = mApp.getClock().now();
-    MutexLocker guard(mTxLatencyMetrics.mMutex);
+
+    // Hash outside the lock: the main thread records every submission under
+    // it, and hashing a full ledger's worth of transactions takes a while.
+    std::vector<std::pair<Hash, bool>> txs;
+    txs.reserve(txSet.sizeTxTotal());
     for (auto const& phase : txSet.getPhases())
     {
         for (auto const& tx : phase)
         {
-            if (auto submitted = mTxLatencyMetrics.mTxSubmitTimes.find(
-                    tx->getContentsHash());
-                submitted != mTxLatencyMetrics.mTxSubmitTimes.end())
-            {
-                mTxLatencyMetrics.mTxsExternalized.inc();
-                (tx->isSoroban() ? mTxLatencyMetrics.mPendingSorobanTxsSelfCount
-                                 : mTxLatencyMetrics.mPendingTxsSelfCount)
-                    .inc();
-                if (recordLatency)
-                {
-                    auto const latency = applyEndTime - submitted->second;
-                    int64_t const ms =
-                        std::chrono::duration_cast<std::chrono::milliseconds>(
-                            latency)
-                            .count();
-                    mTxLatencyMetrics.mSamples.push_back(std::clamp<int64_t>(
-                        ms, 0, std::numeric_limits<uint32_t>::max()));
-                }
-                mTxLatencyMetrics.mTxSubmitTimes.erase(submitted);
-            }
+            txs.emplace_back(tx->getContentsHash(), tx->isSoroban());
         }
     }
+
+    MutexLocker guard(mTxLatencyMetrics.mMutex);
+    for (auto const& [contentsHash, isSoroban] : txs)
+    {
+        auto submitted = mTxLatencyMetrics.mTxSubmitTimes.find(contentsHash);
+        if (submitted == mTxLatencyMetrics.mTxSubmitTimes.end())
+        {
+            continue;
+        }
+        ++(isSoroban ? matched.mSoroban : matched.mClassic);
+        if (recordLatency)
+        {
+            matched.mSubmissionTimes.push_back(submitted->second);
+        }
+        mTxLatencyMetrics.mTxSubmitTimes.erase(submitted);
+    }
+    return matched;
+}
+
+void
+LedgerManagerImpl::recordSelfSubmittedTxsApplied(
+    SelfSubmittedTxs const& txs, VirtualClock::time_point applyEndTime)
+{
+    if (txs.mClassic == 0 && txs.mSoroban == 0)
+    {
+        return;
+    }
+    MutexLocker guard(mTxLatencyMetrics.mMutex);
+    for (auto const& submitted : txs.mSubmissionTimes)
+    {
+        int64_t const ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(applyEndTime -
+                                                                  submitted)
+                .count();
+        mTxLatencyMetrics.mSamples.push_back(
+            std::clamp<int64_t>(ms, 0, std::numeric_limits<uint32_t>::max()));
+    }
+    mTxLatencyMetrics.mTxsExternalized.inc(txs.mClassic + txs.mSoroban);
+    mTxLatencyMetrics.mPendingTxsSelfCount.inc(txs.mClassic);
+    mTxLatencyMetrics.mPendingSorobanTxsSelfCount.inc(txs.mSoroban);
 }
 
 void
@@ -1455,6 +1481,7 @@ LedgerManagerImpl::beginTxLatencyMeasurement(uint32_t expectedTxCount)
     mTxLatencyMetrics.mRunP50.clear();
     mTxLatencyMetrics.mRunP75.clear();
     mTxLatencyMetrics.mRunP99.clear();
+    mTxLatencyMetrics.mRunSamples.clear();
 }
 
 void
@@ -1496,6 +1523,7 @@ LedgerManagerImpl::finalizeTxLatencyMeasurement()
     mTxLatencyMetrics.mRunP50.set_count(percentile(50));
     mTxLatencyMetrics.mRunP75.set_count(percentile(75));
     mTxLatencyMetrics.mRunP99.set_count(percentile(99));
+    mTxLatencyMetrics.mRunSamples.set_count(n);
 }
 #endif
 
@@ -2076,9 +2104,15 @@ LedgerManagerImpl::applyLedger(LedgerCloseData const& ledgerData,
     maybeRunSnapshotInvariantFromLedgerState(mApplyState.copyApplyLedgerView());
 
 #ifdef BUILD_TESTS
+    // Test-only bookkeeping for self-submitted transactions (hashing every
+    // transaction) runs before the simulated apply sleep, so that it overlaps
+    // the simulated work instead of extending the close; the transactions
+    // are counted as applied, and their latency stamped, after the sleep,
+    // when the ledger is (simulated to be) applied.
+    auto selfSubmitted = matchSelfSubmittedTxs(*applicableTxSet);
     maybeSimulateSleep(mApp.getConfig(), txSet->sizeOpTotalForLogging(),
                        applyLedgerTime, mApplySleepRng);
-    recordTxE2eLatency(*applicableTxSet);
+    recordSelfSubmittedTxsApplied(selfSubmitted, mApp.getClock().now());
 #endif
 
     // Steps 6, 7, 8 are done in `advanceLedgerStateAndPublish`

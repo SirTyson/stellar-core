@@ -152,6 +152,67 @@ TEST_CASE("multiple loadgen nodes in overlay-only mode", "[loadgen]")
         500 * simulation->getExpectedLedgerCloseTime(), false);
 }
 
+TEST_CASE("loadgen measures tx latency across simulated apply", "[loadgen]")
+{
+    // Self-submitted transactions are matched before the simulated apply
+    // sleep and their latency stamped after it: every one must be counted
+    // exactly once and produce a latency sample. Ledgers are applied in the
+    // background and the simulated apply takes long enough that the load
+    // generator checks for completion while the last ledger is being
+    // applied; it must not finish before that ledger's samples exist.
+    Hash networkID = sha256(getTestConfig().NETWORK_PASSPHRASE);
+    Simulation::pointer simulation = Topologies::pair(networkID, [&](int i) {
+        auto cfg = getTestConfig(i);
+        cfg.ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING = true;
+        cfg.ARTIFICIALLY_GENERATE_LOAD_FOR_TESTING = true;
+        cfg.TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION =
+            Config::CURRENT_LEDGER_PROTOCOL_VERSION;
+        cfg.GENESIS_TEST_ACCOUNT_COUNT = 1000;
+        cfg.LOADGEN_MEASURE_TX_E2E_LATENCY_FOR_TESTING = true;
+        cfg.OP_APPLY_SLEEP_TIME_DURATION_FOR_TESTING = {
+            std::chrono::milliseconds(50)};
+        cfg.OP_APPLY_SLEEP_TIME_WEIGHT_FOR_TESTING = {1};
+        return cfg;
+    });
+
+    simulation->startAllNodes();
+    simulation->crankUntil(
+        [&]() { return simulation->haveAllExternalized(3, 1); },
+        10 * simulation->getExpectedLedgerCloseTime(), false);
+    auto nodes = simulation->getNodes();
+    for (auto& node : nodes)
+    {
+        node->setRunInOverlayOnlyMode(true);
+    }
+
+    auto& app = *nodes[0];
+    auto& metrics = app.getMetrics();
+    auto& complete = metrics.NewMeter({"loadgen", "run", "complete"}, "run");
+    auto& externalized =
+        metrics.NewCounter({"loadgen", "tx-latency", "externalized"});
+    auto prevComplete = complete.count();
+    auto prevExternalized = externalized.count();
+
+    uint32_t const nTxs = 60;
+    app.getLoadGenerator().generateLoad(GeneratedLoadConfig::txLoad(
+        LoadGenMode::PAY, /* nAccounts */ 100, nTxs, /* txRate */ 30));
+    simulation->crankUntil(
+        [&]() { return complete.count() == prevComplete + 1; },
+        500 * simulation->getExpectedLedgerCloseTime(), false);
+
+    REQUIRE(app.getConfig().parallelLedgerClose());
+    REQUIRE(externalized.count() - prevExternalized == nTxs);
+    REQUIRE(
+        metrics.NewCounter({"loadgen", "tx-latency-run", "samples"}).count() ==
+        nTxs);
+    auto p50 =
+        metrics.NewCounter({"loadgen", "tx-latency-run", "p50-ms"}).count();
+    auto maxMs =
+        metrics.NewCounter({"loadgen", "tx-latency-run", "max-ms"}).count();
+    REQUIRE(p50 > 0);
+    REQUIRE(maxMs >= p50);
+}
+
 TEST_CASE("loadgen recycles accounts released by transaction hash", "[loadgen]")
 {
     // Far fewer accounts than transactions: the run only completes if every

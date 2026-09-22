@@ -456,6 +456,7 @@ class LedgerManagerImpl : public LedgerManager
         medida::Counter& mRunP50;
         medida::Counter& mRunP75;
         medida::Counter& mRunP99;
+        medida::Counter& mRunSamples;
         ANNOTATED_MUTEX(mMutex);
         UnorderedMap<Hash, VirtualClock::time_point>
             mTxSubmitTimes GUARDED_BY(mMutex);
@@ -466,7 +467,23 @@ class LedgerManagerImpl : public LedgerManager
     } mTxLatencyMetrics;
 
     bool txSelfTrackingActive() const;
-    void recordTxE2eLatency(ApplicableTxSetFrame const& txSet);
+    // Self-submitted transactions of an applied tx set.
+    struct SelfSubmittedTxs
+    {
+        uint64_t mClassic{0};
+        uint64_t mSoroban{0};
+        // Submission times whose latency should be sampled (empty unless
+        // latency measurement is on).
+        std::vector<VirtualClock::time_point> mSubmissionTimes;
+    };
+    // Matches the transactions of `txSet` against recorded submissions and
+    // stops tracking the matched ones; they are not counted yet.
+    SelfSubmittedTxs matchSelfSubmittedTxs(ApplicableTxSetFrame const& txSet);
+    // Counts matched transactions as applied and records the e2e latency of
+    // each relative to `applyEndTime`, together, so that the load generator
+    // never sees them applied before their latency samples exist.
+    void recordSelfSubmittedTxsApplied(SelfSubmittedTxs const& txs,
+                                       VirtualClock::time_point applyEndTime);
 #endif
 
     void setState(State s);
