@@ -35,5 +35,42 @@ std::optional<double>
 cpuQuota(std::filesystem::path const& cgroupRoot = "/sys/fs/cgroup",
          std::filesystem::path const& procSelfCgroup = "/proc/self/cgroup");
 
+// Cumulative CPU accounting of a cgroup v2 (`cpu.stat`).
+struct CpuStat
+{
+    uint64_t usageUsec{0};
+    // CFS bandwidth control: enforcement periods elapsed, periods in which
+    // the cgroup was throttled, and total time throttled.
+    uint64_t nrPeriods{0};
+    uint64_t nrThrottled{0};
+    uint64_t throttledUsec{0};
+};
+
+// Parses `cpu.stat` contents; nullopt if `usage_usec` is missing. Throttling
+// fields are 0 when absent (no CPU bandwidth limit).
+std::optional<CpuStat> parseCpuStat(std::string const& contents);
+
+// CPU pressure stall information (`cpu.pressure`): the share of time (in
+// percent, averaged over 10 s) some / all tasks were stalled waiting for
+// CPU, and the cumulative stall time.
+struct CpuPressure
+{
+    double someAvg10{0};
+    uint64_t someTotalUsec{0};
+    double fullAvg10{0};
+    uint64_t fullTotalUsec{0};
+};
+
+std::optional<CpuPressure> parseCpuPressure(std::string const& contents);
+
+// This process's cgroup v2 directory, if it has one.
+std::optional<std::filesystem::path> unifiedCgroupDir(
+    std::filesystem::path const& cgroupRoot = "/sys/fs/cgroup",
+    std::filesystem::path const& procSelfCgroup = "/proc/self/cgroup");
+
+std::optional<CpuStat> readCpuStat(std::filesystem::path const& cgroupDir);
+std::optional<CpuPressure>
+readCpuPressure(std::filesystem::path const& cgroupDir);
+
 } // namespace cgroup
 } // namespace stellar

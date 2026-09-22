@@ -155,5 +155,147 @@ cpuQuota(std::filesystem::path const& cgroupRoot,
 #endif
 }
 
+std::optional<CpuStat>
+parseCpuStat(std::string const& contents)
+{
+    std::istringstream in(contents);
+    std::string key;
+    uint64_t value;
+    CpuStat stat;
+    bool haveUsage = false;
+    while (in >> key >> value)
+    {
+        if (key == "usage_usec")
+        {
+            stat.usageUsec = value;
+            haveUsage = true;
+        }
+        else if (key == "nr_periods")
+        {
+            stat.nrPeriods = value;
+        }
+        else if (key == "nr_throttled")
+        {
+            stat.nrThrottled = value;
+        }
+        else if (key == "throttled_usec")
+        {
+            stat.throttledUsec = value;
+        }
+    }
+    if (!haveUsage)
+    {
+        return std::nullopt;
+    }
+    return stat;
+}
+
+std::optional<CpuPressure>
+parseCpuPressure(std::string const& contents)
+{
+    // some avg10=0.00 avg60=0.00 avg300=0.00 total=0
+    // full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+    std::istringstream in(contents);
+    std::string line;
+    CpuPressure pressure;
+    bool haveSome = false;
+    while (std::getline(in, line))
+    {
+        std::istringstream fields(line);
+        std::string kind;
+        fields >> kind;
+        if (kind != "some" && kind != "full")
+        {
+            continue;
+        }
+        std::optional<double> avg10;
+        std::optional<uint64_t> total;
+        std::string field;
+        while (fields >> field)
+        {
+            auto eq = field.find('=');
+            if (eq == std::string::npos)
+            {
+                continue;
+            }
+            auto name = field.substr(0, eq);
+            auto value = field.substr(eq + 1);
+            try
+            {
+                if (name == "avg10")
+                {
+                    avg10 = std::stod(value);
+                }
+                else if (name == "total")
+                {
+                    total = std::stoull(value);
+                }
+            }
+            catch (std::exception const&)
+            {
+                return std::nullopt;
+            }
+        }
+        if (!avg10 || !total)
+        {
+            return std::nullopt;
+        }
+        if (kind == "some")
+        {
+            pressure.someAvg10 = *avg10;
+            pressure.someTotalUsec = *total;
+            haveSome = true;
+        }
+        else
+        {
+            pressure.fullAvg10 = *avg10;
+            pressure.fullTotalUsec = *total;
+        }
+    }
+    if (!haveSome)
+    {
+        return std::nullopt;
+    }
+    return pressure;
+}
+
+std::optional<std::filesystem::path>
+unifiedCgroupDir(std::filesystem::path const& cgroupRoot,
+                 std::filesystem::path const& procSelfCgroup)
+{
+    auto self = readFile(procSelfCgroup);
+    if (!self)
+    {
+        return std::nullopt;
+    }
+    auto path = parseUnifiedCgroupPath(*self);
+    if (!path)
+    {
+        return std::nullopt;
+    }
+    auto const rel = std::filesystem::path(*path).relative_path();
+    auto dir = rel.empty() ? cgroupRoot : cgroupRoot / rel;
+    std::error_code ec;
+    if (!std::filesystem::is_directory(dir, ec))
+    {
+        return std::nullopt;
+    }
+    return dir;
+}
+
+std::optional<CpuStat>
+readCpuStat(std::filesystem::path const& cgroupDir)
+{
+    auto contents = readFile(cgroupDir / "cpu.stat");
+    return contents ? parseCpuStat(*contents) : std::nullopt;
+}
+
+std::optional<CpuPressure>
+readCpuPressure(std::filesystem::path const& cgroupDir)
+{
+    auto contents = readFile(cgroupDir / "cpu.pressure");
+    return contents ? parseCpuPressure(*contents) : std::nullopt;
+}
+
 } // namespace cgroup
 } // namespace stellar

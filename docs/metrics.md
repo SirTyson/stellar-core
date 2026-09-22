@@ -193,6 +193,13 @@ overlay.send.<X>                          | meter     | sent message <X>
 overlay.timeout.idle                      | meter     | idle peer timeout
 overlay.timeout.straggler                 | meter     | straggler peer timeout
 process.action.queue                      | counter   | number of items waiting in internal action-queue
+process.cgroup.cpu-usage-usec             | counter   | CPU time used by this process's cgroup (cgroup v2 cpu.stat, sampled every second)
+process.cgroup.nr-periods                 | counter   | CFS bandwidth enforcement periods elapsed (cpu.stat)
+process.cgroup.nr-throttled               | counter   | periods in which the cgroup was throttled (cpu.stat)
+process.cgroup.throttled-usec             | counter   | total time the cgroup was throttled (cpu.stat)
+process.cgroup.cpu-pressure-some-avg10-x100 | counter | share of the last 10 s some task waited for CPU, in hundredths of a percent (cpu.pressure)
+process.cgroup.cpu-pressure-some-usec     | counter   | cumulative time some task waited for CPU (cpu.pressure)
+process.cgroup.cpu-pressure-full-usec     | counter   | cumulative time all tasks waited for CPU (cpu.pressure)
 process.action.overloaded                 | counter   | 0-or-1 value indicating action-queue overloading
 process.file.handles                      | counter   | number of open file handles
 process.memory.handles                    | counter   | number of running processes in process manager

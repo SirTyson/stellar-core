@@ -119,6 +119,7 @@ ApplicationImpl::ApplicationImpl(VirtualClock& clock, Config const& cfg)
 #endif
     , mStoppingTimer(*this)
     , mSelfCheckTimer(*this)
+    , mCgroupSampleTimer(*this)
     , mMetrics(std::make_unique<MetricsRegistry>(cfg.HISTOGRAM_WINDOW_SIZE))
     , mPostOnMainThreadDelay(
           mMetrics->NewTimer({"app", "post-on-main-thread", "delay"}))
@@ -784,6 +785,7 @@ ApplicationImpl::startServices()
     {
         mOverlayManager->start();
     }
+    startCgroupCpuSampling();
     auto npub = mHistoryManager->publishQueuedHistory();
     if (npub != 0)
     {
@@ -872,6 +874,7 @@ ApplicationImpl::idempotentShutdown(bool forgetBuckets)
         mOverlayManager->shutdown();
     }
     mSelfCheckTimer.cancel();
+    mCgroupSampleTimer.cancel();
     if (mNtpProbe)
     {
         mNtpProbe->shutdown();
@@ -919,6 +922,72 @@ ApplicationImpl::gracefulStop()
     mStoppingTimer.async_wait(
         std::bind(&ApplicationImpl::shutdownMainIOContext, this),
         VirtualTimer::onFailureNoop);
+}
+
+void
+ApplicationImpl::startCgroupCpuSampling()
+{
+    // Real time only: a recurring timer would keep a virtual clock busy.
+    if (mVirtualClock.getMode() != VirtualClock::REAL_TIME)
+    {
+        return;
+    }
+    mCgroupDir = cgroup::unifiedCgroupDir();
+    if (!mCgroupDir || !cgroup::readCpuStat(*mCgroupDir))
+    {
+        CLOG_DEBUG(Perf, "cgroup v2 CPU accounting unavailable; not sampling");
+        mCgroupDir.reset();
+        return;
+    }
+    sampleCgroupCpu();
+}
+
+void
+ApplicationImpl::sampleCgroupCpu()
+{
+    if (mStopping || !mCgroupDir)
+    {
+        return;
+    }
+    if (auto stat = cgroup::readCpuStat(*mCgroupDir))
+    {
+        auto& m = getMetrics();
+        m.NewCounter({"process", "cgroup", "cpu-usage-usec"})
+            .set_count(static_cast<int64_t>(stat->usageUsec));
+        m.NewCounter({"process", "cgroup", "nr-periods"})
+            .set_count(static_cast<int64_t>(stat->nrPeriods));
+        m.NewCounter({"process", "cgroup", "nr-throttled"})
+            .set_count(static_cast<int64_t>(stat->nrThrottled));
+        m.NewCounter({"process", "cgroup", "throttled-usec"})
+            .set_count(static_cast<int64_t>(stat->throttledUsec));
+        if (mLastCgroupCpuStat &&
+            stat->nrThrottled > mLastCgroupCpuStat->nrThrottled)
+        {
+            CLOG_INFO(
+                Perf,
+                "CGROUP_THROTTLED periods={} throttled_ms={} "
+                "cpu_ms={} in the last second",
+                stat->nrThrottled - mLastCgroupCpuStat->nrThrottled,
+                (stat->throttledUsec - mLastCgroupCpuStat->throttledUsec) /
+                    1000,
+                (stat->usageUsec - mLastCgroupCpuStat->usageUsec) / 1000);
+        }
+        mLastCgroupCpuStat = stat;
+    }
+    if (auto pressure = cgroup::readCpuPressure(*mCgroupDir))
+    {
+        auto& m = getMetrics();
+        // Percent of time over the last 10 s, in hundredths.
+        m.NewCounter({"process", "cgroup", "cpu-pressure-some-avg10-x100"})
+            .set_count(static_cast<int64_t>(pressure->someAvg10 * 100));
+        m.NewCounter({"process", "cgroup", "cpu-pressure-some-usec"})
+            .set_count(static_cast<int64_t>(pressure->someTotalUsec));
+        m.NewCounter({"process", "cgroup", "cpu-pressure-full-usec"})
+            .set_count(static_cast<int64_t>(pressure->fullTotalUsec));
+    }
+    mCgroupSampleTimer.expires_from_now(std::chrono::seconds(1));
+    mCgroupSampleTimer.async_wait([this]() { sampleCgroupCpu(); },
+                                  VirtualTimer::onFailureNoop);
 }
 
 void

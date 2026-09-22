@@ -10,6 +10,7 @@
 #include "main/PersistentState.h"
 #include "medida/timer_context.h"
 #include "overlay/RustOverlayManager.h"
+#include "util/Cgroup.h"
 #include "util/MetricResetter.h"
 #include "util/Timer.h"
 #include "xdr/Stellar-ledger-entries.h"
@@ -260,6 +261,15 @@ class ApplicationImpl : public Application
 
     VirtualTimer mStoppingTimer;
     VirtualTimer mSelfCheckTimer;
+
+    // CPU accounting of this process's cgroup (throttling and CPU pressure),
+    // sampled every second into process.cgroup.* metrics; a CGROUP_THROTTLED
+    // line is logged for any second in which the CFS throttled the cgroup.
+    VirtualTimer mCgroupSampleTimer;
+    std::optional<std::filesystem::path> mCgroupDir;
+    std::optional<cgroup::CpuStat> mLastCgroupCpuStat;
+    void startCgroupCpuSampling();
+    void sampleCgroupCpu();
 
     std::unique_ptr<MetricsRegistry> mMetrics;
     medida::Timer& mPostOnMainThreadDelay;
