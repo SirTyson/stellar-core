@@ -125,7 +125,7 @@ construction) plus seven experiments:
    - **Cost.** Followers no longer hold the transactions before the leader's set arrives, so
      they verify signatures when they check the set at apply instead of in the background.
 6. **The leader's tx set build off the critical path**
-   ([#5505](https://github.com/stellar/stellar-core/pull/5505), the latest experiment). No protocol change: the sets are ordinary
+   ([#5505](https://github.com/stellar/stellar-core/pull/5505)). No protocol change: the sets are ordinary
    tx sets, and every node validates them at apply as before.
    - **A smaller build.** A build pulls the set's capacity plus 10% from the mempool
      (`EXPERIMENTAL_TX_SET_PULL_MARGIN_PERCENT`); it pulled twice the capacity. A phase that lost
@@ -154,8 +154,8 @@ construction) plus seven experiments:
      the shared lock, and the load generator has the two test-only modes of the real-apply runs
      (`sac_setup`, `sac_payment`).
 
-7. **The leader's tx set travels as erasure-coded pieces, or down a spanning tree** (this pull
-   request, the latest experiment). Config-gated, default off: `EXPERIMENTAL_TX_SET_TREE` =
+7. **The leader's tx set travels as erasure-coded pieces, or down a spanning tree**
+   ([#5506](https://github.com/stellar/stellar-core/pull/5506), the latest experiment). Config-gated, default off: `EXPERIMENTAL_TX_SET_TREE` =
    `off`, `star`, `hash`, `rtt` or `coded`. Every node of a network needs the same value. No
    protocol change: only who sends the set's bytes to whom.
    - **Why.** The leader of experiment 2 writes its whole set to every peer: 89 copies at 90
