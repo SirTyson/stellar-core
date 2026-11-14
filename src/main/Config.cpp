@@ -175,6 +175,8 @@ Config::Config() : NODE_SEED(SecretKey::random())
     BACKGROUND_OVERLAY_PROCESSING = true;
     PARALLEL_LEDGER_APPLY = true;
     EXPERIMENTAL_SPECULATIVE_LEDGER_APPLY = true;
+    EXPERIMENTAL_TX_SET_TREE = "off";
+    EXPERIMENTAL_TX_SET_TREE_FANOUT = 0;
     EXPERIMENTAL_PARALLEL_TX_SET_DOWNLOAD = false;
     DISABLE_SOROBAN_METRICS_FOR_TESTING = false;
     DISABLE_TX_META_FOR_TESTING = false;
@@ -1218,6 +1220,24 @@ Config::processConfig(std::shared_ptr<cpptoml::table> t)
                  [&]() {
                      EXPERIMENTAL_SPECULATIVE_LEDGER_APPLY = readBool(item);
                  }},
+                {"EXPERIMENTAL_TX_SET_TREE",
+                 [&]() {
+                     EXPERIMENTAL_TX_SET_TREE = readString(item);
+                     if (EXPERIMENTAL_TX_SET_TREE != "off" &&
+                         EXPERIMENTAL_TX_SET_TREE != "star" &&
+                         EXPERIMENTAL_TX_SET_TREE != "hash" &&
+                         EXPERIMENTAL_TX_SET_TREE != "rtt")
+                     {
+                         throw std::invalid_argument(
+                             "EXPERIMENTAL_TX_SET_TREE must be one of "
+                             "\"off\", \"star\", \"hash\", \"rtt\"");
+                     }
+                 }},
+                {"EXPERIMENTAL_TX_SET_TREE_FANOUT",
+                 [&]() {
+                     EXPERIMENTAL_TX_SET_TREE_FANOUT =
+                         readInt<uint32_t>(item, 0, 255);
+                 }},
                 {"EXPERIMENTAL_PARALLEL_TX_SET_DOWNLOAD",
                  [&]() {
                      EXPERIMENTAL_PARALLEL_TX_SET_DOWNLOAD = readBool(item);
@@ -1243,9 +1263,7 @@ Config::processConfig(std::shared_ptr<cpptoml::table> t)
                          readBool(item);
                  }},
                 {"TX_FLOOD_TARGET_LEADERS",
-                 [&]() {
-                     TX_FLOOD_TARGET_LEADERS = readInt<uint32_t>(item);
-                 }},
+                 [&]() { TX_FLOOD_TARGET_LEADERS = readInt<uint32_t>(item); }},
                 {"TX_FLOOD_LEGACY_ADVERTS",
                  [&]() { TX_FLOOD_LEGACY_ADVERTS = readBool(item); }},
                 {"BATCH_EXECUTOR_TASKS",
@@ -2401,6 +2419,26 @@ Config::logBasicInfo() const
              "EXPERIMENTAL_SPECULATIVE_LEDGER_APPLY="
              "{}",
              EXPERIMENTAL_SPECULATIVE_LEDGER_APPLY ? "true" : "false");
+    LOG_INFO(DEFAULT_LOG, "EXPERIMENTAL_TX_SET_TREE={} (fanout {})",
+             EXPERIMENTAL_TX_SET_TREE, EXPERIMENTAL_TX_SET_TREE_FANOUT);
+}
+
+uint8_t
+Config::txSetTreeMode() const
+{
+    if (EXPERIMENTAL_TX_SET_TREE == "star")
+    {
+        return 1;
+    }
+    if (EXPERIMENTAL_TX_SET_TREE == "hash")
+    {
+        return 2;
+    }
+    if (EXPERIMENTAL_TX_SET_TREE == "rtt")
+    {
+        return 3;
+    }
+    return 0;
 }
 
 void
